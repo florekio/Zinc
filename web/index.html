@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zinc - JavaScript Engine</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        header {
+            padding: 20px 24px;
+            border-bottom: 1px solid #222;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        header h1 {
+            font-size: 20px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        header h1 span {
+            color: #888;
+            font-weight: 400;
+            font-size: 14px;
+            margin-left: 8px;
+        }
+
+        header a {
+            color: #888;
+            text-decoration: none;
+            font-size: 14px;
+        }
+
+        header a:hover { color: #fff; }
+
+        .container {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        .editor-pane, .output-pane {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .editor-pane {
+            border-right: 1px solid #222;
+        }
+
+        .pane-header {
+            padding: 8px 16px;
+            font-size: 12px;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            border-bottom: 1px solid #1a1a1a;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .pane-header button {
+            background: #1a6e3a;
+            color: #fff;
+            border: none;
+            padding: 6px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-family: inherit;
+        }
+
+        .pane-header button:hover { background: #1f8a49; }
+
+        textarea {
+            flex: 1;
+            background: #111;
+            color: #d4d4d4;
+            border: none;
+            padding: 16px;
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 14px;
+            line-height: 1.6;
+            resize: none;
+            outline: none;
+            tab-size: 2;
+        }
+
+        .output {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+
+        .output-line {
+            padding: 1px 0;
+        }
+
+        .output-line.console {
+            color: #9cdcfe;
+        }
+
+        .output-line.result {
+            color: #4ec9b0;
+        }
+
+        .output-line.result::before {
+            content: "← ";
+            color: #555;
+        }
+
+        .output-line.error {
+            color: #f44747;
+        }
+
+        .status {
+            padding: 6px 16px;
+            font-size: 12px;
+            color: #555;
+            border-top: 1px solid #1a1a1a;
+        }
+
+        .examples {
+            padding: 8px 16px;
+            border-top: 1px solid #1a1a1a;
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        .examples button {
+            background: #1a1a1a;
+            color: #888;
+            border: 1px solid #333;
+            padding: 4px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+            font-family: inherit;
+        }
+
+        .examples button:hover { color: #fff; border-color: #555; }
+
+        @media (max-width: 768px) {
+            .container { flex-direction: column; }
+            .editor-pane { border-right: none; border-bottom: 1px solid #222; max-height: 50vh; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Zinc <span>JavaScript Engine in Rust + WASM</span></h1>
+        <a href="https://github.com/florekio/Zinc" target="_blank">GitHub</a>
+    </header>
+
+    <div class="container">
+        <div class="editor-pane">
+            <div class="pane-header">
+                <span>JavaScript</span>
+                <button onclick="runCode()" id="runBtn">Run (Ctrl+Enter)</button>
+            </div>
+            <textarea id="editor" spellcheck="false">// Welcome to Zinc!
+// A JavaScript engine written in Rust, running as WebAssembly.
+
+function fibonacci(n) {
+    if (n <= 1) return n;
+    return fibonacci(n - 1) + fibonacci(n - 2);
+}
+
+console.log("Fibonacci sequence:");
+for (var i = 0; i <= 10; i++) {
+    console.log(`  fib(${i}) = ${fibonacci(i)}`);
+}
+
+// Try editing this code and pressing Run!</textarea>
+            <div class="examples">
+                <button onclick="loadExample('closures')">Closures</button>
+                <button onclick="loadExample('classes')">Classes</button>
+                <button onclick="loadExample('arrays')">Arrays</button>
+                <button onclick="loadExample('json')">JSON</button>
+                <button onclick="loadExample('math')">Math</button>
+                <button onclick="loadExample('errors')">Errors</button>
+            </div>
+        </div>
+
+        <div class="output-pane">
+            <div class="pane-header">
+                <span>Output</span>
+            </div>
+            <div class="output" id="output">
+                <div class="output-line console" style="color: #555">Press Run or Ctrl+Enter to execute...</div>
+            </div>
+            <div class="status" id="status">Ready</div>
+        </div>
+    </div>
+
+    <script type="module">
+        import init, { zinc_eval_with_output } from './pkg/zinc.js';
+
+        let ready = false;
+
+        async function boot() {
+            await init();
+            ready = true;
+            document.getElementById('status').textContent = 'Engine loaded (384 KB WASM)';
+        }
+
+        window.runCode = function() {
+            if (!ready) return;
+            const source = document.getElementById('editor').value;
+            const output = document.getElementById('output');
+            const status = document.getElementById('status');
+            output.innerHTML = '';
+
+            const start = performance.now();
+            const raw = zinc_eval_with_output(source);
+            const elapsed = (performance.now() - start).toFixed(1);
+
+            try {
+                const result = JSON.parse(raw);
+
+                // Show console output
+                for (const line of result.output) {
+                    const div = document.createElement('div');
+                    div.className = 'output-line console';
+                    div.textContent = line;
+                    output.appendChild(div);
+                }
+
+                // Show return value
+                if (result.result !== 'undefined') {
+                    const div = document.createElement('div');
+                    div.className = result.result.startsWith('Error') ? 'output-line error' : 'output-line result';
+                    div.textContent = result.result;
+                    output.appendChild(div);
+                }
+
+                status.textContent = `Executed in ${elapsed}ms`;
+            } catch (e) {
+                const div = document.createElement('div');
+                div.className = 'output-line error';
+                div.textContent = raw;
+                output.appendChild(div);
+                status.textContent = `Error after ${elapsed}ms`;
+            }
+        };
+
+        const examples = {
+            closures: `// Closures with mutable state
+function makeCounter() {
+    var count = 0;
+    function increment() {
+        count++;
+        return count;
+    }
+    return increment;
+}
+
+var counter = makeCounter();
+console.log(counter()); // 1
+console.log(counter()); // 2
+console.log(counter()); // 3
+
+// Higher-order function
+function makeAdder(x) {
+    return function(y) { return x + y; };
+}
+
+var add10 = makeAdder(10);
+console.log(add10(5));  // 15
+console.log(add10(20)); // 30`,
+
+            classes: `// ES6 Classes
+class Animal {
+    constructor(name, sound) {
+        this.name = name;
+        this.sound = sound;
+    }
+    speak() {
+        return this.name + " says " + this.sound + "!";
+    }
+}
+
+var animals = [
+    new Animal("Dog", "Woof"),
+    new Animal("Cat", "Meow"),
+    new Animal("Cow", "Moo")
+];
+
+for (var a of animals) {
+    console.log(a.speak());
+}`,
+
+            arrays: `// Higher-order array methods
+var numbers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+var evens = numbers.filter(function(n) { return n % 2 === 0; });
+console.log("Evens:", evens);
+
+var doubled = evens.map(function(n) { return n * 2; });
+console.log("Doubled:", doubled);
+
+var sum = doubled.reduce(function(a, b) { return a + b; }, 0);
+console.log("Sum:", sum);
+
+console.log("Has >5?", numbers.some(function(n) { return n > 5; }));
+console.log("All >0?", numbers.every(function(n) { return n > 0; }));
+console.log("First >7:", numbers.find(function(n) { return n > 7; }));`,
+
+            json: `// JSON parse & stringify
+var data = JSON.parse('{"users":[{"name":"Alice","age":30},{"name":"Bob","age":25}]}');
+
+for (var user of data.users) {
+    console.log(user.name + " is " + user.age + " years old");
+}
+
+// Build and stringify
+var obj = { engine: "Zinc", language: "Rust", cool: true };
+console.log(JSON.stringify(obj));
+
+// Destructuring
+var { engine, language } = obj;
+console.log(engine + " is written in " + language);`,
+
+            math: `// Math functions
+console.log("PI:", Math.PI);
+console.log("sqrt(144):", Math.sqrt(144));
+console.log("pow(2, 10):", Math.pow(2, 10));
+console.log("max(3,1,4,1,5,9):", Math.max(3, 1, 4, 1, 5, 9));
+console.log("floor(3.7):", Math.floor(3.7));
+console.log("ceil(3.2):", Math.ceil(3.2));
+console.log("abs(-42):", Math.abs(-42));
+
+// Template literals
+var radius = 5;
+var area = Math.PI * Math.pow(radius, 2);
+console.log(\`Circle with r=\${radius}: area=\${Math.round(area * 100) / 100}\`);`,
+
+            errors: `// Error handling
+try {
+    throw new TypeError("invalid argument");
+} catch (e) {
+    console.log("Caught:", e.name);
+    console.log("Message:", e.message);
+}
+
+// Nested try/catch
+function riskyOp(x) {
+    if (x < 0) throw new RangeError("must be positive");
+    return Math.sqrt(x);
+}
+
+for (var val of [16, -4, 9, -1]) {
+    try {
+        console.log("sqrt(" + val + ") = " + riskyOp(val));
+    } catch (e) {
+        console.log("sqrt(" + val + ") -> " + e.name + ": " + e.message);
+    }
+}`
+        };
+
+        window.loadExample = function(name) {
+            document.getElementById('editor').value = examples[name] || '';
+        };
+
+        // Keyboard shortcut
+        document.getElementById('editor').addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                e.preventDefault();
+                runCode();
+            }
+            // Tab inserts spaces
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                const start = this.selectionStart;
+                this.value = this.value.substring(0, start) + '  ' + this.value.substring(this.selectionEnd);
+                this.selectionStart = this.selectionEnd = start + 2;
+            }
+        });
+
+        boot();
+    </script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "zinc",
+  "type": "module",
+  "description": "A JavaScript engine written in Rust",
+  "version": "0.1.0",
+  "files": [
+    "zinc_bg.wasm",
+    "zinc.js",
+    "zinc.d.ts"
+  ],
+  "main": "zinc.js",
+  "types": "zinc.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
