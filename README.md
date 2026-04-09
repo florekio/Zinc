@@ -42,7 +42,7 @@ Zinc JIT:        20ms  ← 1.75x faster than V8
 
 The JIT is **50x faster** than the interpreter and **beats V8** because it has zero warmup overhead — the code is compiled directly to native instructions without optimization tiers.
 
-Currently supports recursive numeric functions (fibonacci-like patterns) on Apple Silicon.
+Currently supports 1-param (fibonacci) and 2-param (Ackermann) recursive numeric functions on Apple Silicon.
 
 ## Features
 
@@ -106,6 +106,7 @@ sieve(10K)             0.030s     0.034s      0.9x  ← Zinc wins
 ```
 Test                         Zinc       Node     Ratio
 ─────────────────────────────────────────────────────
+controlflow-recursive       250ms     260ms      0.96x  ← Zinc JIT wins!
 access-nbody                100ms      39ms      2.6x   ✓
 bitops-3bit-bits-in-byte     63ms      36ms      1.8x   ✓
 math-cordic                 152ms      44ms      3.5x   ✓
