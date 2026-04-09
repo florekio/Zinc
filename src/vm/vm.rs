@@ -103,6 +103,12 @@ pub struct Vm {
     pub(crate) microtask_queue: Vec<Microtask>,
     /// Upvalues for each closure, indexed by closure_id.
     pub(crate) closure_upvalues: Vec<Vec<Upvalue>>,
+    /// Call counter per chunk index (for JIT hotspot detection).
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub(crate) call_counts: HashMap<usize, u32>,
+    /// JIT-compiled native functions, keyed by chunk index.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub(crate) jit_functions: HashMap<usize, crate::jit::compiler::JitFunction>,
     /// console.log output buffer (for testing)
     pub output: Vec<String>,
 }
@@ -220,6 +226,10 @@ impl Vm {
             exc_handlers: Vec::new(),
             microtask_queue: Vec::new(),
             closure_upvalues: Vec::new(),
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            call_counts: HashMap::new(),
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            jit_functions: HashMap::new(),
             output: Vec::new(),
         }
     }
@@ -1167,7 +1177,38 @@ impl Vm {
                                 continue;
                             }
 
-                            // Avoid clone when there are no upvalues (common fast path)
+                            // ---- JIT: check if we have compiled native code ----
+                            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                            {
+                                // Check if JIT code already exists
+                                if let Some(jit_fn) = self.jit_functions.get(&chunk_idx) {
+                                    // Call native code directly!
+                                    let arg = if argc > 0 {
+                                        let v = self.stack[func_pos + 1];
+                                        v.as_number().unwrap_or(0.0) as i64
+                                    } else { 0 };
+                                    let result = jit_fn.call(arg);
+                                    self.stack.truncate(func_pos);
+                                    self.push(Value::int(result as i32));
+                                    continue;
+                                }
+
+                                // Count calls and try to JIT at threshold
+                                let count = self.call_counts.entry(chunk_idx).or_insert(0);
+                                *count += 1;
+                                if *count == 100 {
+                                    // Try to JIT-compile this function
+                                    if let Some(jit_fn) = crate::jit::compiler::jit_compile(
+                                        &self.chunks[chunk_idx],
+                                        &self.chunks,
+                                    ) {
+                                        self.jit_functions.insert(chunk_idx, jit_fn);
+                                        // Don't use it yet on this call — next time
+                                    }
+                                }
+                            }
+
+                            // ---- Interpreter: normal bytecode execution ----
                             let upvalues = if closure_id < self.closure_upvalues.len()
                                 && !self.closure_upvalues[closure_id].is_empty() {
                                 self.closure_upvalues[closure_id].clone()

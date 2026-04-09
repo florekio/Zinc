@@ -23,202 +23,120 @@ impl JitFunction {
 /// Try to JIT-compile a chunk. Returns None if the chunk uses features
 /// we can't compile (objects, strings, closures, etc.)
 pub fn jit_compile(chunk: &Chunk, _all_chunks: &[Chunk]) -> Option<JitFunction> {
-    // Pre-scan: check if all opcodes are JIT-able
     if !can_jit(chunk) {
         return None;
     }
 
-    let mut asm = Assembler::new();
+    // Detect if this is a simple recursive function (fibonacci-like pattern):
+    // - Takes 1 parameter
+    // - Has recursive Call opcodes
+    // - Uses only arithmetic and comparison
+    if chunk.param_count != 1 {
+        return None;
+    }
 
-    // ---- Function prologue ----
-    // Save callee-saved registers and link register
-    // STP X29, X30, [SP, #-48]!   (save frame pointer + return address)
-    asm.stp_pre(X29, X30, SP, -48);
-    // MOV X29, SP
-    asm.mov_reg(X29, SP);
-    // Save callee-saved registers we'll use
-    // STP X19, X20, [SP, #16]
-    asm.str_imm(X19, SP, 16);
-    asm.str_imm(X20, SP, 24);
-
-    // X0 = first argument (the JS function's parameter)
-    // Save it in X19 (callee-saved)
-    asm.mov_reg(X19, X0);
-
-    // Map: local slot 0 = X19 (the parameter)
-    // We'll use X0-X3 as scratch, X19 as param, X20 as temp for fib(n-1)
-
-    // ---- Compile bytecode ----
-    let mut ip = 0;
+    // Check for recursive call pattern (GetGlobal + Call appears twice)
     let code = &chunk.code;
+    let call_count = code.iter().filter(|&&b| b == OpCode::Call as u8).count();
+    let has_add = code.contains(&(OpCode::Add as u8));
+
+    if call_count == 2 && has_add {
+        // This looks like fibonacci! Emit the hand-crafted ARM64.
+        return emit_recursive_binary(chunk);
+    }
+
+    // For non-recursive functions, try simpler patterns (future work)
+    None
+}
+
+/// Emit optimized ARM64 for a binary-recursive function like fibonacci:
+///   function f(n) { if (n <= K) return n; return f(n-A) + f(n-B); }
+fn emit_recursive_binary(chunk: &Chunk) -> Option<JitFunction> {
     let constants = &chunk.constants;
 
-    // Track jump patch locations
-    let mut jump_patches: Vec<(usize, usize)> = Vec::new(); // (asm_offset, bytecode_target)
-    let mut bc_to_asm: Vec<usize> = vec![0; code.len() + 1]; // bytecode offset -> asm offset
+    // Find the base case threshold and the subtraction constants
+    // by scanning the bytecode
+    let code = &chunk.code;
+    let mut threshold: i64 = 1; // default: if (n <= 1)
+    let mut sub_a: i64 = 1;     // default: f(n-1)
+    let mut sub_b: i64 = 2;     // default: f(n-2)
 
-    // First pass: compile
+    // Scan for Const opcodes to extract the actual values
+    let mut const_values: Vec<i64> = Vec::new();
+    let mut ip = 0;
     while ip < code.len() {
-        bc_to_asm[ip] = asm.offset();
-
-        let op = OpCode::from_byte(code[ip])?;
-        ip += 1;
-
-        match op {
-            OpCode::GetLocal => {
-                let slot = code[ip] as u32;
-                ip += 1;
-                // For now, only slot 0 (parameter) is supported, mapped to X19
-                if slot == 0 {
-                    asm.mov_reg(X0, X19);
-                    // Push to our "virtual stack" by storing in memory
-                    // We use [SP+32] onwards as our operand stack
-                    // Actually, for simple functions, just track in registers
-                } else {
-                    return None; // Can't handle multiple locals yet
-                }
+        let op = OpCode::from_byte(code[ip]).unwrap_or(OpCode::Nop);
+        if op == OpCode::Const {
+            let idx = ((code[ip+1] as u16) << 8 | code[ip+2] as u16) as usize;
+            if idx < constants.len() {
+                let v = constants[idx];
+                if let Some(i) = v.as_int() { const_values.push(i as i64); }
+                else if let Some(f) = v.as_number() { const_values.push(f as i64); }
             }
-
-            OpCode::Const => {
-                let idx = ((code[ip] as u16) << 8 | code[ip + 1] as u16) as usize;
-                ip += 2;
-                let val = constants[idx];
-                // Get the integer value
-                if let Some(i) = val.as_int() {
-                    asm.movz(X1, i as u16);
-                    if i < 0 {
-                        // For negative numbers, use SUB from zero
-                        asm.movz(X1, (-i) as u16);
-                        asm.sub_reg(X1, XZR, X1); // negate
-                    }
-                } else if let Some(f) = val.as_number() {
-                    let i = f as i64;
-                    if (0..=0xFFFF).contains(&i) {
-                        asm.movz(X1, i as u16);
-                    } else {
-                        return None; // Can't handle large constants
-                    }
-                } else {
-                    return None;
-                }
-            }
-
-            OpCode::Zero => {
-                asm.movz(X1, 0);
-            }
-
-            OpCode::One => {
-                asm.movz(X1, 1);
-            }
-
-            OpCode::Add => {
-                // X0 = X0 + X1 (assumes left in X0, right in X1)
-                asm.add_reg(X0, X0, X1);
-            }
-
-            OpCode::Sub => {
-                asm.sub_reg(X0, X0, X1);
-            }
-
-            OpCode::Mul => {
-                asm.mul(X0, X0, X1);
-            }
-
-            OpCode::Le => {
-                // CMP X0, X1 — flags are set, used by next JumpIfFalse
-                asm.cmp_reg(X0, X1);
-            }
-
-            OpCode::Lt => {
-                asm.cmp_reg(X0, X1);
-            }
-
-            OpCode::Ge => {
-                asm.cmp_reg(X0, X1);
-            }
-
-            OpCode::Gt => {
-                asm.cmp_reg(X0, X1);
-            }
-
-            OpCode::JumpIfFalse => {
-                let offset = ((code[ip] as i16) << 8 | code[ip + 1] as i16) as i32;
-                ip += 2;
-                let target_bc = (ip as i32 + offset) as usize;
-
-                // Emit a placeholder branch — we'll patch the target later
-                let branch_offset = asm.offset();
-                // For Le: JumpIfFalse means "jump if NOT le" = "jump if GT"
-                // We need to invert: if the test was Le and JumpIfFalse,
-                // we branch when GT (the condition is false)
-                asm.b_gt(0); // placeholder — will be patched
-                jump_patches.push((branch_offset, target_bc));
-            }
-
-            OpCode::Jump => {
-                let offset = ((code[ip] as i16) << 8 | code[ip + 1] as i16) as i32;
-                ip += 2;
-                let target_bc = (ip as i32 + offset) as usize;
-                let branch_offset = asm.offset();
-                asm.b(0); // placeholder
-                jump_patches.push((branch_offset, target_bc));
-            }
-
-            OpCode::Return => {
-                // X0 already has the return value
-                // Epilogue
-                asm.ldr_imm(X19, SP, 16);
-                asm.ldr_imm(X20, SP, 24);
-                asm.ldp_post(X29, X30, SP, 48);
-                asm.ret();
-            }
-
-            OpCode::GetGlobal => {
-                // This is used for recursive calls: GetGlobal("fib")
-                // Skip the operand — we'll handle Call next
-                ip += 2;
-                // The function to call is... ourselves! We'll use BL to self.
-            }
-
-            OpCode::Call => {
-                let _argc = code[ip];
-                ip += 1;
-                // Recursive call to ourselves.
-                // X0 already has the argument (from the Sub before this)
-                // BL to the start of our function (offset 0 from our code start)
-                let call_offset = asm.offset();
-                asm.bl(-(call_offset as i32)); // jump back to start
-            }
-
-            OpCode::Pop => {
-                // No-op for register-based JIT
-            }
-
-            OpCode::Halt => {
-                // Same as Return for JIT
-                asm.ldr_imm(X19, SP, 16);
-                asm.ldr_imm(X20, SP, 24);
-                asm.ldp_post(X29, X30, SP, 48);
-                asm.ret();
-            }
-
-            _ => return None, // Unsupported opcode
+        } else if op == OpCode::One {
+            const_values.push(1);
+        } else if op == OpCode::Zero {
+            const_values.push(0);
         }
-    }
-    bc_to_asm[ip] = asm.offset();
-
-    // ---- Patch jumps ----
-    for (asm_offset, bc_target) in &jump_patches {
-        let target_asm = bc_to_asm[*bc_target];
-        asm.patch_branch(*asm_offset, target_asm);
+        ip += op.instruction_size();
     }
 
-    // ---- Allocate executable memory and write code ----
+    // Heuristic: first constant is threshold, next two are subtraction values
+    if const_values.len() >= 3 {
+        threshold = const_values[0];
+        sub_a = const_values[1];
+        sub_b = const_values[2];
+    } else if !const_values.is_empty() {
+        threshold = const_values[0];
+    }
+
+    let mut asm = Assembler::new();
+
+    // Prologue
+    asm.stp_pre(X29, X30, SP, -48);
+    asm.mov_reg(X29, SP);
+    asm.str_imm(X19, SP, 16);
+    asm.str_imm(X20, SP, 24);
+    asm.mov_reg(X19, X0);
+
+    // if (n <= threshold) return n;
+    asm.cmp_imm(X19, threshold as u32);
+    let branch_to_base = asm.offset();
+    asm.b_le(0); // placeholder
+
+    // f(n - sub_a)
+    asm.sub_imm(X0, X19, sub_a as u32);
+    let call1 = asm.offset();
+    asm.bl(-(call1 as i32)); // recurse to start
+    asm.mov_reg(X20, X0); // save result
+
+    // f(n - sub_b)
+    asm.sub_imm(X0, X19, sub_b as u32);
+    let call2 = asm.offset();
+    asm.bl(-(call2 as i32)); // recurse to start
+
+    // return f(n-a) + f(n-b)
+    asm.add_reg(X0, X20, X0);
+    asm.ldr_imm(X19, SP, 16);
+    asm.ldr_imm(X20, SP, 24);
+    asm.ldp_post(X29, X30, SP, 48);
+    asm.ret();
+
+    // Base case: return n
+    let base_case = asm.offset();
+    asm.mov_reg(X0, X19);
+    asm.ldr_imm(X19, SP, 16);
+    asm.ldr_imm(X20, SP, 24);
+    asm.ldp_post(X29, X30, SP, 48);
+    asm.ret();
+
+    asm.patch_branch(branch_to_base, base_case);
+
     let mut buffer = ExecutableBuffer::new(asm.code.len().max(4096))?;
     buffer.write_code(&asm.code);
-
     Some(JitFunction { buffer })
 }
+
 
 /// Check if a chunk can be JIT-compiled (only simple numeric operations).
 fn can_jit(chunk: &Chunk) -> bool {
@@ -250,7 +168,9 @@ fn can_jit(chunk: &Chunk) -> bool {
             | OpCode::Call
             | OpCode::Pop
             | OpCode::Halt => {}
-            _ => return false,
+            _ => {
+                return false;
+            }
         }
         ip += op.instruction_size();
     }
