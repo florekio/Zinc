@@ -8,6 +8,7 @@ pub const X1: u32 = 1;
 pub const X2: u32 = 2;
 pub const X19: u32 = 19; // callee-saved, used for local 'n'
 pub const X20: u32 = 20; // callee-saved, used for temps
+pub const X21: u32 = 21; // callee-saved, extra temp
 pub const X29: u32 = 29; // frame pointer
 pub const X30: u32 = 30; // link register (return address)
 pub const SP: u32 = 31;  // stack pointer (in some encodings)
@@ -113,6 +114,18 @@ impl Assembler {
     /// B.GT (signed greater than)
     pub fn b_gt(&mut self, byte_offset: i32) { self.b_cond(12, byte_offset); }
 
+    /// CBZ Xn, offset (compare and branch if zero)
+    pub fn cbz(&mut self, rt: u32, byte_offset: i32) {
+        let imm19 = ((byte_offset >> 2) as u32) & 0x7FFFF;
+        self.emit(0xB4000000 | (imm19 << 5) | rt);
+    }
+
+    /// CBNZ Xn, offset (compare and branch if not zero)
+    pub fn cbnz(&mut self, rt: u32, byte_offset: i32) {
+        let imm19 = ((byte_offset >> 2) as u32) & 0x7FFFF;
+        self.emit(0xB5000000 | (imm19 << 5) | rt);
+    }
+
     /// BL (branch with link = function call)
     pub fn bl(&mut self, byte_offset: i32) {
         let imm26 = ((byte_offset >> 2) as u32) & 0x3FFFFFF;
@@ -202,6 +215,9 @@ impl Assembler {
         let patched = if opcode == 0x14000000 || opcode == 0x94000000 {
             // B or BL: 26-bit offset
             (existing & 0xFC000000) | ((relative as u32) & 0x3FFFFFF)
+        } else if opcode == 0xB4000000 || opcode == 0xB5000000 {
+            // CBZ or CBNZ: 19-bit offset, bits [23:5]
+            (existing & 0xFF00001F) | (((relative as u32) & 0x7FFFF) << 5)
         } else {
             // B.cond: 19-bit offset
             (existing & 0xFF00001F) | (((relative as u32) & 0x7FFFF) << 5)

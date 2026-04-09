@@ -1183,11 +1183,19 @@ impl Vm {
                                 // Check if JIT code already exists
                                 if let Some(jit_fn) = self.jit_functions.get(&chunk_idx) {
                                     // Call native code directly!
-                                    let arg = if argc > 0 {
-                                        let v = self.stack[func_pos + 1];
-                                        v.as_number().unwrap_or(0.0) as i64
-                                    } else { 0 };
-                                    let result = jit_fn.call(arg);
+                                    let result = if jit_fn.param_count() == 2 && argc >= 2 {
+                                        let v0 = self.stack[func_pos + 1];
+                                        let v1 = self.stack[func_pos + 2];
+                                        let a0 = v0.as_number().unwrap_or(0.0) as i64;
+                                        let a1 = v1.as_number().unwrap_or(0.0) as i64;
+                                        jit_fn.call2(a0, a1)
+                                    } else {
+                                        let arg = if argc > 0 {
+                                            let v = self.stack[func_pos + 1];
+                                            v.as_number().unwrap_or(0.0) as i64
+                                        } else { 0 };
+                                        jit_fn.call(arg)
+                                    };
                                     self.stack.truncate(func_pos);
                                     self.push(Value::int(result as i32));
                                     continue;

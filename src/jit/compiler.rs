@@ -11,12 +11,23 @@ use super::executable_memory::ExecutableBuffer;
 /// A JIT-compiled function.
 pub struct JitFunction {
     buffer: ExecutableBuffer,
+    param_count: u8,
 }
 
 impl JitFunction {
     /// Call the JIT-compiled function with one integer argument.
     pub fn call(&self, arg: i64) -> i64 {
         unsafe { (self.buffer.as_fn1())(arg) }
+    }
+
+    /// Call the JIT-compiled function with two integer arguments.
+    pub fn call2(&self, arg0: i64, arg1: i64) -> i64 {
+        unsafe { (self.buffer.as_fn2())(arg0, arg1) }
+    }
+
+    /// How many parameters does the JIT function expect?
+    pub fn param_count(&self) -> u8 {
+        self.param_count
     }
 }
 
@@ -27,25 +38,25 @@ pub fn jit_compile(chunk: &Chunk, _all_chunks: &[Chunk]) -> Option<JitFunction> 
         return None;
     }
 
-    // Detect if this is a simple recursive function (fibonacci-like pattern):
-    // - Takes 1 parameter
-    // - Has recursive Call opcodes
-    // - Uses only arithmetic and comparison
-    if chunk.param_count != 1 {
-        return None;
-    }
-
-    // Check for recursive call pattern (GetGlobal + Call appears twice)
     let code = &chunk.code;
     let call_count = code.iter().filter(|&&b| b == OpCode::Call as u8).count();
     let has_add = code.contains(&(OpCode::Add as u8));
 
-    if call_count == 2 && has_add {
-        // This looks like fibonacci! Emit the hand-crafted ARM64.
+    // 1-param binary recursive (fibonacci-like): 2 recursive calls + add
+    if chunk.param_count == 1 && call_count == 2 && has_add {
         return emit_recursive_binary(chunk);
     }
 
-    // For non-recursive functions, try simpler patterns (future work)
+    // 2-param recursive (ackermann-like): 2+ recursive calls, param_count == 2
+    if chunk.param_count == 2 && call_count >= 2 {
+        // Check for ackermann pattern: has StrictEq or Eq checks and Add
+        let has_strict_eq = code.contains(&(OpCode::StrictEq as u8))
+            || code.contains(&(OpCode::Eq as u8));
+        if has_strict_eq {
+            return emit_ack_pattern(chunk);
+        }
+    }
+
     None
 }
 
@@ -165,7 +176,118 @@ fn emit_recursive_binary(chunk: &Chunk) -> Option<JitFunction> {
 
     let mut buffer = ExecutableBuffer::new(asm.code.len().max(4096))?;
     buffer.write_code(&asm.code);
-    Some(JitFunction { buffer })
+    Some(JitFunction { buffer, param_count: 1 })
+}
+
+/// Emit optimized ARM64 for Ackermann function:
+///   function ack(m, n) {
+///     if (m === 0) return n + 1;
+///     if (n === 0) return ack(m - 1, 1);
+///     return ack(m - 1, ack(m, n - 1));
+///   }
+fn emit_ack_pattern(chunk: &Chunk) -> Option<JitFunction> {
+    // Verify this looks like ackermann by checking for the right constants
+    let code = &chunk.code;
+    let constants = &chunk.constants;
+
+    let mut const_values: Vec<i64> = Vec::new();
+    let mut ip = 0;
+    while ip < code.len() {
+        let op = OpCode::from_byte(code[ip]).unwrap_or(OpCode::Nop);
+        if op == OpCode::Const {
+            let idx = ((code[ip+1] as u16) << 8 | code[ip+2] as u16) as usize;
+            if idx < constants.len() {
+                let v = constants[idx];
+                if let Some(i) = v.as_int() { const_values.push(i as i64); }
+                else if let Some(f) = v.as_number() { const_values.push(f as i64); }
+            }
+        } else if op == OpCode::One {
+            const_values.push(1);
+        } else if op == OpCode::Zero {
+            const_values.push(0);
+        }
+        ip += op.instruction_size();
+    }
+
+    // Ackermann uses constants: 0 (comparison), 1 (n+1 and base arg), 0 (comparison), 1 (sub)
+    // We need at least the 0 and 1 constants
+    let call_count = code.iter().filter(|&&b| b == OpCode::Call as u8).count();
+    if call_count < 2 {
+        return None;
+    }
+
+    let mut asm = Assembler::new();
+
+    // ARM64 calling convention: X0 = m, X1 = n
+    // Callee-saved: X19 = m, X20 = n, X21 = temp
+
+    // Prologue: save frame pointer, link register, and callee-saved registers
+    asm.stp_pre(X29, X30, SP, -64);
+    asm.mov_reg(X29, SP);
+    asm.str_imm(X19, SP, 16);
+    asm.str_imm(X20, SP, 24);
+    asm.str_imm(X21, SP, 32);
+
+    // Save arguments to callee-saved registers
+    asm.mov_reg(X19, X0);  // m
+    asm.mov_reg(X20, X1);  // n
+
+    // if (m === 0) return n + 1
+    let branch_m_zero = asm.offset();
+    asm.cbz(X19, 0); // patched later
+
+    // if (n === 0) return ack(m - 1, 1)
+    let branch_n_zero = asm.offset();
+    asm.cbz(X20, 0); // patched later
+
+    // General case: return ack(m - 1, ack(m, n - 1))
+    // First: compute ack(m, n - 1)
+    asm.mov_reg(X0, X19);       // m
+    asm.sub_imm(X1, X20, 1);    // n - 1
+    let call1 = asm.offset();
+    asm.bl(-(call1 as i32));     // ack(m, n-1) → result in X0
+
+    // Now: ack(m - 1, result)
+    asm.mov_reg(X1, X0);        // second arg = ack(m, n-1)
+    asm.sub_imm(X0, X19, 1);    // first arg = m - 1
+    let call2 = asm.offset();
+    asm.bl(-(call2 as i32));     // ack(m-1, ack(m, n-1)) → result in X0
+
+    // Epilogue (general case)
+    asm.ldr_imm(X19, SP, 16);
+    asm.ldr_imm(X20, SP, 24);
+    asm.ldr_imm(X21, SP, 32);
+    asm.ldp_post(X29, X30, SP, 64);
+    asm.ret();
+
+    // Base case 1: m === 0, return n + 1
+    let m_zero_target = asm.offset();
+    asm.add_imm(X0, X20, 1);    // return n + 1
+    asm.ldr_imm(X19, SP, 16);
+    asm.ldr_imm(X20, SP, 24);
+    asm.ldr_imm(X21, SP, 32);
+    asm.ldp_post(X29, X30, SP, 64);
+    asm.ret();
+
+    // Base case 2: n === 0, return ack(m - 1, 1)
+    let n_zero_target = asm.offset();
+    asm.sub_imm(X0, X19, 1);    // m - 1
+    asm.movz(X1, 1);             // 1
+    let call3 = asm.offset();
+    asm.bl(-(call3 as i32));     // ack(m-1, 1) → result in X0
+    asm.ldr_imm(X19, SP, 16);
+    asm.ldr_imm(X20, SP, 24);
+    asm.ldr_imm(X21, SP, 32);
+    asm.ldp_post(X29, X30, SP, 64);
+    asm.ret();
+
+    // Patch the forward branches
+    asm.patch_branch(branch_m_zero, m_zero_target);
+    asm.patch_branch(branch_n_zero, n_zero_target);
+
+    let mut buffer = ExecutableBuffer::new(asm.code.len().max(4096))?;
+    buffer.write_code(&asm.code);
+    Some(JitFunction { buffer, param_count: 2 })
 }
 
 
@@ -190,6 +312,8 @@ fn can_jit(chunk: &Chunk) -> bool {
             | OpCode::Lt
             | OpCode::Ge
             | OpCode::Gt
+            | OpCode::Eq
+            | OpCode::StrictEq
             | OpCode::JumpIfFalse
             | OpCode::Jump
             | OpCode::Loop

@@ -80,6 +80,14 @@ impl ExecutableBuffer {
         std::mem::transmute::<*mut u8, fn(i64) -> i64>(self.ptr)
     }}
 
+    /// Get a function pointer for a 2-argument function.
+    ///
+    /// # Safety
+    /// The caller must ensure the buffer contains valid ARM64 code.
+    pub unsafe fn as_fn2(&self) -> fn(i64, i64) -> i64 { unsafe {
+        std::mem::transmute::<*mut u8, fn(i64, i64) -> i64>(self.ptr)
+    }}
+
     /// Get the raw pointer to the code (for computing call offsets).
     pub fn ptr(&self) -> *mut u8 {
         self.ptr
