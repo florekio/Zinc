@@ -4,7 +4,7 @@ use std::fmt;
 use crate::compiler::chunk::Chunk;
 use crate::compiler::opcode::OpCode;
 use crate::compiler::chunk::ChunkFlags;
-use crate::runtime::object::{JsObject, ObjectHeap, ObjectId, ObjectKind, PromiseReaction, PromiseState};
+use crate::runtime::object::{JsObject, ObjectHeap, ObjectId, ObjectKind, PromiseState};
 use crate::runtime::value::Value;
 use crate::util::interner::{Interner, StringId};
 
@@ -38,7 +38,7 @@ impl std::error::Error for VmError {}
 /// An upvalue: a reference to a variable that may still be on the stack (open)
 /// or has been moved to the heap (closed).
 #[derive(Clone)]
-enum UpvalueLocation {
+pub(crate) enum UpvalueLocation {
     /// Points to a stack slot (variable still on stack).
     Open(usize),
     /// Value has been closed over (moved to heap when enclosing function returned).
@@ -46,32 +46,32 @@ enum UpvalueLocation {
 }
 
 #[derive(Clone)]
-struct Upvalue {
-    location: UpvalueLocation,
+pub(crate) struct Upvalue {
+    pub(crate) location: UpvalueLocation,
 }
 
-struct CallFrame {
-    chunk_idx: usize,
-    ip: usize,
-    base: usize,
-    upvalues: Vec<Upvalue>,
+pub(crate) struct CallFrame {
+    pub(crate) chunk_idx: usize,
+    pub(crate) ip: usize,
+    pub(crate) base: usize,
+    pub(crate) upvalues: Vec<Upvalue>,
     /// The `this` value for this call.
-    this_value: Value,
+    pub(crate) this_value: Value,
     /// If true, ReturnUndefined returns this_value instead.
-    is_constructor: bool,
+    pub(crate) is_constructor: bool,
 }
 
 /// An active exception handler (pushed by PushExcHandler).
 #[allow(dead_code)]
-struct ExcHandler {
-    catch_target: u16,
-    finally_target: u16,
-    stack_depth: usize,
-    frame_idx: usize,
+pub(crate) struct ExcHandler {
+    pub(crate) catch_target: u16,
+    pub(crate) finally_target: u16,
+    pub(crate) stack_depth: usize,
+    pub(crate) frame_idx: usize,
 }
 
 #[derive(Clone)]
-enum Microtask {
+pub(crate) enum Microtask {
     PromiseReaction {
         callback: Option<Value>,
         value: Value,
@@ -82,27 +82,27 @@ enum Microtask {
 
 /// Inline cache entry for GetGlobal: (name_id, cached_value).
 /// Keyed by (chunk_idx, bytecode_offset).
-type GlobalIC = HashMap<(usize, usize), (StringId, Value)>;
+pub(crate) type GlobalIC = HashMap<(usize, usize), (StringId, Value)>;
 
 pub struct Vm {
-    chunks: Vec<Chunk>,
-    frames: Vec<CallFrame>,
-    stack: Vec<Value>,
-    globals: HashMap<StringId, Value>,
+    pub(crate) chunks: Vec<Chunk>,
+    pub(crate) frames: Vec<CallFrame>,
+    pub(crate) stack: Vec<Value>,
+    pub(crate) globals: HashMap<StringId, Value>,
     /// Fast global lookup by StringId index (parallel to HashMap for hot path).
-    globals_vec: Vec<Value>,
-    interner: Interner,
-    heap: ObjectHeap,
+    pub(crate) globals_vec: Vec<Value>,
+    pub(crate) interner: Interner,
+    pub(crate) heap: ObjectHeap,
     #[allow(dead_code)]
-    global_ic: GlobalIC,
+    pub(crate) global_ic: GlobalIC,
     #[allow(dead_code)]
-    global_version: u64,
+    pub(crate) global_version: u64,
     #[allow(dead_code)]
-    global_ic_version: HashMap<(usize, usize), u64>,
-    exc_handlers: Vec<ExcHandler>,
-    microtask_queue: Vec<Microtask>,
+    pub(crate) global_ic_version: HashMap<(usize, usize), u64>,
+    pub(crate) exc_handlers: Vec<ExcHandler>,
+    pub(crate) microtask_queue: Vec<Microtask>,
     /// Upvalues for each closure, indexed by closure_id.
-    closure_upvalues: Vec<Vec<Upvalue>>,
+    pub(crate) closure_upvalues: Vec<Vec<Upvalue>>,
     /// console.log output buffer (for testing)
     pub output: Vec<String>,
 }
@@ -224,7 +224,7 @@ impl Vm {
         }
     }
 
-    fn flatten_chunk(mut chunk: Chunk, out: &mut Vec<Chunk>) {
+    pub(crate) fn flatten_chunk(mut chunk: Chunk, out: &mut Vec<Chunk>) {
         let children = std::mem::take(&mut chunk.child_chunks);
         out.push(chunk);
         for child in children {
@@ -233,7 +233,7 @@ impl Vm {
     }
 
     /// Close all open upvalues that point to stack slots >= `from`.
-    fn close_upvalues_above(&mut self, from: usize) {
+    pub(crate) fn close_upvalues_above(&mut self, from: usize) {
         // Close upvalues in all frames
         for frame in &mut self.frames {
             for uv in &mut frame.upvalues {
@@ -256,776 +256,15 @@ impl Vm {
         }
     }
 
-    // ---- String method dispatch ----
-    fn exec_string_method(&mut self, s: &str, method_name: StringId, args: &[Value]) -> Value {
-        let name = self.interner.resolve(method_name).to_owned();
-        match name.as_str() {
-            "charAt" => {
-                let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                let ch = s.chars().nth(idx).map(|c| c.to_string()).unwrap_or_default();
-                let id = self.interner.intern(&ch);
-                Value::string(id)
-            }
-            "charCodeAt" => {
-                let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                let code = s.chars().nth(idx).map(|c| c as u32 as f64).unwrap_or(f64::NAN);
-                Value::number(code)
-            }
-            "indexOf" => {
-                let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let pos = s.find(&search).map(|i| i as i32).unwrap_or(-1);
-                Value::int(pos)
-            }
-            "lastIndexOf" => {
-                let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let pos = s.rfind(&search).map(|i| i as i32).unwrap_or(-1);
-                Value::int(pos)
-            }
-            "includes" => {
-                let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                Value::boolean(s.contains(&search))
-            }
-            "startsWith" => {
-                let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                Value::boolean(s.starts_with(&search))
-            }
-            "endsWith" => {
-                let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                Value::boolean(s.ends_with(&search))
-            }
-            "slice" => {
-                let len = s.len() as i32;
-                let start = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                let end = args.get(1).and_then(|v| v.as_number()).map(|n| n as i32).unwrap_or(len);
-                let start = if start < 0 { (len + start).max(0) as usize } else { start.min(len) as usize };
-                let end = if end < 0 { (len + end).max(0) as usize } else { end.min(len) as usize };
-                let result = if start <= end { &s[start..end] } else { "" };
-                let id = self.interner.intern(result);
-                Value::string(id)
-            }
-            "substring" => {
-                let len = s.len() as i32;
-                let mut start = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                let mut end = args.get(1).and_then(|v| v.as_number()).map(|n| n as i32).unwrap_or(len);
-                start = start.max(0).min(len);
-                end = end.max(0).min(len);
-                if start > end { std::mem::swap(&mut start, &mut end); }
-                let result = &s[start as usize..end as usize];
-                let id = self.interner.intern(result);
-                Value::string(id)
-            }
-            "toUpperCase" => {
-                let result = s.to_uppercase();
-                let id = self.interner.intern(&result);
-                Value::string(id)
-            }
-            "toLowerCase" => {
-                let result = s.to_lowercase();
-                let id = self.interner.intern(&result);
-                Value::string(id)
-            }
-            "trim" => {
-                let id = self.interner.intern(s.trim());
-                Value::string(id)
-            }
-            "trimStart" => {
-                let id = self.interner.intern(s.trim_start());
-                Value::string(id)
-            }
-            "trimEnd" => {
-                let id = self.interner.intern(s.trim_end());
-                Value::string(id)
-            }
-            "split" => {
-                let sep = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let parts: Vec<Value> = s.split(&sep).map(|part| {
-                    let id = self.interner.intern(part);
-                    Value::string(id)
-                }).collect();
-                let arr = JsObject::array(parts);
-                let oid = self.heap.allocate(arr);
-                Value::object_id(oid)
-            }
-            "replace" => {
-                let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let replacement = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let result = s.replacen(&search, &replacement, 1);
-                let id = self.interner.intern(&result);
-                Value::string(id)
-            }
-            "repeat" => {
-                let count = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                let result = s.repeat(count);
-                let id = self.interner.intern(&result);
-                Value::string(id)
-            }
-            "padStart" => {
-                let target_len = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                let pad = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_else(|| " ".into());
-                let mut result = s.to_string();
-                while result.len() < target_len {
-                    result.insert_str(0, &pad);
-                }
-                if result.len() > target_len { result.truncate(target_len); }
-                let id = self.interner.intern(&result);
-                Value::string(id)
-            }
-            "padEnd" => {
-                let target_len = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                let pad = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_else(|| " ".into());
-                let mut result = s.to_string();
-                while result.len() < target_len {
-                    result.push_str(&pad);
-                }
-                if result.len() > target_len { result.truncate(target_len); }
-                let id = self.interner.intern(&result);
-                Value::string(id)
-            }
-            "concat" => {
-                let mut result = s.to_string();
-                for arg in args {
-                    result.push_str(&self.value_to_string(*arg));
-                }
-                let id = self.interner.intern(&result);
-                Value::string(id)
-            }
-            _ => Value::undefined(),
-        }
-    }
 
-    /// Call a closure value with the given arguments and run it to completion.
-    /// Saves/restores the main run loop's frame depth so the callback executes
-    /// as a nested call and returns its result.
-    fn call_function(&mut self, func_val: Value, args: &[Value]) -> Result<Value, VmError> {
-        if !func_val.is_int() {
-            return Ok(Value::undefined());
-        }
-        let packed = func_val.as_int().unwrap();
-        let closure_id = ((packed as u32) >> 16) as usize;
-        let chunk_idx = (packed & 0xFFFF) as usize;
-        if chunk_idx < 1 || chunk_idx >= self.chunks.len() {
-            return Ok(Value::undefined());
-        }
 
-        let func_pos = self.stack.len();
-        self.push(func_val);
-        for arg in args {
-            self.push(*arg);
-        }
-        let expected = self.chunks[chunk_idx].param_count as usize;
-        let mut argc = args.len();
-        while argc < expected {
-            self.push(Value::undefined());
-            argc += 1;
-        }
 
-        let upvalues = if closure_id < self.closure_upvalues.len() {
-            self.closure_upvalues[closure_id].clone()
-        } else {
-            Vec::new()
-        };
 
-        self.frames.push(CallFrame {
-            chunk_idx, ip: 0, base: func_pos + 1,
-            upvalues, this_value: Value::undefined(), is_constructor: false,
-        });
 
-        // Run the callback by executing bytecode until its frame is popped.
-        let target_frames = self.frames.len();
-        loop {
-            if self.frames.len() < target_frames {
-                // Callback returned — result is on the stack
-                return self.pop().or(Ok(Value::undefined()));
-            }
-            let ci = self.cur_chunk();
-            let ip = self.cur_ip();
-            if ip >= self.chunks[ci].code.len() {
-                let frame = self.frames.pop().unwrap();
-                self.stack.truncate(frame.base.saturating_sub(1));
-                self.push(Value::undefined());
-                return self.pop().or(Ok(Value::undefined()));
-            }
-
-            let byte = self.read_byte();
-            let opcode = match OpCode::from_byte(byte) {
-                Some(op) => op,
-                None => return Err(VmError::RuntimeError(format!("invalid opcode: {byte:#04x}"))),
-            };
-
-            // Handle Return/ReturnUndefined specially to exit the callback
-            match opcode {
-                OpCode::Return => {
-                    let result = self.pop()?;
-                    let frame = self.frames.pop().unwrap();
-                    self.close_upvalues_above(frame.base.saturating_sub(1));
-                    self.stack.truncate(frame.base.saturating_sub(1));
-                    return Ok(result);
-                }
-                OpCode::ReturnUndefined => {
-                    let frame = self.frames.pop().unwrap();
-                    self.close_upvalues_above(frame.base.saturating_sub(1));
-                    self.stack.truncate(frame.base.saturating_sub(1));
-                    return Ok(if frame.is_constructor { frame.this_value } else { Value::undefined() });
-                }
-                OpCode::Halt => {
-                    return Ok(if self.stack.is_empty() { Value::undefined() } else { self.pop()? });
-                }
-                // For all other opcodes, we need the main dispatch.
-                // Since we can't call run() recursively, handle the critical subset:
-                OpCode::Const => { let i = self.read_u16() as usize; let v = self.chunks[self.cur_chunk()].constants[i]; self.push(v); }
-                OpCode::Undefined => self.push(Value::undefined()),
-                OpCode::Null => self.push(Value::null()),
-                OpCode::True => self.push(Value::boolean(true)),
-                OpCode::False => self.push(Value::boolean(false)),
-                OpCode::Zero => self.push(Value::int(0)),
-                OpCode::One => self.push(Value::int(1)),
-                OpCode::Pop => { self.pop()?; }
-                OpCode::Dup => { let v = self.peek()?; self.push(v); }
-                OpCode::Add => {
-                    let b = self.pop()?; let a = self.pop()?;
-                    if a.is_string() || b.is_string() {
-                        let sa = self.value_to_string(a); let sb = self.value_to_string(b);
-                        let r = format!("{sa}{sb}"); let id = self.interner.intern(&r);
-                        self.push(Value::string(id));
-                    } else {
-                        let na = a.as_number().unwrap_or(0.0); let nb = b.as_number().unwrap_or(0.0);
-                        self.push_number(na + nb);
-                    }
-                }
-                OpCode::Sub => { let (a,b) = self.pop_numbers()?; self.push_number(a-b); }
-                OpCode::Mul => { let (a,b) = self.pop_numbers()?; self.push_number(a*b); }
-                OpCode::Div => { let (a,b) = self.pop_numbers()?; self.push_number(a/b); }
-                OpCode::Rem => { let (a,b) = self.pop_numbers()?; self.push_number(a%b); }
-                OpCode::Exp => { let (a,b) = self.pop_numbers()?; self.push_number(a.powf(b)); }
-                OpCode::Neg => { let v = self.pop()?; self.push_number(-self.to_f64(v)); }
-                OpCode::Pos => { let v = self.pop()?; self.push_number(self.to_f64(v)); }
-                OpCode::Not => { let v = self.pop()?; self.push(Value::boolean(!v.to_boolean())); }
-                OpCode::Void => { self.pop()?; self.push(Value::undefined()); }
-                OpCode::TypeOf => {
-                    let v = self.pop()?;
-                    let t = self.type_of_value(v);
-                    let id = self.interner.intern(t);
-                    self.push(Value::string(id));
-                }
-                OpCode::Swap => {
-                    let len = self.stack.len();
-                    if len >= 2 { self.stack.swap(len - 1, len - 2); }
-                }
-                OpCode::Nop => {}
-                OpCode::Eq => { let b = self.pop()?; let a = self.pop()?; self.push(Value::boolean(self.abstract_eq(a,b))); }
-                OpCode::StrictEq => { let b = self.pop()?; let a = self.pop()?; self.push(Value::boolean(self.strict_eq(a,b))); }
-                OpCode::Lt => { let (a,b) = self.pop_numbers()?; self.push(Value::boolean(a<b)); }
-                OpCode::Le => { let (a,b) = self.pop_numbers()?; self.push(Value::boolean(a<=b)); }
-                OpCode::Gt => { let (a,b) = self.pop_numbers()?; self.push(Value::boolean(a>b)); }
-                OpCode::Ge => { let (a,b) = self.pop_numbers()?; self.push(Value::boolean(a>=b)); }
-                OpCode::GetLocal => { let s = self.read_byte() as usize; let b = self.frames.last().unwrap().base; self.push(self.stack[b+s]); }
-                OpCode::SetLocal => { let s = self.read_byte() as usize; let v = self.peek()?; let b = self.frames.last().unwrap().base; self.stack[b+s] = v; }
-                OpCode::GetGlobal => {
-                    let ni = self.read_u16() as usize;
-                    let nv = self.chunks[self.cur_chunk()].constants[ni];
-                    let nid = nv.as_string_id().unwrap();
-                    let ns = self.interner.resolve(nid);
-                    if ns == "__this__" { self.push(self.frames.last().unwrap().this_value); }
-                    else { let v = self.globals.get(&nid).copied().unwrap_or(Value::undefined()); self.push(v); }
-                }
-                OpCode::GetUpvalue => {
-                    let idx = self.read_byte() as usize;
-                    let frame = self.frames.last().unwrap();
-                    let v = if idx < frame.upvalues.len() {
-                        match &frame.upvalues[idx].location { UpvalueLocation::Open(si) => self.stack[*si], UpvalueLocation::Closed(v) => *v }
-                    } else { Value::undefined() };
-                    self.push(v);
-                }
-                OpCode::Jump => { let off = self.read_i16(); self.frames.last_mut().unwrap().ip = (self.frames.last().unwrap().ip as isize + off as isize) as usize; }
-                OpCode::JumpIfFalse => { let off = self.read_i16(); let v = self.pop()?; if !v.to_boolean() { self.frames.last_mut().unwrap().ip = (self.frames.last().unwrap().ip as isize + off as isize) as usize; } }
-                OpCode::JumpIfFalsePeek => { let off = self.read_i16(); let v = self.peek()?; if !v.to_boolean() { self.frames.last_mut().unwrap().ip = (self.frames.last().unwrap().ip as isize + off as isize) as usize; } }
-                OpCode::JumpIfTruePeek => { let off = self.read_i16(); let v = self.peek()?; if v.to_boolean() { self.frames.last_mut().unwrap().ip = (self.frames.last().unwrap().ip as isize + off as isize) as usize; } }
-                OpCode::JumpIfNullishPeek => { let off = self.read_i16(); let v = self.peek()?; if v.is_nullish() { self.frames.last_mut().unwrap().ip = (self.frames.last().unwrap().ip as isize + off as isize) as usize; } }
-                OpCode::JumpIfTrue => { let off = self.read_i16(); let v = self.pop()?; if v.to_boolean() { self.frames.last_mut().unwrap().ip = (self.frames.last().unwrap().ip as isize + off as isize) as usize; } }
-                OpCode::Loop => { let off = self.read_u16() as usize; self.frames.last_mut().unwrap().ip -= off; }
-                OpCode::GetProperty => {
-                    let name_idx = self.read_u16() as usize;
-                    let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
-                    let name_id = name_val.as_string_id().unwrap();
-                    let obj_val = self.pop()?;
-                    if let Some(oid) = obj_val.as_object_id() {
-                        let val = self.heap.get(oid).and_then(|o| o.get_property(name_id)).unwrap_or(Value::undefined());
-                        self.push(val);
-                    } else if obj_val.is_string() && self.interner.resolve(name_id) == "length" {
-                        let sid = obj_val.as_string_id().unwrap();
-                        self.push(Value::int(self.interner.resolve(sid).chars().count() as i32));
-                    } else {
-                        self.push(Value::undefined());
-                    }
-                }
-                OpCode::SetProperty => {
-                    let name_idx = self.read_u16() as usize;
-                    let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
-                    let name_id = name_val.as_string_id().unwrap();
-                    let val = self.pop()?;
-                    let obj_val = self.pop()?;
-                    if let Some(oid) = obj_val.as_object_id()
-                        && let Some(obj) = self.heap.get_mut(oid) { obj.set_property(name_id, val); }
-                    self.push(val);
-                }
-                OpCode::DefineGlobal => {
-                    let ni = self.read_u16() as usize;
-                    let nv = self.chunks[self.cur_chunk()].constants[ni];
-                    let nid = nv.as_string_id().unwrap();
-                    let val = self.pop()?;
-                    self.globals.insert(nid, val);
-                    let idx = nid.0 as usize;
-                    if idx >= self.globals_vec.len() { self.globals_vec.resize(idx + 1, Value::null()); }
-                    self.globals_vec[idx] = val;
-                }
-                OpCode::Closure => {
-                    let child_rel_idx = self.read_u16() as usize;
-                    let current = self.cur_chunk();
-                    let abs_idx = current + 1 + child_rel_idx;
-                    let upvalue_count = if abs_idx < self.chunks.len() { self.chunks[abs_idx].upvalue_count as usize } else { 0 };
-                    let mut upvalues = Vec::with_capacity(upvalue_count);
-                    for _ in 0..upvalue_count {
-                        let is_local = self.read_byte() != 0;
-                        let index = self.read_byte() as usize;
-                        if is_local {
-                            let base = self.frames.last().unwrap().base;
-                            upvalues.push(Upvalue { location: UpvalueLocation::Open(base + index) });
-                        } else {
-                            let parent_uv = self.frames.last().unwrap().upvalues.get(index).cloned();
-                            upvalues.push(parent_uv.unwrap_or(Upvalue { location: UpvalueLocation::Closed(Value::undefined()) }));
-                        }
-                    }
-                    let closure_id = self.closure_upvalues.len();
-                    self.closure_upvalues.push(upvalues);
-                    let packed = ((closure_id as i32) << 16) | (abs_idx as i32 & 0xFFFF);
-                    self.push(Value::int(packed));
-                }
-                OpCode::Await => {
-                    let awaited = self.pop()?;
-                    if let Some(oid) = awaited.as_object_id()
-                        && let Some(obj) = self.heap.get(oid)
-                            && let ObjectKind::Promise { state, result, .. } = &obj.kind {
-                                match state {
-                                    PromiseState::Fulfilled => { self.push(*result); continue; }
-                                    _ => { self.push(Value::undefined()); continue; }
-                                }
-                            }
-                    self.push(awaited);
-                }
-                OpCode::Call => {
-                    // Support nested calls inside callbacks (e.g. resolve())
-                    let cb_argc = self.read_byte() as usize;
-                    let cb_func_pos = self.stack.len() - 1 - cb_argc;
-                    let cb_func = self.stack[cb_func_pos];
-                    // Resolve/reject sentinels
-                    if cb_func.is_int() {
-                        let s = cb_func.as_int().unwrap();
-                        if s <= -600_000 && s > -700_000 {
-                            let pid = ObjectId((-600_000 - s) as u32);
-                            let val = if cb_argc > 0 { self.stack[cb_func_pos + 1] } else { Value::undefined() };
-                            self.stack.truncate(cb_func_pos);
-                            self.resolve_promise(pid, val)?;
-                            self.push(Value::undefined());
-                            continue;
-                        }
-                        if s <= -700_000 && s > -800_000 {
-                            let pid = ObjectId((-700_000 - s) as u32);
-                            let val = if cb_argc > 0 { self.stack[cb_func_pos + 1] } else { Value::undefined() };
-                            self.stack.truncate(cb_func_pos);
-                            self.reject_promise(pid, val)?;
-                            self.push(Value::undefined());
-                            continue;
-                        }
-                    }
-                    // Other calls: truncate and push undefined
-                    self.stack.truncate(cb_func_pos);
-                    self.push(Value::undefined());
-                }
-                OpCode::CallMethod => {
-                    let cb_argc = self.read_byte() as usize;
-                    let _method_idx = self.read_u16();
-                    let method_name_val = self.chunks[self.cur_chunk()].constants[_method_idx as usize];
-                    let method_name_id = method_name_val.as_string_id();
-                    let obj_pos = self.stack.len() - 1 - cb_argc;
-                    let obj_val = self.stack[obj_pos];
-                    // Console.log support inside callbacks
-                    if let Some(oid) = obj_val.as_object_id()
-                        && let Some(mid) = method_name_id {
-                            let log_key = self.interner.intern("log");
-                            let warn_key = self.interner.intern("warn");
-                            let error_key = self.interner.intern("error");
-                            if (mid == log_key || mid == warn_key || mid == error_key)
-                                && let Some(obj) = self.heap.get(oid)
-                                    && let Some(mv) = obj.get_property(mid)
-                                        && mv.is_int() && mv.as_int().unwrap() <= -100 && mv.as_int().unwrap() >= -102 {
-                                            let mut parts = Vec::new();
-                                            for i in 0..cb_argc {
-                                                parts.push(self.value_to_string(self.stack[obj_pos + 1 + i]));
-                                            }
-                                            let line = parts.join(" ");
-                                            println!("{line}");
-                                            self.output.push(line);
-                                            self.stack.truncate(obj_pos);
-                                            self.push(Value::undefined());
-                                            continue;
-                                        }
-                        }
-                    // Promise static methods (Promise.resolve/reject) inside callbacks
-                    if obj_val.is_int() && obj_val.as_int() == Some(-520)
-                        && let Some(mid) = method_name_id {
-                            let args: Vec<Value> = (0..cb_argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                            let result = self.exec_promise_static(mid, &args)?;
-                            self.stack.truncate(obj_pos);
-                            self.push(result);
-                            continue;
-                        }
-                    // Promise instance methods (.then/.catch)
-                    if let Some(oid) = obj_val.as_object_id() {
-                        let is_promise = self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Promise { .. })).unwrap_or(false);
-                        if is_promise
-                            && let Some(mid) = method_name_id {
-                                let args: Vec<Value> = (0..cb_argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                                let result = self.exec_promise_method(oid, mid, &args)?;
-                                self.stack.truncate(obj_pos);
-                                self.push(result);
-                                continue;
-                            }
-                    }
-                    self.stack.truncate(obj_pos);
-                    self.push(Value::undefined());
-                }
-                OpCode::SetGlobal => {
-                    let ni = self.read_u16() as usize;
-                    let nv = self.chunks[self.cur_chunk()].constants[ni];
-                    let nid = nv.as_string_id().unwrap();
-                    let val = self.peek()?;
-                    self.globals.insert(nid, val);
-                }
-                OpCode::Ne => { let b = self.pop()?; let a = self.pop()?; self.push(Value::boolean(!self.abstract_eq(a,b))); }
-                OpCode::StrictNe => { let b = self.pop()?; let a = self.pop()?; self.push(Value::boolean(!self.strict_eq(a,b))); }
-                OpCode::Inc => { let v = self.pop()?; self.push_number(v.as_number().unwrap_or(0.0) + 1.0); }
-                OpCode::Dec => { let v = self.pop()?; self.push_number(v.as_number().unwrap_or(0.0) - 1.0); }
-                _ => {
-                    return Err(VmError::RuntimeError(format!("opcode {opcode:?} not supported in callback")));
-                }
-            }
-        }
-    }
-
-    // ---- Array method dispatch ----
-    fn exec_array_method(&mut self, oid: crate::runtime::object::ObjectId, method_name: StringId, args: &[Value]) -> Result<Value, VmError> {
-        let name = self.interner.resolve(method_name).to_owned();
-        match name.as_str() {
-            "push" => {
-                if let Some(obj) = self.heap.get_mut(oid)
-                    && let ObjectKind::Array(ref mut elements) = obj.kind {
-                        for arg in args {
-                            elements.push(*arg);
-                        }
-                        return Ok(Value::int(elements.len() as i32));
-                    }
-                Ok(Value::undefined())
-            }
-            "pop" => {
-                if let Some(obj) = self.heap.get_mut(oid)
-                    && let ObjectKind::Array(ref mut elements) = obj.kind {
-                        return Ok(elements.pop().unwrap_or(Value::undefined()));
-                    }
-                Ok(Value::undefined())
-            }
-            "join" => {
-                let sep = args.first().map(|v| self.value_to_string(*v)).unwrap_or_else(|| ",".into());
-                if let Some(obj) = self.heap.get(oid)
-                    && let ObjectKind::Array(ref elements) = obj.kind {
-                        let parts: Vec<String> = elements.iter().map(|v| self.value_to_string(*v)).collect();
-                        let result = parts.join(&sep);
-                        let id = self.interner.intern(&result);
-                        return Ok(Value::string(id));
-                    }
-                Ok(Value::undefined())
-            }
-            "indexOf" => {
-                let search = args.first().copied().unwrap_or(Value::undefined());
-                if let Some(obj) = self.heap.get(oid)
-                    && let ObjectKind::Array(ref elements) = obj.kind {
-                        for (i, elem) in elements.iter().enumerate() {
-                            if self.strict_eq(*elem, search) {
-                                return Ok(Value::int(i as i32));
-                            }
-                        }
-                    }
-                Ok(Value::int(-1))
-            }
-            "includes" => {
-                let search = args.first().copied().unwrap_or(Value::undefined());
-                if let Some(obj) = self.heap.get(oid)
-                    && let ObjectKind::Array(ref elements) = obj.kind {
-                        for elem in elements {
-                            if self.strict_eq(*elem, search) {
-                                return Ok(Value::boolean(true));
-                            }
-                        }
-                    }
-                Ok(Value::boolean(false))
-            }
-            "reverse" => {
-                if let Some(obj) = self.heap.get_mut(oid)
-                    && let ObjectKind::Array(ref mut elements) = obj.kind {
-                        elements.reverse();
-                    }
-                Ok(Value::object_id(oid))
-            }
-            "shift" => {
-                if let Some(obj) = self.heap.get_mut(oid)
-                    && let ObjectKind::Array(ref mut elements) = obj.kind
-                        && !elements.is_empty() {
-                            return Ok(elements.remove(0));
-                        }
-                Ok(Value::undefined())
-            }
-            "unshift" => {
-                if let Some(obj) = self.heap.get_mut(oid)
-                    && let ObjectKind::Array(ref mut elements) = obj.kind {
-                        for (i, arg) in args.iter().enumerate() {
-                            elements.insert(i, *arg);
-                        }
-                        return Ok(Value::int(elements.len() as i32));
-                    }
-                Ok(Value::undefined())
-            }
-            "map" => {
-                let callback = args.first().copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                let mut results = Vec::with_capacity(elements.len());
-                for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
-                    results.push(result);
-                }
-                let arr = JsObject::array(results);
-                let new_oid = self.heap.allocate(arr);
-                Ok(Value::object_id(new_oid))
-            }
-            "filter" => {
-                let callback = args.first().copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                let mut results = Vec::new();
-                for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
-                    if result.to_boolean() {
-                        results.push(*elem);
-                    }
-                }
-                let arr = JsObject::array(results);
-                let new_oid = self.heap.allocate(arr);
-                Ok(Value::object_id(new_oid))
-            }
-            "reduce" => {
-                let callback = args.first().copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                let mut acc = if args.len() > 1 { args[1] } else if !elements.is_empty() { elements[0] } else { Value::undefined() };
-                let start = if args.len() > 1 { 0 } else { 1 };
-                for (i, elem) in elements.iter().enumerate().skip(start) {
-                    acc = self.call_function(callback, &[acc, *elem, Value::int(i as i32)])?;
-                }
-                Ok(acc)
-            }
-            "forEach" => {
-                let callback = args.first().copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                for (i, elem) in elements.iter().enumerate() {
-                    self.call_function(callback, &[*elem, Value::int(i as i32)])?;
-                }
-                Ok(Value::undefined())
-            }
-            "find" => {
-                let callback = args.first().copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
-                    if result.to_boolean() { return Ok(*elem); }
-                }
-                Ok(Value::undefined())
-            }
-            "some" => {
-                let callback = args.first().copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
-                    if result.to_boolean() { return Ok(Value::boolean(true)); }
-                }
-                Ok(Value::boolean(false))
-            }
-            "every" => {
-                let callback = args.first().copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
-                    if !result.to_boolean() { return Ok(Value::boolean(false)); }
-                }
-                Ok(Value::boolean(true))
-            }
-            _ => Ok(Value::undefined()),
-        }
-    }
-
-    // ---- Math method dispatch ----
-    fn exec_math_method(&mut self, method_name: StringId, args: &[Value]) -> Value {
-        let name = self.interner.resolve(method_name).to_owned();
-        let a = || args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
-        let b = || args.get(1).and_then(|v| v.as_number()).unwrap_or(f64::NAN);
-
-        let result = match name.as_str() {
-            "abs" => a().abs(),
-            "floor" => a().floor(),
-            "ceil" => a().ceil(),
-            "round" => a().round(),
-            "trunc" => a().trunc(),
-            "sqrt" => a().sqrt(),
-            "cbrt" => a().cbrt(),
-            "sign" => a().signum(),
-            "pow" => a().powf(b()),
-            "log" => a().ln(),
-            "log2" => a().log2(),
-            "log10" => a().log10(),
-            "exp" => a().exp(),
-            "sin" => a().sin(),
-            "cos" => a().cos(),
-            "tan" => a().tan(),
-            "asin" => a().asin(),
-            "acos" => a().acos(),
-            "atan" => a().atan(),
-            "atan2" => a().atan2(b()),
-            "random" => {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let t = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .subsec_nanos();
-                    t as f64 / u32::MAX as f64
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    0.42
-                }
-            }
-            "max" => {
-                if args.is_empty() { return Value::number(f64::NEG_INFINITY); }
-                let mut m = f64::NEG_INFINITY;
-                for arg in args {
-                    let n = arg.as_number().unwrap_or(f64::NAN);
-                    if n.is_nan() { return Value::number(f64::NAN); }
-                    if n > m { m = n; }
-                }
-                m
-            }
-            "min" => {
-                if args.is_empty() { return Value::number(f64::INFINITY); }
-                let mut m = f64::INFINITY;
-                for arg in args {
-                    let n = arg.as_number().unwrap_or(f64::NAN);
-                    if n.is_nan() { return Value::number(f64::NAN); }
-                    if n < m { m = n; }
-                }
-                m
-            }
-            _ => return Value::undefined(),
-        };
-        Value::number(result)
-    }
-
-    /// Check if a value is a String wrapper object.
-    fn is_string_wrapper(&self, val: Value) -> bool {
-        if let Some(oid) = val.as_object_id()
-            && let Some(obj) = self.heap.get(oid)
-                && let ObjectKind::Wrapper(inner) = &obj.kind {
-                    return inner.is_string();
-                }
-        false
-    }
-
-    /// Unwrap a wrapper object to its primitive, or return the value as-is.
-    fn to_primitive(&self, val: Value) -> Value {
-        if let Some(oid) = val.as_object_id()
-            && let Some(obj) = self.heap.get(oid)
-                && let ObjectKind::Wrapper(inner) = &obj.kind {
-                    return *inner;
-                }
-        val
-    }
 
     // ---- Promise helpers ----
 
-    fn resolve_promise(&mut self, oid: ObjectId, value: Value) -> Result<(), VmError> {
-        // Clone reactions before mutating
-        let reactions = {
-            let obj = self.heap.get(oid).ok_or_else(|| VmError::RuntimeError("invalid promise".into()))?;
-            if let ObjectKind::Promise { state, reactions, .. } = &obj.kind {
-                if *state != PromiseState::Pending { return Ok(()); } // already settled
-                reactions.clone()
-            } else {
-                return Ok(());
-            }
-        };
-        // Transition to Fulfilled
-        if let Some(obj) = self.heap.get_mut(oid)
-            && let ObjectKind::Promise { state, result, reactions: r, .. } = &mut obj.kind {
-                *state = PromiseState::Fulfilled;
-                *result = value;
-                r.clear();
-            }
-        // Enqueue reactions as microtasks
-        for reaction in reactions {
-            self.microtask_queue.push(Microtask::PromiseReaction {
-                callback: reaction.on_fulfilled,
-                value,
-                result_promise: reaction.promise,
-                is_fulfilled: true,
-            });
-        }
-        Ok(())
-    }
 
-    fn reject_promise(&mut self, oid: ObjectId, reason: Value) -> Result<(), VmError> {
-        let reactions = {
-            let obj = self.heap.get(oid).ok_or_else(|| VmError::RuntimeError("invalid promise".into()))?;
-            if let ObjectKind::Promise { state, reactions, .. } = &obj.kind {
-                if *state != PromiseState::Pending { return Ok(()); }
-                reactions.clone()
-            } else {
-                return Ok(());
-            }
-        };
-        if let Some(obj) = self.heap.get_mut(oid)
-            && let ObjectKind::Promise { state, result, reactions: r, .. } = &mut obj.kind {
-                *state = PromiseState::Rejected;
-                *result = reason;
-                r.clear();
-            }
-        for reaction in reactions {
-            self.microtask_queue.push(Microtask::PromiseReaction {
-                callback: reaction.on_rejected,
-                value: reason,
-                result_promise: reaction.promise,
-                is_fulfilled: false,
-            });
-        }
-        Ok(())
-    }
 
     pub fn drain_microtasks(&mut self) -> Result<(), VmError> {
         let mut iterations = 0;
@@ -1057,227 +296,11 @@ impl Vm {
         Ok(())
     }
 
-    fn exec_promise_method(&mut self, oid: ObjectId, method_name: StringId, args: &[Value]) -> Result<Value, VmError> {
-        let name = self.interner.resolve(method_name).to_owned();
-        match name.as_str() {
-            "then" => {
-                let on_fulfilled = args.first().copied().filter(|v| v.is_int());
-                let on_rejected = args.get(1).copied().filter(|v| v.is_int());
-                // Create child promise
-                let child = JsObject::promise();
-                let child_id = self.heap.allocate(child);
-                let reaction = PromiseReaction { on_fulfilled, on_rejected, promise: child_id };
 
-                // Check current state
-                let (state, result) = {
-                    let obj = self.heap.get(oid).unwrap();
-                    if let ObjectKind::Promise { state, result, .. } = &obj.kind {
-                        (*state, *result)
-                    } else {
-                        return Ok(Value::undefined());
-                    }
-                };
 
-                match state {
-                    PromiseState::Pending => {
-                        if let Some(obj) = self.heap.get_mut(oid)
-                            && let ObjectKind::Promise { reactions, .. } = &mut obj.kind {
-                                reactions.push(reaction);
-                            }
-                    }
-                    PromiseState::Fulfilled => {
-                        self.microtask_queue.push(Microtask::PromiseReaction {
-                            callback: on_fulfilled,
-                            value: result,
-                            result_promise: child_id,
-                            is_fulfilled: true,
-                        });
-                    }
-                    PromiseState::Rejected => {
-                        self.microtask_queue.push(Microtask::PromiseReaction {
-                            callback: on_rejected,
-                            value: result,
-                            result_promise: child_id,
-                            is_fulfilled: false,
-                        });
-                    }
-                }
-                Ok(Value::object_id(child_id))
-            }
-            "catch" => {
-                let on_rejected = args.first().copied().filter(|v| v.is_int());
-                // Same as .then(undefined, onRejected)
-                let then_args = [Value::undefined(), on_rejected.unwrap_or(Value::undefined())];
-                self.exec_promise_method(oid, method_name, &then_args)
-            }
-            _ => Ok(Value::undefined()),
-        }
-    }
 
-    fn exec_promise_static(&mut self, method_name: StringId, args: &[Value]) -> Result<Value, VmError> {
-        let name = self.interner.resolve(method_name).to_owned();
-        match name.as_str() {
-            "resolve" => {
-                let val = args.first().copied().unwrap_or(Value::undefined());
-                // If already a promise, return it
-                if let Some(oid) = val.as_object_id()
-                    && let Some(obj) = self.heap.get(oid)
-                        && matches!(&obj.kind, ObjectKind::Promise { .. }) {
-                            return Ok(val);
-                        }
-                let p = JsObject::promise();
-                let pid = self.heap.allocate(p);
-                self.resolve_promise(pid, val)?;
-                Ok(Value::object_id(pid))
-            }
-            "reject" => {
-                let val = args.first().copied().unwrap_or(Value::undefined());
-                let p = JsObject::promise();
-                let pid = self.heap.allocate(p);
-                self.reject_promise(pid, val)?;
-                Ok(Value::object_id(pid))
-            }
-            _ => Ok(Value::undefined()),
-        }
-    }
 
-    // ---- Global function dispatch ----
-    fn exec_global_fn(&mut self, sentinel: i32, args: &[Value]) -> Value {
-        match sentinel {
-            -500 => { // parseInt
-                let s = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let radix = args.get(1).and_then(|v| v.as_number()).unwrap_or(10.0) as u32;
-                let s = s.trim();
-                let (s, neg) = if let Some(stripped) = s.strip_prefix('-') { (stripped, true) } else if let Some(stripped) = s.strip_prefix('+') { (stripped, false) } else { (s, false) };
-                let s = if radix == 16 { s.strip_prefix("0x").or(s.strip_prefix("0X")).unwrap_or(s) } else { s };
-                // Parse digits for the given radix
-                let mut result = 0i64;
-                let mut found = false;
-                for c in s.chars() {
-                    let d = c.to_digit(radix);
-                    if let Some(d) = d { result = result * radix as i64 + d as i64; found = true; }
-                    else { break; }
-                }
-                if !found { return Value::number(f64::NAN); }
-                let result = if neg { -result } else { result };
-                Value::number(result as f64)
-            }
-            -501 => { // parseFloat
-                let s = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let s = s.trim();
-                Value::number(s.parse::<f64>().unwrap_or(f64::NAN))
-            }
-            -502 => { // isNaN
-                let n = args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
-                Value::boolean(n.is_nan())
-            }
-            -503 => { // isFinite
-                let n = args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
-                Value::boolean(n.is_finite())
-            }
-            -504 => { // String()
-                let s = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let id = self.interner.intern(&s);
-                Value::string(id)
-            }
-            -505 => { // Number()
-                let v = args.first().copied().unwrap_or(Value::int(0));
-                if let Some(n) = v.as_number() { Value::number(n) }
-                else if v.is_boolean() { Value::number(if v.as_bool().unwrap() { 1.0 } else { 0.0 }) }
-                else if v.is_null() { Value::number(0.0) }
-                else if v.is_undefined() { Value::number(f64::NAN) }
-                else if v.is_string() {
-                    let s = self.value_to_string(v);
-                    Value::number(s.trim().parse::<f64>().unwrap_or(f64::NAN))
-                }
-                else { Value::number(f64::NAN) }
-            }
-            -506 => { // Boolean()
-                let v = args.first().copied().unwrap_or(Value::boolean(false));
-                Value::boolean(v.to_boolean())
-            }
-            -530 => { // Number.isNaN
-                let v = args.first().copied().unwrap_or(Value::undefined());
-                // Number.isNaN does NOT coerce — only true for actual NaN number values
-                if v.is_float() { Value::boolean(v.as_float().unwrap().is_nan()) }
-                else { Value::boolean(false) }
-            }
-            -531 => { // Number.isFinite
-                let v = args.first().copied().unwrap_or(Value::undefined());
-                if let Some(n) = v.as_number() { Value::boolean(n.is_finite()) }
-                else { Value::boolean(false) }
-            }
-            -532 => { // Number.isInteger
-                let v = args.first().copied().unwrap_or(Value::undefined());
-                if let Some(n) = v.as_number() { Value::boolean(n.fract() == 0.0 && n.is_finite()) }
-                else { Value::boolean(false) }
-            }
-            _ => Value::undefined(),
-        }
-    }
 
-    // ---- JSON method dispatch ----
-    fn exec_json_method(&mut self, method_name: StringId, args: &[Value]) -> Value {
-        let name = self.interner.resolve(method_name).to_owned();
-        match name.as_str() {
-            "parse" => {
-                let s = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                match self.json_parse(&s) {
-                    Ok(val) => val,
-                    Err(_) => Value::undefined(), // SyntaxError in real JS
-                }
-            }
-            "stringify" => {
-                let val = args.first().copied().unwrap_or(Value::undefined());
-                let s = self.json_stringify(val);
-                let id = self.interner.intern(&s);
-                Value::string(id)
-            }
-            _ => Value::undefined(),
-        }
-    }
-
-    // ---- JSON.parse: simple recursive descent ----
-    fn json_parse(&mut self, input: &str) -> Result<Value, String> {
-        let input = input.trim();
-        let (val, _) = json_parse_value(input, &mut self.heap, &mut self.interner)?;
-        Ok(val)
-    }
-
-    // ---- JSON.stringify ----
-    fn json_stringify(&self, val: Value) -> String {
-        if val.is_undefined() { return "undefined".into(); }
-        if val.is_null() { return "null".into(); }
-        if val.is_boolean() { return format!("{}", val.as_bool().unwrap()); }
-        if val.is_int() { return format!("{}", val.as_int().unwrap()); }
-        if val.is_float() {
-            let n = val.as_float().unwrap();
-            if n.is_nan() || n.is_infinite() { return "null".into(); }
-            return format!("{n}");
-        }
-        if val.is_string() {
-            let id = val.as_string_id().unwrap();
-            let s = self.interner.resolve(id);
-            return format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t"));
-        }
-        if let Some(oid) = val.as_object_id()
-            && let Some(obj) = self.heap.get(oid) {
-                match &obj.kind {
-                    ObjectKind::Array(elements) => {
-                        let parts: Vec<String> = elements.iter().map(|v| self.json_stringify(*v)).collect();
-                        return format!("[{}]", parts.join(","));
-                    }
-                    _ => {
-                        let parts: Vec<String> = obj.properties.iter().map(|(k, v)| {
-                            let key = self.interner.resolve(*k);
-                            format!("\"{}\":{}", key, self.json_stringify(*v))
-                        }).collect();
-                        return format!("{{{}}}", parts.join(","));
-                    }
-                }
-            }
-        "null".into()
-    }
 
     pub fn take_interner(self) -> Interner {
         self.interner
@@ -1290,19 +313,19 @@ impl Vm {
     // ---- Stack helpers -----------------------------------------------------
 
     #[inline]
-    fn push(&mut self, value: Value) {
+    pub(crate) fn push(&mut self, value: Value) {
         self.stack.push(value);
     }
 
     #[inline]
-    fn pop(&mut self) -> Result<Value, VmError> {
+    pub(crate) fn pop(&mut self) -> Result<Value, VmError> {
         self.stack
             .pop()
             .ok_or_else(|| VmError::RuntimeError("stack underflow".into()))
     }
 
     #[inline]
-    fn peek(&self) -> Result<Value, VmError> {
+    pub(crate) fn peek(&self) -> Result<Value, VmError> {
         self.stack
             .last()
             .copied()
@@ -1312,17 +335,17 @@ impl Vm {
     // ---- Bytecode read helpers --------------------------------------------
 
     #[inline]
-    fn cur_chunk(&self) -> usize {
+    pub(crate) fn cur_chunk(&self) -> usize {
         self.frames.last().unwrap().chunk_idx
     }
 
     #[inline]
-    fn cur_ip(&self) -> usize {
+    pub(crate) fn cur_ip(&self) -> usize {
         self.frames.last().unwrap().ip
     }
 
     #[inline]
-    fn read_byte(&mut self) -> u8 {
+    pub(crate) fn read_byte(&mut self) -> u8 {
         let frame = self.frames.last_mut().unwrap();
         let byte = self.chunks[frame.chunk_idx].code[frame.ip];
         frame.ip += 1;
@@ -1330,7 +353,7 @@ impl Vm {
     }
 
     #[inline]
-    fn read_u16(&mut self) -> u16 {
+    pub(crate) fn read_u16(&mut self) -> u16 {
         let frame = self.frames.last_mut().unwrap();
         let val = self.chunks[frame.chunk_idx].read_u16(frame.ip);
         frame.ip += 2;
@@ -1338,7 +361,7 @@ impl Vm {
     }
 
     #[inline]
-    fn read_i16(&mut self) -> i16 {
+    pub(crate) fn read_i16(&mut self) -> i16 {
         let frame = self.frames.last_mut().unwrap();
         let val = self.chunks[frame.chunk_idx].read_i16(frame.ip);
         frame.ip += 2;
@@ -1350,7 +373,7 @@ impl Vm {
     /// Pop two values off the stack, convert each to f64.
     /// JS ToNumber: coerce any value to f64.
     #[inline(always)]
-    fn to_f64(&self, val: Value) -> f64 {
+    pub(crate) fn to_f64(&self, val: Value) -> f64 {
         if let Some(n) = val.as_number() { return n; }
         if val.is_boolean() { return if val.as_bool().unwrap() { 1.0 } else { 0.0 }; }
         if val.is_null() { return 0.0; }
@@ -1371,14 +394,14 @@ impl Vm {
     }
 
     #[inline(always)]
-    fn pop_numbers(&mut self) -> Result<(f64, f64), VmError> {
+    pub(crate) fn pop_numbers(&mut self) -> Result<(f64, f64), VmError> {
         let b = self.pop()?;
         let a = self.pop()?;
         Ok((self.to_f64(a), self.to_f64(b)))
     }
 
     /// Pop two values, convert to i32 (for bitwise ops).
-    fn pop_ints(&mut self) -> Result<(i32, i32), VmError> {
+    pub(crate) fn pop_ints(&mut self) -> Result<(i32, i32), VmError> {
         let bv = self.pop()?;
         let av = self.pop()?;
         let b = self.to_i32(bv)?;
@@ -1387,14 +410,14 @@ impl Vm {
     }
 
     /// Convert a Value to i32 for bitwise operations (ToInt32).
-    fn to_i32(&self, val: Value) -> Result<i32, VmError> {
+    pub(crate) fn to_i32(&self, val: Value) -> Result<i32, VmError> {
         let n = self.to_f64(val);
         if n.is_nan() || n.is_infinite() || n == 0.0 { return Ok(0); }
         Ok(n as i32)
     }
 
     /// Convert a Value to u32 for unsigned right shift.
-    fn to_u32(&self, val: Value) -> Result<u32, VmError> {
+    pub(crate) fn to_u32(&self, val: Value) -> Result<u32, VmError> {
         let n = self.to_f64(val);
         if n.is_nan() || n.is_infinite() || n == 0.0 { return Ok(0); }
         Ok(n as u32)
@@ -1403,7 +426,7 @@ impl Vm {
     /// Push a number result, using SMI when the value fits in i32 with no
     /// fractional part.  Preserves -0.0 as a float (JS distinguishes it).
     #[inline]
-    fn push_number(&mut self, n: f64) {
+    pub(crate) fn push_number(&mut self, n: f64) {
         if n == 0.0 && n.is_sign_negative() {
             // -0.0 must stay as a float
             self.push(Value::number(n));
@@ -1422,7 +445,7 @@ impl Vm {
 
     /// Convert a Value to its string representation, using the interner for
     /// string values.
-    fn value_to_string(&self, val: Value) -> String {
+    pub(crate) fn value_to_string(&self, val: Value) -> String {
         if let Some(id) = val.as_string_id() {
             self.interner.resolve(id).to_owned()
         } else if val.is_undefined() {
@@ -1466,7 +489,7 @@ impl Vm {
     }
 
     /// Return the typeof string for a value.
-    fn type_of_value(&self, val: Value) -> &'static str {
+    pub(crate) fn type_of_value(&self, val: Value) -> &'static str {
         if val.is_undefined() {
             "undefined"
         } else if val.is_null() {
@@ -1510,7 +533,7 @@ impl Vm {
     ///   - same type: strict equality
     ///   - null == undefined (and vice versa)
     ///   - number == string: coerce string to number
-    fn abstract_eq(&self, a: Value, b: Value) -> bool {
+    pub(crate) fn abstract_eq(&self, a: Value, b: Value) -> bool {
         // Fast path: identical bits
         if a.raw() == b.raw() {
             // NaN !== NaN
@@ -1586,7 +609,7 @@ impl Vm {
     }
 
     /// Strict equality (===).
-    fn strict_eq(&self, a: Value, b: Value) -> bool {
+    pub(crate) fn strict_eq(&self, a: Value, b: Value) -> bool {
         if a.raw() == b.raw() {
             if a.is_float() {
                 let f = a.as_number().unwrap();
@@ -1602,7 +625,7 @@ impl Vm {
     }
 
     /// Try to parse a string value as a number (for == coercion).
-    fn string_to_number(&self, val: Value) -> Option<f64> {
+    pub(crate) fn string_to_number(&self, val: Value) -> Option<f64> {
         let id = val.as_string_id()?;
         let s = self.interner.resolve(id).trim();
         if s.is_empty() {
@@ -3506,91 +2529,6 @@ impl Vm {
 
 // ---- Standalone JSON parser (avoids &mut self borrow issues) ----
 
-fn json_parse_value<'s>(s: &'s str, heap: &mut ObjectHeap, interner: &mut Interner) -> Result<(Value, &'s str), String> {
-    let s = s.trim_start();
-    if s.is_empty() { return Err("unexpected end of JSON".into()); }
-    match s.as_bytes()[0] {
-        b'"' => json_parse_string(s, interner),
-        b'{' => json_parse_object(s, heap, interner),
-        b'[' => json_parse_array(s, heap, interner),
-        b't' if s.starts_with("true") => Ok((Value::boolean(true), &s[4..])),
-        b'f' if s.starts_with("false") => Ok((Value::boolean(false), &s[5..])),
-        b'n' if s.starts_with("null") => Ok((Value::null(), &s[4..])),
-        b'-' | b'0'..=b'9' => json_parse_number(s),
-        _ => Err(format!("unexpected char in JSON: {}", s.chars().next().unwrap())),
-    }
-}
-
-fn json_parse_string<'s>(s: &'s str, interner: &mut Interner) -> Result<(Value, &'s str), String> {
-    let s = &s[1..];
-    let mut result = String::new();
-    let mut chars = s.char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '"' => { let id = interner.intern(&result); return Ok((Value::string(id), &s[i + 1..])); }
-            '\\' => { if let Some((_, esc)) = chars.next() { match esc {
-                '"' => result.push('"'), '\\' => result.push('\\'), '/' => result.push('/'),
-                'n' => result.push('\n'), 'r' => result.push('\r'), 't' => result.push('\t'),
-                _ => { result.push('\\'); result.push(esc); }
-            }}}
-            _ => result.push(c),
-        }
-    }
-    Err("unterminated string".into())
-}
-
-fn json_parse_number(s: &str) -> Result<(Value, &str), String> {
-    let mut end = 0;
-    let b = s.as_bytes();
-    if end < b.len() && b[end] == b'-' { end += 1; }
-    while end < b.len() && b[end].is_ascii_digit() { end += 1; }
-    if end < b.len() && b[end] == b'.' { end += 1; while end < b.len() && b[end].is_ascii_digit() { end += 1; } }
-    if end < b.len() && (b[end] == b'e' || b[end] == b'E') { end += 1; if end < b.len() && (b[end] == b'+' || b[end] == b'-') { end += 1; } while end < b.len() && b[end].is_ascii_digit() { end += 1; } }
-    let n: f64 = s[..end].parse().map_err(|_| "invalid number".to_string())?;
-    Ok((Value::number(n), &s[end..]))
-}
-
-fn json_parse_object<'s>(s: &'s str, heap: &mut ObjectHeap, interner: &mut Interner) -> Result<(Value, &'s str), String> {
-    let mut s = &s[1..];
-    let mut obj = JsObject::ordinary();
-    s = s.trim_start();
-    if let Some(rest) = s.strip_prefix('}') { let oid = heap.allocate(obj); return Ok((Value::object_id(oid), rest)); }
-    loop {
-        s = s.trim_start();
-        let (key, rest) = json_parse_string(s, interner)?;
-        s = rest.trim_start();
-        if let Some(rest) = s.strip_prefix(':') { s = rest; } else { return Err("expected ':'".into()); }
-        let (val, rest) = json_parse_value(s, heap, interner)?;
-        s = rest;
-        if let Some(kid) = key.as_string_id() { obj.set_property(kid, val); }
-        s = s.trim_start();
-        if let Some(rest) = s.strip_prefix(',') { s = rest; continue; }
-        if let Some(rest) = s.strip_prefix('}') { s = rest; break; }
-        return Err("expected ',' or '}'".into());
-    }
-    let oid = heap.allocate(obj);
-    Ok((Value::object_id(oid), s))
-}
-
-fn json_parse_array<'s>(s: &'s str, heap: &mut ObjectHeap, interner: &mut Interner) -> Result<(Value, &'s str), String> {
-    let mut s = &s[1..];
-    let mut elems = Vec::new();
-    s = s.trim_start();
-    if let Some(rest) = s.strip_prefix(']') { let o = JsObject::array(elems); let oid = heap.allocate(o); return Ok((Value::object_id(oid), rest)); }
-    loop {
-        let (val, rest) = json_parse_value(s, heap, interner)?;
-        s = rest; elems.push(val);
-        s = s.trim_start();
-        if let Some(rest) = s.strip_prefix(',') { s = rest; continue; }
-        if let Some(rest) = s.strip_prefix(']') { s = rest; break; }
-        return Err("expected ',' or ']'".into());
-    }
-    let o = JsObject::array(elems);
-    let oid = heap.allocate(o);
-    Ok((Value::object_id(oid), s))
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
