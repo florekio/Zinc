@@ -57,11 +57,14 @@ fn emit_recursive_binary(chunk: &Chunk) -> Option<JitFunction> {
     // Find the base case threshold and the subtraction constants
     // by scanning the bytecode
     let code = &chunk.code;
-    let mut threshold: i64 = 1; // default: if (n <= 1)
-    let mut sub_a: i64 = 1;     // default: f(n-1)
-    let mut sub_b: i64 = 2;     // default: f(n-2)
+    let mut threshold: i64 = 1;
+    let mut sub_a: i64 = 1;
+    let mut sub_b: i64 = 2;
+    let mut use_lt = false;       // true = Lt, false = Le
+    let mut base_returns_n = true; // true = return n, false = return constant
+    let mut base_return_val: i64 = 1;
 
-    // Scan for Const opcodes to extract the actual values
+    // Scan bytecode to extract constants and comparison type
     let mut const_values: Vec<i64> = Vec::new();
     let mut ip = 0;
     while ip < code.len() {
@@ -77,17 +80,37 @@ fn emit_recursive_binary(chunk: &Chunk) -> Option<JitFunction> {
             const_values.push(1);
         } else if op == OpCode::Zero {
             const_values.push(0);
+        } else if op == OpCode::Lt {
+            use_lt = true;
         }
         ip += op.instruction_size();
     }
 
-    // Heuristic: first constant is threshold, next two are subtraction values
-    if const_values.len() >= 3 {
+    // Detect pattern: if constants are [threshold, return_val, sub_a, sub_b]
+    // or [threshold, sub_a, sub_b] depending on base case
+    if const_values.len() >= 4 {
+        threshold = const_values[0];
+        base_return_val = const_values[1];
+        base_returns_n = false;
+        sub_a = const_values[2];
+        sub_b = const_values[3];
+    } else if const_values.len() >= 3 {
         threshold = const_values[0];
         sub_a = const_values[1];
         sub_b = const_values[2];
     } else if !const_values.is_empty() {
         threshold = const_values[0];
+    }
+
+    // Heuristic: if comparison is Lt and first two constants are same (e.g., n<2 return 1)
+    // then it's "return constant" pattern
+    if use_lt && const_values.len() >= 2 && const_values[0] == const_values[1] {
+        base_returns_n = false;
+        base_return_val = const_values[1];
+        if const_values.len() >= 4 {
+            sub_a = const_values[2];
+            sub_b = const_values[3];
+        }
     }
 
     let mut asm = Assembler::new();
@@ -99,10 +122,14 @@ fn emit_recursive_binary(chunk: &Chunk) -> Option<JitFunction> {
     asm.str_imm(X20, SP, 24);
     asm.mov_reg(X19, X0);
 
-    // if (n <= threshold) return n;
+    // if (n <= threshold) or if (n < threshold)
     asm.cmp_imm(X19, threshold as u32);
     let branch_to_base = asm.offset();
-    asm.b_le(0); // placeholder
+    if use_lt {
+        asm.b_lt(0); // branch if n < threshold
+    } else {
+        asm.b_le(0); // branch if n <= threshold
+    }
 
     // f(n - sub_a)
     asm.sub_imm(X0, X19, sub_a as u32);
@@ -122,9 +149,13 @@ fn emit_recursive_binary(chunk: &Chunk) -> Option<JitFunction> {
     asm.ldp_post(X29, X30, SP, 48);
     asm.ret();
 
-    // Base case: return n
+    // Base case: return n or return constant
     let base_case = asm.offset();
-    asm.mov_reg(X0, X19);
+    if base_returns_n {
+        asm.mov_reg(X0, X19);
+    } else {
+        asm.movz(X0, base_return_val as u16);
+    }
     asm.ldr_imm(X19, SP, 16);
     asm.ldr_imm(X20, SP, 24);
     asm.ldp_post(X29, X30, SP, 48);
