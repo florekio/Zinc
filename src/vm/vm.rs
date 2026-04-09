@@ -2393,6 +2393,30 @@ impl Vm {
                     let name_id = name_val.as_string_id().ok_or_else(|| {
                         VmError::RuntimeError("GetProperty: expected string constant".into())
                     })?;
+                    // TypeError for null/undefined property access
+                    let peeked = self.peek()?;
+                    if peeked.is_null() {
+                        self.pop()?;
+                        let type_name = "null";
+                        let prop = self.interner.resolve(name_id).to_owned();
+                        let msg = format!("Cannot read properties of {type_name} (reading '{prop}')");
+                        if !self.exc_handlers.is_empty() {
+                            let mut err = JsObject::ordinary();
+                            let msg_key = self.interner.intern("message");
+                            let msg_id = self.interner.intern(&msg);
+                            err.set_property(msg_key, Value::string(msg_id));
+                            let nk = self.interner.intern("name");
+                            let nv = self.interner.intern("TypeError");
+                            err.set_property(nk, Value::string(nv));
+                            let oid = self.heap.allocate(err);
+                            let handler = self.exc_handlers.pop().unwrap();
+                            self.stack.truncate(handler.stack_depth);
+                            self.push(Value::object_id(oid));
+                            self.frames.last_mut().unwrap().ip = handler.catch_target as usize;
+                            continue;
+                        }
+                        return Err(VmError::TypeError(msg));
+                    }
                     let obj_val = self.pop()?;
                     let name_str = self.interner.resolve(name_id);
                     if let Some(oid) = obj_val.as_object_id() {

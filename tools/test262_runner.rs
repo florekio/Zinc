@@ -97,7 +97,11 @@ fn main() {
         "expressions/arrow-function",
         "expressions/template-literal",
         "expressions/this",
+        "expressions/optional-chaining",
+        "expressions/async-function",
         "statements/for-of",
+        "statements/const",
+        "statements/let",
         "directive-prologue",
         "future-reserved-words",
         // "reserved-words", // 52% — many need strict mode

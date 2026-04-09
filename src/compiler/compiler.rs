@@ -1141,6 +1141,23 @@ impl<'a> Compiler<'a> {
             }
         }
 
+        // Hoist var declarations inside the function body.
+        {
+            let mut hoisted_names = Vec::new();
+            for stmt in &body.body {
+                collect_var_declarations(stmt, &mut hoisted_names);
+            }
+            let param_names: Vec<StringId> = self.locals.iter().map(|l| l.name).collect();
+            for name in hoisted_names {
+                // Don't re-declare parameters
+                if !param_names.contains(&name) && self.resolve_local(name).is_none() {
+                    self.chunk.emit_op(OpCode::Undefined, 0);
+                    self.add_local(name);
+                    self.mark_initialized();
+                }
+            }
+        }
+
         // Compile body.
         for stmt in &body.body {
             self.compile_statement(stmt)?;
