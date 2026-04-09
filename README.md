@@ -42,7 +42,7 @@ Zinc JIT:        20ms  ← 1.75x faster than V8
 
 The JIT is **50x faster** than the interpreter and **beats V8** because it has zero warmup overhead — the code is compiled directly to native instructions without optimization tiers.
 
-Currently supports 1-param (fibonacci) and 2-param (Ackermann) recursive numeric functions on Apple Silicon.
+Currently supports 1-param (fibonacci) and 2-param (Ackermann) recursive numeric functions on Apple Silicon. See [JIT.md](docs/JIT.md) for technical details.
 
 ## Features
 
