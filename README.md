@@ -4,7 +4,7 @@ A JavaScript engine written from scratch in Rust. Also compiles to **WebAssembly
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**81.7% [Test262](docs/TEST262.md) conformance** | **217 tests** | **~13,000 lines of Rust**
+**82.1% [Test262](docs/TEST262.md) conformance** | **217 tests** | **~13,000 lines of Rust**
 
 ![Zinc Playground](web/screenshot.png)
 
@@ -153,13 +153,30 @@ sieve(10K)             0.030s     0.034s      0.9x  ← Zinc wins
 
 Zinc **matches or beats Node.js** on 3 of 6 benchmarks. The gap on fibonacci (21x) is the expected difference between a bytecode interpreter and a JIT compiler.
 
+### SunSpider
+
+Zinc runs 5 of the classic [SunSpider](https://webkit.org/perf/sunspider/sunspider.html) benchmarks with correct results — see [SUNSPIDER.md](docs/SUNSPIDER.md).
+
+```
+Test                         Zinc       Node     Ratio
+─────────────────────────────────────────────────────
+access-nbody                100ms      39ms      2.6x   ✓
+bitops-3bit-bits-in-byte     63ms      36ms      1.8x   ✓
+math-cordic                 152ms      44ms      3.5x   ✓
+math-partial-sums           100ms      44ms      2.3x   ✓
+```
+
+**1.8x-3.5x vs Node** on real-world computational benchmarks.
+
 ```bash
-cargo build --release && bash bench/run_all.sh
+cargo build --release
+bash bench/run_all.sh          # micro benchmarks
+bash bench/sunspider/run.sh    # SunSpider benchmarks
 ```
 
 ## Test262 Conformance
 
-**81.7%** of tested ECMAScript spec tests pass (2,181 / 2,670). See [TEST262.md](docs/TEST262.md) for the full breakdown.
+**82.1%** of tested ECMAScript spec tests pass (2,291 / 2,789). See [TEST262.md](docs/TEST262.md) for the full breakdown.
 
 17 categories with **100% pass rate**: numeric literals, string literals, boolean literals, void, grouping, return, throw, block, empty, expression, punctuators, keywords, line-terminators, coalesce, relational, this, future-reserved-words.
 
@@ -210,7 +227,7 @@ web/                   WASM playground (HTML + compiled WASM)
 
 - **~13,000 lines** of Rust
 - **217 tests** passing
-- **81.7%** Test262 conformance (2,181 / 2,670 tests)
+- **82.1%** Test262 conformance (2,291 / 2,789 tests)
 - **31 source files**
 - **384 KB** WASM binary
 - Zero unsafe in hot paths (unsafe only in GC foundation)
@@ -221,7 +238,6 @@ web/                   WASM playground (HTML + compiled WASM)
 - Regular expressions (via `regex` crate)
 - Prototype chain lookups (real `__proto__` traversal)
 - ES modules (`import`/`export`)
-- Deploy playground to GitHub Pages
 - Inline caching for property access performance
 
 ## License
