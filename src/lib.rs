@@ -2,6 +2,8 @@ pub mod ast;
 pub mod compiler;
 pub mod engine;
 pub mod gc;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub mod jit;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
