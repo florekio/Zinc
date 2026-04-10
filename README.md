@@ -4,7 +4,7 @@ A JavaScript engine written from scratch in Rust with an **experimental ARM64 JI
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**82.1% [Test262](docs/TEST262.md) conformance** | **222 tests** | **~13,000 lines of Rust** | **1.75x faster than V8 on fibonacci**
+**84.2% [Test262](docs/TEST262.md) conformance** | **222 tests** | **~15,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
 
 ![Zinc Playground](web/screenshot.png)
 
@@ -30,19 +30,20 @@ cargo test                         # run tests
 
 Zinc includes an **experimental ARM64 JIT** that emits raw machine code — no Cranelift, no LLVM, just hand-written instruction bytes into `mmap`'d executable memory.
 
-When a function is called 100+ times, the VM detects the hot function, pattern-matches it, and compiles native ARM64 code on the fly:
+The JIT has two modes:
+
+1. **Pattern matching** — detects recursive functions (fibonacci, Ackermann, tak) and emits hand-tuned ARM64
+2. **Bytecode walking** — translates loop-based functions opcode-by-opcode, mapping the VM stack to registers
+
+When a function is called 100+ times, the VM compiles it to native code on the fly:
 
 ```
-fibonacci(35) = 9227465
-
-Interpreter:  1,980ms
-Node.js (V8):    70ms
-Zinc JIT:        20ms  ← 1.75x faster than V8
+fibonacci(35):  Zinc JIT 20ms  vs  Node.js 70ms   (1.75x faster)
+ack(3,9):       Zinc JIT 70ms  vs  Node.js 260ms  (3.7x faster)
+loop_sum(1B):   Zinc JIT 440ms vs  Node.js 630ms  (1.4x faster)
 ```
 
-The JIT is **50x faster** than the interpreter and **beats V8** because it has zero warmup overhead — the code is compiled directly to native instructions without optimization tiers.
-
-Currently supports 1-param (fibonacci) and 2-param (Ackermann) recursive numeric functions on Apple Silicon. See [JIT.md](docs/JIT.md) for technical details.
+See [JIT.md](docs/JIT.md) for technical details.
 
 ## Features
 
@@ -55,12 +56,14 @@ Currently supports 1-param (fibonacci) and 2-param (Ackermann) recursive numeric
 | **Variables** | `var` (with hoisting), `let`, `const` with block scoping |
 | **Control flow** | `if`/`else`, `while`, `do-while`, `for`, `for...in`, `for...of`, `switch`/`case` |
 | **Functions** | Declarations, expressions, arrow functions, closures, recursion, default params |
-| **Classes** | `class`, `constructor`, instance methods, static methods, `new` |
-| **Objects** | Literals, property get/set, computed access, `this` binding, `Object.keys`/`values`/`entries` |
+| **Classes** | `class`, `constructor`, `extends`, `super()`, instance methods, static methods, `new`, prototype chain inheritance |
+| **Objects** | Literals, property get/set, computed access, `this` binding, prototype chain, `Object.keys`/`values`/`entries` |
 | **Arrays** | Literals, indexed access, `.length`, `.push`, `.pop`, `.map`, `.filter`, `.reduce`, `.forEach`, `.find`, `.some`, `.every`, `.join`, `.indexOf`, `.includes`, `.reverse`, `.shift`, `.unshift` |
-| **Strings** | 20 methods: `.toUpperCase`, `.toLowerCase`, `.trim`, `.slice`, `.split`, `.indexOf`, `.includes`, `.startsWith`, `.endsWith`, `.replace`, `.repeat`, `.charAt`, `.padStart`, `.padEnd`, `.concat`, etc. |
+| **Regular expressions** | `/pattern/flags` literals, `.test()`, `.exec()`, `.source`, `.flags`, `.global`; regex-aware `.replace()`, `.match()`, `.search()`, `.split()`, `.replaceAll()` |
+| **Strings** | 23 methods: `.toUpperCase`, `.toLowerCase`, `.trim`, `.slice`, `.split`, `.indexOf`, `.includes`, `.startsWith`, `.endsWith`, `.replace`, `.replaceAll`, `.match`, `.search`, `.repeat`, `.charAt`, `.padStart`, `.padEnd`, `.concat`, etc. |
 | **Template literals** | `` `hello ${name}` `` with interpolation and nesting |
 | **Destructuring** | `var {a, b} = obj`, `var [x, y] = arr` |
+| **Optional chaining** | `obj?.prop`, `obj?.[expr]`, `fn?.()` |
 | **Promises** | `new Promise`, `.then`/`.catch` chaining, `Promise.resolve`/`reject`, microtask queue |
 | **Async/await** | `async function`, `await` on promises and values |
 | **Error handling** | `try`/`catch`/`finally`, `throw`, `new Error()`, `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `instanceof`, `in` |
@@ -74,7 +77,8 @@ Currently supports 1-param (fibonacci) and 2-param (Ackermann) recursive numeric
 - **NaN-boxed values** — every JS value in 8 bytes via IEEE 754 quiet NaN space with sign-bit tagging
 - **~130 bytecode opcodes** with variable-length encoding
 - **Stack-based VM** with call frames, operand stack, and upvalue-based closures
-- **ARM64 JIT** — hand-written machine code emitter, auto-detects hot functions
+- **ARM64 JIT** — hand-written machine code emitter with two compilation modes
+- **Prototype chain** — real `__proto__` traversal for property lookup and class inheritance
 - **Pratt parser** with precedence climbing across ~25 levels
 - **Lua-style upvalues** — open (stack) → closed (heap) for proper closure semantics
 - **String interning** — O(1) comparison for all identifiers and property names
@@ -91,12 +95,13 @@ See [BENCHMARKS.md](docs/BENCHMARKS.md) for details.
 ```
 Benchmark              Zinc       Node       Ratio
 ────────────────────────────────────────────────────
-fibonacci(35)          0.020s     0.070s      0.3x  ← Zinc JIT wins!
-loop_sum(1M)           0.094s     0.036s      2.6x
+fibonacci(35)          0.020s     0.070s      0.3x
+loop_sum(1B)           0.440s     0.630s      0.7x
+closure_counter(100K)  0.030s     0.034s      0.9x
+sieve(10K)             0.030s     0.034s      0.9x
+object_create(100K)    0.036s     0.034s      1.1x
 string_concat(10K)     0.061s     0.033s      1.8x
-closure_counter(100K)  0.030s     0.034s      0.9x  ← Zinc wins
-object_create(100K)    0.036s     0.034s      1.1x  ← tie
-sieve(10K)             0.030s     0.034s      0.9x  ← Zinc wins
+loop_sum(1M interp)    0.094s     0.036s      2.6x
 ```
 
 ### SunSpider
@@ -106,11 +111,11 @@ sieve(10K)             0.030s     0.034s      0.9x  ← Zinc wins
 ```
 Test                         Zinc       Node     Ratio
 ─────────────────────────────────────────────────────
-controlflow-recursive       250ms     260ms      0.96x  ← Zinc JIT wins!
-access-nbody                100ms      39ms      2.6x   ✓
-bitops-3bit-bits-in-byte     63ms      36ms      1.8x   ✓
-math-cordic                 152ms      44ms      3.5x   ✓
-math-partial-sums           100ms      44ms      2.3x   ✓
+controlflow-recursive       250ms     260ms      0.96x
+access-nbody                100ms      39ms      2.6x
+bitops-3bit-bits-in-byte     63ms      36ms      1.8x
+math-cordic                 152ms      44ms      3.5x
+math-partial-sums           100ms      44ms      2.3x
 ```
 
 ```bash
@@ -121,7 +126,7 @@ bash bench/sunspider/run.sh    # SunSpider benchmarks
 
 ## Test262 Conformance
 
-**82.1%** of tested ECMAScript spec tests pass (2,291 / 2,789). See [TEST262.md](docs/TEST262.md).
+**84.2%** of tested ECMAScript spec tests pass (2,349 / 2,789). See [TEST262.md](docs/TEST262.md).
 
 23 categories with **100% pass rate** including: numeric literals, string literals, boolean literals, compound-assignment, if, return, throw, coalesce, keywords, and more.
 
@@ -142,7 +147,7 @@ Every JavaScript value fits in a single `u64`:
 Normal f64:      stored as-is
 Tagged values:   SIGN_BIT | QNAN | 3-bit tag | 48-bit payload
 
-Tags: object ptr | int32 (SMI) | boolean | null | undefined | string id | symbol id
+Tags: object ptr | int32 (SMI) | boolean | null | undefined | string id | symbol id | function ref
 ```
 
 The operand stack is `Vec<u64>` — 8 bytes per slot, zero heap allocation per value.
@@ -171,19 +176,18 @@ web/                   WASM playground (HTML + compiled WASM)
 
 ## Stats
 
-- **~13,000 lines** of Rust
+- **~15,000 lines** of Rust
 - **222 tests** passing
-- **82.1%** Test262 conformance (2,291 / 2,789 tests)
+- **84.2%** Test262 conformance (2,349 / 2,789 tests)
 - **384 KB** WASM binary
-- **1.75x faster than V8** on JIT-compiled fibonacci
+- **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation
 
 ## What's Next
 
-- Extend JIT to loop-based functions (not just recursive)
 - Generators (`function*`, `yield`)
-- Regular expressions (via `regex` crate)
-- Prototype chain lookups (real `__proto__` traversal)
+- Garbage collector (mark-and-sweep — arena heap currently never frees)
+- Floating-point JIT (ARM64 SIMD/FP registers)
 - ES modules (`import`/`export`)
 
 ## License
