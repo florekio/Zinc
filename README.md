@@ -67,7 +67,8 @@ See [JIT.md](docs/JIT.md) for technical details.
 | **Promises** | `new Promise`, `.then`/`.catch` chaining, `Promise.resolve`/`reject`, microtask queue |
 | **Async/await** | `async function`, `await` on promises and values |
 | **Error handling** | `try`/`catch`/`finally`, `throw`, `new Error()`, `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `instanceof`, `in` |
-| **Iterators** | `for...of` with array iterator protocol |
+| **Generators** | `function*`, `yield`, `.next(val)`, `.return()`, `.throw()`, `for...of` integration, infinite generators |
+| **Iterators** | `for...of` with array iterator protocol and generator support |
 | **JSON** | `JSON.parse` (full recursive descent), `JSON.stringify` |
 | **Math** | `PI`, `E`, `floor`, `ceil`, `round`, `abs`, `sqrt`, `pow`, `max`, `min`, `sin`, `cos`, `tan`, `log`, `random`, etc. |
 | **Globals** | `console.log`/`warn`/`error`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `String`, `Number`, `Boolean`, `String.fromCharCode`, `Array.isArray`, `Object.keys`/`values`/`entries` |
@@ -82,7 +83,7 @@ See [JIT.md](docs/JIT.md) for technical details.
 - **Pratt parser** with precedence climbing across ~25 levels
 - **Lua-style upvalues** — open (stack) → closed (heap) for proper closure semantics
 - **String interning** — O(1) comparison for all identifiers and property names
-- **Arena-based object heap** for GC-managed objects
+- **Mark-and-sweep GC** — automatic garbage collection with root tracing and slot reuse
 - **Microtask queue** for Promise resolution
 - **WebAssembly build** — 384 KB WASM binary
 
@@ -176,7 +177,7 @@ web/                   WASM playground (HTML + compiled WASM)
 
 ## Stats
 
-- **~15,000 lines** of Rust
+- **~16,000 lines** of Rust
 - **222 tests** passing
 - **84.2%** Test262 conformance (2,349 / 2,789 tests)
 - **384 KB** WASM binary
@@ -185,10 +186,10 @@ web/                   WASM playground (HTML + compiled WASM)
 
 ## What's Next
 
-- Generators (`function*`, `yield`)
-- Garbage collector (mark-and-sweep — arena heap currently never frees)
 - Floating-point JIT (ARM64 SIMD/FP registers)
 - ES modules (`import`/`export`)
+- WeakRef / FinalizationRegistry
+- Async generators (`async function*`)
 
 ## License
 

@@ -4,7 +4,7 @@ use std::fmt;
 use crate::compiler::chunk::Chunk;
 use crate::compiler::opcode::OpCode;
 use crate::compiler::chunk::ChunkFlags;
-use crate::runtime::object::{GeneratorState, JsObject, ObjectHeap, ObjectId, ObjectKind, PromiseState};
+use crate::runtime::object::{GeneratorState, JsObject, ObjectHeap, ObjectId, ObjectKind, PromiseState, trace_value};
 use crate::runtime::value::Value;
 use crate::util::interner::{Interner, StringId};
 
@@ -315,6 +315,69 @@ impl Vm {
 
 
 
+
+    /// Run mark-and-sweep garbage collection.
+    pub fn collect_gc(&mut self) {
+        let mut roots: Vec<ObjectId> = Vec::new();
+
+        // Root 1: stack
+        for val in &self.stack {
+            if let Some(oid) = trace_value(*val) { roots.push(oid); }
+        }
+
+        // Root 2: globals
+        for val in self.globals.values() {
+            if let Some(oid) = trace_value(*val) { roots.push(oid); }
+        }
+
+        // Root 3: globals_vec
+        for val in &self.globals_vec {
+            if let Some(oid) = trace_value(*val) { roots.push(oid); }
+        }
+
+        // Root 4: call frames
+        for frame in &self.frames {
+            if let Some(oid) = trace_value(frame.this_value) { roots.push(oid); }
+            if let Some(gid) = frame.generator_id { roots.push(gid); }
+            for uv in &frame.upvalues {
+                if let UpvalueLocation::Closed(val) = &uv.location
+                    && let Some(oid) = trace_value(*val)
+                {
+                    roots.push(oid);
+                }
+            }
+        }
+
+        // Root 5: closure upvalues
+        for closure_uvs in &self.closure_upvalues {
+            for uv in closure_uvs {
+                if let UpvalueLocation::Closed(val) = &uv.location
+                    && let Some(oid) = trace_value(*val)
+                {
+                    roots.push(oid);
+                }
+            }
+        }
+
+        // Root 6: microtask queue
+        for task in &self.microtask_queue {
+            match task {
+                Microtask::PromiseReaction { callback, value, result_promise, .. } => {
+                    if let Some(cb) = callback
+                        && let Some(oid) = trace_value(*cb)
+                    {
+                        roots.push(oid);
+                    }
+                    if let Some(oid) = trace_value(*value) { roots.push(oid); }
+                    roots.push(*result_promise);
+                }
+            }
+        }
+
+        self.heap.mark_from_roots(&roots);
+        self.heap.sweep();
+        self.heap.gc_threshold = (self.heap.gc_threshold * 2).max(256);
+    }
 
     pub fn take_interner(self) -> Interner {
         self.interner
@@ -698,6 +761,11 @@ impl Vm {
 
     pub fn run(&mut self) -> Result<Value, VmError> {
         loop {
+            // GC safepoint
+            if self.heap.needs_gc() {
+                self.collect_gc();
+            }
+
             if self.frames.is_empty() {
                 return Ok(if self.stack.is_empty() {
                     Value::undefined()
@@ -2595,6 +2663,7 @@ impl Vm {
                                 properties: std::collections::HashMap::new(),
                                 prototype: None,
                                 kind: ObjectKind::ArrayIterator(oid, 0),
+                                marked: false,
                             };
                             let iter_id = self.heap.allocate(iter_obj);
                             self.push(Value::object_id(iter_id));
@@ -2607,6 +2676,7 @@ impl Vm {
                                 properties: std::collections::HashMap::new(),
                                 prototype: None,
                                 kind: ObjectKind::KeyIterator(keys, 0),
+                                marked: false,
                             };
                             let iter_id = self.heap.allocate(iter_obj);
                             self.push(Value::object_id(iter_id));
