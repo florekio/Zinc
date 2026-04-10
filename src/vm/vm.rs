@@ -4,7 +4,7 @@ use std::fmt;
 use crate::compiler::chunk::Chunk;
 use crate::compiler::opcode::OpCode;
 use crate::compiler::chunk::ChunkFlags;
-use crate::runtime::object::{JsObject, ObjectHeap, ObjectId, ObjectKind, PromiseState};
+use crate::runtime::object::{GeneratorState, JsObject, ObjectHeap, ObjectId, ObjectKind, PromiseState};
 use crate::runtime::value::Value;
 use crate::util::interner::{Interner, StringId};
 
@@ -61,6 +61,8 @@ pub(crate) struct CallFrame {
     pub(crate) is_constructor: bool,
     /// If true, the next Call should propagate this_value (for super()).
     pub(crate) pending_super_call: bool,
+    /// If Some, this frame belongs to a generator object.
+    pub(crate) generator_id: Option<crate::runtime::object::ObjectId>,
 }
 
 /// An active exception handler (pushed by PushExcHandler).
@@ -216,7 +218,7 @@ impl Vm {
         
         Self {
             chunks,
-            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::undefined(), is_constructor: false, pending_super_call: false }],
+            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::undefined(), is_constructor: false, pending_super_call: false, generator_id: None }],
             stack: Vec::with_capacity(256),
             globals,
             interner,
@@ -1285,6 +1287,47 @@ impl Vm {
                                 }
                             }
 
+                            // ---- Generator: create generator object instead of executing ----
+                            if self.chunks[chunk_idx].flags.contains(crate::compiler::chunk::ChunkFlags::GENERATOR) {
+                                // Resolve upvalues to values for snapshot
+                                let saved_upvalues: Vec<Value> = if closure_id < self.closure_upvalues.len() {
+                                    self.closure_upvalues[closure_id].iter().map(|uv| {
+                                        match &uv.location {
+                                            UpvalueLocation::Open(idx) => self.stack.get(*idx).copied().unwrap_or(Value::undefined()),
+                                            UpvalueLocation::Closed(v) => *v,
+                                        }
+                                    }).collect()
+                                } else {
+                                    Vec::new()
+                                };
+
+                                // Save just the arguments as the initial stack
+                                let expected = self.chunks[chunk_idx].param_count as usize;
+                                let saved_stack: Vec<Value> = (0..expected.max(argc))
+                                    .map(|i| {
+                                        if i < argc {
+                                            self.stack[func_pos + 1 + i]
+                                        } else {
+                                            Value::undefined()
+                                        }
+                                    })
+                                    .collect();
+
+                                let mut gen_obj = JsObject::ordinary();
+                                gen_obj.kind = ObjectKind::Generator {
+                                    state: GeneratorState::SuspendedStart,
+                                    chunk_idx,
+                                    ip: 0,
+                                    saved_stack,
+                                    saved_upvalues,
+                                    this_value: Value::undefined(),
+                                };
+                                let gen_oid = self.heap.allocate(gen_obj);
+                                self.stack.truncate(func_pos);
+                                self.push(Value::object_id(gen_oid));
+                                continue;
+                            }
+
                             // ---- Interpreter: normal bytecode execution ----
                             let upvalues = if closure_id < self.closure_upvalues.len()
                                 && !self.closure_upvalues[closure_id].is_empty() {
@@ -1310,6 +1353,7 @@ impl Vm {
                                 this_value: this_val,
                                 is_constructor: false,
                                 pending_super_call: false,
+                                generator_id: None,
                             });
                             continue;
                         }
@@ -1358,15 +1402,25 @@ impl Vm {
                 OpCode::Return => {
                     let result = self.pop()?;
                     let frame = self.frames.pop().unwrap();
-                    // Only close upvalues if there are any (fast path: skip for most functions)
                     if !self.closure_upvalues.is_empty() {
                         self.close_upvalues_above(frame.base.saturating_sub(1));
                     }
-                    if self.frames.is_empty() {
+                    // Generator return: mark completed, produce {value, done: true}
+                    if let Some(gid) = frame.generator_id {
+                        if let Some(obj) = self.heap.get_mut(gid)
+                            && let ObjectKind::Generator { state, .. } = &mut obj.kind
+                        {
+                            *state = GeneratorState::Completed;
+                        }
+                        self.stack.truncate(frame.base.saturating_sub(1));
+                        let iter_result = self.make_iter_result(result, true)?;
+                        self.push(iter_result);
+                    } else if self.frames.is_empty() {
                         return Ok(result);
+                    } else {
+                        self.stack.truncate(frame.base.saturating_sub(1));
+                        self.push(result);
                     }
-                    self.stack.truncate(frame.base.saturating_sub(1));
-                    self.push(result);
                 }
 
                 OpCode::ReturnUndefined => {
@@ -1375,11 +1429,22 @@ impl Vm {
                     if !self.closure_upvalues.is_empty() {
                         self.close_upvalues_above(frame.base.saturating_sub(1));
                     }
-                    if self.frames.is_empty() {
+                    // Generator return: mark completed, produce {value: undefined, done: true}
+                    if let Some(gid) = frame.generator_id {
+                        if let Some(obj) = self.heap.get_mut(gid)
+                            && let ObjectKind::Generator { state, .. } = &mut obj.kind
+                        {
+                            *state = GeneratorState::Completed;
+                        }
+                        self.stack.truncate(frame.base.saturating_sub(1));
+                        let iter_result = self.make_iter_result(Value::undefined(), true)?;
+                        self.push(iter_result);
+                    } else if self.frames.is_empty() {
                         return Ok(result);
+                    } else {
+                        self.stack.truncate(frame.base.saturating_sub(1));
+                        self.push(result);
                     }
-                    self.stack.truncate(frame.base.saturating_sub(1));
-                    self.push(result);
                 }
 
                 // ---- Object / Array (placeholders) -----------------------
@@ -1824,6 +1889,25 @@ impl Vm {
                                 self.push(result);
                                 continue;
                             }
+                        // Check for Generator methods (.next, .return, .throw)
+                        if let Some(obj) = self.heap.get(oid)
+                            && matches!(&obj.kind, ObjectKind::Generator { .. })
+                        {
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            // Clear CallMethod operands before resuming
+                            self.stack.truncate(obj_pos);
+                            let action = self.exec_generator_method(oid, method_name, &args)?;
+                            match action {
+                                crate::vm::generator::GeneratorAction::Done(result) => {
+                                    self.push(result);
+                                    continue;
+                                }
+                                crate::vm::generator::GeneratorAction::Resumed => {
+                                    // Generator frame pushed — main loop will execute it
+                                    continue;
+                                }
+                            }
+                        }
                         // Check for RegExp methods
                         if let Some(obj) = self.heap.get(oid)
                             && matches!(&obj.kind, ObjectKind::RegExp { .. })
@@ -1878,7 +1962,7 @@ impl Vm {
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: obj_pos + 1,
                                         upvalues, this_value: obj_val, is_constructor: false,
-                                        pending_super_call: false,
+                                        pending_super_call: false, generator_id: None,
                                     });
                                     continue;
                                 }
@@ -2156,7 +2240,7 @@ impl Vm {
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: func_pos + 1,
                                         upvalues, this_value: this_val, is_constructor: true,
-                                        pending_super_call: false,
+                                        pending_super_call: false, generator_id: None,
                                     });
                                     continue;
                                 }
@@ -2190,6 +2274,7 @@ impl Vm {
                                 this_value: this_val,
                                 is_constructor: true,
                                 pending_super_call: false,
+                                generator_id: None,
                             });
                             continue;
                         }
@@ -2496,10 +2581,15 @@ impl Vm {
                 OpCode::GetIterator => {
                     let val = self.pop()?;
                     if let Some(oid) = val.as_object_id() {
-                        let is_array = self.heap.get(oid)
-                            .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
+                        // Generators are their own iterators
+                        let is_generator = self.heap.get(oid)
+                            .map(|o| matches!(&o.kind, ObjectKind::Generator { .. }))
                             .unwrap_or(false);
-                        if is_array {
+                        if is_generator {
+                            self.push(val); // pass through as-is
+                        } else if self.heap.get(oid)
+                            .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
+                            .unwrap_or(false) {
                             // Array iterator
                             let iter_obj = JsObject {
                                 properties: std::collections::HashMap::new(),
@@ -2534,6 +2624,24 @@ impl Vm {
                     // Stack: [iterator] -> [iterator_result]
                     let iter_val = self.pop()?;
                     if let Some(iter_oid) = iter_val.as_object_id() {
+                        // Check if this is a generator
+                        let is_gen = self.heap.get(iter_oid)
+                            .map(|o| matches!(&o.kind, ObjectKind::Generator { .. }))
+                            .unwrap_or(false);
+                        if is_gen {
+                            // Resume the generator via .next()
+                            let action = self.generator_resume(iter_oid, Value::undefined())?;
+                            match action {
+                                crate::vm::generator::GeneratorAction::Done(result) => {
+                                    self.push(result);
+                                }
+                                crate::vm::generator::GeneratorAction::Resumed => {
+                                    // Generator frame pushed — main loop will run it.
+                                    // When it yields/returns, {value, done} will be on the stack.
+                                    continue;
+                                }
+                            }
+                        } else { // non-generator iterator path
                         let iter_info = {
                             let iter = self.heap.get(iter_oid).ok_or_else(|| {
                                 VmError::RuntimeError("invalid iterator".into())
@@ -2594,6 +2702,7 @@ impl Vm {
                         result_obj.set_property(done_name, Value::boolean(done));
                         let result_id = self.heap.allocate(result_obj);
                         self.push(Value::object_id(result_id));
+                        } // close non-generator else
                     } else {
                         return Err(VmError::TypeError("not an iterator".into()));
                     }
@@ -2654,8 +2763,51 @@ impl Vm {
                     self.push(awaited);
                 }
 
-                OpCode::Yield
-                | OpCode::YieldStar
+                OpCode::Yield => {
+                    let yielded_value = self.pop()?;
+                    let frame = self.frames.last().unwrap();
+                    let gen_oid = frame.generator_id;
+                    let base = frame.base;
+                    let ip = frame.ip;
+                    let _chunk_idx = frame.chunk_idx;
+                    let this_value = frame.this_value;
+
+                    if let Some(gid) = gen_oid {
+                        // Save the current stack (locals + operand stack)
+                        let saved_stack: Vec<Value> = self.stack[base..].to_vec();
+
+                        // Resolve upvalues to values
+                        let saved_upvalues: Vec<Value> = self.frames.last().unwrap().upvalues.iter().map(|uv| {
+                            match &uv.location {
+                                UpvalueLocation::Open(idx) => self.stack.get(*idx).copied().unwrap_or(Value::undefined()),
+                                UpvalueLocation::Closed(v) => *v,
+                            }
+                        }).collect();
+
+                        // Update generator object
+                        if let Some(obj) = self.heap.get_mut(gid)
+                            && let ObjectKind::Generator { state, ip: saved_ip, saved_stack: ss, saved_upvalues: su, this_value: tv, .. } = &mut obj.kind
+                        {
+                            *state = GeneratorState::SuspendedYield;
+                            *saved_ip = ip;
+                            *ss = saved_stack;
+                            *su = saved_upvalues;
+                            *tv = this_value;
+                        }
+
+                        // Pop the generator frame
+                        self.frames.pop();
+                        self.stack.truncate(base - 1); // remove placeholder too
+
+                        // Push {value, done: false}
+                        let result = self.make_iter_result(yielded_value, false)?;
+                        self.push(result);
+                    } else {
+                        return Err(VmError::RuntimeError("yield outside generator".into()));
+                    }
+                }
+
+                OpCode::YieldStar
                 | OpCode::CreateGenerator
                 | OpCode::AsyncReturn
                 | OpCode::AsyncThrow => {

@@ -16,6 +16,18 @@ pub struct JsObject {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GeneratorState {
+    /// Created but `.next()` not yet called.
+    SuspendedStart,
+    /// Paused at a `yield` expression.
+    SuspendedYield,
+    /// Currently running (re-entrancy guard).
+    Executing,
+    /// Finished (returned or threw).
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PromiseState {
     Pending,
     Fulfilled,
@@ -39,6 +51,15 @@ pub enum ObjectKind {
     KeyIterator(Vec<crate::util::interner::StringId>, usize),
     /// Primitive wrapper object (new Number(5), new Boolean(true), new String("x"))
     Wrapper(Value),
+    /// Generator (suspendable function)
+    Generator {
+        state: GeneratorState,
+        chunk_idx: usize,
+        ip: usize,
+        saved_stack: Vec<Value>,
+        saved_upvalues: Vec<Value>,
+        this_value: Value,
+    },
     /// Regular expression
     RegExp {
         pattern: String,
