@@ -9,10 +9,10 @@ impl Vm {
     /// Saves/restores the main run loop's frame depth so the callback executes
     /// as a nested call and returns its result.
     pub(crate) fn call_function(&mut self, func_val: Value, args: &[Value]) -> Result<Value, VmError> {
-        if !func_val.is_int() {
+        if !func_val.is_function() {
             return Ok(Value::undefined());
         }
-        let packed = func_val.as_int().unwrap();
+        let packed = func_val.as_function().unwrap();
         let closure_id = ((packed as u32) >> 16) as usize;
         let chunk_idx = (packed & 0xFFFF) as usize;
         if chunk_idx < 1 || chunk_idx >= self.chunks.len() {
@@ -210,7 +210,7 @@ impl Vm {
                     let closure_id = self.closure_upvalues.len();
                     self.closure_upvalues.push(upvalues);
                     let packed = ((closure_id as i32) << 16) | (abs_idx as i32 & 0xFFFF);
-                    self.push(Value::int(packed));
+                    self.push(Value::function(packed));
                 }
                 OpCode::Await => {
                     let awaited = self.pop()?;
@@ -230,8 +230,8 @@ impl Vm {
                     let cb_func_pos = self.stack.len() - 1 - cb_argc;
                     let cb_func = self.stack[cb_func_pos];
                     // Resolve/reject sentinels
-                    if cb_func.is_int() {
-                        let s = cb_func.as_int().unwrap();
+                    if cb_func.is_function() {
+                        let s = cb_func.as_function().unwrap();
                         if s <= -600_000 && s > -700_000 {
                             let pid = ObjectId((-600_000 - s) as u32);
                             let val = if cb_argc > 0 { self.stack[cb_func_pos + 1] } else { Value::undefined() };
@@ -269,7 +269,7 @@ impl Vm {
                             if (mid == log_key || mid == warn_key || mid == error_key)
                                 && let Some(obj) = self.heap.get(oid)
                                     && let Some(mv) = obj.get_property(mid)
-                                        && mv.is_int() && mv.as_int().unwrap() <= -100 && mv.as_int().unwrap() >= -102 {
+                                        && mv.is_function() && mv.as_function().unwrap() <= -100 && mv.as_function().unwrap() >= -102 {
                                             let mut parts = Vec::new();
                                             for i in 0..cb_argc {
                                                 parts.push(self.value_to_string(self.stack[obj_pos + 1 + i]));
@@ -283,7 +283,7 @@ impl Vm {
                                         }
                         }
                     // Promise static methods (Promise.resolve/reject) inside callbacks
-                    if obj_val.is_int() && obj_val.as_int() == Some(-520)
+                    if obj_val.is_function() && obj_val.as_function() == Some(-520)
                         && let Some(mid) = method_name_id {
                             let args: Vec<Value> = (0..cb_argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_promise_static(mid, &args)?;

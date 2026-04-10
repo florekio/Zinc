@@ -25,6 +25,11 @@ impl JitFunction {
         unsafe { (self.buffer.as_fn2())(arg0, arg1) }
     }
 
+    /// Call the JIT-compiled function with three integer arguments.
+    pub fn call3(&self, arg0: i64, arg1: i64, arg2: i64) -> i64 {
+        unsafe { (self.buffer.as_fn3())(arg0, arg1, arg2) }
+    }
+
     /// How many parameters does the JIT function expect?
     pub fn param_count(&self) -> u8 {
         self.param_count
@@ -54,6 +59,15 @@ pub fn jit_compile(chunk: &Chunk, _all_chunks: &[Chunk]) -> Option<JitFunction> 
             || code.contains(&(OpCode::Eq as u8));
         if has_strict_eq {
             return emit_ack_pattern(chunk);
+        }
+    }
+
+    // 3-param recursive (tak-like): 3+ recursive calls, param_count == 3
+    if chunk.param_count == 3 && call_count >= 3 {
+        let has_ge = code.contains(&(OpCode::Ge as u8))
+            || code.contains(&(OpCode::Le as u8));
+        if has_ge {
+            return emit_tak_pattern(chunk);
         }
     }
 
@@ -291,6 +305,94 @@ fn emit_ack_pattern(chunk: &Chunk) -> Option<JitFunction> {
 }
 
 
+/// Emit optimized ARM64 for Takeuchi function:
+///   function tak(x, y, z) {
+///     if (y >= x) return z;
+///     return tak(tak(x-1, y, z), tak(y-1, z, x), tak(z-1, x, y));
+///   }
+fn emit_tak_pattern(_chunk: &Chunk) -> Option<JitFunction> {
+    let mut asm = Assembler::new();
+
+    // ARM64 calling convention: X0 = x, X1 = y, X2 = z
+    // Callee-saved: X19 = x, X20 = y, X21 = z, X22/X23 = temps
+
+    // Prologue
+    asm.stp_pre(X29, X30, SP, -80);
+    asm.mov_reg(X29, SP);
+    asm.str_imm(X19, SP, 16);
+    asm.str_imm(X20, SP, 24);
+    asm.str_imm(X21, SP, 32);
+    asm.str_imm(X22, SP, 40);
+    asm.str_imm(X23, SP, 48);
+
+    // Save arguments
+    asm.mov_reg(X19, X0);  // x
+    asm.mov_reg(X20, X1);  // y
+    asm.mov_reg(X21, X2);  // z
+
+    // if (y >= x) return z
+    asm.cmp_reg(X20, X19);
+    let branch_base = asm.offset();
+    asm.b_ge(0); // patched later
+
+    // tak(x-1, y, z) → X22
+    asm.sub_imm(X0, X19, 1);
+    asm.mov_reg(X1, X20);
+    asm.mov_reg(X2, X21);
+    let call1 = asm.offset();
+    asm.bl(-(call1 as i32));
+    asm.mov_reg(X22, X0);
+
+    // tak(y-1, z, x) → X23
+    asm.sub_imm(X0, X20, 1);
+    asm.mov_reg(X1, X21);
+    asm.mov_reg(X2, X19);
+    let call2 = asm.offset();
+    asm.bl(-(call2 as i32));
+    asm.mov_reg(X23, X0);
+
+    // tak(z-1, x, y) → X0
+    asm.sub_imm(X0, X21, 1);
+    asm.mov_reg(X1, X19);
+    asm.mov_reg(X2, X20);
+    let call3 = asm.offset();
+    asm.bl(-(call3 as i32));
+
+    // return tak(X22, X23, X0)
+    asm.mov_reg(X2, X0);   // third arg = tak(z-1,x,y)
+    asm.mov_reg(X0, X22);  // first arg = tak(x-1,y,z)
+    asm.mov_reg(X1, X23);  // second arg = tak(y-1,z,x)
+    let call4 = asm.offset();
+    asm.bl(-(call4 as i32));
+
+    // Epilogue (general case)
+    asm.ldr_imm(X19, SP, 16);
+    asm.ldr_imm(X20, SP, 24);
+    asm.ldr_imm(X21, SP, 32);
+    asm.ldr_imm(X22, SP, 40);
+    asm.ldr_imm(X23, SP, 48);
+    asm.ldp_post(X29, X30, SP, 80);
+    asm.ret();
+
+    // Base case: y >= x, return z
+    let base_target = asm.offset();
+    asm.mov_reg(X0, X21);
+    asm.ldr_imm(X19, SP, 16);
+    asm.ldr_imm(X20, SP, 24);
+    asm.ldr_imm(X21, SP, 32);
+    asm.ldr_imm(X22, SP, 40);
+    asm.ldr_imm(X23, SP, 48);
+    asm.ldp_post(X29, X30, SP, 80);
+    asm.ret();
+
+    // Patch branch
+    asm.patch_branch(branch_base, base_target);
+
+    let mut buffer = ExecutableBuffer::new(asm.code.len().max(4096))?;
+    buffer.write_code(&asm.code);
+    Some(JitFunction { buffer, param_count: 3 })
+}
+
 /// Check if a chunk can be JIT-compiled (only simple numeric operations).
 fn can_jit(chunk: &Chunk) -> bool {
     let mut ip = 0;
@@ -302,18 +404,30 @@ fn can_jit(chunk: &Chunk) -> bool {
         };
         match op {
             OpCode::GetLocal
+            | OpCode::SetLocal
             | OpCode::Const
             | OpCode::Zero
             | OpCode::One
             | OpCode::Add
             | OpCode::Sub
             | OpCode::Mul
+            | OpCode::Div
+            | OpCode::Rem
             | OpCode::Le
             | OpCode::Lt
             | OpCode::Ge
             | OpCode::Gt
             | OpCode::Eq
+            | OpCode::Ne
             | OpCode::StrictEq
+            | OpCode::StrictNe
+            | OpCode::BitAnd
+            | OpCode::BitOr
+            | OpCode::BitXor
+            | OpCode::BitNot
+            | OpCode::Shl
+            | OpCode::Shr
+            | OpCode::UShr
             | OpCode::JumpIfFalse
             | OpCode::Jump
             | OpCode::Loop

@@ -66,8 +66,8 @@ impl Vm {
         let name = self.interner.resolve(method_name).to_owned();
         match name.as_str() {
             "then" => {
-                let on_fulfilled = args.first().copied().filter(|v| v.is_int());
-                let on_rejected = args.get(1).copied().filter(|v| v.is_int());
+                let on_fulfilled = args.first().copied().filter(|v| v.is_function());
+                let on_rejected = args.get(1).copied().filter(|v| v.is_function());
                 // Create child promise
                 let child = JsObject::promise();
                 let child_id = self.heap.allocate(child);
@@ -110,7 +110,7 @@ impl Vm {
                 Ok(Value::object_id(child_id))
             }
             "catch" => {
-                let on_rejected = args.first().copied().filter(|v| v.is_int());
+                let on_rejected = args.first().copied().filter(|v| v.is_function());
                 // Same as .then(undefined, onRejected)
                 let then_args = [Value::undefined(), on_rejected.unwrap_or(Value::undefined())];
                 self.exec_promise_method(oid, method_name, &then_args)

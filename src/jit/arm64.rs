@@ -9,6 +9,8 @@ pub const X2: u32 = 2;
 pub const X19: u32 = 19; // callee-saved, used for local 'n'
 pub const X20: u32 = 20; // callee-saved, used for temps
 pub const X21: u32 = 21; // callee-saved, extra temp
+pub const X22: u32 = 22; // callee-saved, extra temp
+pub const X23: u32 = 23; // callee-saved, extra temp
 pub const X29: u32 = 29; // frame pointer
 pub const X30: u32 = 30; // link register (return address)
 pub const SP: u32 = 31;  // stack pointer (in some encodings)
@@ -71,6 +73,43 @@ impl Assembler {
     /// SDIV Xd, Xn, Xm
     pub fn sdiv(&mut self, rd: u32, rn: u32, rm: u32) {
         self.emit(0x9AC00C00 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    // ---- Bitwise ----
+
+    /// AND Xd, Xn, Xm
+    pub fn and_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0x8A000000 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    /// ORR Xd, Xn, Xm
+    pub fn orr_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0xAA000000 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    /// EOR Xd, Xn, Xm (XOR)
+    pub fn eor_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0xCA000000 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    /// MVN Xd, Xm (bitwise NOT, alias for ORN Xd, XZR, Xm)
+    pub fn mvn(&mut self, rd: u32, rm: u32) {
+        self.emit(0xAA200000 | (rm << 16) | (XZR << 5) | rd);
+    }
+
+    /// LSLV Xd, Xn, Xm (logical shift left, variable)
+    pub fn lsl_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0x9AC02000 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    /// LSRV Xd, Xn, Xm (logical shift right, variable)
+    pub fn lsr_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0x9AC02400 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    /// ASRV Xd, Xn, Xm (arithmetic shift right, variable)
+    pub fn asr_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0x9AC02800 | (rm << 16) | (rn << 5) | rd);
     }
 
     // ---- Comparison ----

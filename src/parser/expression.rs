@@ -134,38 +134,53 @@ pub fn parse_expression(p: &mut Parser, min_bp: u8) -> ParseResult<Expression> {
                 continue;
             }
             TokenKind::QuestionDot if 30 >= min_bp => {
+                // Build an OptionalChainExpression collecting all ?. and . and () chains
+                let start = expr_span(&left).start;
+                let mut chain = Vec::new();
+
+                // Parse first ?. element
                 p.advance(); // ?.
-                // optional member or call
-                if p.at(TokenKind::LParen) {
-                    let args = parse_arguments(p)?;
-                    let start = expr_span(&left).start;
-                    left = Expression::Call(Box::new(CallExpression {
-                        callee: left,
-                        arguments: args,
-                        span: Span::new(start, p.pos()),
-                    }));
-                } else if p.at(TokenKind::LBracket) {
-                    p.advance(); // [
-                    let prop = parse_expression(p, 0)?;
-                    p.expect(TokenKind::RBracket)?;
-                    let start = expr_span(&left).start;
-                    left = Expression::Member(Box::new(MemberExpression {
-                        object: left,
-                        property: MemberProperty::Expression(prop),
-                        computed: true,
-                        span: Span::new(start, p.pos()),
-                    }));
-                } else {
-                    let prop_name = p.intern_current();
-                    p.advance();
-                    let start = expr_span(&left).start;
-                    left = Expression::Member(Box::new(MemberExpression {
-                        object: left,
-                        property: MemberProperty::Identifier(prop_name),
-                        computed: false,
-                        span: Span::new(start, p.pos()),
-                    }));
+                chain.push(parse_optional_chain_element(p, true)?);
+
+                // Continue collecting chain elements (both ?. and regular . / () / [])
+                loop {
+                    if p.at(TokenKind::QuestionDot) {
+                        p.advance();
+                        chain.push(parse_optional_chain_element(p, true)?);
+                    } else if p.at(TokenKind::Dot) {
+                        p.advance();
+                        let prop_name = p.intern_current();
+                        p.advance();
+                        chain.push(OptionalChainElement::Member {
+                            property: MemberProperty::Identifier(prop_name),
+                            computed: false,
+                            optional: false,
+                        });
+                    } else if p.at(TokenKind::LBracket) {
+                        p.advance();
+                        let prop = parse_expression(p, 0)?;
+                        p.expect(TokenKind::RBracket)?;
+                        chain.push(OptionalChainElement::Member {
+                            property: MemberProperty::Expression(prop),
+                            computed: true,
+                            optional: false,
+                        });
+                    } else if p.at(TokenKind::LParen) {
+                        let args = parse_arguments(p)?;
+                        chain.push(OptionalChainElement::Call {
+                            arguments: args,
+                            optional: false,
+                        });
+                    } else {
+                        break;
+                    }
                 }
+
+                left = Expression::OptionalChain(Box::new(OptionalChainExpression {
+                    base: left,
+                    chain,
+                    span: Span::new(start, p.pos()),
+                }));
                 continue;
             }
             _ => {}
@@ -715,6 +730,31 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
         }
 
         _ => Err(ParseError::unexpected(kind, p.current().span)),
+    }
+}
+
+/// Parse a single optional chain element after `?.`
+fn parse_optional_chain_element(p: &mut Parser, optional: bool) -> ParseResult<OptionalChainElement> {
+    if p.at(TokenKind::LParen) {
+        let args = parse_arguments(p)?;
+        Ok(OptionalChainElement::Call { arguments: args, optional })
+    } else if p.at(TokenKind::LBracket) {
+        p.advance(); // [
+        let prop = parse_expression(p, 0)?;
+        p.expect(TokenKind::RBracket)?;
+        Ok(OptionalChainElement::Member {
+            property: MemberProperty::Expression(prop),
+            computed: true,
+            optional,
+        })
+    } else {
+        let prop_name = p.intern_current();
+        p.advance();
+        Ok(OptionalChainElement::Member {
+            property: MemberProperty::Identifier(prop_name),
+            computed: false,
+            optional,
+        })
     }
 }
 

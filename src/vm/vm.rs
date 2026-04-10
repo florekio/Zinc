@@ -134,11 +134,11 @@ impl Vm {
         // Create console object with log/warn/error methods
         let mut console_obj = JsObject::ordinary();
         let log_id = interner.intern("log");
-        console_obj.set_property(log_id, Value::int(-100)); // sentinel for console.log
+        console_obj.set_property(log_id, Value::function(-100)); // sentinel for console.log
         let warn_id = interner.intern("warn");
-        console_obj.set_property(warn_id, Value::int(-101)); // sentinel for console.warn
+        console_obj.set_property(warn_id, Value::function(-101)); // sentinel for console.warn
         let error_id = interner.intern("error");
-        console_obj.set_property(error_id, Value::int(-102)); // sentinel for console.error
+        console_obj.set_property(error_id, Value::function(-102)); // sentinel for console.error
         let console_oid = heap.allocate(console_obj);
         let console_name = interner.intern("console");
         globals.insert(console_name, Value::object_id(console_oid));
@@ -167,39 +167,39 @@ impl Vm {
 
         // Global functions as sentinel values
         let parse_int_name = interner.intern("parseInt");
-        globals.insert(parse_int_name, Value::int(-500));
+        globals.insert(parse_int_name, Value::function(-500));
         let parse_float_name = interner.intern("parseFloat");
-        globals.insert(parse_float_name, Value::int(-501));
+        globals.insert(parse_float_name, Value::function(-501));
         let is_nan_name = interner.intern("isNaN");
-        globals.insert(is_nan_name, Value::int(-502));
+        globals.insert(is_nan_name, Value::function(-502));
         let is_finite_name = interner.intern("isFinite");
-        globals.insert(is_finite_name, Value::int(-503));
+        globals.insert(is_finite_name, Value::function(-503));
         let str_name = interner.intern("String");
-        globals.insert(str_name, Value::int(-504));
+        globals.insert(str_name, Value::function(-504));
         let num_name = interner.intern("Number");
-        globals.insert(num_name, Value::int(-505));
+        globals.insert(num_name, Value::function(-505));
         let bool_name = interner.intern("Boolean");
-        globals.insert(bool_name, Value::int(-506));
+        globals.insert(bool_name, Value::function(-506));
         let arr_is_arr = interner.intern("Array");
-        globals.insert(arr_is_arr, Value::int(-507));
+        globals.insert(arr_is_arr, Value::function(-507));
         let object_name = interner.intern("Object");
-        globals.insert(object_name, Value::int(-508));
+        globals.insert(object_name, Value::function(-508));
 
         // Promise constructor
         let promise_name = interner.intern("Promise");
-        globals.insert(promise_name, Value::int(-520));
+        globals.insert(promise_name, Value::function(-520));
 
         // Error constructors
         let error_name = interner.intern("Error");
-        globals.insert(error_name, Value::int(-510));
+        globals.insert(error_name, Value::function(-510));
         let type_error_name = interner.intern("TypeError");
-        globals.insert(type_error_name, Value::int(-511));
+        globals.insert(type_error_name, Value::function(-511));
         let range_error_name = interner.intern("RangeError");
-        globals.insert(range_error_name, Value::int(-512));
+        globals.insert(range_error_name, Value::function(-512));
         let ref_error_name = interner.intern("ReferenceError");
-        globals.insert(ref_error_name, Value::int(-513));
+        globals.insert(ref_error_name, Value::function(-513));
         let syntax_error_name = interner.intern("SyntaxError");
-        globals.insert(syntax_error_name, Value::int(-514));
+        globals.insert(syntax_error_name, Value::function(-514));
 
         // Pre-populate fast lookup Vec from all initial globals
         let globals_vec = {
@@ -403,10 +403,48 @@ impl Vm {
         f64::NAN
     }
 
+    /// ECMAScript ToPrimitive: call valueOf() then toString() on an object.
+    /// Returns Ok(Some(primitive)) on success, Ok(None) if no methods exist,
+    /// or Err if a method throws.
+    pub(crate) fn to_primitive_object(&mut self, val: Value) -> Option<Value> {
+        let oid = val.as_object_id()?;
+        let obj = self.heap.get(oid)?;
+
+        // Try valueOf first
+        let value_of_name = self.interner.intern("valueOf");
+        if let Some(method_val) = obj.get_property(value_of_name) {
+            if method_val.is_function() {
+                match self.call_function(method_val, &[]) {
+                    Ok(result) if !result.is_object() => return Some(result),
+                    Ok(_) => {} // returned object, try toString
+                    Err(_) => return None, // method threw
+                }
+            }
+        }
+
+        // Then try toString
+        let to_string_name = self.interner.intern("toString");
+        let obj = self.heap.get(oid)?;
+        if let Some(method_val) = obj.get_property(to_string_name) {
+            if method_val.is_function() {
+                match self.call_function(method_val, &[]) {
+                    Ok(result) if !result.is_object() => return Some(result),
+                    Ok(_) => {} // returned object
+                    Err(_) => return None,
+                }
+            }
+        }
+
+        None
+    }
+
     #[inline(always)]
     pub(crate) fn pop_numbers(&mut self) -> Result<(f64, f64), VmError> {
         let b = self.pop()?;
         let a = self.pop()?;
+        // ToPrimitive for objects
+        let a = if a.is_object() { self.to_primitive_object(a).unwrap_or(a) } else { a };
+        let b = if b.is_object() { self.to_primitive_object(b).unwrap_or(b) } else { b };
         Ok((self.to_f64(a), self.to_f64(b)))
     }
 
@@ -414,23 +452,33 @@ impl Vm {
     pub(crate) fn pop_ints(&mut self) -> Result<(i32, i32), VmError> {
         let bv = self.pop()?;
         let av = self.pop()?;
+        // ToPrimitive for objects
+        let av = if av.is_object() { self.to_primitive_object(av).unwrap_or(av) } else { av };
+        let bv = if bv.is_object() { self.to_primitive_object(bv).unwrap_or(bv) } else { bv };
         let b = self.to_i32(bv)?;
         let a = self.to_i32(av)?;
         Ok((a, b))
     }
 
-    /// Convert a Value to i32 for bitwise operations (ToInt32).
+    /// Convert a Value to i32 for bitwise operations (ECMAScript ToInt32).
     pub(crate) fn to_i32(&self, val: Value) -> Result<i32, VmError> {
         let n = self.to_f64(val);
         if n.is_nan() || n.is_infinite() || n == 0.0 { return Ok(0); }
-        Ok(n as i32)
+        let int = n.signum() * n.abs().floor();
+        let int32bit = int.rem_euclid(4294967296.0);
+        if int32bit >= 2147483648.0 {
+            Ok((int32bit - 4294967296.0) as i32)
+        } else {
+            Ok(int32bit as i32)
+        }
     }
 
-    /// Convert a Value to u32 for unsigned right shift.
+    /// Convert a Value to u32 for unsigned right shift (ECMAScript ToUint32).
     pub(crate) fn to_u32(&self, val: Value) -> Result<u32, VmError> {
         let n = self.to_f64(val);
         if n.is_nan() || n.is_infinite() || n == 0.0 { return Ok(0); }
-        Ok(n as u32)
+        let int = n.signum() * n.abs().floor();
+        Ok(int.rem_euclid(4294967296.0) as u32)
     }
 
     /// Push a number result, using SMI when the value fits in i32 with no
@@ -480,6 +528,8 @@ impl Vm {
                 let s = format!("{f}");
                 s
             }
+        } else if val.is_function() {
+            "function() { [native code] }".into()
         } else if let Some(oid) = val.as_object_id() {
             if let Some(obj) = self.heap.get(oid) {
                 match &obj.kind {
@@ -506,15 +556,10 @@ impl Vm {
             "object"
         } else if val.is_boolean() {
             "boolean"
+        } else if val.is_function() {
+            "function"
         } else if val.is_int() {
-            // Check if this is a closure (packed chunk index) or a global fn sentinel
-            let i = val.as_int().unwrap();
-            let chunk_idx = (i & 0xFFFF) as usize;
-            if (chunk_idx >= 1 && chunk_idx < self.chunks.len()) || i <= -500 {
-                "function"
-            } else {
-                "number"
-            }
+            "number"
         } else if val.is_number() {
             "number"
         } else if val.is_string() {
@@ -747,19 +792,28 @@ impl Vm {
                 OpCode::Add => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let a_is_str = a.is_string() || self.is_string_wrapper(a);
-                    let b_is_str = b.is_string() || self.is_string_wrapper(b);
+
+                    // ToPrimitive for objects before type check
+                    let a_prim = if a.is_object() && !self.is_string_wrapper(a) {
+                        self.to_primitive_object(a).unwrap_or(a)
+                    } else { a };
+                    let b_prim = if b.is_object() && !self.is_string_wrapper(b) {
+                        self.to_primitive_object(b).unwrap_or(b)
+                    } else { b };
+
+                    let a_is_str = a_prim.is_string() || self.is_string_wrapper(a_prim);
+                    let b_is_str = b_prim.is_string() || self.is_string_wrapper(b_prim);
 
                     if a_is_str || b_is_str {
-                        let sa = self.value_to_string(a);
-                        let sb = self.value_to_string(b);
+                        let sa = self.value_to_string(a_prim);
+                        let sb = self.value_to_string(b_prim);
                         let mut result = sa;
                         result.push_str(&sb);
                         let id = self.interner.intern(&result);
                         self.push(Value::string(id));
                     } else {
-                        let na = self.to_f64(a);
-                        let nb = self.to_f64(b);
+                        let na = self.to_f64(a_prim);
+                        let nb = self.to_f64(b_prim);
                         self.push_number(na + nb);
                     }
                 }
@@ -1146,8 +1200,8 @@ impl Vm {
                     let func_pos = self.stack.len() - 1 - argc;
                     let func_val = self.stack[func_pos];
 
-                    if func_val.is_int() {
-                        let packed = func_val.as_int().unwrap();
+                    if func_val.is_function() {
+                        let packed = func_val.as_function().unwrap();
                         let closure_id = ((packed as u32) >> 16) as usize;
                         let chunk_idx = (packed & 0xFFFF) as usize;
 
@@ -1183,7 +1237,15 @@ impl Vm {
                                 // Check if JIT code already exists
                                 if let Some(jit_fn) = self.jit_functions.get(&chunk_idx) {
                                     // Call native code directly!
-                                    let result = if jit_fn.param_count() == 2 && argc >= 2 {
+                                    let result = if jit_fn.param_count() == 3 && argc >= 3 {
+                                        let v0 = self.stack[func_pos + 1];
+                                        let v1 = self.stack[func_pos + 2];
+                                        let v2 = self.stack[func_pos + 3];
+                                        let a0 = v0.as_number().unwrap_or(0.0) as i64;
+                                        let a1 = v1.as_number().unwrap_or(0.0) as i64;
+                                        let a2 = v2.as_number().unwrap_or(0.0) as i64;
+                                        jit_fn.call3(a0, a1, a2)
+                                    } else if jit_fn.param_count() == 2 && argc >= 2 {
                                         let v0 = self.stack[func_pos + 1];
                                         let v1 = self.stack[func_pos + 2];
                                         let a0 = v0.as_number().unwrap_or(0.0) as i64;
@@ -1237,8 +1299,8 @@ impl Vm {
                     }
 
                     // Check for Promise resolve/reject sentinels
-                    if func_val.is_int() {
-                        let s = func_val.as_int().unwrap();
+                    if func_val.is_function() {
+                        let s = func_val.as_function().unwrap();
                         if s <= -600_000 && s > -700_000 {
                             // Promise resolve
                             let pid = ObjectId((-600_000 - s) as u32);
@@ -1260,8 +1322,8 @@ impl Vm {
                     }
 
                     // Check for native global function sentinels
-                    if func_val.is_int() {
-                        let sentinel = func_val.as_int().unwrap();
+                    if func_val.is_function() {
+                        let sentinel = func_val.as_function().unwrap();
                         if (-532..=-500).contains(&sentinel) {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                             let result = self.exec_global_fn(sentinel, &args);
@@ -1425,8 +1487,8 @@ impl Vm {
                             let name_key = self.interner.intern("name");
                             if let Some(name_val) = o.get_property(name_key) {
                                 // Check against known error constructors
-                                if constructor.is_int() {
-                                    let sentinel = constructor.as_int().unwrap();
+                                if constructor.is_function() {
+                                    let sentinel = constructor.as_function().unwrap();
                                     let ctor_name = match sentinel {
                                         -510 => "Error",
                                         -511 => "TypeError",
@@ -1541,13 +1603,13 @@ impl Vm {
                                     "padStart" => 17, "padEnd" => 18, "concat" => 19,
                                     _ => 99,
                                 };
-                                self.push(Value::int(-200 - method_idx));
+                                self.push(Value::function(-200 - method_idx));
                             }
                             _ => self.push(Value::undefined()),
                         }
-                    } else if obj_val.is_int() {
+                    } else if obj_val.is_function() {
                         // Property access on sentinel globals (Number.NaN, etc)
-                        let sentinel = obj_val.as_int().unwrap();
+                        let sentinel = obj_val.as_function().unwrap();
                         let result = match sentinel {
                             -505 => match name_str {
                                 "NaN" => Value::number(f64::NAN),
@@ -1558,11 +1620,11 @@ impl Vm {
                                 "MAX_SAFE_INTEGER" => Value::number(9007199254740991.0),
                                 "MIN_SAFE_INTEGER" => Value::number(-9007199254740991.0),
                                 "EPSILON" => Value::number(f64::EPSILON),
-                                "isNaN" => Value::int(-530),
-                                "isFinite" => Value::int(-531),
-                                "isInteger" => Value::int(-532),
-                                "parseInt" => Value::int(-500),
-                                "parseFloat" => Value::int(-501),
+                                "isNaN" => Value::function(-530),
+                                "isFinite" => Value::function(-531),
+                                "isInteger" => Value::function(-532),
+                                "parseInt" => Value::function(-500),
+                                "parseFloat" => Value::function(-501),
                                 _ => Value::undefined(),
                             },
                             _ => Value::undefined(),
@@ -1647,10 +1709,14 @@ impl Vm {
                 }
 
                 OpCode::OptionalChain => {
-                    let _ = self.read_i16();
-                    return Err(VmError::RuntimeError(
-                        "OptionalChain not yet implemented".into(),
-                    ));
+                    let offset = self.read_i16();
+                    let val = self.peek()?;
+                    if val.is_null() || val.is_undefined() {
+                        self.pop()?;
+                        self.push(Value::undefined());
+                        let frame = self.frames.last_mut().unwrap();
+                        frame.ip = (frame.ip as isize + offset as isize) as usize;
+                    }
                 }
 
                 OpCode::GetPrivate | OpCode::SetPrivate => {
@@ -1678,8 +1744,8 @@ impl Vm {
 
                     // Check for console.log/warn/error sentinels
                     if let Some(mv) = method_val
-                        && mv.is_int() {
-                            let sentinel = mv.as_int().unwrap();
+                        && mv.is_function() {
+                            let sentinel = mv.as_function().unwrap();
                             if (-102..=-100).contains(&sentinel) {
                                 // console output
                                 let mut parts = Vec::new();
@@ -1746,8 +1812,8 @@ impl Vm {
                         let method_val = self.heap.get(oid)
                             .and_then(|o| o.get_property(method_name));
                         if let Some(mv) = method_val
-                            && mv.is_int() {
-                                let packed = mv.as_int().unwrap();
+                            && mv.is_function() {
+                                let packed = mv.as_function().unwrap();
                                 let closure_id = ((packed as u32) >> 16) as usize;
                                 let chunk_idx = (packed & 0xFFFF) as usize;
                                 if chunk_idx >= 1 && chunk_idx < self.chunks.len() {
@@ -1787,7 +1853,7 @@ impl Vm {
                     }
 
                     // Object static methods (Object.keys)
-                    if obj_val.is_int() && obj_val.as_int() == Some(-508) {
+                    if obj_val.is_function() && obj_val.as_function() == Some(-508) {
                         let mn = self.interner.resolve(method_name).to_owned();
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                         let result = match mn.as_str() {
@@ -1831,7 +1897,7 @@ impl Vm {
                     }
 
                     // Array.isArray
-                    if obj_val.is_int() && obj_val.as_int() == Some(-507) {
+                    if obj_val.is_function() && obj_val.as_function() == Some(-507) {
                         let mn = self.interner.resolve(method_name).to_owned();
                         if mn == "isArray" {
                             let arg = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
@@ -1846,7 +1912,7 @@ impl Vm {
                     }
 
                     // String.fromCharCode
-                    if obj_val.is_int() && obj_val.as_int() == Some(-504) {
+                    if obj_val.is_function() && obj_val.as_function() == Some(-504) {
                         let mn = self.interner.resolve(method_name).to_owned();
                         if mn == "fromCharCode" {
                             let mut result = String::new();
@@ -1864,7 +1930,7 @@ impl Vm {
                     }
 
                     // Check for Promise static methods (Promise.resolve/reject)
-                    if obj_val.is_int() && obj_val.as_int() == Some(-520) {
+                    if obj_val.is_function() && obj_val.as_function() == Some(-520) {
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                         let result = self.exec_promise_static(method_name, &args)?;
                         self.stack.truncate(obj_pos);
@@ -1883,15 +1949,15 @@ impl Vm {
                     let func_val = self.stack[func_pos];
 
                     // Handle Promise constructor
-                    if func_val.is_int() && func_val.as_int() == Some(-520) {
+                    if func_val.is_function() && func_val.as_function() == Some(-520) {
                         let executor = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
                         let p = JsObject::promise();
                         let pid = self.heap.allocate(p);
                         // Create resolve/reject sentinels
-                        let resolve_val = Value::int(-600_000 - pid.0 as i32);
-                        let reject_val = Value::int(-700_000 - pid.0 as i32);
+                        let resolve_val = Value::function(-600_000 - pid.0 as i32);
+                        let reject_val = Value::function(-700_000 - pid.0 as i32);
                         // Call the executor
-                        if executor.is_int() {
+                        if executor.is_function() {
                             let _ = self.call_function(executor, &[resolve_val, reject_val]);
                         }
                         self.stack.truncate(func_pos);
@@ -1900,8 +1966,8 @@ impl Vm {
                     }
 
                     // Handle wrapper constructors (new Number, new Boolean, new String)
-                    if func_val.is_int() {
-                        let sentinel = func_val.as_int().unwrap();
+                    if func_val.is_function() {
+                        let sentinel = func_val.as_function().unwrap();
                         if (-507..=-504).contains(&sentinel) {
                             let arg = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
                             let wrapped = match sentinel {
@@ -1930,7 +1996,7 @@ impl Vm {
                     }
 
                     // Handle Array constructor: new Array() or new Array(len)
-                    if func_val.is_int() && func_val.as_int() == Some(-507) {
+                    if func_val.is_function() && func_val.as_function() == Some(-507) {
                         let arr = if argc == 1 {
                             let arg = self.stack[func_pos + 1];
                             if let Some(n) = arg.as_number() {
@@ -1953,7 +2019,7 @@ impl Vm {
                     }
 
                     // Handle Object constructor: new Object()
-                    if func_val.is_int() && func_val.as_int() == Some(-508) {
+                    if func_val.is_function() && func_val.as_function() == Some(-508) {
                         let obj = JsObject::ordinary();
                         let oid = self.heap.allocate(obj);
                         self.stack.truncate(func_pos);
@@ -1962,8 +2028,8 @@ impl Vm {
                     }
 
                     // Handle Error constructors
-                    if func_val.is_int() {
-                        let sentinel = func_val.as_int().unwrap();
+                    if func_val.is_function() {
+                        let sentinel = func_val.as_function().unwrap();
                         if (-514..=-510).contains(&sentinel) {
                             let error_type = match sentinel {
                                 -510 => "Error",
@@ -2026,10 +2092,10 @@ impl Vm {
                             }
 
                         if let Some(cv) = ctor_val
-                            && cv.is_int() {
+                            && cv.is_function() {
                                 // Replace func on stack with this, push ctor as the call target
                                 self.stack[func_pos] = this_val;
-                                let packed = cv.as_int().unwrap();
+                                let packed = cv.as_function().unwrap();
                                 let closure_id = ((packed as u32) >> 16) as usize;
                                 let chunk_idx = (packed & 0xFFFF) as usize;
                                 if chunk_idx >= 1 && chunk_idx < self.chunks.len() {
@@ -2055,8 +2121,8 @@ impl Vm {
                         continue;
                     }
 
-                    if func_val.is_int() {
-                        let packed = func_val.as_int().unwrap();
+                    if func_val.is_function() {
+                        let packed = func_val.as_function().unwrap();
                         let closure_id = ((packed as u32) >> 16) as usize;
                         let chunk_idx = (packed & 0xFFFF) as usize;
 
@@ -2202,7 +2268,7 @@ impl Vm {
                     // Actually let's use a simpler approach: store as two values
                     // Or better: pack closure_id << 16 | chunk_idx
                     let packed = ((closure_id as i32) << 16) | (abs_idx as i32 & 0xFFFF);
-                    self.push(Value::int(packed));
+                    self.push(Value::function(packed));
                 }
 
                 OpCode::ClosureLong => {
@@ -2213,7 +2279,7 @@ impl Vm {
                     };
                     let current = self.cur_chunk();
                     let abs_idx = current + 1 + child_rel_idx;
-                    self.push(Value::int(abs_idx as i32));
+                    self.push(Value::function(abs_idx as i32));
                 }
 
                 OpCode::Class => {

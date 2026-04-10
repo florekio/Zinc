@@ -19,7 +19,7 @@
 ///   100 = undefined
 ///   101 = interned string id (u32)
 ///   110 = symbol id (u32)
-///   111 = (reserved)
+///   111 = function reference (packed closure_id << 16 | chunk_idx)
 use std::fmt;
 
 use crate::runtime::object::ObjectId;
@@ -44,6 +44,7 @@ const TAG_NULL: u64 = NANBOX | (0b011 << 48);
 const TAG_UNDEFINED: u64 = NANBOX | (0b100 << 48);
 const TAG_STRING: u64 = NANBOX | (0b101 << 48);
 const TAG_SYMBOL: u64 = NANBOX | (0b110 << 48);
+const TAG_FUNCTION: u64 = NANBOX | (0b111 << 48);
 
 /// A JavaScript value packed into 64 bits via NaN-boxing.
 #[derive(Clone, Copy, PartialEq)]
@@ -92,6 +93,12 @@ impl Value {
     #[inline]
     pub fn symbol(id: u32) -> Self {
         Self(TAG_SYMBOL | id as u64)
+    }
+
+    /// Create a function reference value (packed closure_id << 16 | chunk_idx).
+    #[inline]
+    pub fn function(packed: i32) -> Self {
+        Self(TAG_FUNCTION | (packed as u32 as u64))
     }
 
     /// Create a Value from an ObjectId (stored in the object tag slot).
@@ -169,6 +176,12 @@ impl Value {
         (self.0 & NANBOX_MASK) == TAG_OBJECT
     }
 
+    /// Returns true if this is a function reference.
+    #[inline]
+    pub fn is_function(&self) -> bool {
+        (self.0 & NANBOX_MASK) == TAG_FUNCTION
+    }
+
     // ---- Extractors ----
 
     /// Extract as f64. Returns the number whether it's stored as float or SMI.
@@ -228,6 +241,16 @@ impl Value {
         }
     }
 
+    /// Extract the packed function value (closure_id << 16 | chunk_idx).
+    #[inline]
+    pub fn as_function(&self) -> Option<i32> {
+        if self.is_function() {
+            Some((self.0 & 0xFFFF_FFFF) as u32 as i32)
+        } else {
+            None
+        }
+    }
+
     /// Extract an ObjectId from an object-tagged value.
     #[inline]
     pub fn as_object_id(&self) -> Option<ObjectId> {
@@ -260,6 +283,8 @@ impl Value {
             n != 0.0 && !n.is_nan()
         } else if self.is_int() {
             self.as_int().unwrap() != 0
+        } else if self.is_function() {
+            true // functions are always truthy
         } else if self.is_boolean() {
             (self.0 & 1) != 0
         } else if self.is_null() || self.is_undefined() {
@@ -292,6 +317,8 @@ impl fmt::Debug for Value {
             write!(f, "{}", self.as_bool().unwrap())
         } else if self.is_int() {
             write!(f, "{}i", self.as_int().unwrap())
+        } else if self.is_function() {
+            write!(f, "fn#{}", self.as_function().unwrap())
         } else if self.is_float() {
             write!(f, "{}", f64::from_bits(self.0))
         } else if self.is_string() {
@@ -316,6 +343,8 @@ impl fmt::Display for Value {
             write!(f, "{}", self.as_bool().unwrap())
         } else if self.is_int() {
             write!(f, "{}", self.as_int().unwrap())
+        } else if self.is_function() {
+            write!(f, "function")
         } else if self.is_float() {
             let n = f64::from_bits(self.0);
             if n.is_nan() {
