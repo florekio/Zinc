@@ -281,7 +281,29 @@ fn parse_for(p: &mut Parser) -> ParseResult<Statement> {
             })));
         }
     } else {
-        Some(ForInit::Expression(parse_expression(p, 0)?))
+        let expr = parse_expression(p, 0)?;
+        // Check if this is for-of/for-in with expression LHS: for (expr of/in ...)
+        if p.at(TokenKind::Of) || p.at(TokenKind::In) {
+            let is_of = p.at(TokenKind::Of);
+            p.advance(); // consume 'of' or 'in'
+            let right = parse_expression(p, 0)?;
+            p.expect(TokenKind::RParen)?;
+            let body = parse_statement(p)?;
+            // Convert expr to pattern for the left-hand side
+            let left = ForInOfLeft::Expression(expr);
+            if is_of {
+                return Ok(Statement::ForOf(Box::new(ForOfStatement {
+                    left, right, body, is_await: false,
+                    span: Span::new(start, p.pos()),
+                })));
+            } else {
+                return Ok(Statement::ForIn(Box::new(ForInStatement {
+                    left, right, body,
+                    span: Span::new(start, p.pos()),
+                })));
+            }
+        }
+        Some(ForInit::Expression(expr))
     };
 
     p.expect(TokenKind::Semicolon)?;

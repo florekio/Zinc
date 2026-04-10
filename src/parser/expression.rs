@@ -400,6 +400,14 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
             Ok(Expression::Identifier(Identifier { name, span }))
         }
 
+        // Contextual keywords usable as identifiers (except await/yield which have special semantics)
+        kind if kind.is_contextual_keyword() && kind != TokenKind::Await && kind != TokenKind::Yield => {
+            let name = p.intern_current();
+            let span = p.current().span;
+            p.advance();
+            Ok(Expression::Identifier(Identifier { name, span }))
+        }
+
         TokenKind::This => {
             let span = p.current().span;
             p.advance();
