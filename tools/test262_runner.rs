@@ -105,6 +105,8 @@ fn main() {
         "directive-prologue",
         "future-reserved-words",
         // "reserved-words", // 52% — many need strict mode
+        // "module-code", // 18% — most need multi-file imports or strict module semantics
+        // "export", // needs module mode
     ];
 
     let mut total = 0;
