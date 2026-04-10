@@ -41,6 +41,19 @@ pub fn parse_statement(p: &mut Parser) -> ParseResult<Statement> {
             p.expect_semicolon()?;
             Ok(Statement::Debugger(span))
         }
+        // Check for labeled statement: `identifier : statement`
+        TokenKind::Identifier if p.peek().kind == TokenKind::Colon => {
+            let start = p.pos();
+            let label = p.intern_current();
+            p.advance(); // identifier
+            p.advance(); // colon
+            let body = parse_statement(p)?;
+            Ok(Statement::Labeled(Box::new(LabeledStatement {
+                label,
+                body,
+                span: Span::new(start, p.pos()),
+            })))
+        }
         _ => parse_expression_statement(p),
     }
 }
@@ -245,7 +258,7 @@ fn parse_for(p: &mut Parser) -> ParseResult<Statement> {
             declarations,
             span: Span::new(var_start, p.pos()),
         }))
-    } else if p.at(TokenKind::Identifier) && (p.peek().kind == TokenKind::In || (p.peek().kind == TokenKind::Identifier && p.token_text(p.peek()) == "of")) {
+    } else if p.at(TokenKind::Identifier) && (p.peek().kind == TokenKind::In || p.peek().kind == TokenKind::Of || (p.peek().kind == TokenKind::Identifier && p.token_text(p.peek()) == "of")) {
         // for (x in obj) or for (x of iterable) — x already declared
         let name = p.intern_current();
         let name_span = p.current().span;

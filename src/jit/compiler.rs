@@ -76,9 +76,11 @@ pub fn jit_compile(chunk: &Chunk, _all_chunks: &[Chunk]) -> Option<JitFunction> 
     let has_globals = code.contains(&(OpCode::GetGlobal as u8))
         || code.contains(&(OpCode::SetGlobal as u8));
     if call_count == 0 && has_loop && !has_globals && chunk.local_count <= 8 {
-        // Check if function uses float constants or division → use FP mode
+        // Skip functions with division — integer JIT truncates, FP JIT truncates on return
         let has_div = code.contains(&(OpCode::Div as u8));
-        let uses_float = has_float_constants(chunk) || has_div;
+        if has_div { return None; }
+
+        let uses_float = has_float_constants(chunk);
         if uses_float {
             return emit_loop_function_fp(chunk);
         }

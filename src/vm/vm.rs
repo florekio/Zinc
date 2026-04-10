@@ -2681,6 +2681,24 @@ impl Vm {
                             let iter_id = self.heap.allocate(iter_obj);
                             self.push(Value::object_id(iter_id));
                         }
+                    } else if val.is_string() {
+                        // String iterator: iterate over characters
+                        let sid = val.as_string_id().unwrap();
+                        let s = self.interner.resolve(sid).to_owned();
+                        let chars: Vec<Value> = s.chars().map(|c| {
+                            let id = self.interner.intern(&c.to_string());
+                            Value::string(id)
+                        }).collect();
+                        let arr = JsObject::array(chars);
+                        let arr_oid = self.heap.allocate(arr);
+                        let iter_obj = JsObject {
+                            properties: std::collections::HashMap::new(),
+                            prototype: None,
+                            kind: ObjectKind::ArrayIterator(arr_oid, 0),
+                            marked: false,
+                        };
+                        let iter_id = self.heap.allocate(iter_obj);
+                        self.push(Value::object_id(iter_id));
                     } else {
                         return Err(VmError::TypeError("not iterable".into()));
                     }
