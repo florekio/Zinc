@@ -4,7 +4,7 @@ A JavaScript engine written from scratch in Rust with an **experimental ARM64 JI
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**84.2% [Test262](docs/TEST262.md) conformance** | **222 tests** | **~15,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
+**84.8% [Test262](docs/TEST262.md) conformance** | **222 tests** | **~15,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
 
 ![Zinc Playground](web/screenshot.png)
 
@@ -56,8 +56,8 @@ See [JIT.md](docs/JIT.md) for technical details.
 | **Variables** | `var` (with hoisting), `let`, `const` with block scoping |
 | **Control flow** | `if`/`else`, `while`, `do-while`, `for`, `for...in`, `for...of`, `switch`/`case` |
 | **Functions** | Declarations, expressions, arrow functions, closures, recursion, default params |
-| **Classes** | `class`, `constructor`, `extends`, `super()`, instance methods, static methods, `new`, prototype chain inheritance |
-| **Objects** | Literals, property get/set, computed access, `this` binding, prototype chain, `Object.keys`/`values`/`entries` |
+| **Classes** | `class`, `constructor`, `extends`, `super()`, instance methods, static methods, getters/setters, `new`, prototype chain inheritance |
+| **Objects** | Literals, property get/set, computed access, getters (`get x() {}`), setters (`set x(v) {}`), `this` binding, prototype chain, `Object.keys`/`values`/`entries` |
 | **Arrays** | Literals, indexed access, `.length`, `.push`, `.pop`, `.map`, `.filter`, `.reduce`, `.forEach`, `.find`, `.some`, `.every`, `.join`, `.indexOf`, `.includes`, `.reverse`, `.shift`, `.unshift` |
 | **Regular expressions** | `/pattern/flags` literals, `.test()`, `.exec()`, `.source`, `.flags`, `.global`; regex-aware `.replace()`, `.match()`, `.search()`, `.split()`, `.replaceAll()` |
 | **Strings** | 23 methods: `.toUpperCase`, `.toLowerCase`, `.trim`, `.slice`, `.split`, `.indexOf`, `.includes`, `.startsWith`, `.endsWith`, `.replace`, `.replaceAll`, `.match`, `.search`, `.repeat`, `.charAt`, `.padStart`, `.padEnd`, `.concat`, etc. |
@@ -127,7 +127,7 @@ bash bench/sunspider/run.sh    # SunSpider benchmarks
 
 ## Test262 Conformance
 
-**84.2%** of tested ECMAScript spec tests pass (2,349 / 2,789). See [TEST262.md](docs/TEST262.md).
+**84.8%** of tested ECMAScript spec tests pass (2,364 / 2,789). See [TEST262.md](docs/TEST262.md).
 
 23 categories with **100% pass rate** including: numeric literals, string literals, boolean literals, compound-assignment, if, return, throw, coalesce, keywords, and more.
 
@@ -179,7 +179,7 @@ web/                   WASM playground (HTML + compiled WASM)
 
 - **~16,000 lines** of Rust
 - **222 tests** passing
-- **84.2%** Test262 conformance (2,349 / 2,789 tests)
+- **84.8%** Test262 conformance (2,364 / 2,789 tests)
 - **1.5 MB** WASM binary (includes regex engine)
 - **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation

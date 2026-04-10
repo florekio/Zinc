@@ -1744,6 +1744,17 @@ impl Vm {
                             self.push(val);
                             continue;
                         }
+                        // Check for getter
+                        let getter_key_str = format!("__get_{}__", name_str);
+                        let getter_key = self.interner.intern(&getter_key_str);
+                        let getter_fn = self.heap.get_property_chain(oid, getter_key);
+                        if let Some(gfn) = getter_fn
+                            && gfn.is_function()
+                        {
+                            let result = self.call_function_this(gfn, obj_val, &[])?;
+                            self.push(result);
+                            continue;
+                        }
                         let val = self.heap.get_property_chain(oid, name_id)
                             .unwrap_or(Value::undefined());
                         self.push(val);
@@ -1811,10 +1822,19 @@ impl Vm {
                     let name_id = name_val.as_string_id().unwrap();
                     let val = self.pop()?;
                     let obj_val = self.pop()?;
-                    if let Some(oid) = obj_val.as_object_id()
-                        && let Some(obj) = self.heap.get_mut(oid) {
+                    if let Some(oid) = obj_val.as_object_id() {
+                        // Check for setter
+                        let name_str = self.interner.resolve(name_id).to_owned();
+                        let setter_key = self.interner.intern(&format!("__set_{name_str}__"));
+                        let setter_fn = self.heap.get_property_chain(oid, setter_key);
+                        if let Some(sfn) = setter_fn
+                            && sfn.is_function()
+                        {
+                            let _ = self.call_function_this(sfn, obj_val, &[val]);
+                        } else if let Some(obj) = self.heap.get_mut(oid) {
                             obj.set_property(name_id, val);
                         }
+                    }
                     self.push(val);
                 }
 
@@ -2395,8 +2415,21 @@ impl Vm {
                 }
 
                 OpCode::DefineGetter | OpCode::DefineSetter => {
-                    let _fn = self.pop()?;
-                    let _key = self.pop()?;
+                    let func = self.pop()?;
+                    let key = self.pop()?;
+                    let obj_val = self.peek()?;
+                    if let Some(oid) = obj_val.as_object_id()
+                        && let Some(name_id) = key.as_string_id()
+                        && let Some(obj) = self.heap.get_mut(oid)
+                    {
+                        let name_str = self.interner.resolve(name_id).to_owned();
+                        let accessor_key = if opcode == OpCode::DefineGetter {
+                            self.interner.intern(&format!("__get_{name_str}__"))
+                        } else {
+                            self.interner.intern(&format!("__set_{name_str}__"))
+                        };
+                        obj.set_property(accessor_key, func);
+                    }
                 }
 
                 OpCode::DefineMethod => {

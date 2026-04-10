@@ -9,6 +9,11 @@ impl Vm {
     /// Saves/restores the main run loop's frame depth so the callback executes
     /// as a nested call and returns its result.
     pub(crate) fn call_function(&mut self, func_val: Value, args: &[Value]) -> Result<Value, VmError> {
+        self.call_function_this(func_val, Value::undefined(), args)
+    }
+
+    /// Call a closure with a specific `this` binding.
+    pub(crate) fn call_function_this(&mut self, func_val: Value, this_value: Value, args: &[Value]) -> Result<Value, VmError> {
         if !func_val.is_function() {
             return Ok(Value::undefined());
         }
@@ -39,7 +44,7 @@ impl Vm {
 
         self.frames.push(CallFrame {
             chunk_idx, ip: 0, base: func_pos + 1,
-            upvalues, this_value: Value::undefined(), is_constructor: false,
+            upvalues, this_value, is_constructor: false,
             pending_super_call: false, generator_id: None,
         });
 

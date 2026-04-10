@@ -1001,7 +1001,19 @@ impl<'a> Compiler<'a> {
                 ClassMember::Method(m) => {
                     self.compile_expr(&m.value)?;
                     let key_id = self.property_key_name(&m.key);
-                    let idx = self.make_string_constant(key_id);
+                    // For getters/setters, use __get_name__ / __set_name__ convention
+                    let actual_key = match m.kind {
+                        MethodKind::Get => {
+                            let name = self.interner.resolve(key_id).to_owned();
+                            self.interner.intern(&format!("__get_{name}__"))
+                        }
+                        MethodKind::Set => {
+                            let name = self.interner.resolve(key_id).to_owned();
+                            self.interner.intern(&format!("__set_{name}__"))
+                        }
+                        _ => key_id,
+                    };
+                    let idx = self.make_string_constant(actual_key);
                     let op = if m.is_static {
                         OpCode::ClassStaticMethod
                     } else {
