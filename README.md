@@ -107,7 +107,7 @@ loop_sum(1M interp)    0.094s     0.036s      2.6x
 
 ### SunSpider
 
-5 classic [SunSpider](https://webkit.org/perf/sunspider/sunspider.html) benchmarks — see [SUNSPIDER.md](docs/SUNSPIDER.md).
+12 classic [SunSpider](https://webkit.org/perf/sunspider/sunspider.html) benchmarks — see [SUNSPIDER.md](docs/SUNSPIDER.md).
 
 ```
 Test                         Zinc       Node     Ratio
@@ -117,6 +117,13 @@ access-nbody                100ms      39ms      2.6x
 bitops-3bit-bits-in-byte     63ms      36ms      1.8x
 math-cordic                 152ms      44ms      3.5x
 math-partial-sums           100ms      44ms      2.3x
+access-nsieve               220ms      20ms     11.0x
+bitops-nsieve-bits           230ms      20ms     11.5x
+3d-cube                     380ms      20ms     19.0x
+access-binary-trees        1120ms      20ms     56.0x
+access-fannkuch            1460ms      30ms     48.7x
+bitops-bitwise-and          480ms      10ms     48.0x
+string-validate-input       460ms      20ms     23.0x
 ```
 
 ```bash

@@ -411,17 +411,17 @@ impl Vm {
 
     // ---- Bytecode read helpers --------------------------------------------
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn cur_chunk(&self) -> usize {
-        self.frames.last().unwrap().chunk_idx
+        unsafe { self.frames.last().unwrap_unchecked().chunk_idx }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn cur_ip(&self) -> usize {
-        self.frames.last().unwrap().ip
+        unsafe { self.frames.last().unwrap_unchecked().ip }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn read_byte(&mut self) -> u8 {
         let frame = self.frames.last_mut().unwrap();
         let byte = self.chunks[frame.chunk_idx].code[frame.ip];
@@ -760,9 +760,11 @@ impl Vm {
     // ---- Main execution loop ----------------------------------------------
 
     pub fn run(&mut self) -> Result<Value, VmError> {
+        let mut gc_counter: u32 = 0;
         loop {
-            // GC safepoint
-            if self.heap.needs_gc() {
+            // GC safepoint (check every 1024 instructions)
+            gc_counter = gc_counter.wrapping_add(1);
+            if gc_counter & 0x3FF == 0 && self.heap.needs_gc() {
                 self.collect_gc();
             }
 
@@ -785,9 +787,8 @@ impl Vm {
             }
 
             let byte = self.read_byte();
-            let opcode = OpCode::from_byte(byte).ok_or_else(|| {
-                VmError::RuntimeError(format!("invalid opcode: {byte:#04x}"))
-            })?;
+            // Safety: bytecode was compiled by our own compiler, all opcodes are valid
+            let opcode = unsafe { std::mem::transmute::<u8, OpCode>(byte) };
 
             match opcode {
                 // ---- Constants & Literals --------------------------------
@@ -1842,23 +1843,40 @@ impl Vm {
                     let key = self.pop()?;
                     let obj_val = self.pop()?;
                     if let Some(oid) = obj_val.as_object_id()
-                        && let Some(obj) = self.heap.get(oid) {
-                            if let ObjectKind::Array(ref elements) = obj.kind {
-                                // Numeric index into array
-                                if let Some(idx) = key.as_number() {
-                                    let idx = idx as usize;
-                                    let val = elements.get(idx).copied().unwrap_or(Value::undefined());
-                                    self.push(val);
-                                    continue;
-                                }
-                            }
-                            // String property lookup
-                            if let Some(name_id) = key.as_string_id() {
-                                let val = obj.get_property(name_id).unwrap_or(Value::undefined());
+                        && let Some(obj) = self.heap.get(oid)
+                    {
+                        if let ObjectKind::Array(ref elements) = obj.kind {
+                            // Fast path: SMI index (most common case)
+                            if let Some(i) = key.as_int()
+                                && i >= 0
+                            {
+                                let val = elements.get(i as usize).copied().unwrap_or(Value::undefined());
                                 self.push(val);
                                 continue;
                             }
+                            // Float index
+                            if let Some(idx) = key.as_number() {
+                                let val = elements.get(idx as usize).copied().unwrap_or(Value::undefined());
+                                self.push(val);
+                                continue;
+                            }
+                            // "length" on array via bracket access
+                            if let Some(name_id) = key.as_string_id() {
+                                let name = self.interner.resolve(name_id);
+                                if name == "length" {
+                                    self.push(Value::int(elements.len() as i32));
+                                    continue;
+                                }
+                            }
                         }
+                        // String property lookup (with prototype chain)
+                        if let Some(name_id) = key.as_string_id() {
+                            let val = self.heap.get_property_chain(oid, name_id)
+                                .unwrap_or(Value::undefined());
+                            self.push(val);
+                            continue;
+                        }
+                    }
                     self.push(Value::undefined());
                 }
 
@@ -1867,21 +1885,35 @@ impl Vm {
                     let key = self.pop()?;
                     let obj_val = self.pop()?;
                     if let Some(oid) = obj_val.as_object_id()
-                        && let Some(obj) = self.heap.get_mut(oid) {
-                            if let ObjectKind::Array(ref mut elements) = obj.kind
-                                && let Some(idx) = key.as_number() {
-                                    let idx = idx as usize;
-                                    while elements.len() <= idx {
-                                        elements.push(Value::undefined());
-                                    }
-                                    elements[idx] = val;
-                                    self.push(val);
-                                    continue;
+                        && let Some(obj) = self.heap.get_mut(oid)
+                    {
+                        if let ObjectKind::Array(ref mut elements) = obj.kind {
+                            // Fast path: SMI index
+                            if let Some(i) = key.as_int()
+                                && i >= 0
+                            {
+                                let idx = i as usize;
+                                while elements.len() <= idx {
+                                    elements.push(Value::undefined());
                                 }
-                            if let Some(name_id) = key.as_string_id() {
-                                obj.set_property(name_id, val);
+                                elements[idx] = val;
+                                self.push(val);
+                                continue;
+                            }
+                            if let Some(idx) = key.as_number() {
+                                let idx = idx as usize;
+                                while elements.len() <= idx {
+                                    elements.push(Value::undefined());
+                                }
+                                elements[idx] = val;
+                                self.push(val);
+                                continue;
                             }
                         }
+                        if let Some(name_id) = key.as_string_id() {
+                            obj.set_property(name_id, val);
+                        }
+                    }
                     self.push(val);
                 }
 

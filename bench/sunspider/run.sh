@@ -47,7 +47,7 @@ else:
     printf "%-30s %8sms %8sms %9s  %b\n" "$name" "$zinc_ms" "$node_ms" "$ratio" "$status"
 }
 
-for f in "$DIR"/access-nbody.js "$DIR"/bitops-3bit-bits-in-byte.js "$DIR"/controlflow-recursive.js "$DIR"/math-cordic.js "$DIR"/math-partial-sums.js; do
+for f in "$DIR"/access-nbody.js "$DIR"/access-binary-trees.js "$DIR"/access-fannkuch.js "$DIR"/access-nsieve.js "$DIR"/bitops-3bit-bits-in-byte.js "$DIR"/bitops-bitwise-and.js "$DIR"/bitops-nsieve-bits.js "$DIR"/controlflow-recursive.js "$DIR"/math-cordic.js "$DIR"/math-partial-sums.js "$DIR"/3d-cube.js "$DIR"/string-validate-input.js; do
     name=$(basename "$f" .js)
     run_bench "$name" "$f"
 done
