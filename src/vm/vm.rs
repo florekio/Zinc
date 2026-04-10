@@ -406,32 +406,32 @@ impl Vm {
     /// ECMAScript ToPrimitive: call valueOf() then toString() on an object.
     /// Returns Ok(Some(primitive)) on success, Ok(None) if no methods exist,
     /// or Err if a method throws.
-    pub(crate) fn to_primitive_object(&mut self, val: Value) -> Option<Value> {
+    pub(crate) fn call_value_of_to_string(&mut self, val: Value) -> Option<Value> {
         let oid = val.as_object_id()?;
         let obj = self.heap.get(oid)?;
 
         // Try valueOf first
         let value_of_name = self.interner.intern("valueOf");
-        if let Some(method_val) = obj.get_property(value_of_name) {
-            if method_val.is_function() {
-                match self.call_function(method_val, &[]) {
-                    Ok(result) if !result.is_object() => return Some(result),
-                    Ok(_) => {} // returned object, try toString
-                    Err(_) => return None, // method threw
-                }
+        if let Some(method_val) = obj.get_property(value_of_name)
+            && method_val.is_function()
+        {
+            match self.call_function(method_val, &[]) {
+                Ok(result) if !result.is_object() => return Some(result),
+                Ok(_) => {} // returned object, try toString
+                Err(_) => return None, // method threw
             }
         }
 
         // Then try toString
         let to_string_name = self.interner.intern("toString");
         let obj = self.heap.get(oid)?;
-        if let Some(method_val) = obj.get_property(to_string_name) {
-            if method_val.is_function() {
-                match self.call_function(method_val, &[]) {
-                    Ok(result) if !result.is_object() => return Some(result),
-                    Ok(_) => {} // returned object
-                    Err(_) => return None,
-                }
+        if let Some(method_val) = obj.get_property(to_string_name)
+            && method_val.is_function()
+        {
+            match self.call_function(method_val, &[]) {
+                Ok(result) if !result.is_object() => return Some(result),
+                Ok(_) => {} // returned object
+                Err(_) => return None,
             }
         }
 
@@ -443,8 +443,8 @@ impl Vm {
         let b = self.pop()?;
         let a = self.pop()?;
         // ToPrimitive for objects
-        let a = if a.is_object() { self.to_primitive_object(a).unwrap_or(a) } else { a };
-        let b = if b.is_object() { self.to_primitive_object(b).unwrap_or(b) } else { b };
+        let a = if a.is_object() { self.call_value_of_to_string(a).unwrap_or(a) } else { a };
+        let b = if b.is_object() { self.call_value_of_to_string(b).unwrap_or(b) } else { b };
         Ok((self.to_f64(a), self.to_f64(b)))
     }
 
@@ -453,8 +453,8 @@ impl Vm {
         let bv = self.pop()?;
         let av = self.pop()?;
         // ToPrimitive for objects
-        let av = if av.is_object() { self.to_primitive_object(av).unwrap_or(av) } else { av };
-        let bv = if bv.is_object() { self.to_primitive_object(bv).unwrap_or(bv) } else { bv };
+        let av = if av.is_object() { self.call_value_of_to_string(av).unwrap_or(av) } else { av };
+        let bv = if bv.is_object() { self.call_value_of_to_string(bv).unwrap_or(bv) } else { bv };
         let b = self.to_i32(bv)?;
         let a = self.to_i32(av)?;
         Ok((a, b))
@@ -558,9 +558,7 @@ impl Vm {
             "boolean"
         } else if val.is_function() {
             "function"
-        } else if val.is_int() {
-            "number"
-        } else if val.is_number() {
+        } else if val.is_int() || val.is_number() {
             "number"
         } else if val.is_string() {
             "string"
@@ -795,10 +793,10 @@ impl Vm {
 
                     // ToPrimitive for objects before type check
                     let a_prim = if a.is_object() && !self.is_string_wrapper(a) {
-                        self.to_primitive_object(a).unwrap_or(a)
+                        self.call_value_of_to_string(a).unwrap_or(a)
                     } else { a };
                     let b_prim = if b.is_object() && !self.is_string_wrapper(b) {
-                        self.to_primitive_object(b).unwrap_or(b)
+                        self.call_value_of_to_string(b).unwrap_or(b)
                     } else { b };
 
                     let a_is_str = a_prim.is_string() || self.is_string_wrapper(a_prim);
@@ -1259,7 +1257,11 @@ impl Vm {
                                         jit_fn.call(arg)
                                     };
                                     self.stack.truncate(func_pos);
-                                    self.push(Value::int(result as i32));
+                                    if result >= i32::MIN as i64 && result <= i32::MAX as i64 {
+                                        self.push(Value::int(result as i32));
+                                    } else {
+                                        self.push(Value::number(result as f64));
+                                    }
                                     continue;
                                 }
 

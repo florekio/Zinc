@@ -6,6 +6,13 @@
 pub const X0: u32 = 0;
 pub const X1: u32 = 1;
 pub const X2: u32 = 2;
+pub const X3: u32 = 3;   // caller-saved scratch (operand stack)
+pub const X4: u32 = 4;
+pub const X5: u32 = 5;
+pub const X6: u32 = 6;
+pub const X7: u32 = 7;
+pub const X8: u32 = 8;
+pub const X9: u32 = 9;
 pub const X19: u32 = 19; // callee-saved, used for local 'n'
 pub const X20: u32 = 20; // callee-saved, used for temps
 pub const X21: u32 = 21; // callee-saved, extra temp

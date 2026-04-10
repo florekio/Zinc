@@ -71,6 +71,14 @@ pub fn jit_compile(chunk: &Chunk, _all_chunks: &[Chunk]) -> Option<JitFunction> 
         }
     }
 
+    // Loop-based function (no recursion, has Loop opcode, locals fit in registers)
+    let has_loop = code.contains(&(OpCode::Loop as u8));
+    let has_globals = code.contains(&(OpCode::GetGlobal as u8))
+        || code.contains(&(OpCode::SetGlobal as u8));
+    if call_count == 0 && has_loop && !has_globals && chunk.local_count <= 5 {
+        return emit_loop_function(chunk);
+    }
+
     None
 }
 
@@ -393,6 +401,315 @@ fn emit_tak_pattern(_chunk: &Chunk) -> Option<JitFunction> {
     Some(JitFunction { buffer, param_count: 3 })
 }
 
+/// Map a VM stack position to an ARM64 register.
+/// Positions 0-4 → callee-saved X19-X23, positions 5-11 → caller-saved X3-X9.
+fn reg_for(pos: usize) -> Option<u32> {
+    match pos {
+        0 => Some(X19), 1 => Some(X20), 2 => Some(X21),
+        3 => Some(X22), 4 => Some(X23),
+        5 => Some(X3), 6 => Some(X4), 7 => Some(X5),
+        8 => Some(X6), 9 => Some(X7), 10 => Some(X8), 11 => Some(X9),
+        _ => None,
+    }
+}
+
+/// Emit ARM64 for a loop-based numeric function by walking the bytecode.
+fn emit_loop_function(chunk: &Chunk) -> Option<JitFunction> {
+    let code = &chunk.code;
+    let constants = &chunk.constants;
+    let param_count = chunk.param_count as usize;
+
+    let mut asm = Assembler::new();
+    let mut stack_top: usize = param_count;
+    let mut last_cmp: Option<OpCode> = None;
+
+    // Track bytecode offset → ARM64 offset for jump resolution
+    let mut bc_to_arm: Vec<(usize, usize)> = Vec::new();
+    // Forward patches: (bytecode_target, arm_branch_offset)
+    let mut forward_patches: Vec<(usize, usize)> = Vec::new();
+
+    // ---- Prologue ----
+    asm.stp_pre(X29, X30, SP, -64);
+    asm.mov_reg(X29, SP);
+    asm.str_imm(X19, SP, 16);
+    asm.str_imm(X20, SP, 24);
+    asm.str_imm(X21, SP, 32);
+    asm.str_imm(X22, SP, 40);
+    asm.str_imm(X23, SP, 48);
+
+    // Copy params from argument registers
+    if param_count >= 1 { asm.mov_reg(X19, X0); }
+    if param_count >= 2 { asm.mov_reg(X20, X1); }
+    if param_count >= 3 { asm.mov_reg(X21, X2); }
+
+    // ---- Walk bytecode ----
+    let mut ip = 0;
+    while ip < code.len() {
+        // Record mapping for jump targets
+        bc_to_arm.push((ip, asm.offset()));
+
+        let op = OpCode::from_byte(code[ip])?;
+        match op {
+            OpCode::Nop | OpCode::Halt => {}
+
+            OpCode::Zero => {
+                let r = reg_for(stack_top)?;
+                asm.movz(r, 0);
+                stack_top += 1;
+            }
+            OpCode::One => {
+                let r = reg_for(stack_top)?;
+                asm.movz(r, 1);
+                stack_top += 1;
+            }
+            OpCode::Undefined => {
+                let r = reg_for(stack_top)?;
+                asm.movz(r, 0);
+                stack_top += 1;
+            }
+            OpCode::True => {
+                let r = reg_for(stack_top)?;
+                asm.movz(r, 1);
+                stack_top += 1;
+            }
+            OpCode::False => {
+                let r = reg_for(stack_top)?;
+                asm.movz(r, 0);
+                stack_top += 1;
+            }
+            OpCode::Const => {
+                let idx = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as usize;
+                let val = if idx < constants.len() {
+                    let v = constants[idx];
+                    if let Some(i) = v.as_int() { i as i64 }
+                    else if let Some(f) = v.as_number() { f as i64 }
+                    else { return None; }
+                } else { return None; };
+                let r = reg_for(stack_top)?;
+                if (0..=0xFFFF).contains(&val) {
+                    asm.movz(r, val as u16);
+                } else {
+                    asm.mov_imm64(r, val as u64);
+                }
+                stack_top += 1;
+            }
+
+            OpCode::GetLocal => {
+                let slot = code[ip + 1] as usize;
+                let src = reg_for(slot)?;
+                let dst = reg_for(stack_top)?;
+                asm.mov_reg(dst, src);
+                stack_top += 1;
+            }
+            OpCode::SetLocal => {
+                let slot = code[ip + 1] as usize;
+                if stack_top == 0 { return None; }
+                let src = reg_for(stack_top - 1)?;
+                let dst = reg_for(slot)?;
+                asm.mov_reg(dst, src);
+                // SetLocal does NOT pop — leaves value on stack
+            }
+
+            OpCode::Pop => {
+                stack_top = stack_top.saturating_sub(1);
+            }
+
+            // ---- Arithmetic (pop 2, push 1) ----
+            OpCode::Add => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.add_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Sub => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.sub_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Mul => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.mul(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Div => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.sdiv(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Rem => {
+                // a % b = a - (a / b) * b
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                // Use X0 as scratch for quotient
+                asm.sdiv(X0, ra, rb);
+                asm.mul(X0, X0, rb);
+                asm.sub_reg(ra, ra, X0);
+                stack_top -= 1;
+            }
+
+            // ---- Bitwise (pop 2, push 1) ----
+            OpCode::BitAnd => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.and_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::BitOr => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.orr_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::BitXor => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.eor_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::BitNot => {
+                if stack_top < 1 { return None; }
+                let r = reg_for(stack_top - 1)?;
+                asm.mvn(r, r);
+                // stays same stack depth
+            }
+            OpCode::Shl => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.lsl_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Shr => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.asr_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::UShr => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.lsr_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+
+            // ---- Comparisons (pop 2, set flags) ----
+            OpCode::Lt | OpCode::Le | OpCode::Gt | OpCode::Ge
+            | OpCode::Eq | OpCode::Ne | OpCode::StrictEq | OpCode::StrictNe => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.cmp_reg(ra, rb);
+                stack_top -= 2;
+                last_cmp = Some(op);
+                // Push a placeholder — the next JumpIfFalse will consume it
+                stack_top += 1;
+            }
+
+            // ---- Branches ----
+            OpCode::JumpIfFalse => {
+                let offset = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as i16;
+                let target_bc = (ip as isize + 3 + offset as isize) as usize;
+                stack_top -= 1; // pop the condition
+
+                let arm_off = asm.offset();
+                if let Some(cmp) = last_cmp.take() {
+                    // Fused compare + branch: emit INVERSE condition
+                    match cmp {
+                        OpCode::Lt => asm.b_ge(0),
+                        OpCode::Le => asm.b_gt(0),
+                        OpCode::Gt => asm.b_le(0),
+                        OpCode::Ge => asm.b_lt(0),
+                        OpCode::Eq | OpCode::StrictEq => asm.b_ne(0),
+                        OpCode::Ne | OpCode::StrictNe => asm.b_eq(0),
+                        _ => return None,
+                    }
+                } else {
+                    // Non-fused: value in register
+                    let r = reg_for(stack_top)?;
+                    asm.cbz(r, 0);
+                }
+                forward_patches.push((target_bc, arm_off));
+            }
+            OpCode::Jump => {
+                let offset = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as i16;
+                let target_bc = (ip as isize + 3 + offset as isize) as usize;
+                let arm_off = asm.offset();
+                asm.b(0); // placeholder
+                forward_patches.push((target_bc, arm_off));
+            }
+            OpCode::Loop => {
+                let back = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as usize;
+                let target_bc = ip + 3 - back;
+                // Look up ARM64 offset for the target bytecode offset
+                let target_arm = bc_to_arm.iter()
+                    .find(|(bc, _)| *bc == target_bc)
+                    .map(|(_, arm)| *arm)?;
+                let current = asm.offset();
+                let relative = target_arm as i32 - current as i32;
+                asm.b(relative);
+            }
+
+            // ---- Return ----
+            OpCode::Return => {
+                if stack_top == 0 { return None; }
+                stack_top -= 1;
+                let r = reg_for(stack_top)?;
+                asm.mov_reg(X0, r);
+                // Epilogue
+                asm.ldr_imm(X19, SP, 16);
+                asm.ldr_imm(X20, SP, 24);
+                asm.ldr_imm(X21, SP, 32);
+                asm.ldr_imm(X22, SP, 40);
+                asm.ldr_imm(X23, SP, 48);
+                asm.ldp_post(X29, X30, SP, 64);
+                asm.ret();
+            }
+            OpCode::ReturnUndefined => {
+                asm.movz(X0, 0);
+                asm.ldr_imm(X19, SP, 16);
+                asm.ldr_imm(X20, SP, 24);
+                asm.ldr_imm(X21, SP, 32);
+                asm.ldr_imm(X22, SP, 40);
+                asm.ldr_imm(X23, SP, 48);
+                asm.ldp_post(X29, X30, SP, 64);
+                asm.ret();
+            }
+
+            _ => return None, // unsupported opcode — bail
+        }
+        ip += op.instruction_size();
+    }
+
+    // ---- Patch forward branches ----
+    for (target_bc, arm_branch_off) in &forward_patches {
+        let target_arm = bc_to_arm.iter()
+            .find(|(bc, _)| *bc == *target_bc)
+            .map(|(_, arm)| *arm);
+        if let Some(target) = target_arm {
+            asm.patch_branch(*arm_branch_off, target);
+        } else {
+            return None; // couldn't resolve jump target
+        }
+    }
+
+    let mut buffer = ExecutableBuffer::new(asm.code.len().max(4096))?;
+    buffer.write_code(&asm.code);
+    Some(JitFunction { buffer, param_count: chunk.param_count as u8 })
+}
+
 /// Check if a chunk can be JIT-compiled (only simple numeric operations).
 fn can_jit(chunk: &Chunk) -> bool {
     let mut ip = 0;
@@ -403,11 +720,15 @@ fn can_jit(chunk: &Chunk) -> bool {
             None => return false,
         };
         match op {
-            OpCode::GetLocal
+            OpCode::Nop
+            | OpCode::GetLocal
             | OpCode::SetLocal
             | OpCode::Const
             | OpCode::Zero
             | OpCode::One
+            | OpCode::Undefined
+            | OpCode::True
+            | OpCode::False
             | OpCode::Add
             | OpCode::Sub
             | OpCode::Mul
