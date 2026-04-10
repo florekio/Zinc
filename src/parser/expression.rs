@@ -357,6 +357,19 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
             p.advance();
             Ok(Expression::NullLiteral(span))
         }
+        TokenKind::RegExp => {
+            let text = p.current_text().to_owned();
+            let span = p.current().span;
+            p.advance();
+            // text is "/pattern/flags" — find closing slash (last unescaped /)
+            let inner = &text[1..]; // skip opening '/'
+            let closing = inner.rfind('/').unwrap_or(inner.len());
+            let pattern_str = &inner[..closing];
+            let flags_str = &inner[closing + 1..];
+            let pattern = p.interner.intern(pattern_str);
+            let flags = p.interner.intern(flags_str);
+            Ok(Expression::RegExpLiteral(RegExpLiteral { pattern, flags, span }))
+        }
         TokenKind::Undefined => {
             // `undefined` is technically an identifier, but we treat it as a keyword
             let span = p.current().span;

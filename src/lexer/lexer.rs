@@ -18,6 +18,8 @@ pub struct Lexer<'a> {
     template_brace_stack: Vec<u32>,
     /// Current brace nesting depth.
     brace_depth: u32,
+    /// Previous token kind (for regex vs division disambiguation).
+    prev_kind: TokenKind,
 }
 
 impl<'a> Lexer<'a> {
@@ -29,6 +31,7 @@ impl<'a> Lexer<'a> {
             template_depth: 0,
             template_brace_stack: Vec::new(),
             brace_depth: 0,
+            prev_kind: TokenKind::Eof,
         }
     }
 
@@ -38,6 +41,7 @@ impl<'a> Lexer<'a> {
         loop {
             let tok = self.next_token();
             let is_eof = tok.kind == TokenKind::Eof;
+            self.prev_kind = tok.kind;
             tokens.push(tok);
             if is_eof {
                 break;
@@ -212,6 +216,8 @@ impl<'a> Lexer<'a> {
                 self.cursor.advance();
                 if self.cursor.eat(b'=') {
                     TokenKind::SlashAssign
+                } else if self.can_be_regex_start() {
+                    return self.scan_regexp(start, preceded_by_newline);
                 } else {
                     TokenKind::Slash
                 }
@@ -600,6 +606,73 @@ impl<'a> Lexer<'a> {
 
         // Unterminated template
         Token::new(TokenKind::Error, Span::new(start as u32, self.cursor.pos() as u32), preceded_by_newline)
+    }
+
+    /// Check if `/` can start a regex literal based on the previous token.
+    /// `/` is a regex if the previous token cannot end an expression.
+    fn can_be_regex_start(&self) -> bool {
+        !matches!(
+            self.prev_kind,
+            TokenKind::RParen
+                | TokenKind::RBracket
+                | TokenKind::Identifier
+                | TokenKind::Number
+                | TokenKind::BigInt
+                | TokenKind::String
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::Null
+                | TokenKind::This
+                | TokenKind::PlusPlus
+                | TokenKind::MinusMinus
+                | TokenKind::TemplateLiteralFull
+                | TokenKind::TemplateLiteralTail
+                | TokenKind::RegExp
+        )
+    }
+
+    /// Scan a regex literal: /pattern/flags. The opening `/` has already been consumed.
+    fn scan_regexp(&mut self, start: usize, preceded_by_newline: bool) -> Token {
+        let mut in_char_class = false;
+        loop {
+            match self.cursor.peek() {
+                None | Some(b'\n') | Some(b'\r') => {
+                    return Token::new(
+                        TokenKind::Error,
+                        Span::new(start as u32, self.cursor.pos() as u32),
+                        preceded_by_newline,
+                    );
+                }
+                Some(b'\\') => {
+                    self.cursor.advance(); // backslash
+                    self.cursor.advance(); // escaped char
+                }
+                Some(b'[') if !in_char_class => {
+                    in_char_class = true;
+                    self.cursor.advance();
+                }
+                Some(b']') if in_char_class => {
+                    in_char_class = false;
+                    self.cursor.advance();
+                }
+                Some(b'/') if !in_char_class => {
+                    self.cursor.advance(); // closing '/'
+                    break;
+                }
+                _ => {
+                    self.cursor.advance();
+                }
+            }
+        }
+        // Scan optional flags
+        while matches!(self.cursor.peek(), Some(b'g' | b'i' | b'm' | b's' | b'u' | b'y' | b'd')) {
+            self.cursor.advance();
+        }
+        Token::new(
+            TokenKind::RegExp,
+            Span::new(start as u32, self.cursor.pos() as u32),
+            preceded_by_newline,
+        )
     }
 }
 

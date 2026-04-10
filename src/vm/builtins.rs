@@ -86,6 +86,10 @@ impl Vm {
                 Value::string(id)
             }
             "split" => {
+                // Check if separator is a RegExp
+                if let Some(result) = self.exec_string_regex_method(s, "split", args) {
+                    return result;
+                }
                 let sep = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
                 let parts: Vec<Value> = s.split(&sep).map(|part| {
                     let id = self.interner.intern(part);
@@ -95,12 +99,26 @@ impl Vm {
                 let oid = self.heap.allocate(arr);
                 Value::object_id(oid)
             }
-            "replace" => {
+            "replace" | "replaceAll" => {
+                // Check if first arg is a RegExp
+                if let Some(result) = self.exec_string_regex_method(s, &name, args) {
+                    return result;
+                }
                 let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
                 let replacement = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let result = s.replacen(&search, &replacement, 1);
+                let result = if name == "replaceAll" {
+                    s.replace(&search, &replacement)
+                } else {
+                    s.replacen(&search, &replacement, 1)
+                };
                 let id = self.interner.intern(&result);
                 Value::string(id)
+            }
+            "match" | "search" => {
+                if let Some(result) = self.exec_string_regex_method(s, &name, args) {
+                    return result;
+                }
+                Value::null()
             }
             "repeat" => {
                 let count = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;

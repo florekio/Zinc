@@ -540,6 +540,9 @@ impl Vm {
                         parts.join(",")
                     }
                     ObjectKind::Wrapper(inner) => self.value_to_string(*inner),
+                    ObjectKind::RegExp { pattern, flags } => {
+                        format!("/{pattern}/{flags}")
+                    }
                     _ => "[object Object]".into(),
                 }
             } else {
@@ -1589,6 +1592,25 @@ impl Vm {
                             // Let me just store the sentinel and handle in CallMethod.
                             continue;
                         }
+                        // Check for RegExp properties
+                        if let Some(obj) = self.heap.get(oid)
+                            && let ObjectKind::RegExp { pattern, flags } = &obj.kind
+                        {
+                            let val = match name_str {
+                                "source" => { let id = self.interner.intern(pattern.as_str()); Value::string(id) }
+                                "flags" => { let id = self.interner.intern(flags.as_str()); Value::string(id) }
+                                "global" => Value::boolean(flags.contains('g')),
+                                "ignoreCase" => Value::boolean(flags.contains('i')),
+                                "multiline" => Value::boolean(flags.contains('m')),
+                                "dotAll" => Value::boolean(flags.contains('s')),
+                                "unicode" => Value::boolean(flags.contains('u')),
+                                "sticky" => Value::boolean(flags.contains('y')),
+                                "lastIndex" => Value::int(0),
+                                _ => Value::undefined(),
+                            };
+                            self.push(val);
+                            continue;
+                        }
                         let val = self.heap.get_property_chain(oid, name_id)
                             .unwrap_or(Value::undefined());
                         self.push(val);
@@ -1604,7 +1626,8 @@ impl Vm {
                             | "slice" | "substring" | "toUpperCase" | "toLowerCase"
                             | "trim" | "trimStart" | "trimEnd"
                             | "split" | "replace" | "repeat"
-                            | "padStart" | "padEnd" | "concat" => {
+                            | "padStart" | "padEnd" | "concat"
+                            | "match" | "search" | "replaceAll" => {
                                 // Encode: string sentinel = -200 - method_index
                                 let method_idx = match name_str {
                                     "charAt" => 0, "charCodeAt" => 1, "indexOf" => 2,
@@ -1614,6 +1637,7 @@ impl Vm {
                                     "trim" => 11, "trimStart" => 12, "trimEnd" => 13,
                                     "split" => 14, "replace" => 15, "repeat" => 16,
                                     "padStart" => 17, "padEnd" => 18, "concat" => 19,
+                                    "match" => 20, "search" => 21, "replaceAll" => 22,
                                     _ => 99,
                                 };
                                 self.push(Value::function(-200 - method_idx));
@@ -1800,6 +1824,16 @@ impl Vm {
                                 self.push(result);
                                 continue;
                             }
+                        // Check for RegExp methods
+                        if let Some(obj) = self.heap.get(oid)
+                            && matches!(&obj.kind, ObjectKind::RegExp { .. })
+                        {
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            let result = self.exec_regexp_method(oid, method_name, &args)?;
+                            self.stack.truncate(obj_pos);
+                            self.push(result);
+                            continue;
+                        }
                         // Check for Math methods
                         let math_name = self.interner.intern("Math");
                         if self.globals.get(&math_name).map(|v| v.as_object_id()) == Some(Some(oid)) {
@@ -2226,11 +2260,19 @@ impl Vm {
                 }
 
                 OpCode::CreateRegExp => {
-                    let _pattern = self.read_u16();
-                    let _flags = self.read_u16();
-                    return Err(VmError::RuntimeError(
-                        "CreateRegExp not yet implemented".into(),
-                    ));
+                    let pattern_idx = self.read_u16() as usize;
+                    let flags_idx = self.read_u16() as usize;
+                    let pattern = {
+                        let v = self.chunks[self.cur_chunk()].constants[pattern_idx];
+                        self.value_to_string(v)
+                    };
+                    let flags = {
+                        let v = self.chunks[self.cur_chunk()].constants[flags_idx];
+                        self.value_to_string(v)
+                    };
+                    let obj = JsObject::regexp(pattern, flags);
+                    let oid = self.heap.allocate(obj);
+                    self.push(Value::object_id(oid));
                 }
 
                 OpCode::Closure => {

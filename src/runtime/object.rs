@@ -39,6 +39,11 @@ pub enum ObjectKind {
     KeyIterator(Vec<crate::util::interner::StringId>, usize),
     /// Primitive wrapper object (new Number(5), new Boolean(true), new String("x"))
     Wrapper(Value),
+    /// Regular expression
+    RegExp {
+        pattern: String,
+        flags: String,
+    },
     /// Promise with state machine
     Promise {
         state: PromiseState,
@@ -155,6 +160,14 @@ impl JsObject {
             properties: HashMap::new(),
             prototype: None,
             kind: ObjectKind::Function(FunctionKind::Native { name, func }),
+        }
+    }
+
+    pub fn regexp(pattern: String, flags: String) -> Self {
+        Self {
+            properties: HashMap::new(),
+            prototype: None,
+            kind: ObjectKind::RegExp { pattern, flags },
         }
     }
 
