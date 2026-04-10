@@ -40,7 +40,7 @@ impl Vm {
         self.frames.push(CallFrame {
             chunk_idx, ip: 0, base: func_pos + 1,
             upvalues, this_value: Value::undefined(), is_constructor: false,
-            pending_super_call: false,
+            pending_super_call: false, generator_id: None,
         });
 
         // Run the callback by executing bytecode until its frame is popped.
