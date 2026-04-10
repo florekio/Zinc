@@ -75,7 +75,13 @@ pub fn jit_compile(chunk: &Chunk, _all_chunks: &[Chunk]) -> Option<JitFunction> 
     let has_loop = code.contains(&(OpCode::Loop as u8));
     let has_globals = code.contains(&(OpCode::GetGlobal as u8))
         || code.contains(&(OpCode::SetGlobal as u8));
-    if call_count == 0 && has_loop && !has_globals && chunk.local_count <= 5 {
+    if call_count == 0 && has_loop && !has_globals && chunk.local_count <= 8 {
+        // Check if function uses float constants or division → use FP mode
+        let has_div = code.contains(&(OpCode::Div as u8));
+        let uses_float = has_float_constants(chunk) || has_div;
+        if uses_float {
+            return emit_loop_function_fp(chunk);
+        }
         return emit_loop_function(chunk);
     }
 
@@ -407,10 +413,279 @@ fn reg_for(pos: usize) -> Option<u32> {
     match pos {
         0 => Some(X19), 1 => Some(X20), 2 => Some(X21),
         3 => Some(X22), 4 => Some(X23),
-        5 => Some(X3), 6 => Some(X4), 7 => Some(X5),
-        8 => Some(X6), 9 => Some(X7), 10 => Some(X8), 11 => Some(X9),
+        5 => Some(X24), 6 => Some(X25), 7 => Some(X26),
+        8 => Some(X3), 9 => Some(X4), 10 => Some(X5),
+        11 => Some(X6), 12 => Some(X7), 13 => Some(X8), 14 => Some(X9),
         _ => None,
     }
+}
+
+/// Check if a chunk uses floating-point constants (non-integer numbers).
+fn has_float_constants(chunk: &Chunk) -> bool {
+    let code = &chunk.code;
+    let constants = &chunk.constants;
+    let mut ip = 0;
+    while ip < code.len() {
+        let op = match OpCode::from_byte(code[ip]) {
+            Some(op) => op,
+            None => break,
+        };
+        if op == OpCode::Const {
+            let idx = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as usize;
+            if idx < constants.len() {
+                let v = constants[idx];
+                if let Some(f) = v.as_number()
+                    && (f.fract() != 0.0 || v.is_float())
+                {
+                    return true;
+                }
+            }
+        }
+        ip += op.instruction_size();
+    }
+    false
+}
+
+/// Map a VM stack position to a D (double-precision FP) register.
+/// D8-D15 are callee-saved, D0-D7 are caller-saved.
+fn reg_fp_for(pos: usize) -> Option<u32> {
+    match pos {
+        0 => Some(8),  1 => Some(9),  2 => Some(10),
+        3 => Some(11), 4 => Some(12), 5 => Some(13),
+        6 => Some(14), 7 => Some(15),
+        8 => Some(0),  9 => Some(1),  10 => Some(2),
+        11 => Some(3), 12 => Some(4), 13 => Some(5), 14 => Some(6),
+        _ => None,
+    }
+}
+
+/// Emit ARM64 for a loop-based function using D (double) registers.
+/// All arithmetic is done in f64. Parameters are converted from i64 on entry,
+/// result is converted back to i64 on return.
+fn emit_loop_function_fp(chunk: &Chunk) -> Option<JitFunction> {
+    let code = &chunk.code;
+    let constants = &chunk.constants;
+    let param_count = chunk.param_count as usize;
+
+    let mut asm = Assembler::new();
+    let mut stack_top: usize = param_count;
+    let mut last_cmp: Option<OpCode> = None;
+
+    let mut bc_to_arm: Vec<(usize, usize)> = Vec::new();
+    let mut forward_patches: Vec<(usize, usize)> = Vec::new();
+
+    // ---- Prologue: save callee-saved D8-D15 and frame ----
+    asm.stp_pre(X29, X30, SP, -96);
+    asm.mov_reg(X29, SP);
+    // Save callee-saved FP registers D8-D15 (8 regs × 8 bytes = 64 bytes)
+    asm.str_fp(8, SP, 16);
+    asm.str_fp(9, SP, 24);
+    asm.str_fp(10, SP, 32);
+    asm.str_fp(11, SP, 40);
+    asm.str_fp(12, SP, 48);
+    asm.str_fp(13, SP, 56);
+    asm.str_fp(14, SP, 64);
+    asm.str_fp(15, SP, 72);
+
+    // Convert integer params to f64: X0 → D8, X1 → D9, etc.
+    if param_count >= 1 { asm.scvtf(8, X0); }  // D8 = (double)X0
+    if param_count >= 2 { asm.scvtf(9, X1); }
+    if param_count >= 3 { asm.scvtf(10, X2); }
+
+    // ---- Walk bytecode ----
+    let mut ip = 0;
+    while ip < code.len() {
+        bc_to_arm.push((ip, asm.offset()));
+
+        let op = OpCode::from_byte(code[ip])?;
+        match op {
+            OpCode::Nop | OpCode::Halt => {}
+
+            OpCode::Zero => {
+                let r = reg_fp_for(stack_top)?;
+                // Load 0.0: FMOV Dd, XZR then SCVTF
+                asm.movz(X0, 0);
+                asm.scvtf(r, X0);
+                stack_top += 1;
+            }
+            OpCode::One => {
+                let r = reg_fp_for(stack_top)?;
+                asm.movz(X0, 1);
+                asm.scvtf(r, X0);
+                stack_top += 1;
+            }
+            OpCode::Undefined | OpCode::True | OpCode::False => {
+                let r = reg_fp_for(stack_top)?;
+                asm.movz(X0, 0);
+                asm.scvtf(r, X0);
+                stack_top += 1;
+            }
+            OpCode::Const => {
+                let idx = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as usize;
+                let val = if idx < constants.len() {
+                    let v = constants[idx];
+                    v.as_number()?
+                } else { return None; };
+                let r = reg_fp_for(stack_top)?;
+                // Load f64 constant: move bits into X0, then FMOV to D register
+                asm.mov_imm64(X0, val.to_bits());
+                asm.fmov_to_fp(r, X0);
+                stack_top += 1;
+            }
+
+            OpCode::GetLocal => {
+                let slot = code[ip + 1] as usize;
+                let src = reg_fp_for(slot)?;
+                let dst = reg_fp_for(stack_top)?;
+                asm.fmov_reg(dst, src);
+                stack_top += 1;
+            }
+            OpCode::SetLocal => {
+                let slot = code[ip + 1] as usize;
+                if stack_top == 0 { return None; }
+                let src = reg_fp_for(stack_top - 1)?;
+                let dst = reg_fp_for(slot)?;
+                asm.fmov_reg(dst, src);
+            }
+
+            OpCode::Pop => {
+                stack_top = stack_top.saturating_sub(1);
+            }
+
+            // ---- FP Arithmetic ----
+            OpCode::Add => {
+                if stack_top < 2 { return None; }
+                let rb = reg_fp_for(stack_top - 1)?;
+                let ra = reg_fp_for(stack_top - 2)?;
+                asm.fadd(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Sub => {
+                if stack_top < 2 { return None; }
+                let rb = reg_fp_for(stack_top - 1)?;
+                let ra = reg_fp_for(stack_top - 2)?;
+                asm.fsub(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Mul => {
+                if stack_top < 2 { return None; }
+                let rb = reg_fp_for(stack_top - 1)?;
+                let ra = reg_fp_for(stack_top - 2)?;
+                asm.fmul(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Div => {
+                if stack_top < 2 { return None; }
+                let rb = reg_fp_for(stack_top - 1)?;
+                let ra = reg_fp_for(stack_top - 2)?;
+                asm.fdiv(ra, ra, rb);
+                stack_top -= 1;
+            }
+
+            // ---- FP Comparisons ----
+            OpCode::Lt | OpCode::Le | OpCode::Gt | OpCode::Ge
+            | OpCode::Eq | OpCode::Ne | OpCode::StrictEq | OpCode::StrictNe => {
+                if stack_top < 2 { return None; }
+                let rb = reg_fp_for(stack_top - 1)?;
+                let ra = reg_fp_for(stack_top - 2)?;
+                asm.fcmp(ra, rb);
+                stack_top -= 2;
+                last_cmp = Some(op);
+                stack_top += 1; // placeholder for boolean result
+            }
+
+            // ---- Branches (same as integer version) ----
+            OpCode::JumpIfFalse => {
+                let offset = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as i16;
+                let target_bc = (ip as isize + 3 + offset as isize) as usize;
+                stack_top -= 1;
+
+                let arm_off = asm.offset();
+                if let Some(cmp) = last_cmp.take() {
+                    match cmp {
+                        OpCode::Lt => asm.b_ge(0),
+                        OpCode::Le => asm.b_gt(0),
+                        OpCode::Gt => asm.b_le(0),
+                        OpCode::Ge => asm.b_lt(0),
+                        OpCode::Eq | OpCode::StrictEq => asm.b_ne(0),
+                        OpCode::Ne | OpCode::StrictNe => asm.b_eq(0),
+                        _ => return None,
+                    }
+                } else {
+                    return None; // can't handle non-fused comparisons in FP mode
+                }
+                forward_patches.push((target_bc, arm_off));
+            }
+            OpCode::Jump => {
+                let offset = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as i16;
+                let target_bc = (ip as isize + 3 + offset as isize) as usize;
+                let arm_off = asm.offset();
+                asm.b(0);
+                forward_patches.push((target_bc, arm_off));
+            }
+            OpCode::Loop => {
+                let back = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as usize;
+                let target_bc = ip + 3 - back;
+                let target_arm = bc_to_arm.iter()
+                    .find(|(bc, _)| *bc == target_bc)
+                    .map(|(_, arm)| *arm)?;
+                let current = asm.offset();
+                let relative = target_arm as i32 - current as i32;
+                asm.b(relative);
+            }
+
+            // ---- Return: convert f64 back to i64 ----
+            OpCode::Return => {
+                if stack_top == 0 { return None; }
+                stack_top -= 1;
+                let r = reg_fp_for(stack_top)?;
+                asm.fcvtzs(X0, r); // convert f64 → i64
+                // Epilogue
+                asm.ldr_fp(8, SP, 16);
+                asm.ldr_fp(9, SP, 24);
+                asm.ldr_fp(10, SP, 32);
+                asm.ldr_fp(11, SP, 40);
+                asm.ldr_fp(12, SP, 48);
+                asm.ldr_fp(13, SP, 56);
+                asm.ldr_fp(14, SP, 64);
+                asm.ldr_fp(15, SP, 72);
+                asm.ldp_post(X29, X30, SP, 96);
+                asm.ret();
+            }
+            OpCode::ReturnUndefined => {
+                asm.movz(X0, 0);
+                asm.ldr_fp(8, SP, 16);
+                asm.ldr_fp(9, SP, 24);
+                asm.ldr_fp(10, SP, 32);
+                asm.ldr_fp(11, SP, 40);
+                asm.ldr_fp(12, SP, 48);
+                asm.ldr_fp(13, SP, 56);
+                asm.ldr_fp(14, SP, 64);
+                asm.ldr_fp(15, SP, 72);
+                asm.ldp_post(X29, X30, SP, 96);
+                asm.ret();
+            }
+
+            _ => return None,
+        }
+        ip += op.instruction_size();
+    }
+
+    // Patch forward branches
+    for (target_bc, arm_branch_off) in &forward_patches {
+        let target_arm = bc_to_arm.iter()
+            .find(|(bc, _)| *bc == *target_bc)
+            .map(|(_, arm)| *arm);
+        if let Some(target) = target_arm {
+            asm.patch_branch(*arm_branch_off, target);
+        } else {
+            return None;
+        }
+    }
+
+    let mut buffer = ExecutableBuffer::new(asm.code.len().max(4096))?;
+    buffer.write_code(&asm.code);
+    Some(JitFunction { buffer, param_count: chunk.param_count as u8 })
 }
 
 /// Emit ARM64 for a loop-based numeric function by walking the bytecode.
@@ -429,13 +704,16 @@ fn emit_loop_function(chunk: &Chunk) -> Option<JitFunction> {
     let mut forward_patches: Vec<(usize, usize)> = Vec::new();
 
     // ---- Prologue ----
-    asm.stp_pre(X29, X30, SP, -64);
+    asm.stp_pre(X29, X30, SP, -96);
     asm.mov_reg(X29, SP);
     asm.str_imm(X19, SP, 16);
     asm.str_imm(X20, SP, 24);
     asm.str_imm(X21, SP, 32);
     asm.str_imm(X22, SP, 40);
     asm.str_imm(X23, SP, 48);
+    asm.str_imm(X24, SP, 56);
+    asm.str_imm(X25, SP, 64);
+    asm.str_imm(X26, SP, 72);
 
     // Copy params from argument registers
     if param_count >= 1 { asm.mov_reg(X19, X0); }
@@ -674,7 +952,10 @@ fn emit_loop_function(chunk: &Chunk) -> Option<JitFunction> {
                 asm.ldr_imm(X21, SP, 32);
                 asm.ldr_imm(X22, SP, 40);
                 asm.ldr_imm(X23, SP, 48);
-                asm.ldp_post(X29, X30, SP, 64);
+                asm.ldr_imm(X24, SP, 56);
+                asm.ldr_imm(X25, SP, 64);
+                asm.ldr_imm(X26, SP, 72);
+                asm.ldp_post(X29, X30, SP, 96);
                 asm.ret();
             }
             OpCode::ReturnUndefined => {
@@ -684,7 +965,10 @@ fn emit_loop_function(chunk: &Chunk) -> Option<JitFunction> {
                 asm.ldr_imm(X21, SP, 32);
                 asm.ldr_imm(X22, SP, 40);
                 asm.ldr_imm(X23, SP, 48);
-                asm.ldp_post(X29, X30, SP, 64);
+                asm.ldr_imm(X24, SP, 56);
+                asm.ldr_imm(X25, SP, 64);
+                asm.ldr_imm(X26, SP, 72);
+                asm.ldp_post(X29, X30, SP, 96);
                 asm.ret();
             }
 

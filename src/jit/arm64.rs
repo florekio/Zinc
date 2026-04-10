@@ -18,6 +18,9 @@ pub const X20: u32 = 20; // callee-saved, used for temps
 pub const X21: u32 = 21; // callee-saved, extra temp
 pub const X22: u32 = 22; // callee-saved, extra temp
 pub const X23: u32 = 23; // callee-saved, extra temp
+pub const X24: u32 = 24; // callee-saved, extra local
+pub const X25: u32 = 25; // callee-saved, extra local
+pub const X26: u32 = 26; // callee-saved, extra local
 pub const X29: u32 = 29; // frame pointer
 pub const X30: u32 = 30; // link register (return address)
 pub const SP: u32 = 31;  // stack pointer (in some encodings)
@@ -117,6 +120,70 @@ impl Assembler {
     /// ASRV Xd, Xn, Xm (arithmetic shift right, variable)
     pub fn asr_reg(&mut self, rd: u32, rn: u32, rm: u32) {
         self.emit(0x9AC02800 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    // ---- Floating-point (D registers) ----
+
+    /// FADD Dd, Dn, Dm (double + double)
+    pub fn fadd(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0x1E602800 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    /// FSUB Dd, Dn, Dm (double - double)
+    pub fn fsub(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0x1E603800 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    /// FMUL Dd, Dn, Dm (double * double)
+    pub fn fmul(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0x1E600800 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    /// FDIV Dd, Dn, Dm (double / double)
+    pub fn fdiv(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0x1E601800 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    /// FCMP Dn, Dm (compare doubles, sets NZCV flags)
+    pub fn fcmp(&mut self, rn: u32, rm: u32) {
+        self.emit(0x1E602000 | (rm << 16) | (rn << 5));
+    }
+
+    /// SCVTF Dd, Xn (signed int64 → f64)
+    pub fn scvtf(&mut self, rd: u32, rn: u32) {
+        self.emit(0x9E620000 | (rn << 5) | rd);
+    }
+
+    /// FCVTZS Xd, Dn (f64 → signed int64, truncate toward zero)
+    pub fn fcvtzs(&mut self, rd: u32, rn: u32) {
+        self.emit(0x9E780000 | (rn << 5) | rd);
+    }
+
+    /// FMOV Dd, Xn (copy bits from general register to FP register)
+    pub fn fmov_to_fp(&mut self, rd: u32, rn: u32) {
+        self.emit(0x9E670000 | (rn << 5) | rd);
+    }
+
+    /// FMOV Xd, Dn (copy bits from FP register to general register)
+    pub fn fmov_from_fp(&mut self, rd: u32, rn: u32) {
+        self.emit(0x9E660000 | (rn << 5) | rd);
+    }
+
+    /// STR Dt, [Xn, #imm] (store FP register, unsigned offset)
+    pub fn str_fp(&mut self, rt: u32, rn: u32, imm12: u32) {
+        let scaled = imm12 / 8;
+        self.emit(0xFD000000 | (scaled << 10) | (rn << 5) | rt);
+    }
+
+    /// LDR Dt, [Xn, #imm] (load FP register, unsigned offset)
+    pub fn ldr_fp(&mut self, rt: u32, rn: u32, imm12: u32) {
+        let scaled = imm12 / 8;
+        self.emit(0xFD400000 | (scaled << 10) | (rn << 5) | rt);
+    }
+
+    /// FMOV Dd, Dm (move between FP registers)
+    pub fn fmov_reg(&mut self, rd: u32, rm: u32) {
+        self.emit(0x1E604000 | (rm << 5) | rd);
     }
 
     // ---- Comparison ----
