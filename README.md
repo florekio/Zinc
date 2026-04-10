@@ -4,7 +4,7 @@ A JavaScript engine written from scratch in Rust with an **experimental ARM64 JI
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**84.8% [Test262](docs/TEST262.md) conformance** | **222 tests** | **~15,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
+**84.9% [Test262](docs/TEST262.md) conformance** | **222 tests** | **~17,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
 
 ![Zinc Playground](web/screenshot.png)
 
@@ -68,7 +68,8 @@ See [JIT.md](docs/JIT.md) for technical details.
 | **Async/await** | `async function`, `await` on promises and values |
 | **Error handling** | `try`/`catch`/`finally`, `throw`, `new Error()`, `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `instanceof`, `in` |
 | **Generators** | `function*`, `yield`, `.next(val)`, `.return()`, `.throw()`, `for...of` integration, infinite generators |
-| **Iterators** | `for...of` with array iterator protocol and generator support |
+| **Iterators** | `for...of` with array iterator protocol, generator support, string iteration |
+| **ES Modules** | `import { a } from './mod.js'`, `export function`, `export var`, named exports, module caching |
 | **JSON** | `JSON.parse` (full recursive descent), `JSON.stringify` |
 | **Math** | `PI`, `E`, `floor`, `ceil`, `round`, `abs`, `sqrt`, `pow`, `max`, `min`, `sin`, `cos`, `tan`, `log`, `random`, etc. |
 | **Globals** | `console.log`/`warn`/`error`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `String`, `Number`, `Boolean`, `String.fromCharCode`, `Array.isArray`, `Object.keys`/`values`/`entries` |
@@ -184,19 +185,19 @@ web/                   WASM playground (HTML + compiled WASM)
 
 ## Stats
 
-- **~16,000 lines** of Rust
+- **~17,000 lines** of Rust
 - **222 tests** passing
-- **84.8%** Test262 conformance (2,364 / 2,789 tests)
+- **84.9%** Test262 conformance (2,367 / 2,789 tests)
 - **1.5 MB** WASM binary (includes regex engine)
 - **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation
 
 ## What's Next
 
-- Floating-point JIT (ARM64 SIMD/FP registers)
-- ES modules (`import`/`export`)
-- WeakRef / FinalizationRegistry
+- `export default` and re-exports (`export * from`)
 - Async generators (`async function*`)
+- WeakRef / FinalizationRegistry
+- Inline caching for property access
 
 ## License
 
