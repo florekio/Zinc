@@ -57,9 +57,9 @@ impl Vm {
                         return format!("[{}]", parts.join(","));
                     }
                     _ => {
-                        let parts: Vec<String> = obj.properties.iter().map(|(k, v)| {
-                            let key = self.interner.resolve(*k);
-                            format!("\"{}\":{}", key, self.json_stringify(*v))
+                        let parts: Vec<String> = obj.properties.iter().map(|&(k, v)| {
+                            let key = self.interner.resolve(k);
+                            format!("\"{}\":{}", key, self.json_stringify(v))
                         }).collect();
                         return format!("{{{}}}", parts.join(","));
                     }

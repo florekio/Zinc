@@ -640,8 +640,8 @@ impl Vm {
             if let Some(oid) = val.as_object_id()
                 && let Some(obj) = self.heap.get(oid) {
                     // Classes have __constructor__ — typeof should be "function"
-                    for k in obj.properties.keys() {
-                        if self.interner.resolve(*k) == "__constructor__" {
+                    for &(k, _) in &obj.properties {
+                        if self.interner.resolve(k) == "__constructor__" {
                             return "function";
                         }
                     }
@@ -2123,7 +2123,7 @@ impl Vm {
                             "keys" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                                     let keys: Vec<Value> = self.heap.get(oid)
-                                        .map(|o| o.properties.keys().map(|k| Value::string(*k)).collect())
+                                        .map(|o| o.properties.iter().map(|(k, _)| Value::string(*k)).collect())
                                         .unwrap_or_default();
                                     let arr = JsObject::array(keys);
                                     Value::object_id(self.heap.allocate(arr))
@@ -2132,7 +2132,7 @@ impl Vm {
                             "values" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                                     let vals: Vec<Value> = self.heap.get(oid)
-                                        .map(|o| o.properties.values().copied().collect())
+                                        .map(|o| o.properties.iter().map(|(_, v)| *v).collect())
                                         .unwrap_or_default();
                                     let arr = JsObject::array(vals);
                                     Value::object_id(self.heap.allocate(arr))
@@ -2141,7 +2141,7 @@ impl Vm {
                             "entries" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                                     let pairs: Vec<(Value, Value)> = self.heap.get(oid)
-                                        .map(|o| o.properties.iter().map(|(k, v)| (Value::string(*k), *v)).collect())
+                                        .map(|o| o.properties.iter().map(|&(k, v)| (Value::string(k), v)).collect())
                                         .unwrap_or_default();
                                     let mut entries = Vec::new();
                                     for (k, v) in pairs {
@@ -2737,7 +2737,7 @@ impl Vm {
                             .unwrap_or(false) {
                             // Array iterator
                             let iter_obj = JsObject {
-                                properties: std::collections::HashMap::new(),
+                                properties: Vec::new(),
                                 prototype: None,
                                 kind: ObjectKind::ArrayIterator(oid, 0),
                                 marked: false,
@@ -2747,10 +2747,10 @@ impl Vm {
                         } else {
                             // Object key iterator (for...in)
                             let keys: Vec<_> = self.heap.get(oid)
-                                .map(|o| o.properties.keys().copied().collect())
+                                .map(|o| o.properties.iter().map(|(k, _)| *k).collect())
                                 .unwrap_or_default();
                             let iter_obj = JsObject {
-                                properties: std::collections::HashMap::new(),
+                                properties: Vec::new(),
                                 prototype: None,
                                 kind: ObjectKind::KeyIterator(keys, 0),
                                 marked: false,
@@ -2769,7 +2769,7 @@ impl Vm {
                         let arr = JsObject::array(chars);
                         let arr_oid = self.heap.allocate(arr);
                         let iter_obj = JsObject {
-                            properties: std::collections::HashMap::new(),
+                            properties: Vec::new(),
                             prototype: None,
                             kind: ObjectKind::ArrayIterator(arr_oid, 0),
                             marked: false,

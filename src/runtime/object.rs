@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::runtime::value::Value;
 use crate::util::interner::StringId;
 
@@ -10,7 +8,9 @@ pub type NativeFn = fn(&mut ObjectHeap, Value, &[Value]) -> Result<Value, Value>
 pub struct ObjectId(pub u32);
 
 pub struct JsObject {
-    pub properties: HashMap<StringId, Value>,
+    /// Properties stored as a flat Vec for cache-friendly linear scan.
+    /// Most JS objects have <=4 properties; linear scan beats HashMap.
+    pub properties: Vec<(StringId, Value)>,
     pub prototype: Option<ObjectId>,
     pub kind: ObjectKind,
     pub marked: bool,
@@ -183,8 +183,8 @@ impl ObjectHeap {
         let mut refs = Vec::new();
 
         // Properties
-        for val in obj.properties.values() {
-            if let Some(oid) = trace_value(*val) { refs.push(oid); }
+        for &(_, val) in &obj.properties {
+            if let Some(oid) = trace_value(val) { refs.push(oid); }
         }
 
         // Prototype chain
@@ -291,7 +291,7 @@ impl Default for ObjectHeap {
 impl JsObject {
     pub fn ordinary() -> Self {
         Self {
-            properties: HashMap::new(),
+            properties: Vec::new(),
             prototype: None,
             kind: ObjectKind::Ordinary,
             marked: false,
@@ -300,7 +300,7 @@ impl JsObject {
 
     pub fn promise() -> Self {
         Self {
-            properties: HashMap::new(),
+            properties: Vec::new(),
             prototype: None,
             kind: ObjectKind::Promise {
                 state: PromiseState::Pending,
@@ -313,7 +313,7 @@ impl JsObject {
 
     pub fn array(elements: Vec<Value>) -> Self {
         Self {
-            properties: HashMap::new(),
+            properties: Vec::new(),
             prototype: None,
             kind: ObjectKind::Array(elements),
             marked: false,
@@ -322,7 +322,7 @@ impl JsObject {
 
     pub fn function_bytecode(chunk_idx: usize, name: StringId) -> Self {
         Self {
-            properties: HashMap::new(),
+            properties: Vec::new(),
             prototype: None,
             kind: ObjectKind::Function(FunctionKind::Bytecode { chunk_idx, name }),
             marked: false,
@@ -331,7 +331,7 @@ impl JsObject {
 
     pub fn function_native(name: StringId, func: NativeFn) -> Self {
         Self {
-            properties: HashMap::new(),
+            properties: Vec::new(),
             prototype: None,
             kind: ObjectKind::Function(FunctionKind::Native { name, func }),
             marked: false,
@@ -340,18 +340,29 @@ impl JsObject {
 
     pub fn regexp(pattern: String, flags: String) -> Self {
         Self {
-            properties: HashMap::new(),
+            properties: Vec::new(),
             prototype: None,
             kind: ObjectKind::RegExp { pattern, flags },
             marked: false,
         }
     }
 
+    #[inline(always)]
     pub fn get_property(&self, key: StringId) -> Option<Value> {
-        self.properties.get(&key).copied()
+        for &(k, v) in &self.properties {
+            if k == key { return Some(v); }
+        }
+        None
     }
 
+    #[inline(always)]
     pub fn set_property(&mut self, key: StringId, value: Value) {
-        self.properties.insert(key, value);
+        for entry in &mut self.properties {
+            if entry.0 == key {
+                entry.1 = value;
+                return;
+            }
+        }
+        self.properties.push((key, value));
     }
 }
