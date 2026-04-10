@@ -86,6 +86,7 @@ impl Vm {
                     return Ok(if frame.is_constructor { frame.this_value } else { Value::undefined() });
                 }
                 OpCode::Halt => {
+                    self.frames.pop();
                     return Ok(if self.stack.is_empty() { Value::undefined() } else { self.pop()? });
                 }
                 // For all other opcodes, we need the main dispatch.

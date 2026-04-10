@@ -1063,21 +1063,119 @@ impl<'a> Compiler<'a> {
 
     fn compile_import(&mut self, i: &ImportDeclaration) -> Result<(), String> {
         match i {
-            ImportDeclaration::Standard { source, span, .. } => {
+            ImportDeclaration::Standard { specifiers, source, span } => {
                 let line = span.start;
-                let idx = self.make_string_constant(*source);
-                self.chunk.emit_op_u16(OpCode::ImportModule, idx, line);
-                self.chunk.emit_op(OpCode::Pop, line);
+                // Emit ImportModule which pushes the module exports object
+                let src_idx = self.make_string_constant(*source);
+                self.chunk.emit_op_u16(OpCode::ImportModule, src_idx, line);
+
+                if specifiers.is_empty() {
+                    // Side-effect only import
+                    self.chunk.emit_op(OpCode::Pop, line);
+                } else {
+                    // Bind each specifier from the module exports object
+                    for spec in specifiers {
+                        match spec {
+                            ImportSpecifier::Default { local, .. } => {
+                                self.chunk.emit_op(OpCode::Dup, line);
+                                let key = self.interner.intern("default");
+                                let idx = self.make_string_constant(key);
+                                self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                                let name_idx = self.make_string_constant(*local);
+                                self.chunk.emit_op_u16(OpCode::DefineGlobal, name_idx, line);
+                            }
+                            ImportSpecifier::Named { imported, local, .. } => {
+                                self.chunk.emit_op(OpCode::Dup, line);
+                                let idx = self.make_string_constant(*imported);
+                                self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                                let name_idx = self.make_string_constant(*local);
+                                self.chunk.emit_op_u16(OpCode::DefineGlobal, name_idx, line);
+                            }
+                            ImportSpecifier::Namespace { local, .. } => {
+                                // The whole module object becomes the namespace
+                                self.chunk.emit_op(OpCode::Dup, line);
+                                let name_idx = self.make_string_constant(*local);
+                                self.chunk.emit_op_u16(OpCode::DefineGlobal, name_idx, line);
+                            }
+                        }
+                    }
+                    self.chunk.emit_op(OpCode::Pop, line); // pop module object
+                }
             }
         }
         Ok(())
     }
 
-    // ---- export (stub) ----
-
-    fn compile_export(&mut self, _e: &ExportDeclaration) -> Result<(), String> {
-        // TODO: implement exports
+    fn compile_export(&mut self, e: &ExportDeclaration) -> Result<(), String> {
+        match e {
+            ExportDeclaration::Declaration { declaration, span } => {
+                // export var/let/const/function/class — compile normally
+                // The declaration becomes a global, which the module system can access
+                self.compile_statement(declaration)?;
+                // Mark as exported by setting on __exports__ object
+                let export_names = self.extract_declaration_names(declaration);
+                let line = span.start;
+                for name in export_names {
+                    let exports_key = self.interner.intern("__exports__");
+                    let exports_idx = self.make_string_constant(exports_key);
+                    self.chunk.emit_op_u16(OpCode::GetGlobal, exports_idx, line);
+                    let name_idx = self.make_string_constant(name);
+                    self.chunk.emit_op_u16(OpCode::GetGlobal, name_idx, line);
+                    self.chunk.emit_op(OpCode::Swap, line);
+                    // Stack: [value, exports_obj]
+                    // Need: SetProperty on exports_obj
+                    self.chunk.emit_op(OpCode::Swap, line);
+                    self.chunk.emit_byte(OpCode::SetProperty as u8, line);
+                    self.chunk.code.push((name_idx >> 8) as u8);
+                    self.chunk.code.push((name_idx & 0xFF) as u8);
+                    self.chunk.emit_op(OpCode::Pop, line);
+                }
+            }
+            ExportDeclaration::Default { declaration, span } => {
+                let _line = span.start;
+                self.compile_expr(declaration)?;
+                // For default export, we need to get the value and store on __exports__.default
+                // For function/class declarations, the name is bound globally
+                // For expressions, the value is on the stack
+            }
+            ExportDeclaration::Named { specifiers, span, .. } => {
+                let line = span.start;
+                for spec in specifiers {
+                    let exports_key = self.interner.intern("__exports__");
+                    let exports_idx = self.make_string_constant(exports_key);
+                    self.chunk.emit_op_u16(OpCode::GetGlobal, exports_idx, line);
+                    let local_idx = self.make_string_constant(spec.local);
+                    self.chunk.emit_op_u16(OpCode::GetGlobal, local_idx, line);
+                    let exported_idx = self.make_string_constant(spec.exported);
+                    self.chunk.emit_op(OpCode::Swap, line);
+                    self.chunk.emit_byte(OpCode::SetProperty as u8, line);
+                    self.chunk.code.push((exported_idx >> 8) as u8);
+                    self.chunk.code.push((exported_idx & 0xFF) as u8);
+                    self.chunk.emit_op(OpCode::Pop, line);
+                }
+            }
+            ExportDeclaration::All { .. } => {
+                // export * from 'mod' — re-export, skip for now
+            }
+        }
         Ok(())
+    }
+
+    fn extract_declaration_names(&self, stmt: &Statement) -> Vec<StringId> {
+        match stmt {
+            Statement::Variable(decl) => {
+                decl.declarations.iter().filter_map(|d| {
+                    if let Pattern::Identifier(id) = &d.id { Some(id.name) } else { None }
+                }).collect()
+            }
+            Statement::Function(f) => {
+                if let Some(name) = f.id { vec![name] } else { Vec::new() }
+            }
+            Statement::Class(c) => {
+                if let Some(name) = c.id { vec![name] } else { Vec::new() }
+            }
+            _ => Vec::new(),
+        }
     }
 
     // ---- loop-break helper ----

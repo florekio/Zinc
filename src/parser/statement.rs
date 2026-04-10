@@ -54,8 +54,254 @@ pub fn parse_statement(p: &mut Parser) -> ParseResult<Statement> {
                 span: Span::new(start, p.pos()),
             })))
         }
+        TokenKind::Import => parse_import_declaration(p),
+        TokenKind::Export => parse_export_declaration(p),
         _ => parse_expression_statement(p),
     }
+}
+
+fn parse_import_declaration(p: &mut Parser) -> ParseResult<Statement> {
+    let start = p.pos();
+    p.advance(); // consume 'import'
+
+    // import 'module' (side-effect only)
+    if p.at(TokenKind::String) {
+        let source = p.intern_current();
+        let _source_span = p.current().span;
+        p.advance();
+        p.expect_semicolon()?;
+        return Ok(Statement::Import(ImportDeclaration::Standard {
+            specifiers: Vec::new(),
+            source,
+            span: Span::new(start, p.pos()),
+        }));
+    }
+
+    let mut specifiers = Vec::new();
+
+    // import defaultExport from 'module'
+    if p.at(TokenKind::Identifier) && p.peek().kind != TokenKind::Comma && p.current_text() != "from" {
+        let local = p.intern_current();
+        let span = p.current().span;
+        // Check if this is `import x from` (default) or `import { ... } from`
+        if p.peek().kind == TokenKind::LBrace || (p.peek().kind == TokenKind::Identifier && p.token_text(p.peek()) == "from") {
+            p.advance();
+            specifiers.push(ImportSpecifier::Default { local, span });
+            // May have additional named imports: import x, { a, b } from 'mod'
+            if p.eat(TokenKind::Comma) {
+                if p.at(TokenKind::LBrace) {
+                    parse_named_imports(p, &mut specifiers)?;
+                } else if p.at(TokenKind::Star) {
+                    parse_namespace_import(p, &mut specifiers)?;
+                }
+            }
+        } else {
+            p.advance();
+            specifiers.push(ImportSpecifier::Default { local, span });
+        }
+    } else if p.at(TokenKind::LBrace) {
+        // import { a, b as c } from 'module'
+        parse_named_imports(p, &mut specifiers)?;
+    } else if p.at(TokenKind::Star) {
+        // import * as ns from 'module'
+        parse_namespace_import(p, &mut specifiers)?;
+    }
+
+    // expect 'from'
+    if p.at(TokenKind::Identifier) && p.current_text() == "from" {
+        p.advance();
+    }
+
+    // expect module source string
+    let source = p.intern_current();
+    p.expect(TokenKind::String)?;
+    p.expect_semicolon()?;
+
+    Ok(Statement::Import(ImportDeclaration::Standard {
+        specifiers,
+        source,
+        span: Span::new(start, p.pos()),
+    }))
+}
+
+fn parse_named_imports(p: &mut Parser, specifiers: &mut Vec<ImportSpecifier>) -> ParseResult<()> {
+    p.expect(TokenKind::LBrace)?;
+    while !p.at(TokenKind::RBrace) && !p.at(TokenKind::Eof) {
+        let imported = p.intern_current();
+        let span = p.current().span;
+        p.advance();
+        let local = if p.at(TokenKind::Identifier) && p.current_text() == "as" {
+            p.advance(); // 'as'
+            let l = p.intern_current();
+            p.advance();
+            l
+        } else {
+            imported
+        };
+        specifiers.push(ImportSpecifier::Named { imported, local, span });
+        if !p.at(TokenKind::RBrace) {
+            p.expect(TokenKind::Comma)?;
+        }
+    }
+    p.expect(TokenKind::RBrace)?;
+    Ok(())
+}
+
+fn parse_namespace_import(p: &mut Parser, specifiers: &mut Vec<ImportSpecifier>) -> ParseResult<()> {
+    let span = p.current().span;
+    p.advance(); // '*'
+    if p.at(TokenKind::Identifier) && p.current_text() == "as" {
+        p.advance(); // 'as'
+    }
+    let local = p.intern_current();
+    p.advance();
+    specifiers.push(ImportSpecifier::Namespace { local, span });
+    Ok(())
+}
+
+fn parse_export_declaration(p: &mut Parser) -> ParseResult<Statement> {
+    let start = p.pos();
+    p.advance(); // consume 'export'
+
+    // export default expr
+    if p.at(TokenKind::Default) {
+        p.advance();
+        let expr = if p.at(TokenKind::Function) {
+            // Parse as function declaration, then convert to FunctionExpression
+            let func_start = p.pos();
+            p.expect(TokenKind::Function)?;
+            let is_generator = p.eat(TokenKind::Star);
+            let id = if p.at(TokenKind::Identifier) {
+                let name = p.intern_current();
+                p.advance();
+                Some(name)
+            } else {
+                None
+            };
+            let params = parse_params(p)?;
+            let body = parse_block_statement(p)?;
+            Expression::Function(Box::new(FunctionExpression {
+                id,
+                params,
+                body,
+                is_async: false,
+                is_generator,
+                span: Span::new(func_start, p.pos()),
+            }))
+        } else if p.at(TokenKind::Class) {
+            // Parse as class declaration, then convert to ClassExpression
+            let class_start = p.pos();
+            p.expect(TokenKind::Class)?;
+            let id = if p.at(TokenKind::Identifier) {
+                let name = p.intern_current();
+                p.advance();
+                Some(name)
+            } else {
+                None
+            };
+            let super_class = if p.eat(TokenKind::Extends) {
+                Some(parse_expression(p, 0)?)
+            } else {
+                None
+            };
+            let body = parse_class_body(p)?;
+            Expression::Class(Box::new(ClassExpression {
+                id,
+                super_class,
+                body,
+                span: Span::new(class_start, p.pos()),
+            }))
+        } else {
+            let expr = parse_expression(p, 0)?;
+            p.expect_semicolon()?;
+            expr
+        };
+        return Ok(Statement::Export(Box::new(ExportDeclaration::Default {
+            declaration: expr,
+            span: Span::new(start, p.pos()),
+        })));
+    }
+
+    // export function/var/let/const/class
+    if p.at_any(&[TokenKind::Function, TokenKind::Var, TokenKind::Let, TokenKind::Const, TokenKind::Class]) {
+        let decl = match p.current_kind() {
+            TokenKind::Function => parse_function_declaration(p, false)?,
+            TokenKind::Class => parse_class_declaration(p)?,
+            _ => parse_variable_declaration(p)?,
+        };
+        return Ok(Statement::Export(Box::new(ExportDeclaration::Declaration {
+            declaration: Box::new(decl),
+            span: Span::new(start, p.pos()),
+        })));
+    }
+
+    // export { a, b } or export { a, b } from 'mod'
+    if p.at(TokenKind::LBrace) {
+        p.advance();
+        let mut specifiers = Vec::new();
+        while !p.at(TokenKind::RBrace) && !p.at(TokenKind::Eof) {
+            let local = p.intern_current();
+            let local_span = p.current().span;
+            p.advance();
+            let exported = if p.at(TokenKind::Identifier) && p.current_text() == "as" {
+                p.advance();
+                let e = p.intern_current();
+                p.advance();
+                e
+            } else {
+                local
+            };
+            specifiers.push(ExportSpecifier {
+                local,
+                exported,
+                span: local_span,
+            });
+            if !p.at(TokenKind::RBrace) {
+                p.expect(TokenKind::Comma)?;
+            }
+        }
+        p.expect(TokenKind::RBrace)?;
+        let source = if p.at(TokenKind::Identifier) && p.current_text() == "from" {
+            p.advance();
+            let s = Some(p.intern_current());
+            p.expect(TokenKind::String)?;
+            s
+        } else {
+            None
+        };
+        p.expect_semicolon()?;
+        return Ok(Statement::Export(Box::new(ExportDeclaration::Named {
+            specifiers,
+            source,
+            span: Span::new(start, p.pos()),
+        })));
+    }
+
+    // export * from 'mod'
+    if p.at(TokenKind::Star) {
+        p.advance();
+        let exported = if p.at(TokenKind::Identifier) && p.current_text() == "as" {
+            p.advance();
+            let e = p.intern_current();
+            p.advance();
+            Some(e)
+        } else {
+            None
+        };
+        if p.at(TokenKind::Identifier) && p.current_text() == "from" {
+            p.advance();
+        }
+        let source = p.intern_current();
+        p.expect(TokenKind::String)?;
+        p.expect_semicolon()?;
+        return Ok(Statement::Export(Box::new(ExportDeclaration::All {
+            source,
+            exported,
+            span: Span::new(start, p.pos()),
+        })));
+    }
+
+    Err(ParseError::unexpected(p.current().kind, p.current().span))
 }
 
 fn parse_variable_declaration(p: &mut Parser) -> ParseResult<Statement> {

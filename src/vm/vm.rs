@@ -115,6 +115,10 @@ pub struct Vm {
     pub(crate) jit_functions: HashMap<usize, crate::jit::compiler::JitFunction>,
     /// console.log output buffer (for testing)
     pub output: Vec<String>,
+    /// Module cache: maps module path → exports ObjectId
+    pub(crate) module_cache: HashMap<String, ObjectId>,
+    /// Base directory for resolving relative module imports
+    pub(crate) module_dir: Option<String>,
 }
 
 impl Vm {
@@ -235,6 +239,8 @@ impl Vm {
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             jit_functions: HashMap::new(),
             output: Vec::new(),
+            module_cache: HashMap::new(),
+            module_dir: None,
         }
     }
 
@@ -2996,10 +3002,82 @@ impl Vm {
                 }
 
                 OpCode::ImportModule => {
-                    let _ = self.read_u16();
-                    return Err(VmError::RuntimeError(
-                        "ImportModule not yet implemented".into(),
-                    ));
+                    let src_idx = self.read_u16() as usize;
+                    let src_val = self.chunks[self.cur_chunk()].constants[src_idx];
+                    let module_path_raw = self.value_to_string(src_val);
+                    // Strip quotes from string literal
+                    let module_path = module_path_raw.trim_matches(|c| c == '\'' || c == '"').to_owned();
+
+                    // Check cache
+                    if let Some(&exports_oid) = self.module_cache.get(&module_path) {
+                        self.push(Value::object_id(exports_oid));
+                    } else {
+                        // Resolve path relative to module_dir
+                        let full_path = if let Some(ref dir) = self.module_dir {
+                            if module_path.starts_with("./") || module_path.starts_with("../") {
+                                format!("{}/{}", dir, module_path)
+                            } else {
+                                module_path.clone()
+                            }
+                        } else {
+                            module_path.clone()
+                        };
+
+                        // Read and compile the module
+                        let source = std::fs::read_to_string(&full_path).map_err(|e| {
+                            VmError::RuntimeError(format!("Cannot find module '{}': {}", module_path, e))
+                        })?;
+
+                        // Create exports object and cache it
+                        let exports_obj = JsObject::ordinary();
+                        let exports_oid = self.heap.allocate(exports_obj);
+                        self.module_cache.insert(module_path, exports_oid);
+
+                        // Set __exports__ global for the module to use
+                        let exports_key = self.interner.intern("__exports__");
+                        self.globals.insert(exports_key, Value::object_id(exports_oid));
+
+                        // Lex, parse, compile the module source
+                        let mut lexer = crate::lexer::lexer::Lexer::new(&source, &mut self.interner);
+                        let tokens = lexer.tokenize();
+                        let mut parser = crate::parser::parser::Parser::new(tokens, &source, &mut self.interner);
+                        let program = match parser.parse_program() {
+                            Ok(p) => p,
+                            Err(e) => return Err(VmError::RuntimeError(format!("Module parse error: {e}"))),
+                        };
+                        let compiler = crate::compiler::compiler::Compiler::new(&mut self.interner);
+                        let chunk = match compiler.compile_program(&program) {
+                            Ok(c) => c,
+                            Err(e) => return Err(VmError::RuntimeError(format!("Module compile error: {e}"))),
+                        };
+
+                        // Flatten child chunks and add to VM
+                        let base_idx = self.chunks.len();
+                        let mut flat_chunks = Vec::new();
+                        Vm::flatten_chunk(chunk, &mut flat_chunks);
+                        self.chunks.extend(flat_chunks);
+
+                        // Save current globals
+                        let globals_before: std::collections::HashSet<StringId> =
+                            self.globals.keys().copied().collect();
+
+                        // Execute module using call_function (globals are shared)
+                        let module_fn = Value::function(base_idx as i32);
+                        let _ = self.call_function(module_fn, &[]);
+
+                        // Copy newly-defined globals to exports object
+                        let new_globals: Vec<(StringId, Value)> = self.globals.iter()
+                            .filter(|(k, _)| !globals_before.contains(k))
+                            .map(|(k, v)| (*k, *v))
+                            .collect();
+                        for (name, val) in new_globals {
+                            if let Some(obj) = self.heap.get_mut(exports_oid) {
+                                obj.set_property(name, val);
+                            }
+                        }
+
+                        self.push(Value::object_id(exports_oid));
+                    }
                 }
 
                 OpCode::ImportDynamic | OpCode::ExportDefault => {
@@ -3011,9 +3089,7 @@ impl Vm {
                 OpCode::Export => {
                     let _name = self.read_u16();
                     let _slot = self.read_byte();
-                    return Err(VmError::RuntimeError(
-                        "Export not yet implemented".into(),
-                    ));
+                    // No-op: exports are handled via __exports__ global
                 }
 
                 OpCode::GetModuleVar => {
