@@ -1305,6 +1305,11 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::ImportDynamic, i.span.start);
                 Ok(())
             }
+            Expression::Super(_) => {
+                // super outside of a call is handled by compile_call
+                self.chunk.emit_op(OpCode::GetSuperConstructor, 0);
+                Ok(())
+            }
         }
     }
 
@@ -1747,6 +1752,16 @@ impl<'a> Compiler<'a> {
                     self.chunk.code.push(0);
                 }
             }
+            return Ok(());
+        }
+
+        // super(args) — call parent constructor
+        if matches!(&c.callee, Expression::Super(_)) {
+            self.chunk.emit_op(OpCode::GetSuperConstructor, line);
+            for arg in &c.arguments {
+                self.compile_expr(arg)?;
+            }
+            self.chunk.emit_op_u8(OpCode::Call, argc, line);
             return Ok(());
         }
 

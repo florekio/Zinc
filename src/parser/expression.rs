@@ -393,6 +393,12 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
             Ok(Expression::This(span))
         }
 
+        TokenKind::Super => {
+            let span = p.current().span;
+            p.advance();
+            Ok(Expression::Super(span))
+        }
+
         // ---- Grouping / Arrow ----
         TokenKind::LParen => {
             p.advance(); // (
@@ -1131,6 +1137,7 @@ pub fn expr_span(expr: &Expression) -> Span {
         Expression::Await(a) => a.span,
         Expression::MetaProperty(m) => m.span,
         Expression::Import(i) => i.span,
+        Expression::Super(s) => *s,
     }
 }
 

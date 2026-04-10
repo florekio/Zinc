@@ -59,6 +59,8 @@ pub(crate) struct CallFrame {
     pub(crate) this_value: Value,
     /// If true, ReturnUndefined returns this_value instead.
     pub(crate) is_constructor: bool,
+    /// If true, the next Call should propagate this_value (for super()).
+    pub(crate) pending_super_call: bool,
 }
 
 /// An active exception handler (pushed by PushExcHandler).
@@ -214,7 +216,7 @@ impl Vm {
         
         Self {
             chunks,
-            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::undefined(), is_constructor: false }],
+            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::undefined(), is_constructor: false, pending_super_call: false }],
             stack: Vec::with_capacity(256),
             globals,
             interner,
@@ -1288,13 +1290,23 @@ impl Vm {
                                 Vec::new()
                             };
 
+                            // Check if this is a super() call
+                            let is_super = self.frames.last().map(|f| f.pending_super_call).unwrap_or(false);
+                            let this_val = if is_super {
+                                if let Some(f) = self.frames.last_mut() { f.pending_super_call = false; }
+                                self.frames.last().unwrap().this_value
+                            } else {
+                                Value::undefined()
+                            };
+
                             self.frames.push(CallFrame {
                                 chunk_idx,
                                 ip: 0,
                                 base: func_pos + 1,
                                 upvalues,
-                                this_value: Value::undefined(),
+                                this_value: this_val,
                                 is_constructor: false,
+                                pending_super_call: false,
                             });
                             continue;
                         }
@@ -1577,8 +1589,7 @@ impl Vm {
                             // Let me just store the sentinel and handle in CallMethod.
                             continue;
                         }
-                        let val = self.heap.get(oid)
-                            .and_then(|o| o.get_property(name_id))
+                        let val = self.heap.get_property_chain(oid, name_id)
                             .unwrap_or(Value::undefined());
                         self.push(val);
                     } else if obj_val.is_string() {
@@ -1737,9 +1748,9 @@ impl Vm {
                     let obj_pos = self.stack.len() - 1 - argc;
                     let obj_val = self.stack[obj_pos];
 
-                    // Look up the method on the object
+                    // Look up the method on the object (walking prototype chain)
                     let method_val = if let Some(oid) = obj_val.as_object_id() {
-                        self.heap.get(oid).and_then(|o| o.get_property(method_name))
+                        self.heap.get_property_chain(oid, method_name)
                     } else {
                         None
                     };
@@ -1809,10 +1820,9 @@ impl Vm {
                         }
                     }
 
-                    // Try to call as a closure method on an object
+                    // Try to call as a closure method on an object (walk prototype chain)
                     if let Some(oid) = obj_val.as_object_id() {
-                        let method_val = self.heap.get(oid)
-                            .and_then(|o| o.get_property(method_name));
+                        let method_val = self.heap.get_property_chain(oid, method_name);
                         if let Some(mv) = method_val
                             && mv.is_function() {
                                 let packed = mv.as_function().unwrap();
@@ -1834,6 +1844,7 @@ impl Vm {
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: obj_pos + 1,
                                         upvalues, this_value: obj_val, is_constructor: false,
+                                        pending_super_call: false,
                                     });
                                     continue;
                                 }
@@ -2078,20 +2089,18 @@ impl Vm {
                         let proto_val = self.heap.get(class_oid)
                             .and_then(|o| o.get_property(proto_key));
 
-                        // Set prototype on the new object
+                        // Link prototype chain instead of copying properties
                         if let Some(pv) = proto_val
-                            && let Some(proto_oid) = pv.as_object_id() {
-                                // Copy prototype methods to the new object
-                                if let Some(proto) = self.heap.get(proto_oid) {
-                                    let props: Vec<_> = proto.properties.iter()
-                                        .map(|(k, v)| (*k, *v)).collect();
-                                    if let Some(new_o) = self.heap.get_mut(new_oid) {
-                                        for (k, v) in props {
-                                            new_o.set_property(k, v);
-                                        }
-                                    }
-                                }
-                            }
+                            && let Some(poid) = pv.as_object_id()
+                            && let Some(new_o) = self.heap.get_mut(new_oid)
+                        {
+                            new_o.prototype = Some(poid);
+                        }
+                        // Store class reference for super() resolution
+                        let class_key = self.interner.intern("__class__");
+                        if let Some(new_o) = self.heap.get_mut(new_oid) {
+                            new_o.set_property(class_key, func_val);
+                        }
 
                         if let Some(cv) = ctor_val
                             && cv.is_function() {
@@ -2113,6 +2122,7 @@ impl Vm {
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: func_pos + 1,
                                         upvalues, this_value: this_val, is_constructor: true,
+                                        pending_super_call: false,
                                     });
                                     continue;
                                 }
@@ -2145,6 +2155,7 @@ impl Vm {
                                 upvalues,
                                 this_value: this_val,
                                 is_constructor: true,
+                                pending_super_call: false,
                             });
                             continue;
                         }
@@ -2347,13 +2358,61 @@ impl Vm {
                 }
 
                 OpCode::Inherit => {
-                    // Stack: [class, superclass]
-                    let _super_val = self.pop()?;
-                    // TODO: set up prototype chain
+                    // Stack: [class, superclass] — superclass is on top
+                    let super_val = self.pop()?;
+                    let class_val = self.peek()?;
+
+                    if let Some(super_oid) = super_val.as_object_id()
+                        && let Some(class_oid) = class_val.as_object_id()
+                    {
+                        let proto_key = self.interner.intern("prototype");
+
+                        // Get superclass's prototype
+                        let super_proto = self.heap.get(super_oid)
+                            .and_then(|o| o.get_property(proto_key))
+                            .and_then(|v| v.as_object_id());
+
+                        // Get subclass's prototype
+                        let sub_proto = self.heap.get(class_oid)
+                            .and_then(|o| o.get_property(proto_key))
+                            .and_then(|v| v.as_object_id());
+
+                        // Link: subclass.prototype.__proto__ = superclass.prototype
+                        if let (Some(sub_pid), Some(super_pid)) = (sub_proto, super_proto)
+                            && let Some(sub_proto_obj) = self.heap.get_mut(sub_pid)
+                        {
+                            sub_proto_obj.prototype = Some(super_pid);
+                        }
+
+                        // Store superclass reference for super() calls
+                        let super_key = self.interner.intern("__super__");
+                        if let Some(class_obj) = self.heap.get_mut(class_oid) {
+                            class_obj.set_property(super_key, super_val);
+                        }
+                    }
                 }
 
                 OpCode::GetSuperConstructor => {
-                    self.push(Value::undefined()); // TODO
+                    // Resolve parent constructor: this.__class__.__super__.__constructor__
+                    let this_val = self.frames.last().unwrap().this_value;
+                    let class_key = self.interner.intern("__class__");
+                    let super_key = self.interner.intern("__super__");
+                    let ctor_key = self.interner.intern("__constructor__");
+
+                    let result = this_val.as_object_id()
+                        .and_then(|oid| self.heap.get(oid))
+                        .and_then(|obj| obj.get_property(class_key))
+                        .and_then(|cv| cv.as_object_id())
+                        .and_then(|cid| self.heap.get(cid))
+                        .and_then(|cls| cls.get_property(super_key))
+                        .and_then(|sv| sv.as_object_id())
+                        .and_then(|sid| self.heap.get(sid))
+                        .and_then(|sup| sup.get_property(ctor_key));
+
+                    self.push(result.unwrap_or(Value::undefined()));
+
+                    // Mark that the next Call should propagate this_value
+                    self.frames.last_mut().unwrap().pending_super_call = true;
                 }
 
                 OpCode::Throw => {

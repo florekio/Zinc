@@ -85,6 +85,26 @@ impl ObjectHeap {
     pub fn get_mut(&mut self, id: ObjectId) -> Option<&mut JsObject> {
         self.objects.get_mut(id.0 as usize).and_then(|o| o.as_mut())
     }
+
+    /// Look up a property by walking the prototype chain.
+    /// Returns the value if found, or None if not on any prototype.
+    pub fn get_property_chain(&self, start: ObjectId, key: StringId) -> Option<Value> {
+        let mut current = Some(start);
+        let mut depth = 0;
+        while let Some(oid) = current {
+            if depth > 64 { break; } // prevent infinite loops
+            if let Some(obj) = self.get(oid) {
+                if let Some(val) = obj.get_property(key) {
+                    return Some(val);
+                }
+                current = obj.prototype;
+                depth += 1;
+            } else {
+                break;
+            }
+        }
+        None
+    }
 }
 
 impl Default for ObjectHeap {

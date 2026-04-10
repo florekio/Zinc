@@ -316,6 +316,7 @@ pub enum Expression {
     Await(Box<AwaitExpression>),
     MetaProperty(MetaProperty),
     Import(Box<ImportExpression>),
+    Super(Span),
 }
 
 #[derive(Debug)]
