@@ -85,7 +85,7 @@ See [JIT.md](docs/JIT.md) for technical details.
 - **String interning** — O(1) comparison for all identifiers and property names
 - **Mark-and-sweep GC** — automatic garbage collection with root tracing and slot reuse
 - **Microtask queue** for Promise resolution
-- **WebAssembly build** — 384 KB WASM binary
+- **WebAssembly build** — runs in the browser via WASM
 
 ## Benchmarks
 
@@ -180,7 +180,7 @@ web/                   WASM playground (HTML + compiled WASM)
 - **~16,000 lines** of Rust
 - **222 tests** passing
 - **84.2%** Test262 conformance (2,349 / 2,789 tests)
-- **384 KB** WASM binary
+- **1.5 MB** WASM binary (includes regex engine)
 - **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation
 
