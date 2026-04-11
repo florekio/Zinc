@@ -38,6 +38,7 @@ struct Local {
     depth: u32,
     initialized: bool,
     captured: bool,
+    is_const: bool,
 }
 
 use crate::compiler::chunk::UpvalueDescriptor;
@@ -76,6 +77,8 @@ pub struct Compiler<'a> {
     /// This is set when compiling a nested function.
     enclosing_locals: Option<Vec<Local>>,
     enclosing_upvalues: Option<Vec<CompilerUpvalue>>,
+    /// Set of global-scope const variable names (to prevent reassignment).
+    const_globals: std::collections::HashSet<StringId>,
 }
 
 impl<'a> Compiler<'a> {
@@ -94,6 +97,7 @@ impl<'a> Compiler<'a> {
             loops: Vec::new(),
             enclosing_locals: None,
             enclosing_upvalues: None,
+            const_globals: std::collections::HashSet::new(),
         }
     }
 
@@ -194,6 +198,7 @@ impl<'a> Compiler<'a> {
             depth: self.scope_depth,
             initialized: false,
             captured: false,
+            is_const: false,
         });
     }
 
@@ -263,6 +268,11 @@ impl<'a> Compiler<'a> {
 
     fn compile_set_variable(&mut self, name: StringId, line: u32) -> Result<(), String> {
         if let Some(slot) = self.resolve_local(name) {
+            // Check for const reassignment
+            if self.locals[slot].is_const {
+                let var_name = self.interner.resolve(name).to_owned();
+                return Err(format!("TypeError: Assignment to constant variable '{var_name}'"));
+            }
             if slot <= u8::MAX as usize {
                 self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
             } else {
@@ -272,6 +282,11 @@ impl<'a> Compiler<'a> {
         } else if let Some(uv_idx) = self.resolve_upvalue(name) {
             self.chunk.emit_op_u8(OpCode::SetUpvalue, uv_idx, line);
         } else {
+            // Check for global const reassignment
+            if self.const_globals.contains(&name) {
+                let var_name = self.interner.resolve(name).to_owned();
+                return Err(format!("TypeError: Assignment to constant variable '{var_name}'"));
+            }
             let idx = self.make_string_constant(name);
             self.chunk.emit_op_u16(OpCode::SetGlobal, idx, line);
         }
@@ -340,11 +355,17 @@ impl<'a> Compiler<'a> {
                     }
 
                     if self.scope_depth == 0 {
+                        if decl.kind == VarKind::Const {
+                            self.const_globals.insert(name);
+                        }
                         let idx = self.make_string_constant(name);
                         self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
                     } else {
                         self.add_local(name);
                         self.mark_initialized();
+                        if decl.kind == VarKind::Const {
+                            self.locals.last_mut().unwrap().is_const = true;
+                        }
                         // TDZ bookkeeping for let/const.
                         if decl.kind == VarKind::Let || decl.kind == VarKind::Const {
                             let slot = (self.locals.len() - 1) as u8;
@@ -1293,6 +1314,34 @@ impl<'a> Compiler<'a> {
             }
         }
 
+        // Emit default parameter initialization code.
+        // For each parameter with a default value, check if undefined and assign default.
+        for (i, param) in params.iter().enumerate() {
+            if let Pattern::Assignment(a) = param
+                && let Pattern::Identifier(_) = &a.left {
+                    let line = 0;
+                    self.chunk.emit_op(OpCode::GetLocal, line);
+                    self.chunk.code.push(i as u8);
+                    self.chunk.emit_op(OpCode::Undefined, line);
+                    self.chunk.emit_op(OpCode::StrictNe, line);
+                    let jump_idx = self.chunk.code.len();
+                    self.chunk.emit_op(OpCode::JumpIfTrue, line);
+                    self.chunk.code.push(0);
+                    self.chunk.code.push(0);
+                    // Default value expression
+                    self.compile_expr(&a.right)?;
+                    // Set the local
+                    self.chunk.emit_op(OpCode::SetLocal, line);
+                    self.chunk.code.push(i as u8);
+                    self.chunk.emit_op(OpCode::Pop, line);
+                    // Patch the jump
+                    let target = self.chunk.code.len();
+                    let offset = (target as i16) - (jump_idx as i16) - 3;
+                    self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
+                    self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
+                }
+        }
+
         // Hoist var declarations inside the function body.
         {
             let mut hoisted_names = Vec::new();
@@ -1373,10 +1422,49 @@ impl<'a> Compiler<'a> {
         self.scope_depth = 1;
 
         for param in params {
-            if let Pattern::Identifier(id) = param {
-                self.add_local(id.name);
-                self.mark_initialized();
+            match param {
+                Pattern::Identifier(id) => {
+                    self.add_local(id.name);
+                    self.mark_initialized();
+                }
+                Pattern::Assignment(a) => {
+                    if let Pattern::Identifier(id) = &a.left {
+                        self.add_local(id.name);
+                        self.mark_initialized();
+                    }
+                }
+                Pattern::Rest(r) => {
+                    if let Pattern::Identifier(id) = &r.argument {
+                        self.add_local(id.name);
+                        self.mark_initialized();
+                    }
+                }
+                _ => {}
             }
+        }
+
+        // Emit default parameter initialization for arrow functions
+        for (i, param) in params.iter().enumerate() {
+            if let Pattern::Assignment(a) = param
+                && let Pattern::Identifier(_) = &a.left {
+                    let line = 0;
+                    self.chunk.emit_op(OpCode::GetLocal, line);
+                    self.chunk.code.push(i as u8);
+                    self.chunk.emit_op(OpCode::Undefined, line);
+                    self.chunk.emit_op(OpCode::StrictNe, line);
+                    let jump_idx = self.chunk.code.len();
+                    self.chunk.emit_op(OpCode::JumpIfTrue, line);
+                    self.chunk.code.push(0);
+                    self.chunk.code.push(0);
+                    self.compile_expr(&a.right)?;
+                    self.chunk.emit_op(OpCode::SetLocal, line);
+                    self.chunk.code.push(i as u8);
+                    self.chunk.emit_op(OpCode::Pop, line);
+                    let target = self.chunk.code.len();
+                    let offset = (target as i16) - (jump_idx as i16) - 3;
+                    self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
+                    self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
+                }
         }
 
         match body {

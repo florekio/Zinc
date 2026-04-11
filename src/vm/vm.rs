@@ -468,6 +468,7 @@ impl Vm {
 
     /// Check if the current frame is in strict mode.
     #[inline(always)]
+    #[allow(dead_code)]
     pub(crate) fn is_strict(&self) -> bool {
         self.chunks[self.cur_chunk()].flags.contains(ChunkFlags::STRICT)
     }
@@ -1894,14 +1895,13 @@ impl Vm {
                                     continue;
                                 }
                         // Map/Set size property
-                        if name_str == "size" {
-                            if let Some(obj) = self.heap.get(oid) {
+                        if name_str == "size"
+                            && let Some(obj) = self.heap.get(oid) {
                                 match &obj.kind {
                                     ObjectKind::Map { entries } => { self.push(Value::int(entries.len() as i32)); continue; }
                                     ObjectKind::Set { entries } => { self.push(Value::int(entries.len() as i32)); continue; }
                                     _ => {}
                                 }
-                            }
                         }
                         // Check for array methods (push, pop, etc.)
                         if matches!(name_str,
@@ -2475,32 +2475,27 @@ impl Vm {
                                             value = v;
                                         }
                                         flags = 0;
-                                        if let Some(v) = self.heap.get_property_chain(desc_oid, writable_key) {
-                                            if v.to_boolean() { flags |= Property::WRITABLE; }
-                                        }
-                                        if let Some(v) = self.heap.get_property_chain(desc_oid, enumerable_key) {
-                                            if v.to_boolean() { flags |= Property::ENUMERABLE; }
-                                        }
-                                        if let Some(v) = self.heap.get_property_chain(desc_oid, configurable_key) {
-                                            if v.to_boolean() { flags |= Property::CONFIGURABLE; }
-                                        }
+                                        if let Some(v) = self.heap.get_property_chain(desc_oid, writable_key)
+                                            && v.to_boolean() { flags |= Property::WRITABLE; }
+                                        if let Some(v) = self.heap.get_property_chain(desc_oid, enumerable_key)
+                                            && v.to_boolean() { flags |= Property::ENUMERABLE; }
+                                        if let Some(v) = self.heap.get_property_chain(desc_oid, configurable_key)
+                                            && v.to_boolean() { flags |= Property::CONFIGURABLE; }
                                         // Handle getter/setter
-                                        if let Some(getter) = self.heap.get_property_chain(desc_oid, get_key) {
-                                            if getter.is_function() {
+                                        if let Some(getter) = self.heap.get_property_chain(desc_oid, get_key)
+                                            && getter.is_function() {
                                                 let getter_key = self.interner.intern(&format!("__get_{key_str}__"));
                                                 if let Some(obj) = self.heap.get_mut(target_oid) {
                                                     obj.set_property(getter_key, getter);
                                                 }
                                             }
-                                        }
-                                        if let Some(setter) = self.heap.get_property_chain(desc_oid, set_key) {
-                                            if setter.is_function() {
+                                        if let Some(setter) = self.heap.get_property_chain(desc_oid, set_key)
+                                            && setter.is_function() {
                                                 let setter_key = self.interner.intern(&format!("__set_{key_str}__"));
                                                 if let Some(obj) = self.heap.get_mut(target_oid) {
                                                     obj.set_property(setter_key, setter);
                                                 }
                                             }
-                                        }
                                     }
                                     if let Some(obj) = self.heap.get_mut(target_oid) {
                                         obj.define_property(key_id, Property::with_flags(value, flags));
@@ -2509,9 +2504,8 @@ impl Vm {
                                 } else { target }
                             }
                             "defineProperties" => {
-                                let target = args.first().copied().unwrap_or(Value::undefined());
                                 // Simplified: treat like Object.assign for now
-                                target
+                                args.first().copied().unwrap_or(Value::undefined())
                             }
                             "getOwnPropertyDescriptor" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
@@ -2543,26 +2537,24 @@ impl Vm {
                             }
                             "freeze" => {
                                 let target = args.first().copied().unwrap_or(Value::undefined());
-                                if let Some(oid) = target.as_object_id() {
-                                    if let Some(obj) = self.heap.get_mut(oid) {
+                                if let Some(oid) = target.as_object_id()
+                                    && let Some(obj) = self.heap.get_mut(oid) {
                                         obj.extensible = false;
                                         for entry in &mut obj.properties {
                                             entry.1.flags &= !(Property::WRITABLE | Property::CONFIGURABLE);
                                         }
                                     }
-                                }
                                 target
                             }
                             "seal" => {
                                 let target = args.first().copied().unwrap_or(Value::undefined());
-                                if let Some(oid) = target.as_object_id() {
-                                    if let Some(obj) = self.heap.get_mut(oid) {
+                                if let Some(oid) = target.as_object_id()
+                                    && let Some(obj) = self.heap.get_mut(oid) {
                                         obj.extensible = false;
                                         for entry in &mut obj.properties {
                                             entry.1.flags &= !Property::CONFIGURABLE;
                                         }
                                     }
-                                }
                                 target
                             }
                             "isFrozen" => {
@@ -2615,11 +2607,10 @@ impl Vm {
                             }
                             "preventExtensions" => {
                                 let target = args.first().copied().unwrap_or(Value::undefined());
-                                if let Some(oid) = target.as_object_id() {
-                                    if let Some(obj) = self.heap.get_mut(oid) {
+                                if let Some(oid) = target.as_object_id()
+                                    && let Some(obj) = self.heap.get_mut(oid) {
                                         obj.extensible = false;
                                     }
-                                }
                                 target
                             }
                             "isExtensible" => {
@@ -2764,8 +2755,8 @@ impl Vm {
                             -540 => { // new Map()
                                 let mut entries = Vec::new();
                                 // Optional iterable argument (array of [key, value] pairs)
-                                if argc > 0 {
-                                    if let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
+                                if argc > 0
+                                    && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
                                         && let Some(obj) = self.heap.get(arr_oid)
                                             && let ObjectKind::Array(ref elems) = obj.kind {
                                                 let elems = elems.clone();
@@ -2778,7 +2769,6 @@ impl Vm {
                                                                 }
                                                 }
                                             }
-                                }
                                 let obj = JsObject {
                                     properties: Vec::new(), prototype: None,
                                     kind: ObjectKind::Map { entries }, marked: false, extensible: true,
@@ -2790,13 +2780,12 @@ impl Vm {
                             }
                             -541 => { // new Set()
                                 let mut entries = Vec::new();
-                                if argc > 0 {
-                                    if let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
+                                if argc > 0
+                                    && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
                                         && let Some(obj) = self.heap.get(arr_oid)
                                             && let ObjectKind::Array(ref elems) = obj.kind {
                                                 entries = elems.clone();
                                             }
-                                }
                                 let obj = JsObject {
                                     properties: Vec::new(), prototype: None,
                                     kind: ObjectKind::Set { entries }, marked: false, extensible: true,

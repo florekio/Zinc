@@ -12,6 +12,7 @@ struct TestMeta {
     includes: Vec<String>,
     features: Vec<String>,
     is_negative: bool,
+    #[allow(dead_code)]
     negative_phase: String,
     is_async: bool,
 }
@@ -22,11 +23,9 @@ fn parse_meta(source: &str) -> TestMeta {
     let mut features = Vec::new();
     let mut is_negative = false;
     let mut negative_phase = String::new();
-    let mut is_async = false;
-
     // Extract YAML block between /*--- and ---*/
-    if let Some(start) = source.find("/*---") {
-        if let Some(end) = source[start..].find("---*/") {
+    if let Some(start) = source.find("/*---")
+        && let Some(end) = source[start..].find("---*/") {
             let yaml = &source[start + 5..start + end];
             let mut in_flags = false;
             let mut in_includes = false;
@@ -68,21 +67,19 @@ fn parse_meta(source: &str) -> TestMeta {
                 }
                 // Other top-level key resets list parsing
                 if !trimmed.starts_with("- ") && !trimmed.starts_with("phase:") && !trimmed.starts_with("type:")
-                    && !trimmed.is_empty() && !trimmed.starts_with("#")
+                    && !trimmed.is_empty() && !trimmed.starts_with('#')
                     && trimmed.contains(':')
-                    && !trimmed.starts_with("- ")
+                    && (!in_negative || (!trimmed.starts_with("phase:") && !trimmed.starts_with("type:")))
                 {
-                    if !in_negative || (!trimmed.starts_with("phase:") && !trimmed.starts_with("type:")) {
-                        in_flags = false; in_includes = false; in_features = false;
-                        if !trimmed.starts_with("phase:") && !trimmed.starts_with("type:") {
-                            in_negative = false;
-                        }
+                    in_flags = false; in_includes = false; in_features = false;
+                    if !trimmed.starts_with("phase:") && !trimmed.starts_with("type:") {
+                        in_negative = false;
                     }
                 }
 
                 // YAML list items
-                if trimmed.starts_with("- ") {
-                    let val = trimmed[2..].trim().to_string();
+                if let Some(val) = trimmed.strip_prefix("- ") {
+                    let val = val.trim().to_string();
                     if in_flags { flags.push(val); }
                     else if in_includes { includes.push(val); }
                     else if in_features { features.push(val); }
@@ -94,17 +91,16 @@ fn parse_meta(source: &str) -> TestMeta {
                 }
             }
         }
-    }
 
-    is_async = flags.contains(&"async".to_string());
+    let is_async = flags.contains(&"async".to_string());
 
     TestMeta { flags, includes, features, is_negative, negative_phase, is_async }
 }
 
 /// Extract items from inline bracket list like `flags: [onlyStrict, raw]`
 fn extract_bracket_list(line: &str) -> Option<Vec<String>> {
-    if let Some(open) = line.find('[') {
-        if let Some(close) = line.find(']') {
+    if let Some(open) = line.find('[')
+        && let Some(close) = line.find(']') {
             let inner = &line[open + 1..close];
             let items: Vec<String> = inner.split(',')
                 .map(|s| s.trim().to_string())
@@ -112,7 +108,6 @@ fn extract_bracket_list(line: &str) -> Option<Vec<String>> {
                 .collect();
             return Some(items);
         }
-    }
     None
 }
 
@@ -200,19 +195,17 @@ fn main() {
 
     // Pre-load harness files
     let mut harness_cache: HashMap<String, String> = HashMap::new();
-    if harness_root.exists() {
-        if let Ok(entries) = fs::read_dir(harness_root) {
+    if harness_root.exists()
+        && let Ok(entries) = fs::read_dir(harness_root) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map(|e| e == "js").unwrap_or(false) {
-                    if let Ok(content) = fs::read_to_string(&path) {
+                if path.extension().map(|e| e == "js").unwrap_or(false)
+                    && let Ok(content) = fs::read_to_string(&path) {
                         let name = path.file_name().unwrap().to_string_lossy().to_string();
                         harness_cache.insert(name, content);
                     }
-                }
             }
         }
-    }
 
     // Categories to test
     let categories = vec![

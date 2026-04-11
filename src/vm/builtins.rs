@@ -630,14 +630,13 @@ impl Vm {
     fn flatten_array(&self, elements: &[Value], depth: usize) -> Vec<Value> {
         let mut result = Vec::new();
         for elem in elements {
-            if depth > 0 {
-                if let Some(oid) = elem.as_object_id()
+            if depth > 0
+                && let Some(oid) = elem.as_object_id()
                     && let Some(obj) = self.heap.get(oid)
                         && let ObjectKind::Array(ref inner) = obj.kind {
                             result.extend(self.flatten_array(inner, depth - 1));
                             continue;
                         }
-            }
             result.push(*elem);
         }
         result

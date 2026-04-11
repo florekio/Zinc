@@ -125,12 +125,11 @@ impl Vm {
                         entries.iter().any(|v| self.strict_eq(*v, value))
                     } else { false })
                     .unwrap_or(false);
-                if !has {
-                    if let Some(obj) = self.heap.get_mut(oid)
+                if !has
+                    && let Some(obj) = self.heap.get_mut(oid)
                         && let ObjectKind::Set { entries } = &mut obj.kind {
                             entries.push(value);
                         }
-                }
                 Ok(Value::object_id(oid))
             }
             "has" => {
@@ -240,12 +239,11 @@ impl Vm {
                 let key = args.first().and_then(|v| v.as_object_id());
                 if let Some(key_oid) = key
                     && let Some(obj) = self.heap.get_mut(oid)
-                        && let ObjectKind::WeakMap { entries } = &mut obj.kind {
-                            if let Some(pos) = entries.iter().position(|(k, _)| *k == key_oid) {
+                        && let ObjectKind::WeakMap { entries } = &mut obj.kind
+                            && let Some(pos) = entries.iter().position(|(k, _)| *k == key_oid) {
                                 entries.remove(pos);
                                 return Ok(Value::boolean(true));
                             }
-                        }
                 Ok(Value::boolean(false))
             }
             _ => Ok(Value::undefined()),
@@ -258,11 +256,10 @@ impl Vm {
             "add" => {
                 if let Some(key_oid) = args.first().and_then(|v| v.as_object_id())
                     && let Some(obj) = self.heap.get_mut(oid)
-                        && let ObjectKind::WeakSet { entries } = &mut obj.kind {
-                            if !entries.contains(&key_oid) {
+                        && let ObjectKind::WeakSet { entries } = &mut obj.kind
+                            && !entries.contains(&key_oid) {
                                 entries.push(key_oid);
                             }
-                        }
                 Ok(Value::object_id(oid))
             }
             "has" => {
@@ -276,12 +273,11 @@ impl Vm {
             "delete" => {
                 if let Some(key_oid) = args.first().and_then(|v| v.as_object_id())
                     && let Some(obj) = self.heap.get_mut(oid)
-                        && let ObjectKind::WeakSet { entries } = &mut obj.kind {
-                            if let Some(pos) = entries.iter().position(|k| *k == key_oid) {
+                        && let ObjectKind::WeakSet { entries } = &mut obj.kind
+                            && let Some(pos) = entries.iter().position(|k| *k == key_oid) {
                                 entries.remove(pos);
                                 return Ok(Value::boolean(true));
                             }
-                        }
                 Ok(Value::boolean(false))
             }
             _ => Ok(Value::undefined()),

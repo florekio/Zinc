@@ -271,7 +271,7 @@ impl ObjectHeap {
         let mut refs = Vec::new();
 
         // Properties
-        for &(_, ref prop) in &obj.properties {
+        for (_, prop) in &obj.properties {
             if let Some(oid) = trace_value(prop.value) { refs.push(oid); }
         }
 
