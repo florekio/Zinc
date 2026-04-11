@@ -1132,11 +1132,21 @@ impl<'a> Compiler<'a> {
                 }
             }
             ExportDeclaration::Default { declaration, span } => {
-                let _line = span.start;
+                let line = span.start;
                 self.compile_expr(declaration)?;
-                // For default export, we need to get the value and store on __exports__.default
-                // For function/class declarations, the name is bound globally
-                // For expressions, the value is on the stack
+                // Store the value on __exports__.default
+                let exports_key = self.interner.intern("__exports__");
+                let exports_idx = self.make_string_constant(exports_key);
+                self.chunk.emit_op_u16(OpCode::GetGlobal, exports_idx, line);
+                self.chunk.emit_op(OpCode::Swap, line);
+                // Stack: [exports_obj, value]
+                self.chunk.emit_op(OpCode::Swap, line);
+                let default_key = self.interner.intern("default");
+                let default_idx = self.make_string_constant(default_key);
+                self.chunk.emit_byte(OpCode::SetProperty as u8, line);
+                self.chunk.code.push((default_idx >> 8) as u8);
+                self.chunk.code.push((default_idx & 0xFF) as u8);
+                self.chunk.emit_op(OpCode::Pop, line);
             }
             ExportDeclaration::Named { specifiers, span, .. } => {
                 let line = span.start;
@@ -1154,8 +1164,10 @@ impl<'a> Compiler<'a> {
                     self.chunk.emit_op(OpCode::Pop, line);
                 }
             }
-            ExportDeclaration::All { .. } => {
-                // export * from 'mod' — re-export, skip for now
+            ExportDeclaration::All { source, span, .. } => {
+                let line = span.start;
+                let src_idx = self.make_string_constant(*source);
+                self.chunk.emit_op_u16(OpCode::ExportAllFrom, src_idx, line);
             }
         }
         Ok(())

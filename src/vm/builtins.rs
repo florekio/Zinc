@@ -156,6 +156,25 @@ impl Vm {
                 let id = self.interner.intern(&result);
                 Value::string(id)
             }
+            "codePointAt" => {
+                let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                match s.chars().nth(idx) {
+                    Some(c) => Value::number(c as u32 as f64),
+                    None => Value::undefined(),
+                }
+            }
+            "at" => {
+                let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                let len = s.chars().count() as i32;
+                let actual = if idx < 0 { len + idx } else { idx };
+                if actual >= 0 && (actual as usize) < len as usize {
+                    let ch = s.chars().nth(actual as usize).unwrap().to_string();
+                    let id = self.interner.intern(&ch);
+                    Value::string(id)
+                } else {
+                    Value::undefined()
+                }
+            }
             _ => Value::undefined(),
         }
     }
@@ -326,8 +345,302 @@ impl Vm {
                 }
                 Ok(Value::boolean(true))
             }
+            "findIndex" => {
+                let callback = args.first().copied().unwrap_or(Value::undefined());
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                for (i, elem) in elements.iter().enumerate() {
+                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    if result.to_boolean() { return Ok(Value::int(i as i32)); }
+                }
+                Ok(Value::int(-1))
+            }
+            "findLast" => {
+                let callback = args.first().copied().unwrap_or(Value::undefined());
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                for (i, elem) in elements.iter().enumerate().rev() {
+                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    if result.to_boolean() { return Ok(*elem); }
+                }
+                Ok(Value::undefined())
+            }
+            "findLastIndex" => {
+                let callback = args.first().copied().unwrap_or(Value::undefined());
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                for (i, elem) in elements.iter().enumerate().rev() {
+                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    if result.to_boolean() { return Ok(Value::int(i as i32)); }
+                }
+                Ok(Value::int(-1))
+            }
+            "reduceRight" => {
+                let callback = args.first().copied().unwrap_or(Value::undefined());
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                if elements.is_empty() && args.len() <= 1 {
+                    return Err(VmError::TypeError("reduceRight of empty array with no initial value".into()));
+                }
+                let mut acc = if args.len() > 1 { args[1] } else { *elements.last().unwrap() };
+                let end = if args.len() > 1 { elements.len() } else { elements.len() - 1 };
+                for i in (0..end).rev() {
+                    acc = self.call_function(callback, &[acc, elements[i], Value::int(i as i32)])?;
+                }
+                Ok(acc)
+            }
+            "splice" => {
+                let len = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
+                    .unwrap_or(0);
+                let raw_start = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                let start = if raw_start < 0 { (len as i32 + raw_start).max(0) as usize } else { (raw_start as usize).min(len) };
+                let delete_count = if args.len() >= 2 {
+                    (args[1].as_number().unwrap_or(0.0) as i32).max(0) as usize
+                } else {
+                    len - start
+                };
+                let delete_count = delete_count.min(len - start);
+                let insert_items: Vec<Value> = args.iter().skip(2).copied().collect();
+
+                // Extract deleted elements
+                let deleted: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind {
+                        e[start..start + delete_count].to_vec()
+                    } else { vec![] })
+                    .unwrap_or_default();
+
+                // Perform splice
+                if let Some(obj) = self.heap.get_mut(oid)
+                    && let ObjectKind::Array(ref mut elements) = obj.kind {
+                        let tail: Vec<Value> = elements.drain(start..).collect();
+                        for item in &insert_items {
+                            elements.push(*item);
+                        }
+                        for item in tail.iter().skip(delete_count) {
+                            elements.push(*item);
+                        }
+                    }
+
+                let arr = JsObject::array(deleted);
+                let new_oid = self.heap.allocate(arr);
+                Ok(Value::object_id(new_oid))
+            }
+            "slice" => {
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let len = elements.len() as i32;
+                let raw_start = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                let raw_end = args.get(1).and_then(|v| v.as_number()).map(|n| n as i32).unwrap_or(len);
+                let start = if raw_start < 0 { (len + raw_start).max(0) as usize } else { raw_start.min(len) as usize };
+                let end = if raw_end < 0 { (len + raw_end).max(0) as usize } else { raw_end.min(len) as usize };
+                let sliced = if start < end { elements[start..end].to_vec() } else { vec![] };
+                let arr = JsObject::array(sliced);
+                let new_oid = self.heap.allocate(arr);
+                Ok(Value::object_id(new_oid))
+            }
+            "concat" => {
+                let mut result: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                for arg in args {
+                    if let Some(arg_oid) = arg.as_object_id()
+                        && let Some(obj) = self.heap.get(arg_oid)
+                            && let ObjectKind::Array(ref elems) = obj.kind {
+                                result.extend_from_slice(elems);
+                            } else {
+                        result.push(*arg);
+                    }
+                }
+                let arr = JsObject::array(result);
+                let new_oid = self.heap.allocate(arr);
+                Ok(Value::object_id(new_oid))
+            }
+            "fill" => {
+                let fill_val = args.first().copied().unwrap_or(Value::undefined());
+                let len = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
+                    .unwrap_or(0) as i32;
+                let raw_start = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                let raw_end = args.get(2).and_then(|v| v.as_number()).map(|n| n as i32).unwrap_or(len);
+                let start = if raw_start < 0 { (len + raw_start).max(0) as usize } else { raw_start.min(len) as usize };
+                let end = if raw_end < 0 { (len + raw_end).max(0) as usize } else { raw_end.min(len) as usize };
+                if let Some(obj) = self.heap.get_mut(oid)
+                    && let ObjectKind::Array(ref mut elements) = obj.kind {
+                        for i in start..end.min(elements.len()) {
+                            elements[i] = fill_val;
+                        }
+                    }
+                Ok(Value::object_id(oid))
+            }
+            "copyWithin" => {
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let len = elements.len() as i32;
+                let raw_target = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                let raw_start = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                let raw_end = args.get(2).and_then(|v| v.as_number()).map(|n| n as i32).unwrap_or(len);
+                let target = if raw_target < 0 { (len + raw_target).max(0) as usize } else { raw_target.min(len) as usize };
+                let start = if raw_start < 0 { (len + raw_start).max(0) as usize } else { raw_start.min(len) as usize };
+                let end = if raw_end < 0 { (len + raw_end).max(0) as usize } else { raw_end.min(len) as usize };
+                if let Some(obj) = self.heap.get_mut(oid)
+                    && let ObjectKind::Array(ref mut elems) = obj.kind {
+                        let copy: Vec<Value> = elements[start..end].to_vec();
+                        for (i, val) in copy.iter().enumerate() {
+                            let idx = target + i;
+                            if idx < elems.len() { elems[idx] = *val; }
+                        }
+                    }
+                Ok(Value::object_id(oid))
+            }
+            "flat" => {
+                let depth = args.first().and_then(|v| v.as_number()).unwrap_or(1.0) as usize;
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let result = self.flatten_array(&elements, depth);
+                let arr = JsObject::array(result);
+                let new_oid = self.heap.allocate(arr);
+                Ok(Value::object_id(new_oid))
+            }
+            "flatMap" => {
+                let callback = args.first().copied().unwrap_or(Value::undefined());
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let mut mapped = Vec::new();
+                for (i, elem) in elements.iter().enumerate() {
+                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    if let Some(r_oid) = result.as_object_id()
+                        && let Some(obj) = self.heap.get(r_oid)
+                            && let ObjectKind::Array(ref inner) = obj.kind {
+                                mapped.extend_from_slice(inner);
+                            } else {
+                        mapped.push(result);
+                    }
+                }
+                let arr = JsObject::array(mapped);
+                let new_oid = self.heap.allocate(arr);
+                Ok(Value::object_id(new_oid))
+            }
+            "at" => {
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                let actual = if idx < 0 { elements.len() as i32 + idx } else { idx } as usize;
+                Ok(elements.get(actual).copied().unwrap_or(Value::undefined()))
+            }
+            "sort" => {
+                let comparefn = args.first().copied().filter(|v| v.is_function());
+                let mut elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                // Simple insertion sort to avoid issues with call_function during sort
+                let len = elements.len();
+                for i in 1..len {
+                    let key = elements[i];
+                    let mut j = i;
+                    while j > 0 {
+                        let cmp = if let Some(cfn) = comparefn {
+                            let r = self.call_function(cfn, &[elements[j - 1], key])?;
+                            r.as_number().unwrap_or(0.0)
+                        } else {
+                            let a_str = self.value_to_string(elements[j - 1]);
+                            let b_str = self.value_to_string(key);
+                            if a_str < b_str { -1.0 } else if a_str > b_str { 1.0 } else { 0.0 }
+                        };
+                        if cmp <= 0.0 { break; }
+                        elements[j] = elements[j - 1];
+                        j -= 1;
+                    }
+                    elements[j] = key;
+                }
+                if let Some(obj) = self.heap.get_mut(oid)
+                    && let ObjectKind::Array(ref mut elems) = obj.kind {
+                        *elems = elements;
+                    }
+                Ok(Value::object_id(oid))
+            }
+            "lastIndexOf" => {
+                let search = args.first().copied().unwrap_or(Value::undefined());
+                if let Some(obj) = self.heap.get(oid)
+                    && let ObjectKind::Array(ref elements) = obj.kind {
+                        for i in (0..elements.len()).rev() {
+                            if self.strict_eq(elements[i], search) {
+                                return Ok(Value::int(i as i32));
+                            }
+                        }
+                    }
+                Ok(Value::int(-1))
+            }
+            "toString" => {
+                // Array.prototype.toString is equivalent to join(",")
+                if let Some(obj) = self.heap.get(oid)
+                    && let ObjectKind::Array(ref elements) = obj.kind {
+                        let parts: Vec<String> = elements.iter().map(|v| self.value_to_string(*v)).collect();
+                        let result = parts.join(",");
+                        let id = self.interner.intern(&result);
+                        return Ok(Value::string(id));
+                    }
+                Ok(Value::undefined())
+            }
+            "keys" => {
+                let len = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
+                    .unwrap_or(0);
+                let keys: Vec<Value> = (0..len).map(|i| Value::int(i as i32)).collect();
+                let arr = JsObject::array(keys);
+                let new_oid = self.heap.allocate(arr);
+                Ok(Value::object_id(new_oid))
+            }
+            "values" => {
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let arr = JsObject::array(elements);
+                let new_oid = self.heap.allocate(arr);
+                Ok(Value::object_id(new_oid))
+            }
+            "entries" => {
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let mut entries = Vec::with_capacity(elements.len());
+                for (i, elem) in elements.iter().enumerate() {
+                    let pair = JsObject::array(vec![Value::int(i as i32), *elem]);
+                    let pair_oid = self.heap.allocate(pair);
+                    entries.push(Value::object_id(pair_oid));
+                }
+                let arr = JsObject::array(entries);
+                let new_oid = self.heap.allocate(arr);
+                Ok(Value::object_id(new_oid))
+            }
             _ => Ok(Value::undefined()),
         }
+    }
+
+    /// Helper to flatten an array to a given depth.
+    fn flatten_array(&self, elements: &[Value], depth: usize) -> Vec<Value> {
+        let mut result = Vec::new();
+        for elem in elements {
+            if depth > 0 {
+                if let Some(oid) = elem.as_object_id()
+                    && let Some(obj) = self.heap.get(oid)
+                        && let ObjectKind::Array(ref inner) = obj.kind {
+                            result.extend(self.flatten_array(inner, depth - 1));
+                            continue;
+                        }
+            }
+            result.push(*elem);
+        }
+        result
     }
 
     // ---- Math method dispatch ----
@@ -466,6 +779,12 @@ impl Vm {
                 let v = args.first().copied().unwrap_or(Value::undefined());
                 if let Some(n) = v.as_number() { Value::boolean(n.fract() == 0.0 && n.is_finite()) }
                 else { Value::boolean(false) }
+            }
+            -533 => { // Number.isSafeInteger
+                let v = args.first().copied().unwrap_or(Value::undefined());
+                if let Some(n) = v.as_number() {
+                    Value::boolean(n.fract() == 0.0 && n.is_finite() && n.abs() <= 9007199254740991.0)
+                } else { Value::boolean(false) }
             }
             _ => Value::undefined(),
         }

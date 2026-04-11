@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use regex::Regex;
 
 use crate::runtime::object::{JsObject, ObjectId, ObjectKind};
@@ -6,8 +7,42 @@ use crate::util::interner::StringId;
 
 use super::vm::{Vm, VmError};
 
+/// Cache for compiled regexes, keyed by (pattern, flags).
+pub struct RegexCache {
+    cache: HashMap<(String, String), Regex>,
+}
+
+impl RegexCache {
+    pub fn new() -> Self {
+        Self { cache: HashMap::new() }
+    }
+
+    pub fn get_or_compile(&mut self, pattern: &str, flags: &str) -> Result<(Regex, bool), String> {
+        let global = flags.contains('g');
+        let key = (pattern.to_string(), flags.to_string());
+        if let Some(re) = self.cache.get(&key) {
+            return Ok((re.clone(), global));
+        }
+        let mut prefix = String::new();
+        for ch in flags.chars() {
+            match ch {
+                'i' => prefix.push_str("(?i)"),
+                'm' => prefix.push_str("(?m)"),
+                's' => prefix.push_str("(?s)"),
+                'g' | 'u' | 'y' | 'd' => {} // handled separately or ignored
+                _ => return Err(format!("Invalid regex flag: {ch}")),
+            }
+        }
+        let rust_pattern = format!("{prefix}{pattern}");
+        let re = Regex::new(&rust_pattern).map_err(|e| format!("Invalid regex: {e}"))?;
+        self.cache.insert(key, re.clone());
+        Ok((re, global))
+    }
+}
+
 /// Translate JS regex pattern + flags to a compiled Rust Regex.
 /// Returns (compiled regex, is_global).
+#[allow(dead_code)]
 pub fn compile_js_regex(pattern: &str, flags: &str) -> Result<(Regex, bool), String> {
     let mut prefix = String::new();
     let mut global = false;
@@ -51,7 +86,7 @@ impl Vm {
                     .first()
                     .map(|v| self.value_to_string(*v))
                     .unwrap_or_default();
-                let (re, _global) = compile_js_regex(&pattern, &flags)
+                let (re, _global) = self.regex_cache.get_or_compile(&pattern, &flags)
                     .map_err(VmError::RuntimeError)?;
                 Ok(Value::boolean(re.is_match(&input)))
             }
@@ -60,7 +95,7 @@ impl Vm {
                     .first()
                     .map(|v| self.value_to_string(*v))
                     .unwrap_or_default();
-                let (re, _global) = compile_js_regex(&pattern, &flags)
+                let (re, _global) = self.regex_cache.get_or_compile(&pattern, &flags)
                     .map_err(VmError::RuntimeError)?;
                 match re.captures(&input) {
                     Some(caps) => {
@@ -118,7 +153,7 @@ impl Vm {
             }
         };
 
-        let (re, global) = compile_js_regex(&pattern, &flags).ok()?;
+        let (re, global) = self.regex_cache.get_or_compile(&pattern, &flags).ok()?;
 
         match method {
             "replace" => {

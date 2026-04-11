@@ -270,13 +270,6 @@ fn should_skip(source: &str) -> bool {
     source.contains("import(") ||
     source.contains("import.meta") ||
     source.contains("with (") ||
-    source.contains("Object.defineProperty") ||
-    source.contains("Object.getOwnPropertyDescriptor") ||
-    source.contains("Object.create(") ||
-    source.contains("Object.freeze") ||
-    source.contains("Object.seal") ||
-    source.contains("Object.getPrototypeOf") ||
-    source.contains("Object.preventExtensions") ||
     source.contains("flags: [") ||
     source.contains("includes: [") ||
     source.contains("propertyHelper.js") ||

@@ -4,7 +4,7 @@ use std::fmt;
 use crate::compiler::chunk::Chunk;
 use crate::compiler::opcode::OpCode;
 use crate::compiler::chunk::ChunkFlags;
-use crate::runtime::object::{GeneratorState, JsObject, ObjectHeap, ObjectId, ObjectKind, PromiseState, trace_value};
+use crate::runtime::object::{GeneratorState, JsObject, ObjectHeap, ObjectId, ObjectKind, PromiseState, Property, trace_value};
 use crate::runtime::value::Value;
 use crate::util::interner::{Interner, StringId};
 
@@ -119,6 +119,8 @@ pub struct Vm {
     pub(crate) module_cache: HashMap<String, ObjectId>,
     /// Base directory for resolving relative module imports
     pub(crate) module_dir: Option<String>,
+    /// Regex compilation cache
+    pub(crate) regex_cache: crate::vm::regexp::RegexCache,
 }
 
 impl Vm {
@@ -208,6 +210,14 @@ impl Vm {
         globals.insert(ref_error_name, Value::function(-513));
         let syntax_error_name = interner.intern("SyntaxError");
         globals.insert(syntax_error_name, Value::function(-514));
+        let map_name = interner.intern("Map");
+        globals.insert(map_name, Value::function(-540));
+        let set_name = interner.intern("Set");
+        globals.insert(set_name, Value::function(-541));
+        let weakmap_name = interner.intern("WeakMap");
+        globals.insert(weakmap_name, Value::function(-542));
+        let weakset_name = interner.intern("WeakSet");
+        globals.insert(weakset_name, Value::function(-543));
 
         // Pre-populate fast lookup Vec from all initial globals
         let globals_vec = {
@@ -241,6 +251,7 @@ impl Vm {
             output: Vec::new(),
             module_cache: HashMap::new(),
             module_dir: None,
+            regex_cache: crate::vm::regexp::RegexCache::new(),
         }
     }
 
@@ -647,9 +658,7 @@ impl Vm {
                 && let Some(obj) = self.heap.get(oid) {
                     // Classes have __constructor__ — typeof should be "function"
                     for &(k, _) in &obj.properties {
-                        if self.interner.resolve(k) == "__constructor__" {
-                            return "function";
-                        }
+                        if self.interner.resolve(k) == "__constructor__" { return "function"; }
                     }
                 }
             "object"
@@ -1457,12 +1466,61 @@ impl Vm {
                             self.push(Value::undefined());
                             continue;
                         }
+                        // Promise combinator resolve callback
+                        if s <= -800_000 && s > -900_000 {
+                            let encoded = (-800_000 - s) as u32;
+                            let tracker_oid = ObjectId(encoded / 1024);
+                            let index = (encoded % 1024) as usize;
+                            let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                            self.stack.truncate(func_pos);
+                            self.handle_combinator_resolve(tracker_oid, index, val)?;
+                            self.push(Value::undefined());
+                            continue;
+                        }
+                        // Promise combinator reject callback
+                        if s <= -900_000 && s > -1_000_000 {
+                            let encoded = (-900_000 - s) as u32;
+                            let tracker_oid = ObjectId(encoded / 1024);
+                            let index = (encoded % 1024) as usize;
+                            let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                            self.stack.truncate(func_pos);
+                            self.handle_combinator_reject(tracker_oid, index, val)?;
+                            self.push(Value::undefined());
+                            continue;
+                        }
+                        // Promise.finally fulfill callback
+                        if s <= -1_100_000 && s > -1_200_000 {
+                            let tracker_oid = ObjectId((-1_100_000 - s) as u32);
+                            let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                            self.stack.truncate(func_pos);
+                            // Call the finally callback, then resolve with original value
+                            if let Some(obj) = self.heap.get(tracker_oid)
+                                && let ObjectKind::FinallyTracker { callback, .. } = &obj.kind {
+                                    let cb = *callback;
+                                    let _ = self.call_function(cb, &[]);
+                                }
+                            self.push(val);
+                            continue;
+                        }
+                        // Promise.finally reject callback
+                        if s <= -1_200_000 && s > -1_300_000 {
+                            let tracker_oid = ObjectId((-1_200_000 - s) as u32);
+                            let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                            self.stack.truncate(func_pos);
+                            if let Some(obj) = self.heap.get(tracker_oid)
+                                && let ObjectKind::FinallyTracker { callback, .. } = &obj.kind {
+                                    let cb = *callback;
+                                    let _ = self.call_function(cb, &[]);
+                                }
+                            // Re-throw/reject: propagate rejection reason
+                            return Err(VmError::RuntimeError(self.value_to_string(val)));
+                        }
                     }
 
                     // Check for native global function sentinels
                     if func_val.is_function() {
                         let sentinel = func_val.as_function().unwrap();
-                        if (-532..=-500).contains(&sentinel) {
+                        if (-533..=-500).contains(&sentinel) {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                             let result = self.exec_global_fn(sentinel, &args);
                             self.stack.truncate(func_pos);
@@ -1730,10 +1788,27 @@ impl Vm {
                                     self.push(Value::int(elements.len() as i32));
                                     continue;
                                 }
+                        // Map/Set size property
+                        if name_str == "size" {
+                            if let Some(obj) = self.heap.get(oid) {
+                                match &obj.kind {
+                                    ObjectKind::Map { entries } => { self.push(Value::int(entries.len() as i32)); continue; }
+                                    ObjectKind::Set { entries } => { self.push(Value::int(entries.len() as i32)); continue; }
+                                    _ => {}
+                                }
+                            }
+                        }
                         // Check for array methods (push, pop, etc.)
-                        if name_str == "push" || name_str == "pop" || name_str == "join"
-                            || name_str == "indexOf" || name_str == "includes"
-                            || name_str == "map" || name_str == "filter" || name_str == "forEach" {
+                        if matches!(name_str,
+                            "push" | "pop" | "join" | "indexOf" | "lastIndexOf"
+                            | "includes" | "map" | "filter" | "forEach"
+                            | "find" | "findIndex" | "findLast" | "findLastIndex"
+                            | "some" | "every" | "reduce" | "reduceRight"
+                            | "reverse" | "shift" | "unshift"
+                            | "splice" | "slice" | "concat" | "sort"
+                            | "fill" | "copyWithin" | "flat" | "flatMap"
+                            | "at" | "keys" | "values" | "entries" | "toString"
+                        ) {
                             // Store as sentinel: array_oid in high bits, method marker in low
                             // We'll handle these in CallMethod
                             let sentinel = -((oid.0 as i32 + 1) * 1000 + name_id.0 as i32);
@@ -1790,7 +1865,8 @@ impl Vm {
                             | "trim" | "trimStart" | "trimEnd"
                             | "split" | "replace" | "repeat"
                             | "padStart" | "padEnd" | "concat"
-                            | "match" | "search" | "replaceAll" => {
+                            | "match" | "search" | "replaceAll"
+                            | "codePointAt" | "at" => {
                                 // Encode: string sentinel = -200 - method_index
                                 let method_idx = match name_str {
                                     "charAt" => 0, "charCodeAt" => 1, "indexOf" => 2,
@@ -1801,6 +1877,7 @@ impl Vm {
                                     "split" => 14, "replace" => 15, "repeat" => 16,
                                     "padStart" => 17, "padEnd" => 18, "concat" => 19,
                                     "match" => 20, "search" => 21, "replaceAll" => 22,
+                                    "codePointAt" => 23, "at" => 24,
                                     _ => 99,
                                 };
                                 self.push(Value::function(-200 - method_idx));
@@ -1823,6 +1900,7 @@ impl Vm {
                                 "isNaN" => Value::function(-530),
                                 "isFinite" => Value::function(-531),
                                 "isInteger" => Value::function(-532),
+                                "isSafeInteger" => Value::function(-533),
                                 "parseInt" => Value::function(-500),
                                 "parseFloat" => Value::function(-501),
                                 _ => Value::undefined(),
@@ -2056,6 +2134,60 @@ impl Vm {
                             self.push(result);
                             continue;
                         }
+                        // Check for Map methods
+                        if let Some(obj) = self.heap.get(oid)
+                            && matches!(&obj.kind, ObjectKind::Map { .. })
+                        {
+                            let mn = self.interner.resolve(method_name);
+                            if mn == "size" {
+                                let sz = if let ObjectKind::Map { entries } = &self.heap.get(oid).unwrap().kind { entries.len() } else { 0 };
+                                self.stack.truncate(obj_pos);
+                                self.push(Value::int(sz as i32));
+                                continue;
+                            }
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            let result = self.exec_map_method(oid, method_name, &args)?;
+                            self.stack.truncate(obj_pos);
+                            self.push(result);
+                            continue;
+                        }
+                        // Check for Set methods
+                        if let Some(obj) = self.heap.get(oid)
+                            && matches!(&obj.kind, ObjectKind::Set { .. })
+                        {
+                            let mn = self.interner.resolve(method_name);
+                            if mn == "size" {
+                                let sz = if let ObjectKind::Set { entries } = &self.heap.get(oid).unwrap().kind { entries.len() } else { 0 };
+                                self.stack.truncate(obj_pos);
+                                self.push(Value::int(sz as i32));
+                                continue;
+                            }
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            let result = self.exec_set_method(oid, method_name, &args)?;
+                            self.stack.truncate(obj_pos);
+                            self.push(result);
+                            continue;
+                        }
+                        // Check for WeakMap methods
+                        if let Some(obj) = self.heap.get(oid)
+                            && matches!(&obj.kind, ObjectKind::WeakMap { .. })
+                        {
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            let result = self.exec_weakmap_method(oid, method_name, &args)?;
+                            self.stack.truncate(obj_pos);
+                            self.push(result);
+                            continue;
+                        }
+                        // Check for WeakSet methods
+                        if let Some(obj) = self.heap.get(oid)
+                            && matches!(&obj.kind, ObjectKind::WeakSet { .. })
+                        {
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            let result = self.exec_weakset_method(oid, method_name, &args)?;
+                            self.stack.truncate(obj_pos);
+                            self.push(result);
+                            continue;
+                        }
                         // Check for Math methods
                         let math_name = self.interner.intern("Math");
                         if self.globals.get(&math_name).map(|v| v.as_object_id()) == Some(Some(oid)) {
@@ -2129,7 +2261,9 @@ impl Vm {
                             "keys" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                                     let keys: Vec<Value> = self.heap.get(oid)
-                                        .map(|o| o.properties.iter().map(|(k, _)| Value::string(*k)).collect())
+                                        .map(|o| o.properties.iter()
+                                            .filter(|(_, p)| p.is_enumerable())
+                                            .map(|(k, _)| Value::string(*k)).collect())
                                         .unwrap_or_default();
                                     let arr = JsObject::array(keys);
                                     Value::object_id(self.heap.allocate(arr))
@@ -2138,7 +2272,9 @@ impl Vm {
                             "values" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                                     let vals: Vec<Value> = self.heap.get(oid)
-                                        .map(|o| o.properties.iter().map(|(_, v)| *v).collect())
+                                        .map(|o| o.properties.iter()
+                                            .filter(|(_, p)| p.is_enumerable())
+                                            .map(|(_, p)| p.value).collect())
                                         .unwrap_or_default();
                                     let arr = JsObject::array(vals);
                                     Value::object_id(self.heap.allocate(arr))
@@ -2147,7 +2283,9 @@ impl Vm {
                             "entries" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                                     let pairs: Vec<(Value, Value)> = self.heap.get(oid)
-                                        .map(|o| o.properties.iter().map(|&(k, v)| (Value::string(k), v)).collect())
+                                        .map(|o| o.properties.iter()
+                                            .filter(|(_, p)| p.is_enumerable())
+                                            .map(|&(k, ref p)| (Value::string(k), p.value)).collect())
                                         .unwrap_or_default();
                                     let mut entries = Vec::new();
                                     for (k, v) in pairs {
@@ -2158,6 +2296,232 @@ impl Vm {
                                     Value::object_id(self.heap.allocate(arr))
                                 } else { Value::undefined() }
                             }
+                            "assign" => {
+                                let target = args.first().copied().unwrap_or(Value::undefined());
+                                if let Some(target_oid) = target.as_object_id() {
+                                    for source_val in args.iter().skip(1) {
+                                        if let Some(src_oid) = source_val.as_object_id() {
+                                            let props: Vec<(StringId, Value)> = self.heap.get(src_oid)
+                                                .map(|o| o.properties.iter()
+                                                    .filter(|(_, p)| p.is_enumerable())
+                                                    .map(|&(k, ref p)| (k, p.value)).collect())
+                                                .unwrap_or_default();
+                                            for (k, v) in props {
+                                                if let Some(obj) = self.heap.get_mut(target_oid) {
+                                                    obj.set_property(k, v);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    target
+                                } else { target }
+                            }
+                            "create" => {
+                                let proto = args.first().copied().unwrap_or(Value::null());
+                                let mut obj = JsObject::ordinary();
+                                obj.prototype = proto.as_object_id();
+                                // Handle property descriptors argument (2nd arg)
+                                if let Some(desc_val) = args.get(1)
+                                    && let Some(desc_oid) = desc_val.as_object_id()
+                                {
+                                    let props: Vec<(StringId, Value)> = self.heap.get(desc_oid)
+                                        .map(|o| o.properties.iter().map(|&(k, ref p)| (k, p.value)).collect())
+                                        .unwrap_or_default();
+                                    for (key, desc_obj_val) in props {
+                                        if let Some(d_oid) = desc_obj_val.as_object_id() {
+                                            let value_key = self.interner.intern("value");
+                                            let val = self.heap.get_property_chain(d_oid, value_key)
+                                                .unwrap_or(Value::undefined());
+                                            obj.set_property(key, val);
+                                        }
+                                    }
+                                }
+                                Value::object_id(self.heap.allocate(obj))
+                            }
+                            "defineProperty" => {
+                                let target = args.first().copied().unwrap_or(Value::undefined());
+                                let key_val = args.get(1).copied().unwrap_or(Value::undefined());
+                                let desc_val = args.get(2).copied().unwrap_or(Value::undefined());
+                                if let Some(target_oid) = target.as_object_id() {
+                                    let key_str = self.value_to_string(key_val);
+                                    let key_id = self.interner.intern(&key_str);
+
+                                    let mut flags = Property::ALL;
+                                    let mut value = Value::undefined();
+
+                                    if let Some(desc_oid) = desc_val.as_object_id() {
+                                        let writable_key = self.interner.intern("writable");
+                                        let enumerable_key = self.interner.intern("enumerable");
+                                        let configurable_key = self.interner.intern("configurable");
+                                        let value_key = self.interner.intern("value");
+                                        let get_key = self.interner.intern("get");
+                                        let set_key = self.interner.intern("set");
+
+                                        if let Some(v) = self.heap.get_property_chain(desc_oid, value_key) {
+                                            value = v;
+                                        }
+                                        flags = 0;
+                                        if let Some(v) = self.heap.get_property_chain(desc_oid, writable_key) {
+                                            if v.to_boolean() { flags |= Property::WRITABLE; }
+                                        }
+                                        if let Some(v) = self.heap.get_property_chain(desc_oid, enumerable_key) {
+                                            if v.to_boolean() { flags |= Property::ENUMERABLE; }
+                                        }
+                                        if let Some(v) = self.heap.get_property_chain(desc_oid, configurable_key) {
+                                            if v.to_boolean() { flags |= Property::CONFIGURABLE; }
+                                        }
+                                        // Handle getter/setter
+                                        if let Some(getter) = self.heap.get_property_chain(desc_oid, get_key) {
+                                            if getter.is_function() {
+                                                let getter_key = self.interner.intern(&format!("__get_{key_str}__"));
+                                                if let Some(obj) = self.heap.get_mut(target_oid) {
+                                                    obj.set_property(getter_key, getter);
+                                                }
+                                            }
+                                        }
+                                        if let Some(setter) = self.heap.get_property_chain(desc_oid, set_key) {
+                                            if setter.is_function() {
+                                                let setter_key = self.interner.intern(&format!("__set_{key_str}__"));
+                                                if let Some(obj) = self.heap.get_mut(target_oid) {
+                                                    obj.set_property(setter_key, setter);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Some(obj) = self.heap.get_mut(target_oid) {
+                                        obj.define_property(key_id, Property::with_flags(value, flags));
+                                    }
+                                    target
+                                } else { target }
+                            }
+                            "defineProperties" => {
+                                let target = args.first().copied().unwrap_or(Value::undefined());
+                                // Simplified: treat like Object.assign for now
+                                target
+                            }
+                            "getOwnPropertyDescriptor" => {
+                                if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
+                                    let key_str = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_default();
+                                    let key_id = self.interner.intern(&key_str);
+                                    if let Some(obj) = self.heap.get(oid)
+                                        && let Some(prop) = obj.get_property_descriptor(key_id) {
+                                            let mut desc = JsObject::ordinary();
+                                            let val_key = self.interner.intern("value");
+                                            let wr_key = self.interner.intern("writable");
+                                            let en_key = self.interner.intern("enumerable");
+                                            let cf_key = self.interner.intern("configurable");
+                                            desc.set_property(val_key, prop.value);
+                                            desc.set_property(wr_key, Value::boolean(prop.is_writable()));
+                                            desc.set_property(en_key, Value::boolean(prop.is_enumerable()));
+                                            desc.set_property(cf_key, Value::boolean(prop.is_configurable()));
+                                            Value::object_id(self.heap.allocate(desc))
+                                        } else { Value::undefined() }
+                                } else { Value::undefined() }
+                            }
+                            "getOwnPropertyNames" => {
+                                if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
+                                    let names: Vec<Value> = self.heap.get(oid)
+                                        .map(|o| o.properties.iter().map(|(k, _)| Value::string(*k)).collect())
+                                        .unwrap_or_default();
+                                    let arr = JsObject::array(names);
+                                    Value::object_id(self.heap.allocate(arr))
+                                } else { Value::undefined() }
+                            }
+                            "freeze" => {
+                                let target = args.first().copied().unwrap_or(Value::undefined());
+                                if let Some(oid) = target.as_object_id() {
+                                    if let Some(obj) = self.heap.get_mut(oid) {
+                                        obj.extensible = false;
+                                        for entry in &mut obj.properties {
+                                            entry.1.flags &= !(Property::WRITABLE | Property::CONFIGURABLE);
+                                        }
+                                    }
+                                }
+                                target
+                            }
+                            "seal" => {
+                                let target = args.first().copied().unwrap_or(Value::undefined());
+                                if let Some(oid) = target.as_object_id() {
+                                    if let Some(obj) = self.heap.get_mut(oid) {
+                                        obj.extensible = false;
+                                        for entry in &mut obj.properties {
+                                            entry.1.flags &= !Property::CONFIGURABLE;
+                                        }
+                                    }
+                                }
+                                target
+                            }
+                            "isFrozen" => {
+                                if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
+                                    let frozen = self.heap.get(oid)
+                                        .map(|o| !o.extensible && o.properties.iter().all(|(_, p)| !p.is_writable() && !p.is_configurable()))
+                                        .unwrap_or(true);
+                                    Value::boolean(frozen)
+                                } else { Value::boolean(true) }
+                            }
+                            "isSealed" => {
+                                if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
+                                    let sealed = self.heap.get(oid)
+                                        .map(|o| !o.extensible && o.properties.iter().all(|(_, p)| !p.is_configurable()))
+                                        .unwrap_or(true);
+                                    Value::boolean(sealed)
+                                } else { Value::boolean(true) }
+                            }
+                            "is" => {
+                                let a = args.first().copied().unwrap_or(Value::undefined());
+                                let b = args.get(1).copied().unwrap_or(Value::undefined());
+                                // Object.is: like === but NaN===NaN is true, +0!==-0 is true
+                                let result = if a.is_number() && b.is_number() {
+                                    let na = a.as_number().unwrap();
+                                    let nb = b.as_number().unwrap();
+                                    if na.is_nan() && nb.is_nan() { true }
+                                    else if na == 0.0 && nb == 0.0 { na.to_bits() == nb.to_bits() }
+                                    else { na == nb }
+                                } else {
+                                    self.strict_eq(a, b)
+                                };
+                                Value::boolean(result)
+                            }
+                            "getPrototypeOf" => {
+                                if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
+                                    self.heap.get(oid)
+                                        .and_then(|o| o.prototype.map(Value::object_id))
+                                        .unwrap_or(Value::null())
+                                } else { Value::null() }
+                            }
+                            "setPrototypeOf" => {
+                                let target = args.first().copied().unwrap_or(Value::undefined());
+                                if let Some(oid) = target.as_object_id() {
+                                    let proto = args.get(1).copied().unwrap_or(Value::null());
+                                    if let Some(obj) = self.heap.get_mut(oid) {
+                                        obj.prototype = proto.as_object_id();
+                                    }
+                                }
+                                target
+                            }
+                            "preventExtensions" => {
+                                let target = args.first().copied().unwrap_or(Value::undefined());
+                                if let Some(oid) = target.as_object_id() {
+                                    if let Some(obj) = self.heap.get_mut(oid) {
+                                        obj.extensible = false;
+                                    }
+                                }
+                                target
+                            }
+                            "isExtensible" => {
+                                if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
+                                    Value::boolean(self.heap.get(oid).map(|o| o.extensible).unwrap_or(false))
+                                } else { Value::boolean(false) }
+                            }
+                            "hasOwn" => {
+                                let target = args.first().copied().unwrap_or(Value::undefined());
+                                let key_val = args.get(1).copied().unwrap_or(Value::undefined());
+                                if let Some(oid) = target.as_object_id() {
+                                    let key_str = self.value_to_string(key_val);
+                                    let key_id = self.interner.intern(&key_str);
+                                    Value::boolean(self.heap.get(oid).map(|o| o.has_own_property(key_id)).unwrap_or(false))
+                                } else { Value::boolean(false) }
+                            }
                             _ => Value::undefined(),
                         };
                         self.stack.truncate(obj_pos);
@@ -2165,25 +2529,70 @@ impl Vm {
                         continue;
                     }
 
-                    // Array.isArray
+                    // Array.isArray / Array.from / Array.of
                     if obj_val.is_function() && obj_val.as_function() == Some(-507) {
                         let mn = self.interner.resolve(method_name).to_owned();
-                        if mn == "isArray" {
-                            let arg = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
-                            let is_arr = arg.as_object_id()
-                                .and_then(|oid| self.heap.get(oid))
-                                .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
-                                .unwrap_or(false);
-                            self.stack.truncate(obj_pos);
-                            self.push(Value::boolean(is_arr));
-                            continue;
+                        match mn.as_str() {
+                            "isArray" => {
+                                let arg = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
+                                let is_arr = arg.as_object_id()
+                                    .and_then(|oid| self.heap.get(oid))
+                                    .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
+                                    .unwrap_or(false);
+                                self.stack.truncate(obj_pos);
+                                self.push(Value::boolean(is_arr));
+                                continue;
+                            }
+                            "from" => {
+                                let source = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
+                                let map_fn = if argc > 1 { Some(self.stack[obj_pos + 2]) } else { None };
+                                let mut result = Vec::new();
+                                if let Some(src_oid) = source.as_object_id()
+                                    && let Some(obj) = self.heap.get(src_oid)
+                                        && let ObjectKind::Array(ref elems) = obj.kind {
+                                            let elems = elems.clone();
+                                            for (i, elem) in elems.iter().enumerate() {
+                                                if let Some(mfn) = map_fn {
+                                                    result.push(self.call_function(mfn, &[*elem, Value::int(i as i32)])?);
+                                                } else {
+                                                    result.push(*elem);
+                                                }
+                                            }
+                                        } else if source.is_string() {
+                                    let sid = source.as_string_id().unwrap();
+                                    let s = self.interner.resolve(sid).to_owned();
+                                    for (i, ch) in s.chars().enumerate() {
+                                        let ch_id = self.interner.intern(&ch.to_string());
+                                        let val = Value::string(ch_id);
+                                        if let Some(mfn) = map_fn {
+                                            result.push(self.call_function(mfn, &[val, Value::int(i as i32)])?);
+                                        } else {
+                                            result.push(val);
+                                        }
+                                    }
+                                }
+                                let arr = JsObject::array(result);
+                                let new_oid = self.heap.allocate(arr);
+                                self.stack.truncate(obj_pos);
+                                self.push(Value::object_id(new_oid));
+                                continue;
+                            }
+                            "of" => {
+                                let items: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                                let arr = JsObject::array(items);
+                                let new_oid = self.heap.allocate(arr);
+                                self.stack.truncate(obj_pos);
+                                self.push(Value::object_id(new_oid));
+                                continue;
+                            }
+                            _ => {}
                         }
                     }
 
-                    // String.fromCharCode
+                    // String.fromCharCode / String.fromCodePoint
                     if obj_val.is_function() && obj_val.as_function() == Some(-504) {
                         let mn = self.interner.resolve(method_name).to_owned();
-                        if mn == "fromCharCode" {
+                        if mn == "fromCharCode" || mn == "fromCodePoint" {
                             let mut result = String::new();
                             for i in 0..argc {
                                 let code = self.to_f64(self.stack[obj_pos + 1 + i]) as u32;
@@ -2232,6 +2641,79 @@ impl Vm {
                         self.stack.truncate(func_pos);
                         self.push(Value::object_id(pid));
                         continue;
+                    }
+
+                    // Handle Map/Set/WeakMap/WeakSet constructors
+                    if func_val.is_function() {
+                        let sentinel = func_val.as_function().unwrap();
+                        match sentinel {
+                            -540 => { // new Map()
+                                let mut entries = Vec::new();
+                                // Optional iterable argument (array of [key, value] pairs)
+                                if argc > 0 {
+                                    if let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
+                                        && let Some(obj) = self.heap.get(arr_oid)
+                                            && let ObjectKind::Array(ref elems) = obj.kind {
+                                                let elems = elems.clone();
+                                                for elem in &elems {
+                                                    if let Some(pair_oid) = elem.as_object_id()
+                                                        && let Some(pair_obj) = self.heap.get(pair_oid)
+                                                            && let ObjectKind::Array(ref pair) = pair_obj.kind
+                                                                && pair.len() >= 2 {
+                                                                    entries.push((pair[0], pair[1]));
+                                                                }
+                                                }
+                                            }
+                                }
+                                let obj = JsObject {
+                                    properties: Vec::new(), prototype: None,
+                                    kind: ObjectKind::Map { entries }, marked: false, extensible: true,
+                                };
+                                let oid = self.heap.allocate(obj);
+                                self.stack.truncate(func_pos);
+                                self.push(Value::object_id(oid));
+                                continue;
+                            }
+                            -541 => { // new Set()
+                                let mut entries = Vec::new();
+                                if argc > 0 {
+                                    if let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
+                                        && let Some(obj) = self.heap.get(arr_oid)
+                                            && let ObjectKind::Array(ref elems) = obj.kind {
+                                                entries = elems.clone();
+                                            }
+                                }
+                                let obj = JsObject {
+                                    properties: Vec::new(), prototype: None,
+                                    kind: ObjectKind::Set { entries }, marked: false, extensible: true,
+                                };
+                                let oid = self.heap.allocate(obj);
+                                self.stack.truncate(func_pos);
+                                self.push(Value::object_id(oid));
+                                continue;
+                            }
+                            -542 => { // new WeakMap()
+                                let obj = JsObject {
+                                    properties: Vec::new(), prototype: None,
+                                    kind: ObjectKind::WeakMap { entries: Vec::new() }, marked: false, extensible: true,
+                                };
+                                let oid = self.heap.allocate(obj);
+                                self.stack.truncate(func_pos);
+                                self.push(Value::object_id(oid));
+                                continue;
+                            }
+                            -543 => { // new WeakSet()
+                                let obj = JsObject {
+                                    properties: Vec::new(), prototype: None,
+                                    kind: ObjectKind::WeakSet { entries: Vec::new() }, marked: false, extensible: true,
+                                };
+                                let oid = self.heap.allocate(obj);
+                                self.stack.truncate(func_pos);
+                                self.push(Value::object_id(oid));
+                                continue;
+                            }
+                            _ => {}
+                        }
                     }
 
                     // Handle wrapper constructors (new Number, new Boolean, new String)
@@ -2747,19 +3229,23 @@ impl Vm {
                                 prototype: None,
                                 kind: ObjectKind::ArrayIterator(oid, 0),
                                 marked: false,
+                                extensible: true,
                             };
                             let iter_id = self.heap.allocate(iter_obj);
                             self.push(Value::object_id(iter_id));
                         } else {
                             // Object key iterator (for...in)
                             let keys: Vec<_> = self.heap.get(oid)
-                                .map(|o| o.properties.iter().map(|(k, _)| *k).collect())
+                                .map(|o| o.properties.iter()
+                                    .filter(|(_, p)| p.is_enumerable())
+                                    .map(|(k, _)| *k).collect())
                                 .unwrap_or_default();
                             let iter_obj = JsObject {
                                 properties: Vec::new(),
                                 prototype: None,
                                 kind: ObjectKind::KeyIterator(keys, 0),
                                 marked: false,
+                                extensible: true,
                             };
                             let iter_id = self.heap.allocate(iter_obj);
                             self.push(Value::object_id(iter_id));
@@ -2779,6 +3265,7 @@ impl Vm {
                             prototype: None,
                             kind: ObjectKind::ArrayIterator(arr_oid, 0),
                             marked: false,
+                            extensible: true,
                         };
                         let iter_id = self.heap.allocate(iter_obj);
                         self.push(Value::object_id(iter_id));
@@ -3077,6 +3564,44 @@ impl Vm {
                         }
 
                         self.push(Value::object_id(exports_oid));
+                    }
+                }
+
+                OpCode::ExportAllFrom => {
+                    // export * from 'mod': import the module, copy all its exports to __exports__
+                    let src_idx = self.read_u16() as usize;
+                    let src_val = self.chunks[self.cur_chunk()].constants[src_idx];
+                    let module_path_raw = self.value_to_string(src_val);
+                    let module_path = module_path_raw.trim_matches(|c| c == '\'' || c == '"').to_owned();
+
+                    // Get or load the module (reuse ImportModule logic)
+                    let mod_exports_oid = if let Some(&oid) = self.module_cache.get(&module_path) {
+                        oid
+                    } else {
+                        // Import the module by pushing and executing it
+                        // For simplicity, just error — modules should be imported first
+                        return Err(VmError::RuntimeError(format!("Module '{}' not loaded for re-export", module_path)));
+                    };
+
+                    // Get our exports object
+                    let exports_key = self.interner.intern("__exports__");
+                    let our_exports = self.globals.get(&exports_key).copied();
+
+                    // Copy all properties from mod_exports to our_exports
+                    if let Some(our_val) = our_exports
+                        && let Some(our_oid) = our_val.as_object_id()
+                    {
+                        let props: Vec<(StringId, Value)> = self.heap.get(mod_exports_oid)
+                            .map(|obj| obj.properties.iter().map(|&(k, ref p)| (k, p.value)).collect())
+                            .unwrap_or_default();
+                        for (key, val) in props {
+                            // Skip 'default' export — export * doesn't re-export default
+                            let key_str = self.interner.resolve(key);
+                            if key_str == "default" { continue; }
+                            if let Some(obj) = self.heap.get_mut(our_oid) {
+                                obj.set_property(key, val);
+                            }
+                        }
                     }
                 }
 

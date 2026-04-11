@@ -7,13 +7,47 @@ pub type NativeFn = fn(&mut ObjectHeap, Value, &[Value]) -> Result<Value, Value>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectId(pub u32);
 
+/// Property flags: writable (W), enumerable (E), configurable (C).
+/// Default for user-created properties: all true (0b111).
+#[derive(Debug, Clone, Copy)]
+pub struct Property {
+    pub value: Value,
+    pub flags: u8,
+}
+
+impl Property {
+    pub const WRITABLE: u8     = 0b001;
+    pub const ENUMERABLE: u8   = 0b010;
+    pub const CONFIGURABLE: u8 = 0b100;
+    pub const ALL: u8          = 0b111;
+
+    #[inline(always)]
+    pub fn data(value: Value) -> Self {
+        Self { value, flags: Self::ALL }
+    }
+
+    #[inline(always)]
+    pub fn with_flags(value: Value, flags: u8) -> Self {
+        Self { value, flags }
+    }
+
+    #[inline(always)]
+    pub fn is_writable(self) -> bool { self.flags & Self::WRITABLE != 0 }
+    #[inline(always)]
+    pub fn is_enumerable(self) -> bool { self.flags & Self::ENUMERABLE != 0 }
+    #[inline(always)]
+    pub fn is_configurable(self) -> bool { self.flags & Self::CONFIGURABLE != 0 }
+}
+
 pub struct JsObject {
     /// Properties stored as a flat Vec for cache-friendly linear scan.
     /// Most JS objects have <=4 properties; linear scan beats HashMap.
-    pub properties: Vec<(StringId, Value)>,
+    pub properties: Vec<(StringId, Property)>,
     pub prototype: Option<ObjectId>,
     pub kind: ObjectKind,
     pub marked: bool,
+    /// Whether Object.preventExtensions() has been called
+    pub extensible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +106,44 @@ pub enum ObjectKind {
         result: Value,
         reactions: Vec<PromiseReaction>,
     },
+    /// Promise combinator tracking state (Promise.all, race, allSettled, any)
+    PromiseCombinator {
+        kind: CombinatorKind,
+        remaining: usize,
+        values: Vec<Value>,
+        result_promise: ObjectId,
+        /// For Promise.any: collect rejection reasons
+        errors: Vec<Value>,
+    },
+    /// Tracks a .finally() callback for propagation
+    FinallyTracker {
+        callback: Value,
+        is_reject: bool,
+    },
+    /// ES6 Map: ordered key-value pairs
+    Map {
+        entries: Vec<(Value, Value)>,
+    },
+    /// ES6 Set: ordered unique values
+    Set {
+        entries: Vec<Value>,
+    },
+    /// WeakMap: object keys only, not traced by GC
+    WeakMap {
+        entries: Vec<(ObjectId, Value)>,
+    },
+    /// WeakSet: object values only, not traced by GC
+    WeakSet {
+        entries: Vec<ObjectId>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CombinatorKind {
+    All,
+    Race,
+    AllSettled,
+    Any,
 }
 
 pub enum FunctionKind {
@@ -101,6 +173,22 @@ pub fn trace_value(val: Value) -> Option<ObjectId> {
         }
         if s <= -700_000 && s > -800_000 {
             return Some(ObjectId((-700_000 - s) as u32));
+        }
+        // Combinator resolve callbacks: tracker_oid encoded as (encoded / 1024)
+        if s <= -800_000 && s > -900_000 {
+            let encoded = (-800_000 - s) as u32;
+            return Some(ObjectId(encoded / 1024));
+        }
+        if s <= -900_000 && s > -1_000_000 {
+            let encoded = (-900_000 - s) as u32;
+            return Some(ObjectId(encoded / 1024));
+        }
+        // Finally tracker sentinels
+        if s <= -1_100_000 && s > -1_200_000 {
+            return Some(ObjectId((-1_100_000 - s) as u32));
+        }
+        if s <= -1_200_000 && s > -1_300_000 {
+            return Some(ObjectId((-1_200_000 - s) as u32));
         }
     }
     None
@@ -183,8 +271,8 @@ impl ObjectHeap {
         let mut refs = Vec::new();
 
         // Properties
-        for &(_, val) in &obj.properties {
-            if let Some(oid) = trace_value(val) { refs.push(oid); }
+        for &(_, ref prop) in &obj.properties {
+            if let Some(oid) = trace_value(prop.value) { refs.push(oid); }
         }
 
         // Prototype chain
@@ -230,6 +318,18 @@ impl ObjectHeap {
                     refs.push(reaction.promise);
                 }
             }
+            ObjectKind::PromiseCombinator { values, result_promise, errors, .. } => {
+                for val in values {
+                    if let Some(oid) = trace_value(*val) { refs.push(oid); }
+                }
+                for val in errors {
+                    if let Some(oid) = trace_value(*val) { refs.push(oid); }
+                }
+                refs.push(*result_promise);
+            }
+            ObjectKind::FinallyTracker { callback, .. } => {
+                if let Some(oid) = trace_value(*callback) { refs.push(oid); }
+            }
             ObjectKind::Function(fk) => {
                 if let FunctionKind::Bound { target, this_val, args } = fk {
                     refs.push(*target);
@@ -238,6 +338,26 @@ impl ObjectHeap {
                         if let Some(oid) = trace_value(*val) { refs.push(oid); }
                     }
                 }
+            }
+            ObjectKind::Map { entries } => {
+                for (k, v) in entries {
+                    if let Some(oid) = trace_value(*k) { refs.push(oid); }
+                    if let Some(oid) = trace_value(*v) { refs.push(oid); }
+                }
+            }
+            ObjectKind::Set { entries } => {
+                for v in entries {
+                    if let Some(oid) = trace_value(*v) { refs.push(oid); }
+                }
+            }
+            ObjectKind::WeakMap { entries } => {
+                // Only trace values, NOT keys (keys are weak references)
+                for (_, v) in entries {
+                    if let Some(oid) = trace_value(*v) { refs.push(oid); }
+                }
+            }
+            ObjectKind::WeakSet { .. } => {
+                // Do not trace entries (weak references)
             }
             ObjectKind::Ordinary
             | ObjectKind::KeyIterator(_, _)
@@ -295,6 +415,7 @@ impl JsObject {
             prototype: None,
             kind: ObjectKind::Ordinary,
             marked: false,
+            extensible: true,
         }
     }
 
@@ -308,6 +429,7 @@ impl JsObject {
                 reactions: Vec::new(),
             },
             marked: false,
+            extensible: true,
         }
     }
 
@@ -317,6 +439,7 @@ impl JsObject {
             prototype: None,
             kind: ObjectKind::Array(elements),
             marked: false,
+            extensible: true,
         }
     }
 
@@ -326,6 +449,7 @@ impl JsObject {
             prototype: None,
             kind: ObjectKind::Function(FunctionKind::Bytecode { chunk_idx, name }),
             marked: false,
+            extensible: true,
         }
     }
 
@@ -335,6 +459,7 @@ impl JsObject {
             prototype: None,
             kind: ObjectKind::Function(FunctionKind::Native { name, func }),
             marked: false,
+            extensible: true,
         }
     }
 
@@ -344,25 +469,68 @@ impl JsObject {
             prototype: None,
             kind: ObjectKind::RegExp { pattern, flags },
             marked: false,
+            extensible: true,
         }
     }
 
+    /// Get a property value (ignoring descriptor flags).
     #[inline(always)]
     pub fn get_property(&self, key: StringId) -> Option<Value> {
-        for &(k, v) in &self.properties {
-            if k == key { return Some(v); }
+        for &(k, ref prop) in &self.properties {
+            if k == key { return Some(prop.value); }
         }
         None
     }
 
+    /// Get the full property descriptor.
+    #[inline(always)]
+    pub fn get_property_descriptor(&self, key: StringId) -> Option<Property> {
+        for &(k, prop) in &self.properties {
+            if k == key { return Some(prop); }
+        }
+        None
+    }
+
+    /// Set a property value with default flags (writable|enumerable|configurable).
     #[inline(always)]
     pub fn set_property(&mut self, key: StringId, value: Value) {
         for entry in &mut self.properties {
             if entry.0 == key {
-                entry.1 = value;
+                // Respect writable flag
+                if entry.1.is_writable() {
+                    entry.1.value = value;
+                }
                 return;
             }
         }
-        self.properties.push((key, value));
+        self.properties.push((key, Property::data(value)));
+    }
+
+    /// Define a property with explicit flags (for Object.defineProperty).
+    pub fn define_property(&mut self, key: StringId, prop: Property) {
+        for entry in &mut self.properties {
+            if entry.0 == key {
+                entry.1 = prop;
+                return;
+            }
+        }
+        self.properties.push((key, prop));
+    }
+
+    /// Check if the object has its own property (not inherited).
+    pub fn has_own_property(&self, key: StringId) -> bool {
+        self.properties.iter().any(|&(k, _)| k == key)
+    }
+
+    /// Delete a property (respects configurable flag).
+    pub fn delete_property(&mut self, key: StringId) -> bool {
+        if let Some(idx) = self.properties.iter().position(|&(k, _)| k == key) {
+            if self.properties[idx].1.is_configurable() {
+                self.properties.remove(idx);
+                return true;
+            }
+            return false; // not configurable
+        }
+        true // property doesn't exist, deletion succeeds
     }
 }

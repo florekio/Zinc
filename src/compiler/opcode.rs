@@ -303,6 +303,8 @@ pub enum OpCode {
     ExportDefault = 0xEB,
     /// Read imported binding (u16 module, u16 binding)
     GetModuleVar = 0xEC,
+    /// export * from 'mod': import module then copy all exports (u16 source)
+    ExportAllFrom = 0xED,
 
     // ---- Miscellaneous ----
     /// No operation
@@ -506,6 +508,7 @@ impl OpCode {
             | OpCode::ClassPrivateMethod
             | OpCode::DestructureDefault
             | OpCode::ImportModule
+            | OpCode::ExportAllFrom
             | OpCode::SetFunctionName => 3,
 
             // 4 bytes (u16 + u16)

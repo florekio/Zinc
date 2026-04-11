@@ -123,7 +123,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         | OpCode::DefineMethod | OpCode::Class
         | OpCode::ClassStaticMethod | OpCode::ClassMethod
         | OpCode::ClassField | OpCode::ClassStaticField | OpCode::ClassPrivateMethod
-        | OpCode::SetFunctionName | OpCode::ImportModule
+        | OpCode::SetFunctionName | OpCode::ImportModule | OpCode::ExportAllFrom
         | OpCode::TypeOfGlobal | OpCode::DeleteGlobal => {
             let idx = chunk.read_u16(offset + 1);
             out.push_str(&format!("{op:<20} [{idx}]\n"));
