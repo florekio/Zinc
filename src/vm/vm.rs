@@ -63,6 +63,8 @@ pub(crate) struct CallFrame {
     pub(crate) pending_super_call: bool,
     /// If Some, this frame belongs to a generator object.
     pub(crate) generator_id: Option<crate::runtime::object::ObjectId>,
+    /// Number of actual arguments passed to this function call.
+    pub(crate) argc: usize,
 }
 
 /// An active exception handler (pushed by PushExcHandler).
@@ -257,7 +259,7 @@ impl Vm {
         
         Self {
             chunks,
-            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::undefined(), is_constructor: false, pending_super_call: false, generator_id: None }],
+            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::undefined(), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0 }],
             stack: Vec::with_capacity(256),
             globals,
             interner,
@@ -720,7 +722,7 @@ impl Vm {
     ///   - same type: strict equality
     ///   - null == undefined (and vice versa)
     ///   - number == string: coerce string to number
-    pub(crate) fn abstract_eq(&self, a: Value, b: Value) -> bool {
+    pub(crate) fn abstract_eq(&mut self, a: Value, b: Value) -> bool {
         // Fast path: identical bits
         if a.raw() == b.raw() {
             // NaN !== NaN
@@ -780,13 +782,13 @@ impl Vm {
         // object vs primitive: unwrap wrapper only when the OTHER side is primitive
         // (object == object compares references, not values)
         if a.is_object() && !b.is_object() {
-            let pa = self.to_primitive(a);
+            let pa = self.coerce_to_primitive(a);
             if pa.raw() != a.raw() {
                 return self.abstract_eq(pa, b);
             }
         }
         if b.is_object() && !a.is_object() {
-            let pb = self.to_primitive(b);
+            let pb = self.coerce_to_primitive(b);
             if pb.raw() != b.raw() {
                 return self.abstract_eq(a, pb);
             }
@@ -1053,13 +1055,15 @@ impl Vm {
                 OpCode::Eq => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    self.push(Value::boolean(self.abstract_eq(a, b)));
+                    let result = self.abstract_eq(a, b);
+                    self.push(Value::boolean(result));
                 }
 
                 OpCode::Ne => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    self.push(Value::boolean(!self.abstract_eq(a, b)));
+                    let result = self.abstract_eq(a, b);
+                    self.push(Value::boolean(!result));
                 }
 
                 OpCode::StrictEq => {
@@ -1075,8 +1079,8 @@ impl Vm {
                 }
 
                 OpCode::Lt => {
-                    let bv = self.pop()?; let b = self.to_primitive(bv);
-                    let av = self.pop()?; let a = self.to_primitive(av);
+                    let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
+                    let av = self.pop()?; let a = self.coerce_to_primitive(av);
                     if a.is_string() && b.is_string() {
                         let sa = self.interner.resolve(a.as_string_id().unwrap());
                         let sb = self.interner.resolve(b.as_string_id().unwrap());
@@ -1087,8 +1091,8 @@ impl Vm {
                 }
 
                 OpCode::Le => {
-                    let bv = self.pop()?; let b = self.to_primitive(bv);
-                    let av = self.pop()?; let a = self.to_primitive(av);
+                    let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
+                    let av = self.pop()?; let a = self.coerce_to_primitive(av);
                     if a.is_string() && b.is_string() {
                         let sa = self.interner.resolve(a.as_string_id().unwrap());
                         let sb = self.interner.resolve(b.as_string_id().unwrap());
@@ -1099,8 +1103,8 @@ impl Vm {
                 }
 
                 OpCode::Gt => {
-                    let bv = self.pop()?; let b = self.to_primitive(bv);
-                    let av = self.pop()?; let a = self.to_primitive(av);
+                    let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
+                    let av = self.pop()?; let a = self.coerce_to_primitive(av);
                     if a.is_string() && b.is_string() {
                         let sa = self.interner.resolve(a.as_string_id().unwrap());
                         let sb = self.interner.resolve(b.as_string_id().unwrap());
@@ -1111,8 +1115,8 @@ impl Vm {
                 }
 
                 OpCode::Ge => {
-                    let bv = self.pop()?; let b = self.to_primitive(bv);
-                    let av = self.pop()?; let a = self.to_primitive(av);
+                    let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
+                    let av = self.pop()?; let a = self.coerce_to_primitive(av);
                     if a.is_string() && b.is_string() {
                         let sa = self.interner.resolve(a.as_string_id().unwrap());
                         let sb = self.interner.resolve(b.as_string_id().unwrap());
@@ -1233,10 +1237,10 @@ impl Vm {
                         self.push(this_val);
                     } else if name_str == "arguments" && self.frames.len() > 1 {
                         let frame = self.frames.last().unwrap();
-                        let param_count = self.chunks[frame.chunk_idx].param_count as usize;
+                        let actual_argc = frame.argc;
                         let base = frame.base;
                         let mut args = Vec::new();
-                        for i in 0..param_count {
+                        for i in 0..actual_argc {
                             if base + i < self.stack.len() {
                                 args.push(self.stack[base + i]);
                             }
@@ -1487,6 +1491,7 @@ impl Vm {
                                 is_constructor: false,
                                 pending_super_call: false,
                                 generator_id: None,
+                                argc,
                             });
                             continue;
                         }
@@ -1914,10 +1919,9 @@ impl Vm {
                             | "fill" | "copyWithin" | "flat" | "flatMap"
                             | "at" | "keys" | "values" | "entries" | "toString"
                         ) {
-                            // Store as sentinel: array_oid in high bits, method marker in low
-                            // We'll handle these in CallMethod
+                            // Store as function sentinel for typeof correctness
                             let sentinel = -((oid.0 as i32 + 1) * 1000 + name_id.0 as i32);
-                            self.push(Value::int(sentinel));
+                            self.push(Value::function(sentinel));
                             // Also push the object back since CallMethod expects it
                             // Actually -- the object was already popped. For CallMethod,
                             // the compiler pushes obj first, then looks up the method.
@@ -2346,7 +2350,7 @@ impl Vm {
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: obj_pos + 1,
                                         upvalues, this_value: obj_val, is_constructor: false,
-                                        pending_super_call: false, generator_id: None,
+                                        pending_super_call: false, generator_id: None, argc: 0,
                                     });
                                     continue;
                                 }
@@ -2497,8 +2501,18 @@ impl Vm {
                                                 }
                                             }
                                     }
-                                    if let Some(obj) = self.heap.get_mut(target_oid) {
-                                        obj.define_property(key_id, Property::with_flags(value, flags));
+                                    // Only create data property if no getter/setter was defined
+                                    // (accessor and data descriptors are mutually exclusive)
+                                    let has_accessor = self.heap.get(target_oid)
+                                        .map(|o| {
+                                            let gk = self.interner.intern(&format!("__get_{key_str}__"));
+                                            let sk = self.interner.intern(&format!("__set_{key_str}__"));
+                                            o.has_own_property(gk) || o.has_own_property(sk)
+                                        })
+                                        .unwrap_or(false);
+                                    if !has_accessor
+                                        && let Some(obj) = self.heap.get_mut(target_oid) {
+                                            obj.define_property(key_id, Property::with_flags(value, flags));
                                     }
                                     target
                                 } else { target }
@@ -2963,7 +2977,7 @@ impl Vm {
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: func_pos + 1,
                                         upvalues, this_value: this_val, is_constructor: true,
-                                        pending_super_call: false, generator_id: None,
+                                        pending_super_call: false, generator_id: None, argc: 0,
                                     });
                                     continue;
                                 }
@@ -2998,6 +3012,7 @@ impl Vm {
                                 is_constructor: true,
                                 pending_super_call: false,
                                 generator_id: None,
+                                argc,
                             });
                             continue;
                         }

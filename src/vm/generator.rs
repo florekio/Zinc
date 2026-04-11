@@ -143,6 +143,7 @@ impl Vm {
                     is_constructor: false,
                     pending_super_call: false,
                     generator_id: Some(gen_oid),
+                    argc: 0,
                 });
 
                 // For SuspendedYield, the input becomes the result of the yield expression

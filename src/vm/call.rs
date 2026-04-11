@@ -45,7 +45,7 @@ impl Vm {
         self.frames.push(CallFrame {
             chunk_idx, ip: 0, base: func_pos + 1,
             upvalues, this_value, is_constructor: false,
-            pending_super_call: false, generator_id: None,
+            pending_super_call: false, generator_id: None, argc: args.len(),
         });
 
         // Run the callback by executing bytecode until its frame is popped.
@@ -131,7 +131,7 @@ impl Vm {
                     if len >= 2 { self.stack.swap(len - 1, len - 2); }
                 }
                 OpCode::Nop => {}
-                OpCode::Eq => { let b = self.pop()?; let a = self.pop()?; self.push(Value::boolean(self.abstract_eq(a,b))); }
+                OpCode::Eq => { let b = self.pop()?; let a = self.pop()?; let r = self.abstract_eq(a,b); self.push(Value::boolean(r)); }
                 OpCode::StrictEq => { let b = self.pop()?; let a = self.pop()?; self.push(Value::boolean(self.strict_eq(a,b))); }
                 OpCode::Lt => { let (a,b) = self.pop_numbers()?; self.push(Value::boolean(a<b)); }
                 OpCode::Le => { let (a,b) = self.pop_numbers()?; self.push(Value::boolean(a<=b)); }
@@ -320,7 +320,7 @@ impl Vm {
                     let val = self.peek()?;
                     self.globals.insert(nid, val);
                 }
-                OpCode::Ne => { let b = self.pop()?; let a = self.pop()?; self.push(Value::boolean(!self.abstract_eq(a,b))); }
+                OpCode::Ne => { let b = self.pop()?; let a = self.pop()?; let r = self.abstract_eq(a,b); self.push(Value::boolean(!r)); }
                 OpCode::StrictNe => { let b = self.pop()?; let a = self.pop()?; self.push(Value::boolean(!self.strict_eq(a,b))); }
                 OpCode::Inc => { let v = self.pop()?; self.push_number(v.as_number().unwrap_or(0.0) + 1.0); }
                 OpCode::Dec => { let v = self.pop()?; self.push_number(v.as_number().unwrap_or(0.0) - 1.0); }
