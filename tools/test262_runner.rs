@@ -160,12 +160,13 @@ fn should_skip(source: &str, meta: &TestMeta) -> bool {
     // Skip tests that reference features not captured in metadata
     if source.contains("Proxy(") || source.contains("new Proxy")
         || source.contains("Reflect.")
-        || source.contains("Symbol(") || source.contains("Symbol.")
         || source.contains("WeakRef(")
         || source.contains("SharedArrayBuffer")
         || source.contains("Atomics.")
         || source.contains("import(") || source.contains("import.meta")
-        || source.contains("with (")
+        || source.contains("Symbol.toPrimitive")
+        || source.contains("Symbol.species")
+        || source.contains("[Symbol.")
     {
         return true;
     }
@@ -177,9 +178,17 @@ fn should_skip(source: &str, meta: &TestMeta) -> bool {
     // Skip tests needing Function constructor (fnGlobalObject)
     if source.contains("fnGlobalObject") { return true; }
 
-    // Skip tests with flags/includes metadata and heavy eval usage
-    if source.contains("flags: [") || source.contains("includes: [") { return true; }
-    if source.contains("eval(") { return true; }
+    // Skip tests that require complex harness include files
+    for inc in &meta.includes {
+        match inc.as_str() {
+            "compareArray.js" | "deepEqual.js" | "nans.js"
+            | "decimalToHexString.js" | "isConstructor.js" => {} // safe to include
+            _ => return true, // skip tests needing other includes
+        }
+    }
+
+    // Skip tests with raw flag (parser edge cases, no harness)
+    if meta.flags.contains(&"raw".to_string()) { return true; }
 
     false
 }
