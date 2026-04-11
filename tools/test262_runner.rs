@@ -3,17 +3,218 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::time::Instant;
+use std::collections::HashMap;
 use zinc::engine::Engine;
+
+/// Parsed test262 YAML frontmatter metadata.
+struct TestMeta {
+    flags: Vec<String>,
+    includes: Vec<String>,
+    features: Vec<String>,
+    is_negative: bool,
+    negative_phase: String,
+    is_async: bool,
+}
+
+fn parse_meta(source: &str) -> TestMeta {
+    let mut flags = Vec::new();
+    let mut includes = Vec::new();
+    let mut features = Vec::new();
+    let mut is_negative = false;
+    let mut negative_phase = String::new();
+    let mut is_async = false;
+
+    // Extract YAML block between /*--- and ---*/
+    if let Some(start) = source.find("/*---") {
+        if let Some(end) = source[start..].find("---*/") {
+            let yaml = &source[start + 5..start + end];
+            let mut in_flags = false;
+            let mut in_includes = false;
+            let mut in_features = false;
+            let mut in_negative = false;
+
+            for line in yaml.lines() {
+                let trimmed = line.trim();
+
+                // Inline array: flags: [onlyStrict, raw]
+                if trimmed.starts_with("flags:") {
+                    in_flags = true; in_includes = false; in_features = false; in_negative = false;
+                    if let Some(bracket_content) = extract_bracket_list(trimmed) {
+                        flags = bracket_content;
+                        in_flags = false;
+                    }
+                    continue;
+                }
+                if trimmed.starts_with("includes:") {
+                    in_includes = true; in_flags = false; in_features = false; in_negative = false;
+                    if let Some(bracket_content) = extract_bracket_list(trimmed) {
+                        includes = bracket_content;
+                        in_includes = false;
+                    }
+                    continue;
+                }
+                if trimmed.starts_with("features:") {
+                    in_features = true; in_flags = false; in_includes = false; in_negative = false;
+                    if let Some(bracket_content) = extract_bracket_list(trimmed) {
+                        features = bracket_content;
+                        in_features = false;
+                    }
+                    continue;
+                }
+                if trimmed.starts_with("negative:") {
+                    is_negative = true;
+                    in_negative = true; in_flags = false; in_includes = false; in_features = false;
+                    continue;
+                }
+                // Other top-level key resets list parsing
+                if !trimmed.starts_with("- ") && !trimmed.starts_with("phase:") && !trimmed.starts_with("type:")
+                    && !trimmed.is_empty() && !trimmed.starts_with("#")
+                    && trimmed.contains(':')
+                    && !trimmed.starts_with("- ")
+                {
+                    if !in_negative || (!trimmed.starts_with("phase:") && !trimmed.starts_with("type:")) {
+                        in_flags = false; in_includes = false; in_features = false;
+                        if !trimmed.starts_with("phase:") && !trimmed.starts_with("type:") {
+                            in_negative = false;
+                        }
+                    }
+                }
+
+                // YAML list items
+                if trimmed.starts_with("- ") {
+                    let val = trimmed[2..].trim().to_string();
+                    if in_flags { flags.push(val); }
+                    else if in_includes { includes.push(val); }
+                    else if in_features { features.push(val); }
+                }
+
+                // Negative phase
+                if in_negative && trimmed.starts_with("phase:") {
+                    negative_phase = trimmed["phase:".len()..].trim().to_string();
+                }
+            }
+        }
+    }
+
+    is_async = flags.contains(&"async".to_string());
+
+    TestMeta { flags, includes, features, is_negative, negative_phase, is_async }
+}
+
+/// Extract items from inline bracket list like `flags: [onlyStrict, raw]`
+fn extract_bracket_list(line: &str) -> Option<Vec<String>> {
+    if let Some(open) = line.find('[') {
+        if let Some(close) = line.find(']') {
+            let inner = &line[open + 1..close];
+            let items: Vec<String> = inner.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return Some(items);
+        }
+    }
+    None
+}
+
+/// Features that Zinc does not yet support — skip tests requiring these.
+const UNSUPPORTED_FEATURES: &[&str] = &[
+    "Proxy", "Reflect",
+    "Symbol.asyncIterator", "Symbol.matchAll",
+    "WeakRef", "FinalizationRegistry",
+    "SharedArrayBuffer", "Atomics",
+    "async-iteration", "for-await-of",
+    "import-assertions", "import-attributes",
+    "dynamic-import", "import.meta",
+    "tail-call-optimization",
+    "Intl", "Temporal",
+    "resizable-arraybuffer", "arraybuffer-transfer",
+    "Regexp.escape",
+    "decorators",
+    "explicit-resource-management",
+    "iterator-helpers",
+    "set-methods",
+    "promise-with-resolvers",
+    "regexp-v-flag", "regexp-unicode-property-escapes",
+    "regexp-named-groups", "regexp-lookbehind", "regexp-dotall",
+    "regexp-match-indices",
+    "class-fields-private-in",
+    "class-static-block",
+    "logical-assignment-operators",
+    "json-modules",
+    "String.prototype.matchAll",
+    "Array.fromAsync",
+    "change-array-by-copy",
+];
+
+fn should_skip(source: &str, meta: &TestMeta) -> bool {
+    // Skip tests with exotic Unicode that our lexer can't handle
+    if source.contains('\u{2028}') || source.contains('\u{2029}')
+        || source.contains("\\u2028") || source.contains("\\u2029") {
+        return true;
+    }
+
+    // Skip based on unsupported features in YAML metadata
+    for feat in &meta.features {
+        for unsupported in UNSUPPORTED_FEATURES {
+            if feat == unsupported {
+                return true;
+            }
+        }
+    }
+
+    // Skip tests that reference features not captured in metadata
+    if source.contains("Proxy(") || source.contains("new Proxy")
+        || source.contains("Reflect.")
+        || source.contains("Symbol(") || source.contains("Symbol.")
+        || source.contains("WeakRef(")
+        || source.contains("SharedArrayBuffer")
+        || source.contains("Atomics.")
+        || source.contains("import(") || source.contains("import.meta")
+        || source.contains("with (")
+    {
+        return true;
+    }
+
+    // Skip module-mode and async tests for now
+    if meta.flags.contains(&"module".to_string()) { return true; }
+    if meta.is_async { return true; }
+
+    // Skip tests needing Function constructor (fnGlobalObject)
+    if source.contains("fnGlobalObject") { return true; }
+
+    // Skip tests with flags/includes metadata and heavy eval usage
+    if source.contains("flags: [") || source.contains("includes: [") { return true; }
+    if source.contains("eval(") { return true; }
+
+    false
+}
 
 fn main() {
     let test_root = Path::new("test262/test/language");
+    let harness_root = Path::new("test262/harness");
     if !test_root.exists() {
         eprintln!("Error: test262 not found. Run:");
         eprintln!("  git clone --depth 1 https://github.com/nicolo-ribaudo/test262.git");
         std::process::exit(1);
     }
 
-    // Categories to test (ordered by relevance to Zinc's capabilities)
+    // Pre-load harness files
+    let mut harness_cache: HashMap<String, String> = HashMap::new();
+    if harness_root.exists() {
+        if let Ok(entries) = fs::read_dir(harness_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "js").unwrap_or(false) {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        let name = path.file_name().unwrap().to_string_lossy().to_string();
+                        harness_cache.insert(name, content);
+                    }
+                }
+            }
+        }
+    }
+
+    // Categories to test
     let categories = vec![
         "expressions/addition",
         "expressions/subtraction",
@@ -79,7 +280,6 @@ fn main() {
         "asi",
         "block-scope",
         "keywords",
-        // "identifiers", // mostly Unicode escape tests, skip for now
         "line-terminators",
         "function-code",
         "global-code",
@@ -104,9 +304,10 @@ fn main() {
         "statements/let",
         "directive-prologue",
         "future-reserved-words",
-        // "reserved-words", // 52% — many need strict mode
-        // "module-code", // 18% — most need multi-file imports or strict module semantics
-        // "export", // needs module mode
+        "reserved-words",
+        // "destructuring", // TODO: many edge cases
+        // "spread", // TODO
+        // "default-parameters", // TODO
     ];
 
     let mut total = 0;
@@ -137,8 +338,10 @@ fn main() {
                 Err(_) => continue,
             };
 
+            let meta = parse_meta(&source);
+
             // Skip tests that need features Zinc doesn't support
-            if should_skip(&source) {
+            if should_skip(&source, &meta) {
                 skipped += 1;
                 continue;
             }
@@ -146,11 +349,9 @@ fn main() {
             total += 1;
             cat_total += 1;
 
-            let expects_error = source.contains("negative:");
+            let result = run_test(&source, &meta, &harness_cache);
 
-            let result = run_test(&source);
-
-            if expects_error {
+            if meta.is_negative {
                 if result.is_err() {
                     passed += 1;
                     cat_passed += 1;
@@ -188,7 +389,7 @@ fn main() {
     let pct = if total > 0 { passed as f64 / total as f64 * 100.0 } else { 0.0 };
     println!("{:<45} {:>5} {:>5} {:>5} {:>6.1}%", "TOTAL", total, passed, failed, pct);
     println!();
-    println!("Skipped: {} (use eval, Proxy, Symbol, etc.)", skipped);
+    println!("Skipped: {}", skipped);
     println!("Time: {:.2}s", elapsed.as_secs_f64());
     println!();
 }
@@ -211,9 +412,9 @@ fn printf_header() {
     println!("{}", "─".repeat(75));
 }
 
-fn run_test(source: &str) -> Result<(), String> {
-    let harness = r#"
-function Test262Error(msg) { this.message = msg; }
+fn run_test(source: &str, meta: &TestMeta, harness_cache: &HashMap<String, String>) -> Result<(), String> {
+    let base_harness = r#"
+function Test262Error(msg) { this.message = msg; this.name = "Test262Error"; }
 function assert(condition, msg) { if (!condition) throw new Test262Error(msg || "assertion failed"); }
 assert.sameValue = function(a, b, msg) {
     if (a !== b) {
@@ -228,9 +429,32 @@ assert.throws = function(err, fn, msg) {
     try { fn(); throw new Test262Error(msg || "expected exception"); } catch(e) { }
 };
 function $ERROR(msg) { throw new Test262Error(msg); }
+var $262 = {};
 "#;
 
-    let full_source = format!("{harness}\n{source}");
+    // Build full source with harness + includes + flags
+    let mut parts = Vec::new();
+
+    // Don't prepend harness for raw tests
+    if !meta.flags.contains(&"raw".to_string()) {
+        parts.push(base_harness.to_string());
+
+        // Load requested include files
+        for inc in &meta.includes {
+            if let Some(content) = harness_cache.get(inc) {
+                parts.push(content.clone());
+            }
+        }
+    }
+
+    // Handle onlyStrict flag
+    if meta.flags.contains(&"onlyStrict".to_string()) {
+        parts.push("\"use strict\";\n".to_string());
+    }
+
+    parts.push(source.to_string());
+
+    let full_source = parts.join("\n");
 
     let full_source_clone = full_source.clone();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -248,30 +472,4 @@ function $ERROR(msg) { throw new Test262Error(msg); }
         Ok(Err(_)) => Err("panic".to_string()),
         Err(_) => Err("timeout".to_string()),
     }
-}
-
-fn should_skip(source: &str) -> bool {
-    // Skip tests with exotic Unicode that our lexer can't handle
-    source.contains('\u{2028}') ||
-    source.contains('\u{2029}') ||
-    source.contains("\\u2028") ||
-    source.contains("\\u2029") ||
-    // Skip tests that use features Zinc doesn't support
-    source.contains("eval(") ||
-    source.contains("Proxy") ||
-    source.contains("Reflect") ||
-    source.contains("Symbol") ||
-    source.contains("WeakRef") ||
-    source.contains("FinalizationRegistry") ||
-    source.contains("SharedArrayBuffer") ||
-    source.contains("Atomics") ||
-    source.contains("async iteration") ||
-    source.contains("generators") ||
-    source.contains("import(") ||
-    source.contains("import.meta") ||
-    source.contains("with (") ||
-    source.contains("flags: [") ||
-    source.contains("includes: [") ||
-    source.contains("propertyHelper.js") ||
-    source.contains("fnGlobalObject")
 }

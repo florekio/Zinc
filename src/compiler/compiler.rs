@@ -100,6 +100,11 @@ impl<'a> Compiler<'a> {
     pub fn compile_program(mut self, program: &Program) -> Result<Chunk, String> {
         if program.source_type == SourceType::Module {
             self.chunk.flags |= ChunkFlags::MODULE;
+            self.chunk.flags |= ChunkFlags::STRICT; // modules are always strict
+        }
+        // Detect "use strict" directive prologue
+        if self.has_use_strict_directive(&program.body) {
+            self.chunk.flags |= ChunkFlags::STRICT;
         }
         // Hoist var declarations: scan for all `var` in the body and define them as undefined
         if self.scope_depth == 0 {
@@ -1173,6 +1178,27 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// Check if the body starts with a "use strict" directive prologue.
+    fn has_use_strict_directive(&self, body: &[Statement]) -> bool {
+        for stmt in body {
+            match stmt {
+                Statement::Expression(expr_stmt) => {
+                    if let Expression::StringLiteral(s) = &expr_stmt.expression {
+                        let text = self.interner.resolve(s.value);
+                        if text == "use strict" {
+                            return true;
+                        }
+                        // Continue checking — directives can be multiple strings
+                        continue;
+                    }
+                    break; // Non-string expression ends directive prologue
+                }
+                _ => break, // Any non-expression statement ends prologue
+            }
+        }
+        false
+    }
+
     fn extract_declaration_names(&self, stmt: &Statement) -> Vec<StringId> {
         match stmt {
             Statement::Variable(decl) => {
@@ -1222,6 +1248,10 @@ impl<'a> Compiler<'a> {
         }
         if is_generator {
             flags |= ChunkFlags::GENERATOR;
+        }
+        // Inherit strict mode from parent, or detect "use strict" directive
+        if self.chunk.flags.contains(ChunkFlags::STRICT) || self.has_use_strict_directive(&body.body) {
+            flags |= ChunkFlags::STRICT;
         }
         child_chunk.flags = flags;
 

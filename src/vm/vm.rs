@@ -121,6 +121,17 @@ pub struct Vm {
     pub(crate) module_dir: Option<String>,
     /// Regex compilation cache
     pub(crate) regex_cache: crate::vm::regexp::RegexCache,
+    /// Symbol descriptions: index = symbol_id, value = optional description StringId
+    pub(crate) symbol_descriptions: Vec<Option<StringId>>,
+    /// Next symbol ID to allocate
+    pub(crate) next_symbol_id: u32,
+    /// Well-known symbol IDs
+    pub(crate) sym_iterator: u32,
+    pub(crate) sym_has_instance: u32,
+    pub(crate) sym_to_primitive: u32,
+    pub(crate) sym_to_string_tag: u32,
+    pub(crate) sym_species: u32,
+    pub(crate) sym_unscopables: u32,
 }
 
 impl Vm {
@@ -210,6 +221,10 @@ impl Vm {
         globals.insert(ref_error_name, Value::function(-513));
         let syntax_error_name = interner.intern("SyntaxError");
         globals.insert(syntax_error_name, Value::function(-514));
+        let eval_name = interner.intern("eval");
+        globals.insert(eval_name, Value::function(-560));
+        let symbol_name = interner.intern("Symbol");
+        globals.insert(symbol_name, Value::function(-570));
         let map_name = interner.intern("Map");
         globals.insert(map_name, Value::function(-540));
         let set_name = interner.intern("Set");
@@ -218,6 +233,16 @@ impl Vm {
         globals.insert(weakmap_name, Value::function(-542));
         let weakset_name = interner.intern("WeakSet");
         globals.insert(weakset_name, Value::function(-543));
+
+        // Pre-register well-known symbol descriptions
+        let sym_descs = vec![
+            Some(interner.intern("Symbol.iterator")),
+            Some(interner.intern("Symbol.hasInstance")),
+            Some(interner.intern("Symbol.toPrimitive")),
+            Some(interner.intern("Symbol.toStringTag")),
+            Some(interner.intern("Symbol.species")),
+            Some(interner.intern("Symbol.unscopables")),
+        ];
 
         // Pre-populate fast lookup Vec from all initial globals
         let globals_vec = {
@@ -252,6 +277,14 @@ impl Vm {
             module_cache: HashMap::new(),
             module_dir: None,
             regex_cache: crate::vm::regexp::RegexCache::new(),
+            symbol_descriptions: sym_descs,
+            next_symbol_id: 6, // 0-5 are well-known
+            sym_iterator: 0,
+            sym_has_instance: 1,
+            sym_to_primitive: 2,
+            sym_to_string_tag: 3,
+            sym_species: 4,
+            sym_unscopables: 5,
         }
     }
 
@@ -431,6 +464,12 @@ impl Vm {
     #[inline(always)]
     pub(crate) fn cur_chunk(&self) -> usize {
         unsafe { self.frames.last().unwrap_unchecked().chunk_idx }
+    }
+
+    /// Check if the current frame is in strict mode.
+    #[inline(always)]
+    pub(crate) fn is_strict(&self) -> bool {
+        self.chunks[self.cur_chunk()].flags.contains(ChunkFlags::STRICT)
     }
 
     #[inline(always)]
@@ -613,6 +652,13 @@ impl Vm {
                 // Use JS-like number formatting
                 let s = format!("{f}");
                 s
+            }
+        } else if val.is_symbol() {
+            let id = val.as_symbol_id().unwrap();
+            if let Some(Some(desc)) = self.symbol_descriptions.get(id as usize) {
+                format!("Symbol({})", self.interner.resolve(*desc))
+            } else {
+                "Symbol()".into()
             }
         } else if val.is_function() {
             "function() { [native code] }".into()
@@ -1517,6 +1563,65 @@ impl Vm {
                         }
                     }
 
+                    // Check for Symbol() — NOT constructable with new
+                    if func_val.is_function() && func_val.as_function() == Some(-570) {
+                        let desc = if argc > 0 {
+                            let d = self.stack[func_pos + 1];
+                            if d.is_undefined() { None } else { Some(self.interner.intern(&self.value_to_string(d))) }
+                        } else { None };
+                        let id = self.next_symbol_id;
+                        self.next_symbol_id += 1;
+                        if id as usize >= self.symbol_descriptions.len() {
+                            self.symbol_descriptions.resize(id as usize + 1, None);
+                        }
+                        self.symbol_descriptions[id as usize] = desc;
+                        self.stack.truncate(func_pos);
+                        self.push(Value::symbol(id));
+                        continue;
+                    }
+
+                    // Check for eval()
+                    if func_val.is_function() && func_val.as_function() == Some(-560) {
+                        let code = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                        self.stack.truncate(func_pos);
+                        // eval with non-string argument returns the argument
+                        if !code.is_string() {
+                            self.push(code);
+                            continue;
+                        }
+                        let code_str = {
+                            let sid = code.as_string_id().unwrap();
+                            self.interner.resolve(sid).to_owned()
+                        };
+                        // Lex, parse, compile
+                        let mut lexer = crate::lexer::lexer::Lexer::new(&code_str, &mut self.interner);
+                        let tokens = lexer.tokenize();
+                        let mut parser = crate::parser::parser::Parser::new(tokens, &code_str, &mut self.interner);
+                        let program = match parser.parse_program() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                return Err(VmError::RuntimeError(format!("eval SyntaxError: {e}")));
+                            }
+                        };
+                        let compiler = crate::compiler::compiler::Compiler::new(&mut self.interner);
+                        let chunk = match compiler.compile_program(&program) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                return Err(VmError::RuntimeError(format!("eval CompileError: {e}")));
+                            }
+                        };
+                        // Flatten and add chunks to VM
+                        let base_idx = self.chunks.len();
+                        let mut flat_chunks = Vec::new();
+                        Vm::flatten_chunk(chunk, &mut flat_chunks);
+                        self.chunks.extend(flat_chunks);
+                        // Execute as a function call
+                        let eval_fn = Value::function(base_idx as i32);
+                        let result = self.call_function(eval_fn, &[])?;
+                        self.push(result);
+                        continue;
+                    }
+
                     // Check for native global function sentinels
                     if func_val.is_function() {
                         let sentinel = func_val.as_function().unwrap();
@@ -1903,6 +2008,15 @@ impl Vm {
                                 "isSafeInteger" => Value::function(-533),
                                 "parseInt" => Value::function(-500),
                                 "parseFloat" => Value::function(-501),
+                                _ => Value::undefined(),
+                            },
+                            -570 => match name_str {
+                                "iterator" => Value::symbol(self.sym_iterator),
+                                "hasInstance" => Value::symbol(self.sym_has_instance),
+                                "toPrimitive" => Value::symbol(self.sym_to_primitive),
+                                "toStringTag" => Value::symbol(self.sym_to_string_tag),
+                                "species" => Value::symbol(self.sym_species),
+                                "unscopables" => Value::symbol(self.sym_unscopables),
                                 _ => Value::undefined(),
                             },
                             _ => Value::undefined(),
