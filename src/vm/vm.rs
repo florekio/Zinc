@@ -2091,6 +2091,33 @@ impl Vm {
                             continue;
                         }
                     }
+                    // String bracket index access: "hello"[0] → "h"
+                    if obj_val.is_string() {
+                        let sid = obj_val.as_string_id().unwrap();
+                        let s = self.interner.resolve(sid).to_owned();
+                        if let Some(i) = key.as_int() {
+                            if i >= 0
+                                && let Some(ch) = s.chars().nth(i as usize) {
+                                    let ch_id = self.interner.intern(&ch.to_string());
+                                    self.push(Value::string(ch_id));
+                                    continue;
+                                }
+                        } else if let Some(idx) = key.as_number() {
+                            let i = idx as usize;
+                            if idx >= 0.0 && idx.fract() == 0.0
+                                && let Some(ch) = s.chars().nth(i) {
+                                    let ch_id = self.interner.intern(&ch.to_string());
+                                    self.push(Value::string(ch_id));
+                                    continue;
+                                }
+                        } else if let Some(name_id) = key.as_string_id() {
+                            let name = self.interner.resolve(name_id);
+                            if name == "length" {
+                                self.push(Value::int(s.chars().count() as i32));
+                                continue;
+                            }
+                        }
+                    }
                     self.push(Value::undefined());
                 }
 
@@ -2213,6 +2240,69 @@ impl Vm {
                         continue;
                     }
 
+                    // Check for Function.prototype.call/apply/bind
+                    if obj_val.is_function() || (obj_val.is_object() && obj_val.as_object_id()
+                        .and_then(|oid| self.heap.get(oid))
+                        .map(|o| matches!(&o.kind, ObjectKind::Function(_)))
+                        .unwrap_or(false))
+                    {
+                        let mn = self.interner.resolve(method_name).to_owned();
+                        match mn.as_str() {
+                            "call" => {
+                                let this_arg = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
+                                let call_args: Vec<Value> = (1..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                                self.stack.truncate(obj_pos);
+                                let result = self.call_function_this(obj_val, this_arg, &call_args)?;
+                                self.push(result);
+                                continue;
+                            }
+                            "apply" => {
+                                let this_arg = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
+                                let mut call_args = Vec::new();
+                                if argc > 1 {
+                                    let arr_val = self.stack[obj_pos + 2];
+                                    if let Some(arr_oid) = arr_val.as_object_id()
+                                        && let Some(obj) = self.heap.get(arr_oid)
+                                            && let ObjectKind::Array(ref elems) = obj.kind {
+                                                call_args = elems.clone();
+                                            }
+                                }
+                                self.stack.truncate(obj_pos);
+                                let result = self.call_function_this(obj_val, this_arg, &call_args)?;
+                                self.push(result);
+                                continue;
+                            }
+                            "bind" => {
+                                let this_arg = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
+                                let bound_args: Vec<Value> = (1..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                                // Create a bound function object
+                                let func_obj_id = if let Some(oid) = obj_val.as_object_id() { oid }
+                                    else {
+                                        // Wrap the function value in an object
+                                        let packed = obj_val.as_function().unwrap();
+                                        let chunk_idx = (packed & 0xFFFF) as usize;
+                                        let name = if chunk_idx < self.chunks.len() { self.chunks[chunk_idx].name } else { self.interner.intern("<bound>") };
+                                        let fobj = JsObject::function_bytecode(chunk_idx, name);
+                                        self.heap.allocate(fobj)
+                                    };
+                                let bound = JsObject {
+                                    properties: Vec::new(), prototype: None,
+                                    kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Bound {
+                                        target: func_obj_id,
+                                        this_val: this_arg,
+                                        args: bound_args,
+                                    }),
+                                    marked: false, extensible: true,
+                                };
+                                let bound_oid = self.heap.allocate(bound);
+                                self.stack.truncate(obj_pos);
+                                self.push(Value::object_id(bound_oid));
+                                continue;
+                            }
+                            _ => {} // fall through to other dispatchers
+                        }
+                    }
+
                     // Check for array methods
                     if let Some(oid) = obj_val.as_object_id() {
                         if let Some(obj) = self.heap.get(oid)
@@ -2323,6 +2413,45 @@ impl Vm {
                             self.stack.truncate(obj_pos);
                             self.push(result);
                             continue;
+                        }
+                    }
+
+                    // Object.prototype methods (hasOwnProperty, toString, valueOf, etc.)
+                    if let Some(oid) = obj_val.as_object_id() {
+                        let mn = self.interner.resolve(method_name).to_owned();
+                        match mn.as_str() {
+                            "hasOwnProperty" => {
+                                let key = if argc > 0 { self.value_to_string(self.stack[obj_pos + 1]) } else { String::new() };
+                                let key_id = self.interner.intern(&key);
+                                let has = self.heap.get(oid).map(|o| o.has_own_property(key_id)).unwrap_or(false);
+                                self.stack.truncate(obj_pos);
+                                self.push(Value::boolean(has));
+                                continue;
+                            }
+                            "propertyIsEnumerable" => {
+                                let key = if argc > 0 { self.value_to_string(self.stack[obj_pos + 1]) } else { String::new() };
+                                let key_id = self.interner.intern(&key);
+                                let is_enum = self.heap.get(oid)
+                                    .and_then(|o| o.get_property_descriptor(key_id))
+                                    .map(|p| p.is_enumerable())
+                                    .unwrap_or(false);
+                                self.stack.truncate(obj_pos);
+                                self.push(Value::boolean(is_enum));
+                                continue;
+                            }
+                            "toString" => {
+                                let s = self.value_to_string(obj_val);
+                                let id = self.interner.intern(&s);
+                                self.stack.truncate(obj_pos);
+                                self.push(Value::string(id));
+                                continue;
+                            }
+                            "valueOf" => {
+                                self.stack.truncate(obj_pos);
+                                self.push(obj_val);
+                                continue;
+                            }
+                            _ => {}
                         }
                     }
 
@@ -2722,6 +2851,27 @@ impl Vm {
                             let id = self.interner.intern(&result);
                             self.stack.truncate(obj_pos);
                             self.push(Value::string(id));
+                            continue;
+                        }
+                    }
+
+                    // Number static methods (Number.isNaN, Number.isFinite, etc.)
+                    if obj_val.is_function() && obj_val.as_function() == Some(-505) {
+                        let mn = self.interner.resolve(method_name).to_owned();
+                        let sentinel = match mn.as_str() {
+                            "isNaN" => Some(-530),
+                            "isFinite" => Some(-531),
+                            "isInteger" => Some(-532),
+                            "isSafeInteger" => Some(-533),
+                            "parseInt" => Some(-500),
+                            "parseFloat" => Some(-501),
+                            _ => None,
+                        };
+                        if let Some(s) = sentinel {
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            let result = self.exec_global_fn(s, &args);
+                            self.stack.truncate(obj_pos);
+                            self.push(result);
                             continue;
                         }
                     }
