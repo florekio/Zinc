@@ -1844,31 +1844,55 @@ impl Vm {
                 OpCode::InstanceOf => {
                     let constructor = self.pop()?;
                     let obj = self.pop()?;
-                    // Simple instanceof: check if object's "name" matches constructor name
-                    let result = if let Some(oid) = obj.as_object_id() {
-                        if let Some(o) = self.heap.get(oid) {
-                            let name_key = self.interner.intern("name");
-                            if let Some(name_val) = o.get_property(name_key) {
-                                // Check against known error constructors
-                                if constructor.is_function() {
-                                    let sentinel = constructor.as_function().unwrap();
-                                    let ctor_name = match sentinel {
-                                        -510 => "Error",
-                                        -511 => "TypeError",
-                                        -512 => "RangeError",
-                                        -513 => "ReferenceError",
-                                        -514 => "SyntaxError",
-                                        _ => "",
-                                    };
-                                    if !ctor_name.is_empty() {
-                                        if let Some(nid) = name_val.as_string_id() {
-                                            let n = self.interner.resolve(nid);
-                                            n == ctor_name
+                    let result = if let Some(obj_oid) = obj.as_object_id() {
+                        // Get constructor.prototype
+                        let ctor_proto = if constructor.is_function() {
+                            let packed = constructor.as_function().unwrap();
+                            self.func_prototypes.get(&packed).copied()
+                        } else if let Some(ctor_oid) = constructor.as_object_id() {
+                            // Class-based constructor: look up prototype property
+                            let proto_key = self.interner.intern("prototype");
+                            self.heap.get(ctor_oid)
+                                .and_then(|o| o.get_property(proto_key))
+                                .and_then(|v| v.as_object_id())
+                        } else { None };
+
+                        if let Some(target_proto) = ctor_proto {
+                            // Walk obj's prototype chain looking for target_proto
+                            let mut current = self.heap.get(obj_oid).and_then(|o| o.prototype);
+                            let mut depth = 0;
+                            let mut found = false;
+                            while let Some(proto_oid) = current {
+                                if depth > 64 { break; }
+                                if proto_oid == target_proto { found = true; break; }
+                                current = self.heap.get(proto_oid).and_then(|o| o.prototype);
+                                depth += 1;
+                            }
+                            found
+                        } else {
+                            // Fallback: check error constructor name matching
+                            if let Some(o) = self.heap.get(obj_oid) {
+                                let name_key = self.interner.intern("name");
+                                if let Some(name_val) = o.get_property(name_key)
+                                    && constructor.is_function() {
+                                        let sentinel = constructor.as_function().unwrap();
+                                        let ctor_name = match sentinel {
+                                            -510 => "Error", -511 => "TypeError",
+                                            -512 => "RangeError", -513 => "ReferenceError",
+                                            -514 => "SyntaxError", _ => "",
+                                        };
+                                        if !ctor_name.is_empty() {
+                                            name_val.as_string_id()
+                                                .map(|nid| {
+                                                    let n = self.interner.resolve(nid);
+                                                    // Exact match or base Error matches any *Error
+                                                    n == ctor_name || (ctor_name == "Error" && n.ends_with("Error"))
+                                                })
+                                                .unwrap_or(false)
                                         } else { false }
                                     } else { false }
-                                } else { false }
                             } else { false }
-                        } else { false }
+                        }
                     } else { false };
                     self.push(Value::boolean(result));
                 }
@@ -2173,8 +2197,18 @@ impl Vm {
                                 }
                             }
                         }
-                        // String property lookup (with prototype chain)
+                        // String property lookup — check getter first, then plain property
                         if let Some(name_id) = key.as_string_id() {
+                            let name_str = self.interner.resolve(name_id).to_owned();
+                            // Check for getter
+                            let getter_key_str = format!("__get_{name_str}__");
+                            let getter_key = self.interner.intern(&getter_key_str);
+                            if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
+                                && gfn.is_function() {
+                                    let result = self.call_function_this(gfn, obj_val, &[])?;
+                                    self.push(result);
+                                    continue;
+                                }
                             let val = self.heap.get_property_chain(oid, name_id)
                                 .unwrap_or(Value::undefined());
                             self.push(val);
@@ -2242,7 +2276,18 @@ impl Vm {
                             }
                         }
                         if let Some(name_id) = key.as_string_id() {
-                            obj.set_property(name_id, val);
+                            // Check for setter first
+                            let name_str = self.interner.resolve(name_id).to_owned();
+                            let setter_key = self.interner.intern(&format!("__set_{name_str}__"));
+                            if let Some(sfn) = self.heap.get_property_chain(oid, setter_key)
+                                && sfn.is_function() {
+                                    let _ = self.call_function_this(sfn, obj_val, &[val]);
+                                    self.push(val);
+                                    continue;
+                                }
+                            if let Some(obj) = self.heap.get_mut(oid) {
+                                obj.set_property(name_id, val);
+                            }
                         }
                     }
                     self.push(val);
@@ -2325,6 +2370,58 @@ impl Vm {
                         let s = self.interner.resolve(sid).to_owned();
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                         let result = self.exec_string_method(&s, method_name, &args);
+                        self.stack.truncate(obj_pos);
+                        self.push(result);
+                        continue;
+                    }
+
+                    // Number primitive methods: (42).toString(16), (3.14).toFixed(2)
+                    if obj_val.is_number() || obj_val.is_int() {
+                        let mn = self.interner.resolve(method_name).to_owned();
+                        let n = self.to_f64(obj_val);
+                        let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                        let result = match mn.as_str() {
+                            "toString" => {
+                                let radix = args.first().and_then(|v| v.as_number()).unwrap_or(10.0) as u32;
+                                let s = if radix == 10 {
+                                    self.value_to_string(obj_val)
+                                } else if n.fract() == 0.0 && n.is_finite() {
+                                    // Integer with non-10 radix
+                                    let i = n as i64;
+                                    if i >= 0 { radix_fmt(i as u64, radix) }
+                                    else { format!("-{}", radix_fmt((-i) as u64, radix)) }
+                                } else {
+                                    self.value_to_string(obj_val)
+                                };
+                                let id = self.interner.intern(&s);
+                                Value::string(id)
+                            }
+                            "valueOf" => obj_val,
+                            "toFixed" => {
+                                let digits = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                                let s = format!("{:.prec$}", n, prec = digits);
+                                let id = self.interner.intern(&s);
+                                Value::string(id)
+                            }
+                            _ => Value::undefined(),
+                        };
+                        self.stack.truncate(obj_pos);
+                        self.push(result);
+                        continue;
+                    }
+
+                    // Boolean primitive methods: true.toString()
+                    if obj_val.is_boolean() {
+                        let mn = self.interner.resolve(method_name).to_owned();
+                        let result = match mn.as_str() {
+                            "toString" => {
+                                let s = if obj_val.as_bool().unwrap() { "true" } else { "false" };
+                                let id = self.interner.intern(s);
+                                Value::string(id)
+                            }
+                            "valueOf" => obj_val,
+                            _ => Value::undefined(),
+                        };
                         self.stack.truncate(obj_pos);
                         self.push(result);
                         continue;
@@ -4122,6 +4219,19 @@ impl Vm {
 }
 
 // ---- Standalone JSON parser (avoids &mut self borrow issues) ----
+
+/// Format an unsigned integer in a given radix (2-36).
+fn radix_fmt(mut n: u64, radix: u32) -> String {
+    if n == 0 { return "0".to_string(); }
+    let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut result = Vec::new();
+    while n > 0 {
+        result.push(digits[(n % radix as u64) as usize]);
+        n /= radix as u64;
+    }
+    result.reverse();
+    String::from_utf8(result).unwrap()
+}
 
 // Tests
 // ---------------------------------------------------------------------------

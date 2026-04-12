@@ -175,6 +175,10 @@ impl Vm {
                     Value::undefined()
                 }
             }
+            "toString" | "valueOf" => {
+                let id = self.interner.intern(s);
+                Value::string(id)
+            }
             _ => Value::undefined(),
         }
     }
