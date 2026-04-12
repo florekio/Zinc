@@ -749,11 +749,18 @@ fn parse_try(p: &mut Parser) -> ParseResult<Statement> {
     let handler = if p.eat(TokenKind::Catch) {
         let catch_start = p.pos();
         let param = if p.eat(TokenKind::LParen) {
-            let name = p.intern_current();
-            let name_span = p.current().span;
-            p.expect(TokenKind::Identifier)?;
+            let pat = if p.at(TokenKind::LBrace) {
+                parse_object_pattern(p)?
+            } else if p.at(TokenKind::LBracket) {
+                parse_array_pattern(p)?
+            } else {
+                let name = p.intern_current();
+                let name_span = p.current().span;
+                p.expect(TokenKind::Identifier)?;
+                Pattern::Identifier(Identifier { name, span: name_span })
+            };
             p.expect(TokenKind::RParen)?;
-            Some(Pattern::Identifier(Identifier { name, span: name_span }))
+            Some(pat)
         } else {
             None
         };

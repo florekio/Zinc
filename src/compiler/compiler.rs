@@ -1126,6 +1126,46 @@ impl<'a> Compiler<'a> {
                         self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
                     }
                 }
+                Some(Pattern::Object(obj_pat)) => {
+                    // Destructure the caught exception: catch({ message })
+                    // Exception is on the stack — destructure it
+                    let anon = self.interner.intern("__catch_val__");
+                    self.add_local(anon);
+                    self.mark_initialized();
+                    let src_slot = (self.locals.len() - 1) as u8;
+                    for prop in &obj_pat.properties {
+                        if let ObjectPatternProperty::Property { key, value: Pattern::Identifier(id), .. } = prop {
+                            let key_sid = match key {
+                                PropertyKey::Identifier(s) | PropertyKey::StringLiteral(s) => *s,
+                                _ => continue,
+                            };
+                            self.chunk.emit_op_u8(OpCode::GetLocal, src_slot, line);
+                            let key_idx = self.make_string_constant(key_sid);
+                            self.chunk.emit_byte(OpCode::GetProperty as u8, line);
+                            self.chunk.code.push((key_idx >> 8) as u8);
+                            self.chunk.code.push((key_idx & 0xFF) as u8);
+                            self.add_local(id.name);
+                            self.mark_initialized();
+                        }
+                    }
+                }
+                Some(Pattern::Array(arr_pat)) => {
+                    let anon = self.interner.intern("__catch_val__");
+                    self.add_local(anon);
+                    self.mark_initialized();
+                    let src_slot = (self.locals.len() - 1) as u8;
+                    for (i, elem) in arr_pat.elements.iter().enumerate() {
+                        if let Some(Pattern::Identifier(id)) = elem {
+                            self.chunk.emit_op_u8(OpCode::GetLocal, src_slot, line);
+                            let idx_val = Value::int(i as i32);
+                            let cidx = self.chunk.add_constant(idx_val);
+                            self.chunk.emit_op_u16(OpCode::Const, cidx, line);
+                            self.chunk.emit_op(OpCode::GetElement, line);
+                            self.add_local(id.name);
+                            self.mark_initialized();
+                        }
+                    }
+                }
                 Some(_) => self.chunk.emit_op(OpCode::Pop, line),
                 None => self.chunk.emit_op(OpCode::Pop, line),
             }

@@ -1483,6 +1483,9 @@ impl Vm {
                             let this_val = if is_super {
                                 if let Some(f) = self.frames.last_mut() { f.pending_super_call = false; }
                                 self.frames.last().unwrap().this_value
+                            } else if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
+                                // Arrow functions inherit `this` from enclosing scope
+                                self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined())
                             } else {
                                 Value::undefined()
                             };
@@ -2048,7 +2051,41 @@ impl Vm {
                                 "unscopables" => Value::symbol(self.sym_unscopables),
                                 _ => Value::undefined(),
                             },
-                            _ => Value::undefined(),
+                            _ => {
+                                // User-defined function properties
+                                match name_str {
+                                    "prototype" => {
+                                        // Create/return a prototype object for this function
+                                        let mut proto = JsObject::ordinary();
+                                        let ctor_key = self.interner.intern("constructor");
+                                        proto.set_property(ctor_key, obj_val);
+                                        Value::object_id(self.heap.allocate(proto))
+                                    }
+                                    "name" => {
+                                        let chunk_idx = (sentinel & 0xFFFF) as usize;
+                                        if chunk_idx < self.chunks.len() {
+                                            let name = self.chunks[chunk_idx].name;
+                                            Value::string(name)
+                                        } else {
+                                            let s = self.interner.intern("");
+                                            Value::string(s)
+                                        }
+                                    }
+                                    "length" => {
+                                        let chunk_idx = (sentinel & 0xFFFF) as usize;
+                                        if chunk_idx < self.chunks.len() {
+                                            Value::int(self.chunks[chunk_idx].param_count as i32)
+                                        } else {
+                                            Value::int(0)
+                                        }
+                                    }
+                                    "call" | "apply" | "bind" => {
+                                        // Return function sentinel for method dispatch
+                                        obj_val
+                                    }
+                                    _ => Value::undefined(),
+                                }
+                            }
                         };
                         self.push(result);
                     } else {
@@ -2546,9 +2583,18 @@ impl Vm {
                             "keys" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                                     let keys: Vec<Value> = self.heap.get(oid)
-                                        .map(|o| o.properties.iter()
-                                            .filter(|(_, p)| p.is_enumerable())
-                                            .map(|(k, _)| Value::string(*k)).collect())
+                                        .map(|o| {
+                                            if let ObjectKind::Array(ref elems) = o.kind {
+                                                (0..elems.len()).map(|i| {
+                                                    let s = self.interner.intern(&i.to_string());
+                                                    Value::string(s)
+                                                }).collect()
+                                            } else {
+                                                o.properties.iter()
+                                                    .filter(|(_, p)| p.is_enumerable())
+                                                    .map(|(k, _)| Value::string(*k)).collect()
+                                            }
+                                        })
                                         .unwrap_or_default();
                                     let arr = JsObject::array(keys);
                                     Value::object_id(self.heap.allocate(arr))
@@ -2557,9 +2603,15 @@ impl Vm {
                             "values" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                                     let vals: Vec<Value> = self.heap.get(oid)
-                                        .map(|o| o.properties.iter()
-                                            .filter(|(_, p)| p.is_enumerable())
-                                            .map(|(_, p)| p.value).collect())
+                                        .map(|o| {
+                                            if let ObjectKind::Array(ref elems) = o.kind {
+                                                elems.clone()
+                                            } else {
+                                                o.properties.iter()
+                                                    .filter(|(_, p)| p.is_enumerable())
+                                                    .map(|(_, p)| p.value).collect()
+                                            }
+                                        })
                                         .unwrap_or_default();
                                     let arr = JsObject::array(vals);
                                     Value::object_id(self.heap.allocate(arr))
