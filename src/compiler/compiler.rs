@@ -60,6 +60,8 @@ struct LoopCtx {
     break_patches: Vec<usize>,
     /// Scope depth when the loop was entered so we know how many locals to pop.
     scope_depth: u32,
+    /// Optional label for labeled statements.
+    label: Option<StringId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +600,7 @@ impl<'a> Compiler<'a> {
             continue_target: loop_start,
             break_patches: Vec::new(),
             scope_depth: self.scope_depth,
+            label: None,
         });
 
         self.compile_expr(&w.test)?;
@@ -620,6 +623,7 @@ impl<'a> Compiler<'a> {
             continue_target: loop_start,
             break_patches: Vec::new(),
             scope_depth: self.scope_depth,
+            label: None,
         });
 
         self.compile_statement(&d.body)?;
@@ -636,7 +640,9 @@ impl<'a> Compiler<'a> {
 
     fn compile_for(&mut self, f: &ForStatement) -> Result<(), String> {
         let line = f.span.start;
-        self.begin_scope();
+        // Only create a scope for let/const — var should hoist to enclosing scope
+        let needs_scope = matches!(&f.init, Some(ForInit::Variable(decl)) if decl.kind != VarKind::Var);
+        if needs_scope { self.begin_scope(); }
 
         // Init.
         if let Some(init) = &f.init {
@@ -656,6 +662,7 @@ impl<'a> Compiler<'a> {
             continue_target: loop_start,
             break_patches: Vec::new(),
             scope_depth: self.scope_depth,
+            label: None,
         });
 
         // Condition.
@@ -688,7 +695,7 @@ impl<'a> Compiler<'a> {
         }
 
         self.patch_loop_breaks();
-        self.end_scope();
+        if needs_scope { self.end_scope(); }
         Ok(())
     }
 
@@ -696,7 +703,9 @@ impl<'a> Compiler<'a> {
 
     fn compile_for_in(&mut self, f: &ForInStatement) -> Result<(), String> {
         let line = f.span.start;
-        self.begin_scope();
+        // Only scope for let/const
+        let is_var = matches!(&f.left, ForInOfLeft::Variable(decl) if decl.kind == VarKind::Var);
+        if !is_var { self.begin_scope(); }
 
         // Declare the loop variable
         let var_name = match &f.left {
@@ -744,6 +753,7 @@ impl<'a> Compiler<'a> {
             continue_target: loop_start,
             break_patches: Vec::new(),
             scope_depth: self.scope_depth,
+            label: None,
         });
         self.compile_statement(&f.body)?;
         self.chunk.emit_loop(loop_start, line);
@@ -753,7 +763,7 @@ impl<'a> Compiler<'a> {
         self.chunk.emit_op(OpCode::Pop, line); // pop iterator
 
         self.patch_loop_breaks();
-        self.end_scope();
+        if !is_var { self.end_scope(); }
         Ok(())
     }
 
@@ -761,7 +771,8 @@ impl<'a> Compiler<'a> {
 
     fn compile_for_of(&mut self, f: &ForOfStatement) -> Result<(), String> {
         let line = f.span.start;
-        self.begin_scope();
+        let is_var = matches!(&f.left, ForInOfLeft::Variable(decl) if decl.kind == VarKind::Var);
+        if !is_var { self.begin_scope(); }
 
         // Determine the loop variable pattern
         enum LoopVar {
@@ -904,6 +915,7 @@ impl<'a> Compiler<'a> {
             continue_target: loop_start,
             break_patches: Vec::new(),
             scope_depth: self.scope_depth,
+            label: None,
         });
 
         self.compile_statement(&f.body)?;
@@ -919,7 +931,7 @@ impl<'a> Compiler<'a> {
         // Patch break jumps
         self.patch_loop_breaks();
 
-        self.end_scope();
+        if !is_var { self.end_scope(); }
         Ok(())
     }
 
@@ -961,6 +973,7 @@ impl<'a> Compiler<'a> {
             continue_target: 0, // unused for switch
             break_patches: Vec::new(),
             scope_depth: self.scope_depth,
+            label: None,
         });
 
         let mut body_starts: Vec<usize> = Vec::new();
@@ -1037,7 +1050,14 @@ impl<'a> Compiler<'a> {
         if self.loops.is_empty() {
             return Err(format!("'break' outside of loop/switch at offset {line}"));
         }
-        let loop_depth = self.loops.last().unwrap().scope_depth;
+        // Find the target loop context (by label if specified, otherwise innermost)
+        let target_idx = if let Some(label) = b.label {
+            self.loops.iter().rposition(|l| l.label == Some(label))
+                .ok_or_else(|| format!("label not found at offset {line}"))?
+        } else {
+            self.loops.len() - 1
+        };
+        let loop_depth = self.loops[target_idx].scope_depth;
         let pop_n = self.locals_above_depth(loop_depth);
         if pop_n > 0 && pop_n <= u8::MAX as usize {
             self.chunk.emit_op_u8(OpCode::PopN, pop_n as u8, line);
@@ -1047,7 +1067,7 @@ impl<'a> Compiler<'a> {
             }
         }
         let patch = self.chunk.emit_jump(OpCode::Jump, line);
-        self.loops.last_mut().unwrap().break_patches.push(patch);
+        self.loops[target_idx].break_patches.push(patch);
         Ok(())
     }
 
@@ -1296,7 +1316,17 @@ impl<'a> Compiler<'a> {
     // ---- labeled ----
 
     fn compile_labeled(&mut self, l: &LabeledStatement) -> Result<(), String> {
-        self.compile_statement(&l.body)
+        // Push a label context so `break label` can find it
+        self.loops.push(LoopCtx {
+            continue_target: self.chunk.len(), // not meaningful for non-loop labels
+            break_patches: Vec::new(),
+            scope_depth: self.scope_depth,
+            label: Some(l.label),
+        });
+        self.compile_statement(&l.body)?;
+        // Patch any break jumps targeting this label
+        self.patch_loop_breaks();
+        Ok(())
     }
 
     // ---- with ----
