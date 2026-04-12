@@ -394,34 +394,75 @@ impl<'a> Compiler<'a> {
                                     PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => *id,
                                     _ => continue,
                                 };
-                                let var_name = match value {
-                                    Pattern::Identifier(id) => id.name,
-                                    _ => continue,
-                                };
+                                // Get the property from source object
                                 self.chunk.emit_op_u8(OpCode::GetLocal, src_slot, line);
                                 let idx = self.make_string_constant(prop_name);
                                 self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
-                                self.add_local(var_name);
-                                self.mark_initialized();
+                                // Handle different value patterns
+                                match value {
+                                    Pattern::Identifier(id) => {
+                                        self.add_local(id.name);
+                                        self.mark_initialized();
+                                    }
+                                    Pattern::Assignment(a) => {
+                                        if let Pattern::Identifier(id) = &a.left {
+                                            // Check undefined → use default
+                                            self.chunk.emit_op(OpCode::Dup, line);
+                                            self.chunk.emit_op(OpCode::Undefined, line);
+                                            self.chunk.emit_op(OpCode::StrictNe, line);
+                                            let jump_idx = self.chunk.code.len();
+                                            self.chunk.emit_op(OpCode::JumpIfTrue, line);
+                                            self.chunk.code.push(0); self.chunk.code.push(0);
+                                            self.chunk.emit_op(OpCode::Pop, line);
+                                            self.compile_expr(&a.right)?;
+                                            let target = self.chunk.code.len();
+                                            let offset = (target as i16) - (jump_idx as i16) - 3;
+                                            self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
+                                            self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
+                                            self.add_local(id.name);
+                                            self.mark_initialized();
+                                        }
+                                    }
+                                    _ => { self.chunk.emit_op(OpCode::Pop, line); }
+                                }
                             }
                         }
                     } else {
-                        // Global scope: dup, get property, define global
+                        // Global scope
                         for prop in &obj_pat.properties {
                             if let ObjectPatternProperty::Property { key, value, .. } = prop {
                                 let prop_name = match key {
                                     PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => *id,
                                     _ => continue,
                                 };
-                                let var_name = match value {
-                                    Pattern::Identifier(id) => id.name,
-                                    _ => continue,
-                                };
                                 self.chunk.emit_op(OpCode::Dup, line);
                                 let idx = self.make_string_constant(prop_name);
                                 self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
-                                let vidx = self.make_string_constant(var_name);
-                                self.chunk.emit_op_u16(OpCode::DefineGlobal, vidx, line);
+                                match value {
+                                    Pattern::Identifier(id) => {
+                                        let vidx = self.make_string_constant(id.name);
+                                        self.chunk.emit_op_u16(OpCode::DefineGlobal, vidx, line);
+                                    }
+                                    Pattern::Assignment(a) => {
+                                        if let Pattern::Identifier(id) = &a.left {
+                                            self.chunk.emit_op(OpCode::Dup, line);
+                                            self.chunk.emit_op(OpCode::Undefined, line);
+                                            self.chunk.emit_op(OpCode::StrictNe, line);
+                                            let jump_idx = self.chunk.code.len();
+                                            self.chunk.emit_op(OpCode::JumpIfTrue, line);
+                                            self.chunk.code.push(0); self.chunk.code.push(0);
+                                            self.chunk.emit_op(OpCode::Pop, line);
+                                            self.compile_expr(&a.right)?;
+                                            let target = self.chunk.code.len();
+                                            let offset = (target as i16) - (jump_idx as i16) - 3;
+                                            self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
+                                            self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
+                                            let vidx = self.make_string_constant(id.name);
+                                            self.chunk.emit_op_u16(OpCode::DefineGlobal, vidx, line);
+                                        }
+                                    }
+                                    _ => { self.chunk.emit_op(OpCode::Pop, line); }
+                                }
                             }
                         }
                         self.chunk.emit_op(OpCode::Pop, line);

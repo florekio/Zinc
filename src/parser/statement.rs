@@ -974,15 +974,46 @@ fn parse_object_pattern(p: &mut Parser) -> ParseResult<Pattern> {
         p.advance(); // consume identifier (or keyword used as property)
 
         if p.eat(TokenKind::Colon) {
-            // Renamed: { a: x }
-            let value_name = p.intern_current();
-            let value_span = p.current().span;
-            p.expect(TokenKind::Identifier)?;
+            // Renamed: { a: x }, { a: {b} }, { a: [x, y] }, { a: x = 5 }
+            let value_pat = if p.at(TokenKind::LBrace) {
+                parse_object_pattern(p)?
+            } else if p.at(TokenKind::LBracket) {
+                parse_array_pattern(p)?
+            } else {
+                let value_name = p.intern_current();
+                let value_span = p.current().span;
+                p.expect(TokenKind::Identifier)?;
+                // Check for default: { a: x = 5 }
+                if p.eat(TokenKind::Assign) {
+                    let default_expr = super::expression::parse_expression(p, 3)?;
+                    Pattern::Assignment(Box::new(AssignmentPattern {
+                        left: Pattern::Identifier(Identifier { name: value_name, span: value_span }),
+                        right: default_expr,
+                        span: Span::new(value_span.start, p.pos()),
+                    }))
+                } else {
+                    Pattern::Identifier(Identifier { name: value_name, span: value_span })
+                }
+            };
             properties.push(ObjectPatternProperty::Property {
                 key: PropertyKey::Identifier(key_name),
-                value: Pattern::Identifier(Identifier { name: value_name, span: value_span }),
+                value: value_pat,
                 computed: false,
                 shorthand: false,
+                span: Span::new(prop_start, p.pos()),
+            });
+        } else if p.eat(TokenKind::Assign) {
+            // Shorthand with default: { a = 10 }
+            let default_expr = super::expression::parse_expression(p, 3)?;
+            properties.push(ObjectPatternProperty::Property {
+                key: PropertyKey::Identifier(key_name),
+                value: Pattern::Assignment(Box::new(AssignmentPattern {
+                    left: Pattern::Identifier(Identifier { name: key_name, span: key_span }),
+                    right: default_expr,
+                    span: Span::new(key_span.start, p.pos()),
+                })),
+                computed: false,
+                shorthand: true,
                 span: Span::new(prop_start, p.pos()),
             });
         } else {
