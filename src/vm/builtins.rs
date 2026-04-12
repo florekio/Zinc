@@ -648,11 +648,12 @@ impl Vm {
 
     // ---- Math method dispatch ----
     pub(crate) fn exec_math_method(&mut self, method_name: StringId, args: &[Value]) -> Value {
-        let name = self.interner.resolve(method_name).to_owned();
         let a = || args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
         let b = || args.get(1).and_then(|v| v.as_number()).unwrap_or(f64::NAN);
 
-        let result = match name.as_str() {
+        // Fast path: compare StringId directly (avoids string allocation)
+        let name_str = self.interner.resolve(method_name);
+        let result = match name_str {
             "abs" => a().abs(),
             "floor" => a().floor(),
             "ceil" => a().ceil(),

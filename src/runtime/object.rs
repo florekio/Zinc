@@ -205,7 +205,7 @@ impl ObjectHeap {
     pub fn new() -> Self {
         Self {
             objects: Vec::new(),
-            gc_threshold: 256,
+            gc_threshold: 4096,
             free_list: Vec::new(),
         }
     }

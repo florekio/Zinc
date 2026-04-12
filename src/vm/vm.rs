@@ -125,6 +125,10 @@ pub struct Vm {
     pub(crate) regex_cache: crate::vm::regexp::RegexCache,
     /// Function prototype cache: maps packed function value → prototype ObjectId
     pub(crate) func_prototypes: HashMap<i32, ObjectId>,
+    /// Cached Math object ID for fast dispatch
+    pub(crate) math_oid: Option<ObjectId>,
+    /// Cached JSON object ID for fast dispatch
+    pub(crate) json_oid: Option<ObjectId>,
     /// Symbol descriptions: index = symbol_id, value = optional description StringId
     pub(crate) symbol_descriptions: Vec<Option<StringId>>,
     /// Next symbol ID to allocate
@@ -282,6 +286,8 @@ impl Vm {
             module_dir: None,
             regex_cache: crate::vm::regexp::RegexCache::new(),
             func_prototypes: HashMap::new(),
+            math_oid: Some(math_oid),
+            json_oid: Some(json_oid),
             symbol_descriptions: sym_descs,
             next_symbol_id: 6, // 0-5 are well-known
             sym_iterator: 0,
@@ -2583,18 +2589,34 @@ impl Vm {
                             self.push(result);
                             continue;
                         }
-                        // Check for Math methods
-                        let math_name = self.interner.intern("Math");
-                        if self.globals.get(&math_name).map(|v| v.as_object_id()) == Some(Some(oid)) {
-                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                            let result = self.exec_math_method(method_name, &args);
+                        // Check for Math methods (fast: cached ObjectId comparison)
+                        if self.math_oid == Some(oid) {
+                            // Fast path: read args directly from stack, avoid Vec alloc for 1-2 args
+                            let arg0 = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
+                            let arg1 = if argc > 1 { self.stack[obj_pos + 2] } else { Value::undefined() };
+                            let name_str = self.interner.resolve(method_name);
+                            let result = match name_str {
+                                "sin" => Value::number(self.to_f64(arg0).sin()),
+                                "cos" => Value::number(self.to_f64(arg0).cos()),
+                                "abs" => Value::number(self.to_f64(arg0).abs()),
+                                "floor" => Value::number(self.to_f64(arg0).floor()),
+                                "ceil" => Value::number(self.to_f64(arg0).ceil()),
+                                "round" => Value::number(self.to_f64(arg0).round()),
+                                "sqrt" => Value::number(self.to_f64(arg0).sqrt()),
+                                "pow" => Value::number(self.to_f64(arg0).powf(self.to_f64(arg1))),
+                                "max" => Value::number(self.to_f64(arg0).max(self.to_f64(arg1))),
+                                "min" => Value::number(self.to_f64(arg0).min(self.to_f64(arg1))),
+                                _ => {
+                                    let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                                    self.exec_math_method(method_name, &args)
+                                }
+                            };
                             self.stack.truncate(obj_pos);
                             self.push(result);
                             continue;
                         }
-                        // Check for JSON methods
-                        let json_name = self.interner.intern("JSON");
-                        if self.globals.get(&json_name).map(|v| v.as_object_id()) == Some(Some(oid)) {
+                        // Check for JSON methods (fast: cached ObjectId comparison)
+                        if self.json_oid == Some(oid) {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_json_method(method_name, &args);
                             self.stack.truncate(obj_pos);
