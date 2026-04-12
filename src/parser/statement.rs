@@ -423,6 +423,63 @@ fn parse_for(p: &mut Parser) -> ParseResult<Statement> {
             _ => unreachable!(),
         };
         p.advance();
+
+        // Check for destructuring pattern in for-in/for-of: for (var [a,b] of ...)
+        if p.at(TokenKind::LBracket) || p.at(TokenKind::LBrace) {
+            let pat_start = p.pos();
+            let pattern = if p.at(TokenKind::LBracket) {
+                parse_array_pattern(p)?
+            } else {
+                parse_object_pattern(p)?
+            };
+            let pat_end = p.pos();
+            // Must be for-in or for-of
+            if p.at(TokenKind::In) {
+                p.advance();
+                let right = parse_expression(p, 0)?;
+                p.expect(TokenKind::RParen)?;
+                let body = parse_statement(p)?;
+                let decl = VariableDeclaration {
+                    kind,
+                    declarations: vec![VariableDeclarator {
+                        id: pattern,
+                        init: None,
+                        span: Span::new(pat_start, pat_end),
+                    }],
+                    span: Span::new(var_start, pat_end),
+                };
+                return Ok(Statement::ForIn(Box::new(ForInStatement {
+                    left: ForInOfLeft::Variable(decl),
+                    right,
+                    body,
+                    span: Span::new(start, p.pos()),
+                })));
+            }
+            if p.at(TokenKind::Of) || (p.at(TokenKind::Identifier) && p.current_text() == "of") {
+                p.advance();
+                let right = parse_expression(p, 3)?;
+                p.expect(TokenKind::RParen)?;
+                let body = parse_statement(p)?;
+                let decl = VariableDeclaration {
+                    kind,
+                    declarations: vec![VariableDeclarator {
+                        id: pattern,
+                        init: None,
+                        span: Span::new(pat_start, pat_end),
+                    }],
+                    span: Span::new(var_start, pat_end),
+                };
+                return Ok(Statement::ForOf(Box::new(ForOfStatement {
+                    left: ForInOfLeft::Variable(decl),
+                    right,
+                    body,
+                    is_await: false,
+                    span: Span::new(start, p.pos()),
+                })));
+            }
+            return Err(ParseError::unexpected(p.current().kind, p.current().span));
+        }
+
         let name = p.intern_current();
         let name_span = p.current().span;
         p.expect(TokenKind::Identifier)?;

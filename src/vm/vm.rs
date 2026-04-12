@@ -860,7 +860,8 @@ impl Vm {
                 // ---- Constants & Literals --------------------------------
                 OpCode::Const => {
                     let index = self.read_u16() as usize;
-                    let val = self.chunks[self.cur_chunk()].constants[index];
+                    let chunk = self.cur_chunk();
+                    let val = self.chunks[chunk].constants.get(index).copied().unwrap_or(Value::undefined());
                     self.push(val);
                 }
 
@@ -870,7 +871,8 @@ impl Vm {
                         self.frames.last_mut().unwrap().ip += 4;
                         v as usize
                     };
-                    let val = self.chunks[self.cur_chunk()].constants[index];
+                    let chunk = self.cur_chunk();
+                    let val = self.chunks[chunk].constants.get(index).copied().unwrap_or(Value::undefined());
                     self.push(val);
                 }
 
@@ -1311,7 +1313,8 @@ impl Vm {
                 OpCode::GetLocal => {
                     let slot = self.read_byte() as usize;
                     let base = self.frames.last().unwrap().base;
-                    let val = self.stack[base + slot];
+                    let idx = base + slot;
+                    let val = if idx < self.stack.len() { self.stack[idx] } else { Value::undefined() };
                     self.push(val);
                 }
 
@@ -1319,13 +1322,15 @@ impl Vm {
                     let slot = self.read_byte() as usize;
                     let val = self.peek()?;
                     let base = self.frames.last().unwrap().base;
-                    self.stack[base + slot] = val;
+                    let idx = base + slot;
+                    if idx < self.stack.len() { self.stack[idx] = val; }
                 }
 
                 OpCode::GetLocalWide => {
                     let slot = self.read_u16() as usize;
                     let base = self.frames.last().unwrap().base;
-                    let val = self.stack[base + slot];
+                    let idx = base + slot;
+                    let val = if idx < self.stack.len() { self.stack[idx] } else { Value::undefined() };
                     self.push(val);
                 }
 

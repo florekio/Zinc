@@ -58,6 +58,9 @@ impl<'a> Cursor<'a> {
 
     /// Peek the current character (handles multi-byte UTF-8).
     pub fn peek_char(&self) -> Option<char> {
+        if self.pos >= self.source.len() || !self.source.is_char_boundary(self.pos) {
+            return None;
+        }
         self.source[self.pos..].chars().next()
     }
 
@@ -75,6 +78,9 @@ impl<'a> Cursor<'a> {
 
     /// Advance by one character (handles multi-byte UTF-8) and return it.
     pub fn advance_char(&mut self) -> Option<char> {
+        if self.pos >= self.source.len() || !self.source.is_char_boundary(self.pos) {
+            return None;
+        }
         let ch = self.source[self.pos..].chars().next()?;
         let len = ch.len_utf8();
         for _ in 0..len {

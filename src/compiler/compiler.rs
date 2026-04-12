@@ -671,25 +671,71 @@ impl<'a> Compiler<'a> {
         let line = f.span.start;
         self.begin_scope();
 
-        // Pre-declare the loop variable
-        let var_name = match &f.left {
+        // Determine the loop variable pattern
+        enum LoopVar {
+            Simple(StringId),
+            ArrayDestructure,
+            ObjectDestructure,
+            None,
+        }
+        let loop_var = match &f.left {
             ForInOfLeft::Variable(decl) => {
-                decl.declarations.first().and_then(|d| {
-                    if let Pattern::Identifier(id) = &d.id { Some(id.name) } else { None }
-                })
+                if let Some(d) = decl.declarations.first() {
+                    match &d.id {
+                        Pattern::Identifier(id) => LoopVar::Simple(id.name),
+                        Pattern::Array(_) => LoopVar::ArrayDestructure,
+                        Pattern::Object(_) => LoopVar::ObjectDestructure,
+                        _ => LoopVar::None,
+                    }
+                } else { LoopVar::None }
             }
-            ForInOfLeft::Pattern(Pattern::Identifier(id)) => Some(id.name),
-            _ => None,
+            ForInOfLeft::Pattern(Pattern::Identifier(id)) => LoopVar::Simple(id.name),
+            _ => LoopVar::None,
         };
-        if let Some(name) = var_name {
-            self.chunk.emit_op(OpCode::Undefined, line);
-            if self.scope_depth <= 1 {
-                let idx = self.make_string_constant(name);
-                self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
+        // Pre-declare loop variable(s)
+        let declare_var = |this: &mut Self, name: StringId| {
+            this.chunk.emit_op(OpCode::Undefined, line);
+            if this.scope_depth <= 1 {
+                let idx = this.make_string_constant(name);
+                this.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
             } else {
-                self.add_local(name);
-                self.mark_initialized();
+                this.add_local(name);
+                this.mark_initialized();
             }
+        };
+        match &loop_var {
+            LoopVar::Simple(name) => declare_var(self, *name),
+            LoopVar::ArrayDestructure => {
+                let arr_pat = match &f.left {
+                    ForInOfLeft::Variable(decl) => if let Some(d) = decl.declarations.first() { if let Pattern::Array(a) = &d.id { Some(a) } else { None } } else { None },
+                    _ => None,
+                };
+                if let Some(ap) = arr_pat {
+                    for elem in ap.elements.iter().flatten() {
+                        let name = match elem {
+                                Pattern::Identifier(id) => Some(id.name),
+                                Pattern::Rest(r) => if let Pattern::Identifier(id) = &r.argument { Some(id.name) } else { None },
+                                Pattern::Assignment(a) => if let Pattern::Identifier(id) = &a.left { Some(id.name) } else { None },
+                                _ => None,
+                            };
+                            if let Some(n) = name { declare_var(self, n); }
+                    }
+                }
+            }
+            LoopVar::ObjectDestructure => {
+                let obj_pat = match &f.left {
+                    ForInOfLeft::Variable(decl) => if let Some(d) = decl.declarations.first() { if let Pattern::Object(o) = &d.id { Some(o) } else { None } } else { None },
+                    _ => None,
+                };
+                if let Some(op) = obj_pat {
+                    for prop in &op.properties {
+                        if let ObjectPatternProperty::Property { value: Pattern::Identifier(id), .. } = prop {
+                            declare_var(self, id.name);
+                        }
+                    }
+                }
+            }
+            LoopVar::None => {}
         }
 
         // Compile the iterable and get its iterator
@@ -705,13 +751,60 @@ impl<'a> Compiler<'a> {
         self.chunk.emit_op(OpCode::IteratorDone, line);
         let exit_jump = self.chunk.emit_jump(OpCode::JumpIfTrue, line);
 
-        // Get the value and assign to loop variable
+        // Get the value and assign to loop variable(s)
         self.chunk.emit_op(OpCode::IteratorValue, line);
-        if let Some(name) = var_name {
-            self.compile_set_variable(name, line)?;
-            self.chunk.emit_op(OpCode::Pop, line);
-        } else {
-            self.chunk.emit_op(OpCode::Pop, line);
+        match &loop_var {
+            LoopVar::Simple(name) => {
+                self.compile_set_variable(*name, line)?;
+                self.chunk.emit_op(OpCode::Pop, line);
+            }
+            LoopVar::ArrayDestructure => {
+                let arr_pat = match &f.left {
+                    ForInOfLeft::Variable(decl) => if let Some(d) = decl.declarations.first() { if let Pattern::Array(a) = &d.id { Some(a) } else { None } } else { None },
+                    _ => None,
+                };
+                if let Some(ap) = arr_pat {
+                    for (i, elem) in ap.elements.iter().enumerate() {
+                        if let Some(Pattern::Identifier(id)) = elem {
+                            self.chunk.emit_op(OpCode::Dup, line);
+                            let idx_val = Value::int(i as i32);
+                            let idx = self.chunk.add_constant(idx_val);
+                            self.chunk.emit_op_u16(OpCode::Const, idx, line);
+                            self.chunk.emit_op(OpCode::GetElement, line);
+                            self.compile_set_variable(id.name, line)?;
+                            self.chunk.emit_op(OpCode::Pop, line);
+                        }
+                    }
+                }
+                self.chunk.emit_op(OpCode::Pop, line);
+            }
+            LoopVar::ObjectDestructure => {
+                let obj_pat = match &f.left {
+                    ForInOfLeft::Variable(decl) => if let Some(d) = decl.declarations.first() { if let Pattern::Object(o) = &d.id { Some(o) } else { None } } else { None },
+                    _ => None,
+                };
+                if let Some(op) = obj_pat {
+                    for prop in &op.properties {
+                        if let ObjectPatternProperty::Property { key, value: Pattern::Identifier(id), .. } = prop {
+                            let key_sid = match key {
+                                PropertyKey::Identifier(s) | PropertyKey::StringLiteral(s) => *s,
+                                _ => continue,
+                            };
+                            self.chunk.emit_op(OpCode::Dup, line);
+                            let key_idx = self.make_string_constant(key_sid);
+                            self.chunk.emit_byte(OpCode::GetProperty as u8, line);
+                            self.chunk.code.push((key_idx >> 8) as u8);
+                            self.chunk.code.push((key_idx & 0xFF) as u8);
+                            self.compile_set_variable(id.name, line)?;
+                            self.chunk.emit_op(OpCode::Pop, line);
+                        }
+                    }
+                }
+                self.chunk.emit_op(OpCode::Pop, line);
+            }
+            LoopVar::None => {
+                self.chunk.emit_op(OpCode::Pop, line);
+            }
         }
 
         // Compile body with loop context for break/continue
