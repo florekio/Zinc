@@ -32,6 +32,8 @@ pub struct Chunk {
     pub upvalue_count: u16,
     /// Number of declared parameters.
     pub param_count: u16,
+    /// Function.length: params before first default/rest.
+    pub formal_length: u16,
     /// Function name (for stack traces).
     pub name: StringId,
     /// Chunk flags (strict, generator, async, etc.)
@@ -82,6 +84,7 @@ impl Chunk {
             local_count: 0,
             upvalue_count: 0,
             param_count: 0,
+            formal_length: 0,
             name,
             flags: ChunkFlags::empty(),
             upvalue_descriptors: Vec::new(),

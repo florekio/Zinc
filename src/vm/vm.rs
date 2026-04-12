@@ -123,6 +123,8 @@ pub struct Vm {
     pub(crate) module_dir: Option<String>,
     /// Regex compilation cache
     pub(crate) regex_cache: crate::vm::regexp::RegexCache,
+    /// Function prototype cache: maps packed function value → prototype ObjectId
+    pub(crate) func_prototypes: HashMap<i32, ObjectId>,
     /// Symbol descriptions: index = symbol_id, value = optional description StringId
     pub(crate) symbol_descriptions: Vec<Option<StringId>>,
     /// Next symbol ID to allocate
@@ -279,6 +281,7 @@ impl Vm {
             module_cache: HashMap::new(),
             module_dir: None,
             regex_cache: crate::vm::regexp::RegexCache::new(),
+            func_prototypes: HashMap::new(),
             symbol_descriptions: sym_descs,
             next_symbol_id: 6, // 0-5 are well-known
             sym_iterator: 0,
@@ -520,6 +523,18 @@ impl Vm {
             let id = val.as_string_id().unwrap();
             let s = self.interner.resolve(id).trim();
             if s.is_empty() { return 0.0; }
+            // Handle hex literals: 0x, 0X
+            if s.starts_with("0x") || s.starts_with("0X") {
+                return u64::from_str_radix(&s[2..], 16).map(|v| v as f64).unwrap_or(f64::NAN);
+            }
+            // Handle octal literals: 0o, 0O
+            if s.starts_with("0o") || s.starts_with("0O") {
+                return u64::from_str_radix(&s[2..], 8).map(|v| v as f64).unwrap_or(f64::NAN);
+            }
+            // Handle binary literals: 0b, 0B
+            if s.starts_with("0b") || s.starts_with("0B") {
+                return u64::from_str_radix(&s[2..], 2).map(|v| v as f64).unwrap_or(f64::NAN);
+            }
             return s.parse::<f64>().unwrap_or(f64::NAN);
         }
         // Wrapper objects: unwrap and coerce the primitive
@@ -2055,11 +2070,17 @@ impl Vm {
                                 // User-defined function properties
                                 match name_str {
                                     "prototype" => {
-                                        // Create/return a prototype object for this function
-                                        let mut proto = JsObject::ordinary();
-                                        let ctor_key = self.interner.intern("constructor");
-                                        proto.set_property(ctor_key, obj_val);
-                                        Value::object_id(self.heap.allocate(proto))
+                                        // Get or create the prototype object for this function
+                                        if let Some(&proto_oid) = self.func_prototypes.get(&sentinel) {
+                                            Value::object_id(proto_oid)
+                                        } else {
+                                            let mut proto = JsObject::ordinary();
+                                            let ctor_key = self.interner.intern("constructor");
+                                            proto.set_property(ctor_key, obj_val);
+                                            let proto_oid = self.heap.allocate(proto);
+                                            self.func_prototypes.insert(sentinel, proto_oid);
+                                            Value::object_id(proto_oid)
+                                        }
                                     }
                                     "name" => {
                                         let chunk_idx = (sentinel & 0xFFFF) as usize;
@@ -2074,7 +2095,8 @@ impl Vm {
                                     "length" => {
                                         let chunk_idx = (sentinel & 0xFFFF) as usize;
                                         if chunk_idx < self.chunks.len() {
-                                            Value::int(self.chunks[chunk_idx].param_count as i32)
+                                            // Function.length = params before first default
+                                            Value::int(self.chunks[chunk_idx].formal_length as i32)
                                         } else {
                                             Value::int(0)
                                         }
@@ -2136,11 +2158,17 @@ impl Vm {
                                 self.push(val);
                                 continue;
                             }
-                            // "length" on array via bracket access
+                            // String key on array: "length" or numeric string like "0"
                             if let Some(name_id) = key.as_string_id() {
                                 let name = self.interner.resolve(name_id);
                                 if name == "length" {
                                     self.push(Value::int(elements.len() as i32));
+                                    continue;
+                                }
+                                // Try parsing string as numeric index: arr["0"]
+                                if let Ok(idx) = name.parse::<usize>() {
+                                    let val = elements.get(idx).copied().unwrap_or(Value::undefined());
+                                    self.push(val);
                                     continue;
                                 }
                             }
@@ -3170,8 +3198,25 @@ impl Vm {
                         }
                     }
 
-                    // Create a new object for `this`
-                    let new_obj = JsObject::ordinary();
+                    // Create a new object for `this`, linked to F.prototype
+                    let mut new_obj = JsObject::ordinary();
+                    if func_val.is_function() {
+                        let packed = func_val.as_function().unwrap();
+                        // Get or create the prototype from the cache
+                        if let Some(&proto_oid) = self.func_prototypes.get(&packed) {
+                            new_obj.prototype = Some(proto_oid);
+                        } else {
+                            let chunk_idx = (packed & 0xFFFF) as usize;
+                            if chunk_idx < self.chunks.len() {
+                                let mut proto = JsObject::ordinary();
+                                let ctor_key = self.interner.intern("constructor");
+                                proto.set_property(ctor_key, func_val);
+                                let proto_oid = self.heap.allocate(proto);
+                                self.func_prototypes.insert(packed, proto_oid);
+                                new_obj.prototype = Some(proto_oid);
+                            }
+                        }
+                    }
                     let new_oid = self.heap.allocate(new_obj);
                     let this_val = Value::object_id(new_oid);
 

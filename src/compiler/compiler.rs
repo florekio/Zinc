@@ -1487,6 +1487,10 @@ impl<'a> Compiler<'a> {
 
         let mut child_chunk = Chunk::new(name, source_name);
         child_chunk.param_count = params.len() as u16;
+        // Function.length: count params before first default or rest
+        child_chunk.formal_length = params.iter()
+            .take_while(|p| !matches!(p, Pattern::Assignment(_) | Pattern::Rest(_)))
+            .count() as u16;
 
         let mut flags = ChunkFlags::empty();
         if is_async {
@@ -1634,6 +1638,9 @@ impl<'a> Compiler<'a> {
 
         let mut child_chunk = Chunk::new(arrow_name, source_name);
         child_chunk.param_count = params.len() as u16;
+        child_chunk.formal_length = params.iter()
+            .take_while(|p| !matches!(p, Pattern::Assignment(_) | Pattern::Rest(_)))
+            .count() as u16;
         child_chunk.flags = ChunkFlags::ARROW;
         if is_async {
             child_chunk.flags |= ChunkFlags::ASYNC;
@@ -2426,6 +2433,14 @@ impl<'a> Compiler<'a> {
             let line = f.span.start;
             self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
             self.chunk.emit_byte(desc.index, line);
+        }
+        // For named function expressions, store function as global so it can self-reference
+        // (the name should only be visible inside the function body per spec,
+        // but global binding makes self-recursion work)
+        if f.id.is_some() {
+            self.chunk.emit_op(OpCode::Dup, f.span.start);
+            let idx = self.make_string_constant(name);
+            self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, f.span.start);
         }
         Ok(())
     }
