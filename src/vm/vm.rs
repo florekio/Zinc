@@ -1799,8 +1799,20 @@ impl Vm {
                 }
 
                 OpCode::DeleteProp => {
-                    self.pop()?;
-                    self.push(Value::boolean(true));
+                    let key = self.pop()?;
+                    let obj_val = self.pop()?;
+                    let result = if let Some(oid) = obj_val.as_object_id() {
+                        if let Some(key_id) = key.as_string_id() {
+                            self.heap.get_mut(oid)
+                                .map(|o| o.delete_property(key_id))
+                                .unwrap_or(true)
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    self.push(Value::boolean(result));
                 }
 
                 OpCode::DeleteGlobal => {
@@ -1848,7 +1860,15 @@ impl Vm {
                     let key = self.pop()?;
                     let result = if let Some(oid) = obj.as_object_id() {
                         if let Some(kid) = key.as_string_id() {
-                            self.heap.get(oid).map(|o| o.get_property(kid).is_some()).unwrap_or(false)
+                            // Walk prototype chain for 'in' operator
+                            self.heap.get_property_chain(oid, kid).is_some()
+                        } else if let Some(idx) = key.as_int() {
+                            // Numeric key: check array elements
+                            self.heap.get(oid)
+                                .map(|o| if let ObjectKind::Array(ref elems) = o.kind {
+                                    idx >= 0 && (idx as usize) < elems.len()
+                                } else { false })
+                                .unwrap_or(false)
                         } else { false }
                     } else { false };
                     self.push(Value::boolean(result));
@@ -3204,20 +3224,58 @@ impl Vm {
                         v as usize
                     };
                     let val = self.pop()?;
-                    // Array is on stack below
                     let arr_val = self.peek()?;
                     if let Some(oid) = arr_val.as_object_id()
                         && let Some(obj) = self.heap.get_mut(oid)
                             && let ObjectKind::Array(ref mut elements) = obj.kind {
-                                while elements.len() <= idx {
-                                    elements.push(Value::undefined());
+                                // If array already has more elements than idx (due to spread),
+                                // push to end instead of overwriting
+                                if idx < elements.len() && elements.len() > idx {
+                                    elements.push(val);
+                                } else {
+                                    while elements.len() <= idx {
+                                        elements.push(Value::undefined());
+                                    }
+                                    elements[idx] = val;
                                 }
-                                elements[idx] = val;
                             }
                 }
 
-                OpCode::ArraySpread | OpCode::ObjectSpread => {
-                    let _source = self.pop()?;
+                OpCode::ArraySpread => {
+                    let source = self.pop()?;
+                    let target = self.peek()?;
+                    // Copy elements from source into target array (spread semantics)
+                    if let Some(src_oid) = source.as_object_id() {
+                        let elems = self.heap.get(src_oid)
+                            .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                            .unwrap_or_default();
+                        if let Some(tgt_oid) = target.as_object_id()
+                            && let Some(tgt_obj) = self.heap.get_mut(tgt_oid)
+                                && let ObjectKind::Array(ref mut tgt_elems) = tgt_obj.kind {
+                                    tgt_elems.extend(elems);
+                                }
+                    }
+                }
+
+                OpCode::ObjectSpread => {
+                    let source = self.pop()?;
+                    let target = self.peek()?;
+                    // Copy enumerable own properties from source to target
+                    if let Some(src_oid) = source.as_object_id() {
+                        let props: Vec<(StringId, Value)> = self.heap.get(src_oid)
+                            .map(|o| o.properties.iter()
+                                .filter(|(_, p)| p.is_enumerable())
+                                .map(|&(k, ref p)| (k, p.value))
+                                .collect())
+                            .unwrap_or_default();
+                        if let Some(tgt_oid) = target.as_object_id() {
+                            for (key, val) in props {
+                                if let Some(tgt) = self.heap.get_mut(tgt_oid) {
+                                    tgt.set_property(key, val);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 OpCode::DefineDataProp => {
@@ -3522,9 +3580,26 @@ impl Vm {
                         } else {
                             // Object key iterator (for...in)
                             let keys: Vec<_> = self.heap.get(oid)
-                                .map(|o| o.properties.iter()
-                                    .filter(|(_, p)| p.is_enumerable())
-                                    .map(|(k, _)| *k).collect())
+                                .map(|_| {
+                                    // Walk prototype chain for for-in
+                                    let mut all_keys = Vec::new();
+                                    let mut seen = std::collections::HashSet::new();
+                                    let mut cur = Some(oid);
+                                    let mut depth = 0;
+                                    while let Some(cid) = cur {
+                                        if depth > 64 { break; }
+                                        if let Some(obj) = self.heap.get(cid) {
+                                            for &(k, ref p) in &obj.properties {
+                                                if p.is_enumerable() && seen.insert(k) {
+                                                    all_keys.push(k);
+                                                }
+                                            }
+                                            cur = obj.prototype;
+                                        } else { break; }
+                                        depth += 1;
+                                    }
+                                    all_keys
+                                })
                                 .unwrap_or_default();
                             let iter_obj = JsObject {
                                 properties: Vec::new(),
