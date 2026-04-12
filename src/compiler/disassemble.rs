@@ -57,7 +57,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         | OpCode::DefineGetter | OpCode::DefineSetter | OpCode::ObjectSpread
         | OpCode::Inherit | OpCode::GetSuperConstructor
         | OpCode::Throw | OpCode::PopExcHandler | OpCode::EnterFinally | OpCode::LeaveFinally
-        | OpCode::GetIterator | OpCode::GetAsyncIterator
+        | OpCode::GetIterator | OpCode::GetForInIterator | OpCode::GetAsyncIterator
         | OpCode::IteratorNext | OpCode::IteratorDone | OpCode::IteratorValue | OpCode::IteratorClose
         | OpCode::Yield | OpCode::YieldStar | OpCode::Await | OpCode::CreateGenerator
         | OpCode::AsyncReturn | OpCode::AsyncThrow
@@ -123,7 +123,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         | OpCode::DefineMethod | OpCode::Class
         | OpCode::ClassStaticMethod | OpCode::ClassMethod
         | OpCode::ClassField | OpCode::ClassStaticField | OpCode::ClassPrivateMethod
-        | OpCode::SetFunctionName | OpCode::ImportModule | OpCode::ExportAllFrom
+        | OpCode::SetFunctionName | OpCode::ImportModule | OpCode::ExportAllFrom | OpCode::CollectRest
         | OpCode::TypeOfGlobal | OpCode::DeleteGlobal => {
             let idx = chunk.read_u16(offset + 1);
             out.push_str(&format!("{op:<20} [{idx}]\n"));

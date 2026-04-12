@@ -308,6 +308,10 @@ pub enum OpCode {
 
     // ---- Miscellaneous ----
     /// No operation
+    /// Collect remaining arguments into rest array (u8 start_index, u8 target_slot)
+    CollectRest = 0xEE,
+    /// Get iterator for for-in (always key iterator, even for arrays)
+    GetForInIterator = 0xEF,
     Nop = 0x00,
     /// debugger statement
     Debugger = 0xF0,
@@ -450,6 +454,7 @@ impl OpCode {
             | OpCode::NewTarget
             | OpCode::ImportMeta
             | OpCode::ToPropertyKey
+            | OpCode::GetForInIterator
             | OpCode::WithEnter
             | OpCode::WithExit
             | OpCode::GetSuperElem
@@ -509,7 +514,8 @@ impl OpCode {
             | OpCode::DestructureDefault
             | OpCode::ImportModule
             | OpCode::ExportAllFrom
-            | OpCode::SetFunctionName => 3,
+            | OpCode::SetFunctionName
+            | OpCode::CollectRest => 3,
 
             // 4 bytes (u16 + u16)
             OpCode::PushExcHandler | OpCode::GetModuleVar => 5,

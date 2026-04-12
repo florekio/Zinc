@@ -1746,6 +1746,28 @@ impl Vm {
                     });
                 }
 
+                OpCode::CollectRest => {
+                    let start_idx = self.read_byte() as usize;
+                    let target_slot = self.read_byte() as usize;
+                    let frame = self.frames.last().unwrap();
+                    let base = frame.base;
+                    let argc = frame.argc;
+                    // Collect args from start_idx..argc into an array
+                    let mut rest_elements = Vec::new();
+                    for i in start_idx..argc {
+                        if base + i < self.stack.len() {
+                            rest_elements.push(self.stack[base + i]);
+                        }
+                    }
+                    let arr = JsObject::array(rest_elements);
+                    let arr_oid = self.heap.allocate(arr);
+                    // Store in the target local slot
+                    let base = self.frames.last().unwrap().base;
+                    if base + target_slot < self.stack.len() {
+                        self.stack[base + target_slot] = Value::object_id(arr_oid);
+                    }
+                }
+
                 OpCode::Nop => { /* do nothing */ }
 
                 // ---- Unimplemented opcodes (stubs) -----------------------
@@ -3769,6 +3791,56 @@ impl Vm {
 
                 OpCode::EnterFinally | OpCode::LeaveFinally => {
                     // Simplified: finally blocks just execute inline
+                }
+
+                OpCode::GetForInIterator => {
+                    // for-in: always create key iterator (string indices for arrays)
+                    let val = self.pop()?;
+                    if let Some(oid) = val.as_object_id() {
+                        let keys: Vec<_> = self.heap.get(oid)
+                            .map(|o| {
+                                if let ObjectKind::Array(ref elems) = o.kind {
+                                    // Array: yield "0", "1", "2", ...
+                                    (0..elems.len()).map(|i| self.interner.intern(&i.to_string())).collect()
+                                } else {
+                                    // Object: walk prototype chain
+                                    let mut all_keys = Vec::new();
+                                    let mut seen = std::collections::HashSet::new();
+                                    let mut cur = Some(oid);
+                                    let mut depth = 0;
+                                    while let Some(cid) = cur {
+                                        if depth > 64 { break; }
+                                        if let Some(obj) = self.heap.get(cid) {
+                                            for &(k, ref p) in &obj.properties {
+                                                if p.is_enumerable() && seen.insert(k) {
+                                                    all_keys.push(k);
+                                                }
+                                            }
+                                            cur = obj.prototype;
+                                        } else { break; }
+                                        depth += 1;
+                                    }
+                                    all_keys
+                                }
+                            })
+                            .unwrap_or_default();
+                        let iter_obj = JsObject {
+                            properties: Vec::new(), prototype: None,
+                            kind: ObjectKind::KeyIterator(keys, 0),
+                            marked: false, extensible: true,
+                        };
+                        let iter_id = self.heap.allocate(iter_obj);
+                        self.push(Value::object_id(iter_id));
+                    } else {
+                        // Primitive: empty iterator
+                        let iter_obj = JsObject {
+                            properties: Vec::new(), prototype: None,
+                            kind: ObjectKind::KeyIterator(Vec::new(), 0),
+                            marked: false, extensible: true,
+                        };
+                        let iter_id = self.heap.allocate(iter_obj);
+                        self.push(Value::object_id(iter_id));
+                    }
                 }
 
                 OpCode::GetIterator => {

@@ -769,10 +769,9 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        // Compile the object expression, then emit GetIterator
-        // The VM's GetIterator will detect ordinary objects and create a key iterator
+        // Compile the object expression, then emit GetForInIterator (key iterator)
         self.compile_expr(&f.right)?;
-        self.chunk.emit_op(OpCode::GetIterator, line);
+        self.chunk.emit_op(OpCode::GetForInIterator, line);
 
         let loop_start = self.chunk.len();
 
@@ -1639,6 +1638,16 @@ impl<'a> Compiler<'a> {
                     let offset = (target as i16) - (jump_idx as i16) - 3;
                     self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
                     self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
+                }
+        }
+
+        // Emit CollectRest for rest parameters
+        for (i, param) in params.iter().enumerate() {
+            if let Pattern::Rest(r) = param
+                && let Pattern::Identifier(_) = &r.argument {
+                    self.chunk.emit_byte(OpCode::CollectRest as u8, 0);
+                    self.chunk.code.push(i as u8);
+                    self.chunk.code.push(i as u8);
                 }
         }
 
