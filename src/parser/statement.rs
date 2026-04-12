@@ -1026,10 +1026,30 @@ fn parse_array_pattern(p: &mut Parser) -> ParseResult<Pattern> {
             }))));
             break;
         }
-        let name = p.intern_current();
-        let name_span = p.current().span;
-        p.expect(TokenKind::Identifier)?;
-        elements.push(Some(Pattern::Identifier(Identifier { name, span: name_span })));
+        if p.at(TokenKind::LBracket) {
+            // Nested array pattern: [[a, b], c]
+            let nested = parse_array_pattern(p)?;
+            elements.push(Some(nested));
+        } else if p.at(TokenKind::LBrace) {
+            // Nested object pattern: [{a, b}, c]
+            let nested = parse_object_pattern(p)?;
+            elements.push(Some(nested));
+        } else {
+            let name = p.intern_current();
+            let name_span = p.current().span;
+            p.expect(TokenKind::Identifier)?;
+            // Check for default value: x = expr
+            if p.eat(TokenKind::Assign) {
+                let default_expr = super::expression::parse_expression(p, 3)?;
+                elements.push(Some(Pattern::Assignment(Box::new(AssignmentPattern {
+                    left: Pattern::Identifier(Identifier { name, span: name_span }),
+                    right: default_expr,
+                    span: Span::new(name_span.start, p.pos()),
+                }))));
+            } else {
+                elements.push(Some(Pattern::Identifier(Identifier { name, span: name_span })));
+            }
+        }
 
         if !p.at(TokenKind::RBracket) {
             p.expect(TokenKind::Comma)?;

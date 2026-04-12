@@ -1167,6 +1167,66 @@ fn expr_to_assignment_target(expr: Expression) -> ParseResult<AssignmentTarget> 
     match expr {
         Expression::Identifier(id) => Ok(AssignmentTarget::Identifier(id)),
         Expression::Member(m) => Ok(AssignmentTarget::Member(m)),
+        Expression::Array(arr) => {
+            // Convert array expression to array destructuring pattern
+            let mut elements = Vec::new();
+            for elem in arr.elements {
+                match elem {
+                    Some(Expression::Identifier(id)) => elements.push(Some(Pattern::Identifier(id))),
+                    Some(Expression::Assignment(a)) => {
+                        if let AssignmentTarget::Identifier(id) = a.left {
+                            elements.push(Some(Pattern::Assignment(Box::new(AssignmentPattern {
+                                left: Pattern::Identifier(id),
+                                right: a.right,
+                                span: a.span,
+                            }))));
+                        } else {
+                            elements.push(None);
+                        }
+                    }
+                    Some(Expression::Spread(s)) => {
+                        if let Expression::Identifier(id) = s.argument {
+                            elements.push(Some(Pattern::Rest(Box::new(RestElement {
+                                argument: Pattern::Identifier(id),
+                                span: s.span,
+                            }))));
+                        } else {
+                            elements.push(None);
+                        }
+                    }
+                    None => elements.push(None),
+                    _ => elements.push(None),
+                }
+            }
+            Ok(AssignmentTarget::Pattern(Pattern::Array(ArrayPattern {
+                elements,
+                span: arr.span,
+            })))
+        }
+        Expression::Object(obj) => {
+            // Convert object expression to object destructuring pattern
+            let mut properties = Vec::new();
+            for prop in obj.properties {
+                if let ObjectProperty::Property(p) = prop
+                    && let Expression::Identifier(id) = p.value {
+                        let key = match p.key {
+                            PropertyKey::Identifier(s) | PropertyKey::StringLiteral(s) => s,
+                            _ => continue,
+                        };
+                        properties.push(ObjectPatternProperty::Property {
+                            key: PropertyKey::Identifier(key),
+                            value: Pattern::Identifier(id),
+                            computed: false,
+                            shorthand: p.shorthand,
+                            span: p.span,
+                        });
+                    }
+            }
+            Ok(AssignmentTarget::Pattern(Pattern::Object(ObjectPattern {
+                properties,
+                span: obj.span,
+            })))
+        }
         _ => {
             let span = expr_span(&expr);
             Err(ParseError::new("Invalid assignment target", span))
