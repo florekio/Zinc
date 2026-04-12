@@ -1509,8 +1509,15 @@ impl<'a> Compiler<'a> {
 
         let parent_chunk = std::mem::replace(&mut self.chunk, child_chunk);
         let parent_locals = std::mem::take(&mut self.locals);
+        let parent_upvalues = std::mem::take(&mut self.upvalues);
         let parent_depth = self.scope_depth;
         let parent_loops = std::mem::take(&mut self.loops);
+        let parent_enclosing_locals = self.enclosing_locals.take();
+        let parent_enclosing_upvalues = self.enclosing_upvalues.take();
+
+        // Make parent's locals available for upvalue resolution (enables nested closures)
+        self.enclosing_locals = Some(parent_locals.clone());
+        self.enclosing_upvalues = Some(parent_upvalues.clone());
 
         self.scope_depth = 1;
 
@@ -1577,10 +1584,28 @@ impl<'a> Compiler<'a> {
 
         self.chunk.local_count = self.locals.len() as u16;
 
+        // Store upvalue descriptors
+        let upvalue_descs: Vec<UpvalueDescriptor> = self.upvalues.iter().map(|uv| {
+            UpvalueDescriptor { index: uv.index, is_local: uv.is_local }
+        }).collect();
+        self.chunk.upvalue_count = upvalue_descs.len() as u16;
+        self.chunk.upvalue_descriptors = upvalue_descs;
+
         let compiled = std::mem::replace(&mut self.chunk, parent_chunk);
-        self.locals = parent_locals;
+
+        // Propagate captured flags back to parent locals
+        let mut restored_locals = parent_locals;
+        for uv in &self.upvalues {
+            if uv.is_local && (uv.index as usize) < restored_locals.len() {
+                restored_locals[uv.index as usize].captured = true;
+            }
+        }
+        self.locals = restored_locals;
+        self.upvalues = parent_upvalues;
         self.scope_depth = parent_depth;
         self.loops = parent_loops;
+        self.enclosing_locals = parent_enclosing_locals;
+        self.enclosing_upvalues = parent_enclosing_upvalues;
 
         Ok(compiled)
     }

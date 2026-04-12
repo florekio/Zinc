@@ -2445,8 +2445,21 @@ impl Vm {
                                 continue;
                             }
                             "toString" => {
-                                let s = self.value_to_string(obj_val);
-                                let id = self.interner.intern(&s);
+                                // Return [object Type] string
+                                let tag = if let Some(o) = self.heap.get(oid) {
+                                    match &o.kind {
+                                        ObjectKind::Array(_) => "[object Array]",
+                                        ObjectKind::Function(_) => "[object Function]",
+                                        ObjectKind::RegExp { .. } => "[object RegExp]",
+                                        ObjectKind::Promise { .. } => "[object Promise]",
+                                        ObjectKind::Map { .. } => "[object Map]",
+                                        ObjectKind::Set { .. } => "[object Set]",
+                                        ObjectKind::WeakMap { .. } => "[object WeakMap]",
+                                        ObjectKind::WeakSet { .. } => "[object WeakSet]",
+                                        _ => "[object Object]",
+                                    }
+                                } else { "[object Object]" };
+                                let id = self.interner.intern(tag);
                                 self.stack.truncate(obj_pos);
                                 self.push(Value::string(id));
                                 continue;
