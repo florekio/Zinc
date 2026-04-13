@@ -717,6 +717,33 @@ impl Vm {
                 }
                 m
             }
+            "hypot" => {
+                let mut sum = 0.0;
+                for arg in args {
+                    let n = arg.as_number().unwrap_or(f64::NAN);
+                    sum += n * n;
+                }
+                sum.sqrt()
+            }
+            "log1p" => a().ln_1p(),
+            "expm1" => a().exp_m1(),
+            "cosh" => a().cosh(),
+            "sinh" => a().sinh(),
+            "tanh" => a().tanh(),
+            "asinh" => a().asinh(),
+            "acosh" => a().acosh(),
+            "atanh" => a().atanh(),
+            "fround" => (a() as f32) as f64,
+            "clz32" => {
+                let n = a();
+                if n.is_nan() || n.is_infinite() { 32.0 }
+                else { (n as u32).leading_zeros() as f64 }
+            }
+            "imul" => {
+                let x = a() as i32 as i64;
+                let y = b() as i32 as i64;
+                ((x * y) as i32) as f64
+            }
             _ => return Value::undefined(),
         };
         Value::number(result)

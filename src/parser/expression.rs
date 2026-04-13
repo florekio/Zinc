@@ -1028,6 +1028,7 @@ fn is_keyword_property(kind: TokenKind) -> bool {
             | TokenKind::False
             | TokenKind::Null
             | TokenKind::Undefined
+            | TokenKind::Of
     )
 }
 

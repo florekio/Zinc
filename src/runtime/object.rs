@@ -503,6 +503,10 @@ impl JsObject {
                 return;
             }
         }
+        // Don't add new properties to non-extensible (frozen/sealed) objects
+        if !self.extensible {
+            return;
+        }
         self.properties.push((key, Property::data(value)));
     }
 

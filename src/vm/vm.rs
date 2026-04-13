@@ -3486,7 +3486,54 @@ impl Vm {
                 }
                 OpCode::SpreadConstruct => {
                     let _ = self.read_byte();
-                    return Err(VmError::RuntimeError("SpreadConstruct not yet implemented".into()));
+                    // Stack: [func, args_array]
+                    let args_val = self.pop()?;
+                    let func_val = self.pop()?;
+                    let args: Vec<Value> = if let Some(arr_oid) = args_val.as_object_id() {
+                        self.heap.get(arr_oid)
+                            .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                            .unwrap_or_default()
+                    } else { vec![] };
+                    // Re-push func and args, then dispatch as if Construct(argc) was called
+                    let argc = args.len();
+                    self.push(func_val);
+                    for arg in &args { self.push(*arg); }
+                    // Push back the bytecode equivalent of Construct
+                    // We can't easily call Construct from here since it's part of the run loop.
+                    // Instead, inline the logic: use call_function_this with a new object
+                    self.stack.truncate(self.stack.len() - argc - 1); // pop everything we just pushed
+
+                    // Now call construct logic manually for user functions
+                    if func_val.is_function() {
+                        let packed = func_val.as_function().unwrap();
+                        let chunk_idx = (packed & 0xFFFF) as usize;
+                        if chunk_idx > 0 && chunk_idx < self.chunks.len() {
+                            // Create new object with prototype linkage
+                            let mut new_obj = JsObject::ordinary();
+                            if let Some(&proto_oid) = self.func_prototypes.get(&packed) {
+                                new_obj.prototype = Some(proto_oid);
+                            } else {
+                                let mut proto = JsObject::ordinary();
+                                let ctor_key = self.interner.intern("constructor");
+                                proto.set_property(ctor_key, func_val);
+                                let proto_oid = self.heap.allocate(proto);
+                                self.func_prototypes.insert(packed, proto_oid);
+                                new_obj.prototype = Some(proto_oid);
+                            }
+                            let new_oid = self.heap.allocate(new_obj);
+                            let this_val = Value::object_id(new_oid);
+                            // Call the function with this binding
+                            let result = self.call_function_this(func_val, this_val, &args)?;
+                            // Per JS spec, if constructor returns an object, use that; else return new instance
+                            if result.is_object() {
+                                self.push(result);
+                            } else {
+                                self.push(this_val);
+                            }
+                            continue;
+                        }
+                    }
+                    self.push(Value::undefined());
                 }
 
                 OpCode::SetArrayItem => {
@@ -3817,13 +3864,14 @@ impl Vm {
 
                 OpCode::Throw => {
                     let val = self.pop()?;
-                    // Look for an exception handler
+                    // Look for an exception handler in any frame (unwinding as needed)
                     if let Some(handler) = self.exc_handlers.pop() {
-                        // Unwind stack to the handler's saved depth
+                        // Unwind frames until we're at the handler's frame
+                        while self.frames.len() > handler.frame_idx + 1 {
+                            self.frames.pop();
+                        }
                         self.stack.truncate(handler.stack_depth);
-                        // Push the thrown value (catch parameter)
                         self.push(val);
-                        // Jump to catch target
                         let frame = self.frames.last_mut().unwrap();
                         frame.ip = handler.catch_target as usize;
                     } else {
@@ -3918,6 +3966,33 @@ impl Vm {
                                 properties: Vec::new(),
                                 prototype: None,
                                 kind: ObjectKind::ArrayIterator(oid, 0),
+                                marked: false,
+                                extensible: true,
+                            };
+                            let iter_id = self.heap.allocate(iter_obj);
+                            self.push(Value::object_id(iter_id));
+                        } else if let Some(kind_info) = self.heap.get(oid).and_then(|o| match &o.kind {
+                            ObjectKind::Map { entries } => Some((true, entries.clone(), Vec::<Value>::new())),
+                            ObjectKind::Set { entries } => Some((false, Vec::<(Value,Value)>::new(), entries.clone())),
+                            _ => None,
+                        }) {
+                            // Build a temporary array to iterate
+                            let elements: Vec<Value> = if kind_info.0 {
+                                // Map: build [k,v] pair arrays
+                                kind_info.1.into_iter().map(|(k, v)| {
+                                    let pair_arr = JsObject::array(vec![k, v]);
+                                    Value::object_id(self.heap.allocate(pair_arr))
+                                }).collect()
+                            } else {
+                                // Set: just values
+                                kind_info.2
+                            };
+                            let arr = JsObject::array(elements);
+                            let arr_oid = self.heap.allocate(arr);
+                            let iter_obj = JsObject {
+                                properties: Vec::new(),
+                                prototype: None,
+                                kind: ObjectKind::ArrayIterator(arr_oid, 0),
                                 marked: false,
                                 extensible: true,
                             };

@@ -2612,6 +2612,26 @@ impl<'a> Compiler<'a> {
 
     fn compile_new(&mut self, n: &NewExpression) -> Result<(), String> {
         let line = n.span.start;
+        let has_spread = n.arguments.iter().any(|a| matches!(a, Expression::Spread(_)));
+        if has_spread {
+            // Build args array, then SpreadConstruct
+            self.compile_expr(&n.callee)?;
+            self.chunk.emit_op_u16(OpCode::CreateArray, 0, line);
+            let mut idx: u32 = 0;
+            for arg in &n.arguments {
+                if let Expression::Spread(sp) = arg {
+                    self.compile_expr(&sp.argument)?;
+                    self.chunk.emit_op(OpCode::ArraySpread, line);
+                    idx = u32::MAX;
+                } else {
+                    self.compile_expr(arg)?;
+                    self.chunk.emit_op_u32(OpCode::SetArrayItem, idx, line);
+                    if idx != u32::MAX { idx = idx.saturating_add(1); }
+                }
+            }
+            self.chunk.emit_op_u8(OpCode::SpreadConstruct, 0, line);
+            return Ok(());
+        }
         self.compile_expr(&n.callee)?;
         for arg in &n.arguments {
             self.compile_expr(arg)?;
