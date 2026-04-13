@@ -3076,28 +3076,51 @@ impl Vm {
                                 let source = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
                                 let map_fn = if argc > 1 { Some(self.stack[obj_pos + 2]) } else { None };
                                 let mut result = Vec::new();
-                                if let Some(src_oid) = source.as_object_id()
-                                    && let Some(obj) = self.heap.get(src_oid)
-                                        && let ObjectKind::Array(ref elems) = obj.kind {
-                                            let elems = elems.clone();
-                                            for (i, elem) in elems.iter().enumerate() {
-                                                if let Some(mfn) = map_fn {
-                                                    result.push(self.call_function(mfn, &[*elem, Value::int(i as i32)])?);
-                                                } else {
-                                                    result.push(*elem);
-                                                }
+                                // Collect raw elements first
+                                let raw_elems: Vec<Value> = if let Some(src_oid) = source.as_object_id() {
+                                    if let Some(obj) = self.heap.get(src_oid) {
+                                        match &obj.kind {
+                                            ObjectKind::Array(elems) => elems.clone(),
+                                            ObjectKind::Set { entries } => entries.clone(),
+                                            ObjectKind::Map { entries } => {
+                                                let pairs = entries.clone();
+                                                pairs.into_iter().map(|(k, v)| {
+                                                    let pair_arr = JsObject::array(vec![k, v]);
+                                                    Value::object_id(self.heap.allocate(pair_arr))
+                                                }).collect()
                                             }
-                                        } else if source.is_string() {
+                                            _ => {
+                                                // Try array-like with length
+                                                let length_key = self.interner.intern("length");
+                                                if let Some(len_val) = obj.get_property(length_key) {
+                                                    if let Some(len) = len_val.as_number() {
+                                                        let n = len as usize;
+                                                        let mut items = Vec::with_capacity(n);
+                                                        for i in 0..n {
+                                                            let key_str = i.to_string();
+                                                            let key_id = self.interner.intern(&key_str);
+                                                            items.push(self.heap.get(src_oid).and_then(|o| o.get_property(key_id)).unwrap_or(Value::undefined()));
+                                                        }
+                                                        items
+                                                    } else { vec![] }
+                                                } else { vec![] }
+                                            }
+                                        }
+                                    } else { vec![] }
+                                } else if source.is_string() {
                                     let sid = source.as_string_id().unwrap();
                                     let s = self.interner.resolve(sid).to_owned();
-                                    for (i, ch) in s.chars().enumerate() {
-                                        let ch_id = self.interner.intern(&ch.to_string());
-                                        let val = Value::string(ch_id);
-                                        if let Some(mfn) = map_fn {
-                                            result.push(self.call_function(mfn, &[val, Value::int(i as i32)])?);
-                                        } else {
-                                            result.push(val);
-                                        }
+                                    s.chars().map(|c| {
+                                        let id = self.interner.intern(&c.to_string());
+                                        Value::string(id)
+                                    }).collect()
+                                } else { vec![] };
+                                // Apply map_fn if provided
+                                for (i, elem) in raw_elems.iter().enumerate() {
+                                    if let Some(mfn) = map_fn {
+                                        result.push(self.call_function(mfn, &[*elem, Value::int(i as i32)])?);
+                                    } else {
+                                        result.push(*elem);
                                     }
                                 }
                                 let arr = JsObject::array(result);
@@ -3563,17 +3586,62 @@ impl Vm {
                 OpCode::ArraySpread => {
                     let source = self.pop()?;
                     let target = self.peek()?;
-                    // Copy elements from source into target array (spread semantics)
-                    if let Some(src_oid) = source.as_object_id() {
-                        let elems = self.heap.get(src_oid)
-                            .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                            .unwrap_or_default();
-                        if let Some(tgt_oid) = target.as_object_id()
-                            && let Some(tgt_obj) = self.heap.get_mut(tgt_oid)
-                                && let ObjectKind::Array(ref mut tgt_elems) = tgt_obj.kind {
-                                    tgt_elems.extend(elems);
+                    // Spread iterable into target array
+                    let elems: Vec<Value> = if let Some(src_oid) = source.as_object_id() {
+                        match self.heap.get(src_oid).map(|o| std::ptr::from_ref(&o.kind)) {
+                            Some(_) => match &self.heap.get(src_oid).unwrap().kind {
+                                ObjectKind::Array(e) => e.clone(),
+                                ObjectKind::Set { entries } => entries.clone(),
+                                ObjectKind::Map { entries } => {
+                                    // Map yields [k,v] pair arrays
+                                    let pairs = entries.clone();
+                                    pairs.into_iter().map(|(k, v)| {
+                                        let pair_arr = JsObject::array(vec![k, v]);
+                                        Value::object_id(self.heap.allocate(pair_arr))
+                                    }).collect()
                                 }
-                    }
+                                ObjectKind::Generator { .. } => {
+                                    // Drive generator until done
+                                    let mut result = Vec::new();
+                                    loop {
+                                        let next_name = self.interner.intern("next");
+                                        let next_result = self.exec_generator_method(src_oid, next_name, &[]);
+                                        match next_result {
+                                            Ok(crate::vm::generator::GeneratorAction::Done(iter_res)) => {
+                                                if let Some(io) = iter_res.as_object_id()
+                                                    && let Some(obj) = self.heap.get(io)
+                                                {
+                                                    let done_key = self.interner.intern("done");
+                                                    let value_key = self.interner.intern("value");
+                                                    let is_done = obj.get_property(done_key).map(|v| v.to_boolean()).unwrap_or(true);
+                                                    if is_done { break; }
+                                                    let val = obj.get_property(value_key).unwrap_or(Value::undefined());
+                                                    result.push(val);
+                                                } else { break; }
+                                            }
+                                            _ => break,
+                                        }
+                                        if result.len() > 100_000 { break; } // safety
+                                    }
+                                    result
+                                }
+                                _ => vec![],
+                            },
+                            None => vec![],
+                        }
+                    } else if source.is_string() {
+                        let sid = source.as_string_id().unwrap();
+                        let s = self.interner.resolve(sid).to_owned();
+                        s.chars().map(|c| {
+                            let id = self.interner.intern(&c.to_string());
+                            Value::string(id)
+                        }).collect()
+                    } else { vec![] };
+                    if let Some(tgt_oid) = target.as_object_id()
+                        && let Some(tgt_obj) = self.heap.get_mut(tgt_oid)
+                            && let ObjectKind::Array(ref mut tgt_elems) = tgt_obj.kind {
+                                tgt_elems.extend(elems);
+                            }
                 }
 
                 OpCode::ObjectSpread => {
