@@ -969,6 +969,36 @@ fn parse_object_pattern(p: &mut Parser) -> ParseResult<Pattern> {
         }
 
         let prop_start = p.pos();
+
+        // Computed property: { [expr]: value }
+        if p.at(TokenKind::LBracket) {
+            p.advance();
+            let key_expr = super::expression::parse_expression(p, 0)?;
+            p.expect(TokenKind::RBracket)?;
+            p.expect(TokenKind::Colon)?;
+            let value_pat = if p.at(TokenKind::LBrace) {
+                parse_object_pattern(p)?
+            } else if p.at(TokenKind::LBracket) {
+                parse_array_pattern(p)?
+            } else {
+                let value_name = p.intern_current();
+                let value_span = p.current().span;
+                p.expect(TokenKind::Identifier)?;
+                Pattern::Identifier(Identifier { name: value_name, span: value_span })
+            };
+            properties.push(ObjectPatternProperty::Property {
+                key: PropertyKey::Computed(Box::new(key_expr)),
+                value: value_pat,
+                computed: true,
+                shorthand: false,
+                span: Span::new(prop_start, p.pos()),
+            });
+            if !p.at(TokenKind::RBrace) {
+                p.expect(TokenKind::Comma)?;
+            }
+            continue;
+        }
+
         let key_name = p.intern_current();
         let key_span = p.current().span;
         p.advance(); // consume identifier (or keyword used as property)

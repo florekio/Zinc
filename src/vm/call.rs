@@ -100,6 +100,49 @@ impl Vm {
                 OpCode::One => self.push(Value::int(1)),
                 OpCode::Pop => { self.pop()?; }
                 OpCode::Dup => { let v = self.peek()?; self.push(v); }
+                OpCode::GetElement => {
+                    let key = self.pop()?;
+                    let obj_val = self.pop()?;
+                    if let Some(oid) = obj_val.as_object_id()
+                        && let Some(obj) = self.heap.get(oid)
+                    {
+                        if let ObjectKind::Array(ref elements) = obj.kind {
+                            if let Some(i) = key.as_int()
+                                && i >= 0 {
+                                    self.push(elements.get(i as usize).copied().unwrap_or(Value::undefined()));
+                                    continue;
+                                }
+                            if let Some(idx) = key.as_number() {
+                                self.push(elements.get(idx as usize).copied().unwrap_or(Value::undefined()));
+                                continue;
+                            }
+                        }
+                        if let Some(name_id) = key.as_string_id() {
+                            self.push(self.heap.get_property_chain(oid, name_id).unwrap_or(Value::undefined()));
+                            continue;
+                        }
+                    }
+                    self.push(Value::undefined());
+                }
+                OpCode::CollectRest => {
+                    let start_idx = self.read_byte() as usize;
+                    let target_slot = self.read_byte() as usize;
+                    let frame = self.frames.last().unwrap();
+                    let base = frame.base;
+                    let argc = frame.argc;
+                    let mut rest_elements = Vec::new();
+                    for i in start_idx..argc {
+                        if base + i < self.stack.len() {
+                            rest_elements.push(self.stack[base + i]);
+                        }
+                    }
+                    let arr = crate::runtime::object::JsObject::array(rest_elements);
+                    let arr_oid = self.heap.allocate(arr);
+                    let base = self.frames.last().unwrap().base;
+                    if base + target_slot < self.stack.len() {
+                        self.stack[base + target_slot] = Value::object_id(arr_oid);
+                    }
+                }
                 OpCode::CreateArray => {
                     let hint = self.read_u16() as usize;
                     let arr = crate::runtime::object::JsObject::array(Vec::with_capacity(hint));

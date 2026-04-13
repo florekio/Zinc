@@ -58,6 +58,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         | OpCode::Inherit | OpCode::GetSuperConstructor
         | OpCode::Throw | OpCode::PopExcHandler | OpCode::EnterFinally | OpCode::LeaveFinally
         | OpCode::GetIterator | OpCode::GetForInIterator | OpCode::GetAsyncIterator
+        | OpCode::GetSuperClass
         | OpCode::IteratorNext | OpCode::IteratorDone | OpCode::IteratorValue | OpCode::IteratorClose
         | OpCode::Yield | OpCode::YieldStar | OpCode::Await | OpCode::CreateGenerator
         | OpCode::AsyncReturn | OpCode::AsyncThrow
@@ -166,6 +167,12 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
             offset + 5
         }
 
+        // ObjectRest: u8 num_keys + (u16 key_idx) * num_keys
+        OpCode::ObjectRest => {
+            let n = chunk.code[offset + 1] as usize;
+            out.push_str(&format!("{op:<20} excl:{n}\n"));
+            offset + 2 + (n * 2)
+        }
         // Closure: u16 chunk_index + upvalue descriptors
         OpCode::Closure => {
             let idx = chunk.read_u16(offset + 1);

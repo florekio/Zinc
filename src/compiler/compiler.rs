@@ -405,14 +405,19 @@ impl<'a> Compiler<'a> {
                         let src_slot = (self.locals.len() - 1) as u8;
                         for prop in &obj_pat.properties {
                             if let ObjectPatternProperty::Property { key, value, .. } = prop {
-                                let prop_name = match key {
-                                    PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => *id,
-                                    _ => continue,
-                                };
                                 // Get the property from source object
                                 self.chunk.emit_op_u8(OpCode::GetLocal, src_slot, line);
-                                let idx = self.make_string_constant(prop_name);
-                                self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                                match key {
+                                    PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => {
+                                        let idx = self.make_string_constant(*id);
+                                        self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                                    }
+                                    PropertyKey::Computed(expr) => {
+                                        self.compile_expr(expr)?;
+                                        self.chunk.emit_op(OpCode::GetElement, line);
+                                    }
+                                    _ => { self.chunk.emit_op(OpCode::Pop, line); continue; }
+                                }
                                 // Handle different value patterns
                                 match value {
                                     Pattern::Identifier(id) => {
@@ -485,17 +490,47 @@ impl<'a> Compiler<'a> {
                                 }
                             }
                         }
+                        // Handle ObjectPatternProperty::Rest
+                        for prop in &obj_pat.properties {
+                            if let ObjectPatternProperty::Rest(rest) = prop
+                                && let Pattern::Identifier(id) = &rest.argument {
+                                    // Collect string keys to exclude
+                                    let excluded: Vec<StringId> = obj_pat.properties.iter().filter_map(|p| {
+                                        if let ObjectPatternProperty::Property { key, .. } = p {
+                                            match key {
+                                                PropertyKey::Identifier(s) | PropertyKey::StringLiteral(s) => Some(*s),
+                                                _ => None,
+                                            }
+                                        } else { None }
+                                    }).collect();
+                                    self.chunk.emit_op_u8(OpCode::GetLocal, src_slot, line);
+                                    self.chunk.emit_byte(OpCode::ObjectRest as u8, line);
+                                    self.chunk.code.push(excluded.len() as u8);
+                                    for k in &excluded {
+                                        let idx = self.make_string_constant(*k);
+                                        self.chunk.code.push((idx >> 8) as u8);
+                                        self.chunk.code.push((idx & 0xFF) as u8);
+                                    }
+                                    self.add_local(id.name);
+                                    self.mark_initialized();
+                                }
+                        }
                     } else {
                         // Global scope
                         for prop in &obj_pat.properties {
                             if let ObjectPatternProperty::Property { key, value, .. } = prop {
-                                let prop_name = match key {
-                                    PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => *id,
-                                    _ => continue,
-                                };
                                 self.chunk.emit_op(OpCode::Dup, line);
-                                let idx = self.make_string_constant(prop_name);
-                                self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                                match key {
+                                    PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => {
+                                        let idx = self.make_string_constant(*id);
+                                        self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                                    }
+                                    PropertyKey::Computed(expr) => {
+                                        self.compile_expr(expr)?;
+                                        self.chunk.emit_op(OpCode::GetElement, line);
+                                    }
+                                    _ => { self.chunk.emit_op(OpCode::Pop, line); continue; }
+                                }
                                 match value {
                                     Pattern::Identifier(id) => {
                                         let vidx = self.make_string_constant(id.name);
@@ -557,6 +592,30 @@ impl<'a> Compiler<'a> {
                                     _ => { self.chunk.emit_op(OpCode::Pop, line); }
                                 }
                             }
+                        }
+                        // Handle Rest in global scope
+                        for prop in &obj_pat.properties {
+                            if let ObjectPatternProperty::Rest(rest) = prop
+                                && let Pattern::Identifier(id) = &rest.argument {
+                                    let excluded: Vec<StringId> = obj_pat.properties.iter().filter_map(|p| {
+                                        if let ObjectPatternProperty::Property { key, .. } = p {
+                                            match key {
+                                                PropertyKey::Identifier(s) | PropertyKey::StringLiteral(s) => Some(*s),
+                                                _ => None,
+                                            }
+                                        } else { None }
+                                    }).collect();
+                                    self.chunk.emit_op(OpCode::Dup, line);
+                                    self.chunk.emit_byte(OpCode::ObjectRest as u8, line);
+                                    self.chunk.code.push(excluded.len() as u8);
+                                    for k in &excluded {
+                                        let idx = self.make_string_constant(*k);
+                                        self.chunk.code.push((idx >> 8) as u8);
+                                        self.chunk.code.push((idx & 0xFF) as u8);
+                                    }
+                                    let vidx = self.make_string_constant(id.name);
+                                    self.chunk.emit_op_u16(OpCode::DefineGlobal, vidx, line);
+                                }
                         }
                         self.chunk.emit_op(OpCode::Pop, line);
                     }
@@ -2423,6 +2482,24 @@ impl<'a> Compiler<'a> {
 
     fn compile_member(&mut self, m: &MemberExpression) -> Result<(), String> {
         let line = m.span.start;
+        // Special case: super.method — push the parent class object
+        if matches!(&m.object, Expression::Super(_)) {
+            // Emit __super_class__ access (this.__class__.__super__)
+            self.chunk.emit_op(OpCode::GetSuperClass, line);
+            match &m.property {
+                MemberProperty::Identifier(name) => {
+                    let idx = self.make_string_constant(*name);
+                    self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                }
+                MemberProperty::Expression(key) => {
+                    self.compile_expr(key)?;
+                    self.chunk.emit_op(OpCode::GetElement, line);
+                }
+                _ => {}
+            }
+            // Mark next call to propagate this
+            return Ok(());
+        }
         self.compile_expr(&m.object)?;
         match &m.property {
             MemberProperty::Identifier(name) => {
@@ -2450,6 +2527,21 @@ impl<'a> Compiler<'a> {
         // Method call: obj.method(args) -> CallMethod
         // Stack layout for CallMethod: [obj, arg0, arg1, ..., argN]
         if let Expression::Member(m) = &c.callee {
+            // Special case: super.method() — get method from super class but call with original this
+            if matches!(&m.object, Expression::Super(_))
+                && let MemberProperty::Identifier(name) = &m.property {
+                    // Get the method from super class
+                    self.chunk.emit_op(OpCode::GetSuperClass, line);
+                    let idx = self.make_string_constant(*name);
+                    self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                    // Push args
+                    for arg in &c.arguments {
+                        self.compile_expr(arg)?;
+                    }
+                    // Use Call (not CallMethod) — pending_super_call will use original this
+                    self.chunk.emit_op_u8(OpCode::Call, argc, line);
+                    return Ok(());
+                }
             self.compile_expr(&m.object)?; // push obj
             for arg in &c.arguments {
                 self.compile_expr(arg)?;

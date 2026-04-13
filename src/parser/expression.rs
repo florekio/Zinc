@@ -133,6 +133,17 @@ pub fn parse_expression(p: &mut Parser, min_bp: u8) -> ParseResult<Expression> {
                 }));
                 continue;
             }
+            // Tagged template: tag`hello${x}world`
+            TokenKind::TemplateLiteralFull | TokenKind::TemplateLiteralHead if 30 >= min_bp => {
+                let template = parse_template_literal(p)?;
+                let start = expr_span(&left).start;
+                left = Expression::TaggedTemplate(Box::new(TaggedTemplateExpression {
+                    tag: left,
+                    quasi: template,
+                    span: Span::new(start, p.pos()),
+                }));
+                continue;
+            }
             TokenKind::QuestionDot if 30 >= min_bp => {
                 // Build an OptionalChainExpression collecting all ?. and . and () chains
                 let start = expr_span(&left).start;
@@ -333,6 +344,15 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
             let span = p.current().span;
             p.advance();
             let value = p.parse_number(&text);
+            Ok(Expression::NumberLiteral(NumberLiteral { value, span }))
+        }
+        TokenKind::BigInt => {
+            // Treat BigInt as a regular number (strip 'n' suffix)
+            let text = p.current_text().to_owned();
+            let span = p.current().span;
+            p.advance();
+            let stripped = text.trim_end_matches('n');
+            let value = p.parse_number(stripped);
             Ok(Expression::NumberLiteral(NumberLiteral { value, span }))
         }
         TokenKind::String => {
@@ -1304,4 +1324,54 @@ pub fn parse_function_body_expr(
     is_generator: bool,
 ) -> ParseResult<Expression> {
     parse_function_body(p, is_async, is_generator)
+}
+
+/// Parse a template literal starting at the current TemplateLiteralFull or TemplateLiteralHead token.
+/// Returns the TemplateLiteral AST node.
+pub fn parse_template_literal(p: &mut Parser) -> ParseResult<TemplateLiteral> {
+    if p.at(TokenKind::TemplateLiteralFull) {
+        let text = p.current_text().to_owned();
+        let span = p.current().span;
+        p.advance();
+        let raw = p.interner.intern(&text[1..text.len() - 1]);
+        return Ok(TemplateLiteral {
+            quasis: vec![TemplateElement { raw, cooked: Some(raw), tail: true, span }],
+            expressions: vec![],
+            span,
+        });
+    }
+    // TemplateLiteralHead
+    let head_text = p.current_text().to_owned();
+    let start_span = p.current().span;
+    p.advance();
+    let head_str = &head_text[1..head_text.len() - 2];
+    let head_id = p.interner.intern(head_str);
+    let mut quasis = vec![TemplateElement { raw: head_id, cooked: Some(head_id), tail: false, span: start_span }];
+    let mut expressions = Vec::new();
+    loop {
+        let expr = parse_expression(p, 0)?;
+        expressions.push(expr);
+        match p.current_kind() {
+            TokenKind::TemplateLiteralMiddle => {
+                let text = p.current_text().to_owned();
+                let span = p.current().span;
+                p.advance();
+                let mid_str = &text[1..text.len() - 2];
+                let mid_id = p.interner.intern(mid_str);
+                quasis.push(TemplateElement { raw: mid_id, cooked: Some(mid_id), tail: false, span });
+            }
+            TokenKind::TemplateLiteralTail => {
+                let text = p.current_text().to_owned();
+                let span = p.current().span;
+                p.advance();
+                let tail_str = &text[1..text.len() - 1];
+                let tail_id = p.interner.intern(tail_str);
+                quasis.push(TemplateElement { raw: tail_id, cooked: Some(tail_id), tail: true, span });
+                break;
+            }
+            _ => return Err(ParseError::expected("template continuation", p.current_kind(), p.current().span)),
+        }
+    }
+    let end = p.pos();
+    Ok(TemplateLiteral { quasis, expressions, span: Span::new(start_span.start, end) })
 }

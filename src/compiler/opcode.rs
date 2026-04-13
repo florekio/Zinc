@@ -308,6 +308,12 @@ pub enum OpCode {
 
     // ---- Miscellaneous ----
     /// No operation
+    /// Build rest object: pop source, build object excluding keys.
+    /// Operand: u8 num_excluded_keys, then for each key: u16 string constant index.
+    /// Stack: [source] -> [rest_object]
+    ObjectRest = 0xE4,
+    /// Push parent class object (this.__class__.__super__)
+    GetSuperClass = 0xE5,
     /// Collect remaining arguments into rest array (u8 start_index, u8 target_slot)
     CollectRest = 0xEE,
     /// Get iterator for for-in (always key iterator, even for arrays)
@@ -365,8 +371,8 @@ impl OpCode {
             | 0xC0..=0xC4
             | 0xD0..=0xD5
             | 0xD8..=0xDD
-            | 0xE0..=0xE3
-            | 0xE8..=0xEC
+            | 0xE0..=0xE5
+            | 0xE8..=0xEF
             | 0xF0..=0xF5
             | 0xF7
             | 0xF9..=0xFA
@@ -455,6 +461,8 @@ impl OpCode {
             | OpCode::ImportMeta
             | OpCode::ToPropertyKey
             | OpCode::GetForInIterator
+            | OpCode::ObjectRest
+            | OpCode::GetSuperClass
             | OpCode::WithEnter
             | OpCode::WithExit
             | OpCode::GetSuperElem

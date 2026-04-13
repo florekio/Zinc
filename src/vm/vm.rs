@@ -3768,6 +3768,30 @@ impl Vm {
                     }
                 }
 
+                OpCode::GetSuperClass => {
+                    // Push parent class prototype: this.__class__.__super__.prototype
+                    let this_val = self.frames.last().unwrap().this_value;
+                    let class_key = self.interner.intern("__class__");
+                    let super_key = self.interner.intern("__super__");
+                    let proto_key = self.interner.intern("prototype");
+                    let super_class = this_val.as_object_id()
+                        .and_then(|oid| self.heap.get(oid))
+                        .and_then(|obj| obj.get_property(class_key))
+                        .and_then(|cv| cv.as_object_id())
+                        .and_then(|cid| self.heap.get(cid))
+                        .and_then(|cls| cls.get_property(super_key));
+                    // Try super_class.prototype first, fall back to super_class itself
+                    let result = if let Some(sv) = super_class {
+                        if let Some(sid) = sv.as_object_id() {
+                            self.heap.get(sid)
+                                .and_then(|s| s.get_property(proto_key))
+                                .or(Some(sv))
+                        } else { Some(sv) }
+                    } else { None };
+                    self.push(result.unwrap_or(Value::undefined()));
+                    self.frames.last_mut().unwrap().pending_super_call = true;
+                }
+
                 OpCode::GetSuperConstructor => {
                     // Resolve parent constructor: this.__class__.__super__.__constructor__
                     let this_val = self.frames.last().unwrap().this_value;
@@ -4164,6 +4188,33 @@ impl Vm {
                     )));
                 }
 
+                OpCode::ObjectRest => {
+                    // u8 num_excluded_keys, then (u16 key_idx) * num
+                    let n = self.read_byte() as usize;
+                    let mut excluded: std::collections::HashSet<StringId> = std::collections::HashSet::new();
+                    for _ in 0..n {
+                        let idx = self.read_u16() as usize;
+                        if let Some(sid) = self.chunks[self.cur_chunk()].constants[idx].as_string_id() {
+                            excluded.insert(sid);
+                        }
+                    }
+                    let source = self.pop()?;
+                    let mut rest = JsObject::ordinary();
+                    if let Some(src_oid) = source.as_object_id() {
+                        let props: Vec<(StringId, Value)> = self.heap.get(src_oid)
+                            .map(|o| o.properties.iter()
+                                .filter(|(k, p)| p.is_enumerable() && !excluded.contains(k))
+                                .map(|&(k, ref p)| (k, p.value))
+                                .collect())
+                            .unwrap_or_default();
+                        for (k, v) in props {
+                            rest.set_property(k, v);
+                        }
+                    }
+                    let oid = self.heap.allocate(rest);
+                    self.push(Value::object_id(oid));
+                }
+
                 OpCode::DestructureDefault => {
                     let _ = self.read_i16();
                     return Err(VmError::RuntimeError(
@@ -4316,11 +4367,47 @@ impl Vm {
                     )));
                 }
 
-                OpCode::TemplateTag | OpCode::CreateRestParam => {
+                OpCode::TemplateTag => {
+                    let total = self.read_byte() as usize;
+                    // Stack layout: [tag, quasi0..quasiN, expr0..exprM]
+                    // Where N = number of quasis, M = N-1
+                    // For simplicity: split: half are quasis, rest are exprs
+                    // Actually compiler emits: total = quasis.len() + expressions.len()
+                    // quasis come first, then expressions
+                    let num_exprs = total / 2; // expressions
+                    let num_quasis = total - num_exprs;
+                    let stack_len = self.stack.len();
+                    let tag_pos = stack_len - 1 - total;
+                    let tag = self.stack[tag_pos];
+                    // Build strings array from quasis
+                    let mut quasi_strings = Vec::with_capacity(num_quasis);
+                    for i in 0..num_quasis {
+                        quasi_strings.push(self.stack[tag_pos + 1 + i]);
+                    }
+                    // Collect expressions
+                    let mut exprs: Vec<Value> = Vec::with_capacity(num_exprs);
+                    for i in 0..num_exprs {
+                        exprs.push(self.stack[tag_pos + 1 + num_quasis + i]);
+                    }
+                    let strings_arr = JsObject::array(quasi_strings.clone());
+                    let arr_oid = self.heap.allocate(strings_arr);
+                    // Add 'raw' property pointing to same array (simplified)
+                    let raw_arr = JsObject::array(quasi_strings);
+                    let raw_oid = self.heap.allocate(raw_arr);
+                    let raw_key = self.interner.intern("raw");
+                    if let Some(obj) = self.heap.get_mut(arr_oid) {
+                        obj.set_property(raw_key, Value::object_id(raw_oid));
+                    }
+                    // Build args: [strings_array, ...exprs]
+                    let mut args = vec![Value::object_id(arr_oid)];
+                    args.extend(exprs);
+                    self.stack.truncate(tag_pos);
+                    let result = self.call_function(tag, &args)?;
+                    self.push(result);
+                }
+                OpCode::CreateRestParam => {
                     let _ = self.read_byte();
-                    return Err(VmError::RuntimeError(format!(
-                        "{opcode:?} not yet implemented"
-                    )));
+                    return Err(VmError::RuntimeError("CreateRestParam not yet implemented".into()));
                 }
 
                 OpCode::ToPropertyKey => {
