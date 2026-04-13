@@ -1733,24 +1733,33 @@ impl<'a> Compiler<'a> {
                                 self.mark_initialized();
                             }
                             Pattern::Assignment(a) => {
-                                if let Pattern::Identifier(id) = &a.left {
-                                    // Check undefined → use default
-                                    self.chunk.emit_op(OpCode::Dup, line);
-                                    self.chunk.emit_op(OpCode::Undefined, line);
-                                    self.chunk.emit_op(OpCode::StrictNe, line);
-                                    let jump_idx = self.chunk.code.len();
-                                    self.chunk.emit_op(OpCode::JumpIfTrue, line);
-                                    self.chunk.code.push(0); self.chunk.code.push(0);
-                                    self.chunk.emit_op(OpCode::Pop, line);
-                                    self.compile_expr(&a.right)?;
-                                    let target = self.chunk.code.len();
-                                    let offset = (target as i16) - (jump_idx as i16) - 3;
-                                    self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
-                                    self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
-                                    self.add_local(id.name);
-                                    self.mark_initialized();
-                                } else {
-                                    self.chunk.emit_op(OpCode::Pop, line);
+                                // Apply default if value is undefined
+                                self.chunk.emit_op(OpCode::Dup, line);
+                                self.chunk.emit_op(OpCode::Undefined, line);
+                                self.chunk.emit_op(OpCode::StrictNe, line);
+                                let jump_idx = self.chunk.code.len();
+                                self.chunk.emit_op(OpCode::JumpIfTrue, line);
+                                self.chunk.code.push(0); self.chunk.code.push(0);
+                                self.chunk.emit_op(OpCode::Pop, line);
+                                self.compile_expr(&a.right)?;
+                                let target = self.chunk.code.len();
+                                let offset = (target as i16) - (jump_idx as i16) - 3;
+                                self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
+                                self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
+                                // Now destructure the inner pattern from the value on stack
+                                match &a.left {
+                                    Pattern::Identifier(id) => {
+                                        self.add_local(id.name);
+                                        self.mark_initialized();
+                                    }
+                                    Pattern::Array(_) | Pattern::Object(_) => {
+                                        let anon = self.interner.intern("__destruct_inner__");
+                                        self.add_local(anon);
+                                        self.mark_initialized();
+                                        let inner_slot = (self.locals.len() - 1) as u8;
+                                        self.destructure_pattern_from_slot(&a.left, inner_slot, line)?;
+                                    }
+                                    _ => { self.chunk.emit_op(OpCode::Pop, line); }
                                 }
                             }
                             Pattern::Array(_) | Pattern::Object(_) => {
@@ -1790,23 +1799,31 @@ impl<'a> Compiler<'a> {
                                     self.mark_initialized();
                                 }
                                 Pattern::Assignment(a) => {
-                                    if let Pattern::Identifier(id) = &a.left {
-                                        self.chunk.emit_op(OpCode::Dup, line);
-                                        self.chunk.emit_op(OpCode::Undefined, line);
-                                        self.chunk.emit_op(OpCode::StrictNe, line);
-                                        let jump_idx = self.chunk.code.len();
-                                        self.chunk.emit_op(OpCode::JumpIfTrue, line);
-                                        self.chunk.code.push(0); self.chunk.code.push(0);
-                                        self.chunk.emit_op(OpCode::Pop, line);
-                                        self.compile_expr(&a.right)?;
-                                        let target = self.chunk.code.len();
-                                        let offset = (target as i16) - (jump_idx as i16) - 3;
-                                        self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
-                                        self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
-                                        self.add_local(id.name);
-                                        self.mark_initialized();
-                                    } else {
-                                        self.chunk.emit_op(OpCode::Pop, line);
+                                    self.chunk.emit_op(OpCode::Dup, line);
+                                    self.chunk.emit_op(OpCode::Undefined, line);
+                                    self.chunk.emit_op(OpCode::StrictNe, line);
+                                    let jump_idx = self.chunk.code.len();
+                                    self.chunk.emit_op(OpCode::JumpIfTrue, line);
+                                    self.chunk.code.push(0); self.chunk.code.push(0);
+                                    self.chunk.emit_op(OpCode::Pop, line);
+                                    self.compile_expr(&a.right)?;
+                                    let target = self.chunk.code.len();
+                                    let offset = (target as i16) - (jump_idx as i16) - 3;
+                                    self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
+                                    self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
+                                    match &a.left {
+                                        Pattern::Identifier(id) => {
+                                            self.add_local(id.name);
+                                            self.mark_initialized();
+                                        }
+                                        Pattern::Array(_) | Pattern::Object(_) => {
+                                            let anon = self.interner.intern("__destruct_inner__");
+                                            self.add_local(anon);
+                                            self.mark_initialized();
+                                            let inner_slot = (self.locals.len() - 1) as u8;
+                                            self.destructure_pattern_from_slot(&a.left, inner_slot, line)?;
+                                        }
+                                        _ => { self.chunk.emit_op(OpCode::Pop, line); }
                                     }
                                 }
                                 Pattern::Array(_) | Pattern::Object(_) => {

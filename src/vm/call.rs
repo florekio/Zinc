@@ -257,7 +257,16 @@ impl Vm {
                     let name_id = name_val.as_string_id().unwrap();
                     let obj_val = self.pop()?;
                     if let Some(oid) = obj_val.as_object_id() {
-                        let val = self.heap.get(oid).and_then(|o| o.get_property(name_id)).unwrap_or(Value::undefined());
+                        // Array length
+                        let name_str = self.interner.resolve(name_id);
+                        if name_str == "length"
+                            && let Some(obj) = self.heap.get(oid)
+                            && let ObjectKind::Array(ref elements) = obj.kind
+                        {
+                            self.push(Value::int(elements.len() as i32));
+                            continue;
+                        }
+                        let val = self.heap.get_property_chain(oid, name_id).unwrap_or(Value::undefined());
                         self.push(val);
                     } else if obj_val.is_string() && self.interner.resolve(name_id) == "length" {
                         let sid = obj_val.as_string_id().unwrap();
