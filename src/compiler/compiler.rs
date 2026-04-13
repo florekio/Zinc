@@ -1706,22 +1706,15 @@ impl<'a> Compiler<'a> {
                 for (i, elem_opt) in arr.elements.iter().enumerate() {
                     if let Some(elem) = elem_opt {
                         if let Pattern::Rest(r) = elem {
-                            // Rest: collect remaining elements into an array
-                            self.chunk.emit_op_u8(OpCode::GetLocal, src_slot, line);
-                            self.chunk.emit_op(OpCode::CreateArray, line);
-                            self.chunk.code.push(0);
-                            self.chunk.code.push(0);
-                            // For each index from i to length, push into rest array
-                            // Simpler: emit a small loop via native helpers? Use slice operation.
-                            // Fallback: push CallMethod on slice
+                            // Rest: arr.slice(i)
                             let slice_name = self.interner.intern("slice");
                             let slice_idx = self.make_string_constant(slice_name);
-                            // Pop the just-created empty array, recall slice(src, i)
-                            self.chunk.emit_op(OpCode::Pop, line);
                             self.chunk.emit_op_u8(OpCode::GetLocal, src_slot, line);
                             self.emit_constant(Value::int(i as i32), line);
-                            self.chunk.emit_op_u16(OpCode::CallMethod, slice_idx, line);
-                            self.chunk.code.push(1);
+                            self.chunk.emit_byte(OpCode::CallMethod as u8, line);
+                            self.chunk.code.push(1); // argc
+                            self.chunk.code.push((slice_idx >> 8) as u8);
+                            self.chunk.code.push((slice_idx & 0xFF) as u8);
                             if let Pattern::Identifier(id) = &r.argument {
                                 self.add_local(id.name);
                                 self.mark_initialized();
@@ -2065,25 +2058,43 @@ impl<'a> Compiler<'a> {
 
         self.scope_depth = 1;
 
-        for param in params {
+        for (param_idx, param) in params.iter().enumerate() {
             match param {
                 Pattern::Identifier(id) => {
                     self.add_local(id.name);
                     self.mark_initialized();
                 }
                 Pattern::Assignment(a) => {
-                    if let Pattern::Identifier(id) = &a.left {
-                        self.add_local(id.name);
-                        self.mark_initialized();
+                    match &a.left {
+                        Pattern::Identifier(id) => {
+                            self.add_local(id.name);
+                            self.mark_initialized();
+                        }
+                        _ => {
+                            let anon = self.interner.intern(&format!("__param{param_idx}__"));
+                            self.add_local(anon);
+                            self.mark_initialized();
+                        }
                     }
                 }
                 Pattern::Rest(r) => {
-                    if let Pattern::Identifier(id) = &r.argument {
-                        self.add_local(id.name);
-                        self.mark_initialized();
+                    match &r.argument {
+                        Pattern::Identifier(id) => {
+                            self.add_local(id.name);
+                            self.mark_initialized();
+                        }
+                        _ => {
+                            let anon = self.interner.intern(&format!("__param{param_idx}__"));
+                            self.add_local(anon);
+                            self.mark_initialized();
+                        }
                     }
                 }
-                _ => {}
+                Pattern::Array(_) | Pattern::Object(_) => {
+                    let anon = self.interner.intern(&format!("__param{param_idx}__"));
+                    self.add_local(anon);
+                    self.mark_initialized();
+                }
             }
         }
 
@@ -2109,6 +2120,31 @@ impl<'a> Compiler<'a> {
                     self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
                     self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
                 }
+        }
+
+        // Emit CollectRest for rest parameters
+        for (i, param) in params.iter().enumerate() {
+            if let Pattern::Rest(r) = param
+                && let Pattern::Identifier(_) = &r.argument {
+                    self.chunk.emit_byte(OpCode::CollectRest as u8, 0);
+                    self.chunk.code.push(i as u8);
+                    self.chunk.code.push(i as u8);
+                }
+        }
+
+        // Destructure array/object pattern parameters
+        for (i, param) in params.iter().enumerate() {
+            let pattern_to_destructure = match param {
+                Pattern::Array(_) | Pattern::Object(_) => Some(param),
+                Pattern::Assignment(a) => match &a.left {
+                    Pattern::Array(_) | Pattern::Object(_) => Some(&a.left),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(pat) = pattern_to_destructure {
+                self.destructure_pattern_from_slot(pat, i as u8, 0)?;
+            }
         }
 
         match body {

@@ -1358,6 +1358,7 @@ fn expr_to_param(expr: Expression) -> ParseResult<Pattern> {
         Expression::Assignment(a) => {
             let left = match a.left {
                 AssignmentTarget::Identifier(id) => Pattern::Identifier(id),
+                AssignmentTarget::Pattern(p) => p,
                 _ => {
                     return Err(ParseError::new("Invalid parameter", a.span));
                 }
@@ -1375,11 +1376,51 @@ fn expr_to_param(expr: Expression) -> ParseResult<Pattern> {
                 span: s.span,
             })))
         }
+        Expression::Array(a) => array_expr_to_pattern(a),
+        Expression::Object(o) => object_expr_to_pattern(o),
         _ => {
             let span = expr_span(&expr);
             Err(ParseError::new("Invalid parameter", span))
         }
     }
+}
+
+fn array_expr_to_pattern(arr: ArrayExpression) -> ParseResult<Pattern> {
+    let mut elements = Vec::new();
+    for e_opt in arr.elements {
+        if let Some(e) = e_opt {
+            match e {
+                Expression::Spread(s) => {
+                    let inner = expr_to_param(s.argument)?;
+                    elements.push(Some(Pattern::Rest(Box::new(RestElement {
+                        argument: inner,
+                        span: s.span,
+                    }))));
+                }
+                other => elements.push(Some(expr_to_param(other)?)),
+            }
+        } else {
+            elements.push(None);
+        }
+    }
+    Ok(Pattern::Array(ArrayPattern { elements, span: arr.span }))
+}
+
+fn object_expr_to_pattern(o: ObjectExpression) -> ParseResult<Pattern> {
+    let mut props = Vec::new();
+    for prop in o.properties {
+        if let ObjectProperty::Property(p) = prop {
+            let value = expr_to_param(p.value)?;
+            props.push(ObjectPatternProperty::Property {
+                key: p.key,
+                value,
+                computed: p.computed,
+                shorthand: p.shorthand,
+                span: p.span,
+            });
+        }
+    }
+    Ok(Pattern::Object(ObjectPattern { properties: props, span: o.span }))
 }
 
 /// Parse a property key in class body (re-exported for statement.rs).

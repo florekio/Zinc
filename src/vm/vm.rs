@@ -2552,6 +2552,54 @@ impl Vm {
                                 let id = self.interner.intern(&s);
                                 Value::string(id)
                             }
+                            "toPrecision" => {
+                                let s = if let Some(p) = args.first().and_then(|v| v.as_number()) {
+                                    let p = p as usize;
+                                    if n == 0.0 {
+                                        format!("{:.prec$}", 0.0, prec = p.saturating_sub(1))
+                                    } else {
+                                        let mag = n.abs().log10().floor() as i32;
+                                        if mag >= -6 && mag < p as i32 {
+                                            let decimals = (p as i32 - 1 - mag).max(0) as usize;
+                                            format!("{:.prec$}", n, prec = decimals)
+                                        } else {
+                                            let mantissa = n / 10f64.powi(mag);
+                                            let decimals = p.saturating_sub(1);
+                                            let sign = if mag >= 0 { "+" } else { "-" };
+                                            format!("{:.prec$}e{}{}", mantissa, sign, mag.abs(), prec = decimals)
+                                        }
+                                    }
+                                } else {
+                                    self.value_to_string(obj_val)
+                                };
+                                let id = self.interner.intern(&s);
+                                Value::string(id)
+                            }
+                            "toExponential" => {
+                                let digits = args.first().and_then(|v| v.as_number()).map(|d| d as usize);
+                                let s = if n == 0.0 {
+                                    let decimals = digits.unwrap_or(0);
+                                    if decimals == 0 { "0e+0".to_string() }
+                                    else { format!("{:.prec$}e+0", 0.0, prec = decimals) }
+                                } else {
+                                    let mag = n.abs().log10().floor() as i32;
+                                    let mantissa = n / 10f64.powi(mag);
+                                    let sign = if mag >= 0 { "+" } else { "-" };
+                                    match digits {
+                                        Some(d) => format!("{:.prec$}e{}{}", mantissa, sign, mag.abs(), prec = d),
+                                        None => {
+                                            // Minimum digits: default formatting, trim trailing zeros
+                                            let mut m = format!("{mantissa}");
+                                            if m.contains('.') {
+                                                m = m.trim_end_matches('0').trim_end_matches('.').to_string();
+                                            }
+                                            format!("{}e{}{}", m, sign, mag.abs())
+                                        }
+                                    }
+                                };
+                                let id = self.interner.intern(&s);
+                                Value::string(id)
+                            }
                             _ => Value::undefined(),
                         };
                         self.stack.truncate(obj_pos);
