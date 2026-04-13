@@ -91,10 +91,13 @@ impl Vm {
                     return result;
                 }
                 let sep = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let parts: Vec<Value> = s.split(&sep).map(|part| {
+                let limit = args.get(1).and_then(|v| v.as_number()).map(|n| n as usize);
+                let mut parts: Vec<Value> = Vec::new();
+                for part in s.split(&sep) {
+                    if let Some(lim) = limit && parts.len() >= lim { break; }
                     let id = self.interner.intern(part);
-                    Value::string(id)
-                }).collect();
+                    parts.push(Value::string(id));
+                }
                 let arr = JsObject::array(parts);
                 let oid = self.heap.allocate(arr);
                 Value::object_id(oid)
