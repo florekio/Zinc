@@ -18,7 +18,24 @@ impl Vm {
             }
             "stringify" => {
                 let val = args.first().copied().unwrap_or(Value::undefined());
-                let s = self.json_stringify(val);
+                // args[2] is the indent (number of spaces or string)
+                let indent = args.get(2).map(|v| {
+                    if let Some(n) = v.as_number() {
+                        " ".repeat((n as usize).min(10))
+                    } else if v.is_string() {
+                        let id = v.as_string_id().unwrap();
+                        let s = self.interner.resolve(id);
+                        // Limit to 10 chars
+                        s.chars().take(10).collect()
+                    } else {
+                        String::new()
+                    }
+                }).unwrap_or_default();
+                let s = if indent.is_empty() {
+                    self.json_stringify(val)
+                } else {
+                    self.json_stringify_pretty(val, &indent, 0)
+                };
                 let id = self.interner.intern(&s);
                 Value::string(id)
             }
@@ -64,6 +81,49 @@ impl Vm {
                                 format!("\"{}\":{}", key, self.json_stringify(p.value))
                             }).collect();
                         return format!("{{{}}}", parts.join(","));
+                    }
+                }
+            }
+        "null".into()
+    }
+
+    /// JSON.stringify with indentation
+    pub(crate) fn json_stringify_pretty(&self, val: Value, indent: &str, depth: usize) -> String {
+        if val.is_undefined() || val.is_function() { return "null".into(); }
+        if val.is_null() { return "null".into(); }
+        if val.is_boolean() { return format!("{}", val.as_bool().unwrap()); }
+        if val.is_int() { return format!("{}", val.as_int().unwrap()); }
+        if val.is_float() {
+            let n = val.as_float().unwrap();
+            if n.is_nan() || n.is_infinite() { return "null".into(); }
+            return format!("{n}");
+        }
+        if val.is_string() {
+            let id = val.as_string_id().unwrap();
+            let s = self.interner.resolve(id);
+            return format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t"));
+        }
+        if let Some(oid) = val.as_object_id()
+            && let Some(obj) = self.heap.get(oid) {
+                let cur_indent = indent.repeat(depth + 1);
+                let close_indent = indent.repeat(depth);
+                match &obj.kind {
+                    ObjectKind::Array(elements) => {
+                        if elements.is_empty() { return "[]".into(); }
+                        let parts: Vec<String> = elements.iter()
+                            .map(|v| format!("{cur_indent}{}", self.json_stringify_pretty(*v, indent, depth + 1)))
+                            .collect();
+                        return format!("[\n{}\n{close_indent}]", parts.join(",\n"));
+                    }
+                    _ => {
+                        let props: Vec<_> = obj.properties.iter().filter(|(_, p)| p.is_enumerable()).collect();
+                        if props.is_empty() { return "{}".into(); }
+                        let parts: Vec<String> = props.iter()
+                            .map(|&&(k, ref p)| {
+                                let key = self.interner.resolve(k);
+                                format!("{cur_indent}\"{}\": {}", key, self.json_stringify_pretty(p.value, indent, depth + 1))
+                            }).collect();
+                        return format!("{{\n{}\n{close_indent}}}", parts.join(",\n"));
                     }
                 }
             }

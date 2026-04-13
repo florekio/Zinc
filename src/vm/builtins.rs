@@ -235,9 +235,15 @@ impl Vm {
                 if let Some(obj) = self.heap.get(oid)
                     && let ObjectKind::Array(ref elements) = obj.kind {
                         for elem in elements {
+                            // SameValueZero: NaN equals NaN, +0 equals -0
                             if self.strict_eq(*elem, search) {
                                 return Ok(Value::boolean(true));
                             }
+                            // Both NaN case
+                            if let (Some(a), Some(b)) = (elem.as_number(), search.as_number())
+                                && a.is_nan() && b.is_nan() {
+                                    return Ok(Value::boolean(true));
+                                }
                         }
                     }
                 Ok(Value::boolean(false))

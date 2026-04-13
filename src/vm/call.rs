@@ -100,6 +100,47 @@ impl Vm {
                 OpCode::One => self.push(Value::int(1)),
                 OpCode::Pop => { self.pop()?; }
                 OpCode::Dup => { let v = self.peek()?; self.push(v); }
+                OpCode::CreateArray => {
+                    let hint = self.read_u16() as usize;
+                    let arr = crate::runtime::object::JsObject::array(Vec::with_capacity(hint));
+                    let oid = self.heap.allocate(arr);
+                    self.push(Value::object_id(oid));
+                }
+                OpCode::SetArrayItem => {
+                    let idx = {
+                        let v = self.chunks[self.cur_chunk()].read_u32(self.cur_ip());
+                        self.frames.last_mut().unwrap().ip += 4;
+                        v as usize
+                    };
+                    let val = self.pop()?;
+                    let arr_val = self.peek()?;
+                    if let Some(oid) = arr_val.as_object_id()
+                        && let Some(obj) = self.heap.get_mut(oid)
+                            && let ObjectKind::Array(ref mut elements) = obj.kind {
+                                if idx < elements.len() && elements.len() > idx {
+                                    elements.push(val);
+                                } else {
+                                    while elements.len() <= idx {
+                                        elements.push(Value::undefined());
+                                    }
+                                    elements[idx] = val;
+                                }
+                            }
+                }
+                OpCode::ArraySpread => {
+                    let source = self.pop()?;
+                    let target = self.peek()?;
+                    if let Some(src_oid) = source.as_object_id() {
+                        let elems = self.heap.get(src_oid)
+                            .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                            .unwrap_or_default();
+                        if let Some(tgt_oid) = target.as_object_id()
+                            && let Some(tgt_obj) = self.heap.get_mut(tgt_oid)
+                                && let ObjectKind::Array(ref mut tgt_elems) = tgt_obj.kind {
+                                    tgt_elems.extend(elems);
+                                }
+                    }
+                }
                 OpCode::Add => {
                     let b = self.pop()?; let a = self.pop()?;
                     if a.is_string() || b.is_string() {

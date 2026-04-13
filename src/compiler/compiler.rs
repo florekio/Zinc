@@ -2487,6 +2487,28 @@ impl<'a> Compiler<'a> {
 
         // Regular call.
         self.compile_expr(&c.callee)?;
+        // Check if any argument is a spread
+        let has_spread = c.arguments.iter().any(|a| matches!(a, Expression::Spread(_)));
+        if has_spread {
+            // Build a flat args array (with spreads expanded), then SpreadCall
+            self.chunk.emit_op_u16(OpCode::CreateArray, 0, line);
+            let mut idx: u32 = 0;
+            for arg in &c.arguments {
+                if let Expression::Spread(sp) = arg {
+                    self.compile_expr(&sp.argument)?;
+                    self.chunk.emit_op(OpCode::ArraySpread, line);
+                    idx = u32::MAX; // length unknown after spread
+                } else {
+                    self.compile_expr(arg)?;
+                    self.chunk.emit_op_u32(OpCode::SetArrayItem, idx, line);
+                    if idx != u32::MAX { idx = idx.saturating_add(1); }
+                }
+            }
+            // Stack: [func, args_array]; SpreadCall pops both, pushes result
+            self.chunk.emit_op_u8(OpCode::SpreadCall, 0, line);
+            return Ok(());
+        }
+
         for arg in &c.arguments {
             self.compile_expr(arg)?;
         }

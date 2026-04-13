@@ -3029,6 +3029,28 @@ impl Vm {
                                     Value::boolean(self.heap.get(oid).map(|o| o.has_own_property(key_id)).unwrap_or(false))
                                 } else { Value::boolean(false) }
                             }
+                            "fromEntries" => {
+                                // Object.fromEntries(iterable)
+                                let mut obj = JsObject::ordinary();
+                                if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
+                                    let entries: Vec<Value> = self.heap.get(oid)
+                                        .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                                        .unwrap_or_default();
+                                    for entry in entries {
+                                        if let Some(entry_oid) = entry.as_object_id()
+                                            && let Some(eobj) = self.heap.get(entry_oid)
+                                                && let ObjectKind::Array(ref pair) = eobj.kind
+                                                    && pair.len() >= 2 {
+                                                        let key_val = pair[0];
+                                                        let val = pair[1];
+                                                        let key_str = self.value_to_string(key_val);
+                                                        let key_id = self.interner.intern(&key_str);
+                                                        obj.set_property(key_id, val);
+                                                    }
+                                    }
+                                }
+                                Value::object_id(self.heap.allocate(obj))
+                            }
                             _ => Value::undefined(),
                         };
                         self.stack.truncate(obj_pos);
@@ -3448,11 +3470,23 @@ impl Vm {
                     self.push(this_val);
                 }
 
-                OpCode::SpreadCall | OpCode::SpreadConstruct => {
-                    let _argc = self.read_byte();
-                    return Err(VmError::RuntimeError(format!(
-                        "{opcode:?} not yet implemented"
-                    )));
+                OpCode::SpreadCall => {
+                    let _ = self.read_byte();
+                    // Stack: [func, args_array]
+                    let args_val = self.pop()?;
+                    let func_val = self.pop()?;
+                    // Extract args from array
+                    let args: Vec<Value> = if let Some(arr_oid) = args_val.as_object_id() {
+                        self.heap.get(arr_oid)
+                            .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                            .unwrap_or_default()
+                    } else { vec![] };
+                    let result = self.call_function(func_val, &args)?;
+                    self.push(result);
+                }
+                OpCode::SpreadConstruct => {
+                    let _ = self.read_byte();
+                    return Err(VmError::RuntimeError("SpreadConstruct not yet implemented".into()));
                 }
 
                 OpCode::SetArrayItem => {
