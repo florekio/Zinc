@@ -1,7 +1,7 @@
 use crate::ast::span::Span;
 use crate::util::interner::Interner;
 
-use super::cursor::{is_id_continue, is_line_terminator, Cursor};
+use super::cursor::{is_id_continue, is_line_terminator, is_unicode_line_terminator, is_unicode_whitespace, Cursor};
 use super::token::{lookup_keyword, Token, TokenKind};
 
 /// The Zinc lexer: converts source text into a stream of tokens.
@@ -83,6 +83,9 @@ impl<'a> Lexer<'a> {
         let kind = match byte {
             // Identifiers and keywords
             b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'$' => return self.scan_identifier(start, preceded_by_newline),
+
+            // \uXXXX escape at start of identifier
+            b'\\' if self.cursor.peek_at(1) == Some(b'u') => return self.scan_escaped_identifier(start, preceded_by_newline),
 
             // Numbers
             b'0'..=b'9' => return self.scan_number(start, preceded_by_newline),
@@ -313,7 +316,8 @@ impl<'a> Lexer<'a> {
                     && super::cursor::is_unicode_id_start(c) {
                         return self.scan_unicode_identifier(start, preceded_by_newline);
                     }
-                self.cursor.advance();
+                // Consume the full UTF-8 character so spans stay on boundaries
+                self.cursor.advance_char();
                 TokenKind::Error
             }
 
@@ -327,6 +331,7 @@ impl<'a> Lexer<'a> {
     }
 
     // ---- Whitespace & Comments ----
+
 
     fn skip_whitespace_and_comments(&mut self) {
         loop {
@@ -346,6 +351,20 @@ impl<'a> Lexer<'a> {
                     // \u00A0 (NBSP)
                     self.cursor.advance();
                     self.cursor.advance();
+                }
+                Some(b) if b >= 0x80 => {
+                    // Possibly Unicode whitespace or line terminator
+                    if let Some(c) = self.cursor.peek_char() {
+                        if is_unicode_whitespace(c) {
+                            self.cursor.advance_char();
+                            continue;
+                        } else if is_unicode_line_terminator(c) {
+                            self.saw_newline = true;
+                            self.cursor.advance_char();
+                            continue;
+                        }
+                    }
+                    return;
                 }
                 Some(b'/') => {
                     match self.cursor.peek_at(1) {
@@ -391,13 +410,25 @@ impl<'a> Lexer<'a> {
 
     fn scan_identifier(&mut self, start: usize, preceded_by_newline: bool) -> Token {
         self.cursor.advance(); // first char already validated
+        let mut had_escape = false;
+        let mut decoded = String::new();
+        decoded.push(self.cursor.source().as_bytes()[start] as char);
         while let Some(b) = self.cursor.peek() {
             if is_id_continue(b) {
+                decoded.push(b as char);
                 self.cursor.advance();
+            } else if b == b'\\' && self.cursor.peek_at(1) == Some(b'u') {
+                // \uXXXX or \u{XXXX}
+                if let Some(c) = self.consume_unicode_escape() {
+                    had_escape = true;
+                    decoded.push(c);
+                } else {
+                    break;
+                }
             } else if !b.is_ascii() {
-                // Might be a unicode continue character
                 if let Some(c) = self.cursor.peek_char()
                     && super::cursor::is_unicode_id_continue(c) {
+                        decoded.push(c);
                         self.cursor.advance_char();
                         continue;
                     }
@@ -407,16 +438,97 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        let span = Span::new(start as u32, self.cursor.pos() as u32);
+        if had_escape {
+            // An identifier containing a UnicodeEscapeSequence is always an Identifier,
+            // never a reserved word (even if the decoded form matches one).
+            self.interner.intern(&decoded);
+            return Token::new(TokenKind::Identifier, span, preceded_by_newline);
+        }
         let text = self.cursor.slice_from(start);
         let kind = lookup_keyword(text).unwrap_or(TokenKind::Identifier);
-        let span = Span::new(start as u32, self.cursor.pos() as u32);
-
-        // Intern the identifier (even keywords, for consistency)
         if kind == TokenKind::Identifier {
             self.interner.intern(text);
         }
-
         Token::new(kind, span, preceded_by_newline)
+    }
+
+    /// Consume \uXXXX or \u{X...X} and return the decoded char, or None on invalid.
+    fn consume_unicode_escape(&mut self) -> Option<char> {
+        // Peek '\' and 'u'
+        if self.cursor.peek() != Some(b'\\') || self.cursor.peek_at(1) != Some(b'u') {
+            return None;
+        }
+        self.cursor.advance(); // backslash
+        self.cursor.advance(); // u
+        let code = if self.cursor.peek() == Some(b'{') {
+            self.cursor.advance();
+            let mut code = 0u32;
+            let mut count = 0;
+            while let Some(b) = self.cursor.peek() {
+                if b == b'}' { self.cursor.advance(); break; }
+                let digit = match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    b'A'..=b'F' => b - b'A' + 10,
+                    _ => return None,
+                };
+                code = code * 16 + digit as u32;
+                self.cursor.advance();
+                count += 1;
+                if count > 6 { return None; }
+            }
+            code
+        } else {
+            let mut code = 0u32;
+            for _ in 0..4 {
+                let b = self.cursor.peek()?;
+                let digit = match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    b'A'..=b'F' => b - b'A' + 10,
+                    _ => return None,
+                };
+                code = code * 16 + digit as u32;
+                self.cursor.advance();
+            }
+            code
+        };
+        char::from_u32(code)
+    }
+
+    fn scan_escaped_identifier(&mut self, start: usize, preceded_by_newline: bool) -> Token {
+        let mut decoded = String::new();
+        if let Some(c) = self.consume_unicode_escape() {
+            if !super::cursor::is_unicode_id_start(c) {
+                // Invalid: escape at start must be id-start
+                return Token::new(TokenKind::Error, Span::new(start as u32, self.cursor.pos() as u32), preceded_by_newline);
+            }
+            decoded.push(c);
+        } else {
+            return Token::new(TokenKind::Error, Span::new(start as u32, self.cursor.pos() as u32), preceded_by_newline);
+        }
+        while let Some(b) = self.cursor.peek() {
+            if is_id_continue(b) {
+                decoded.push(b as char);
+                self.cursor.advance();
+            } else if b == b'\\' && self.cursor.peek_at(1) == Some(b'u') {
+                if let Some(c) = self.consume_unicode_escape() {
+                    decoded.push(c);
+                } else { break; }
+            } else if !b.is_ascii() {
+                if let Some(c) = self.cursor.peek_char()
+                    && super::cursor::is_unicode_id_continue(c) {
+                        decoded.push(c);
+                        self.cursor.advance_char();
+                        continue;
+                    }
+                break;
+            } else { break; }
+        }
+        self.interner.intern(&decoded);
+        let span = Span::new(start as u32, self.cursor.pos() as u32);
+        Token::new(TokenKind::Identifier, span, preceded_by_newline)
     }
 
     fn scan_unicode_identifier(&mut self, start: usize, preceded_by_newline: bool) -> Token {

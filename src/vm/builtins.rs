@@ -22,7 +22,15 @@ impl Vm {
             }
             "indexOf" => {
                 let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let pos = s.find(&search).map(|i| i as i32).unwrap_or(-1);
+                let from = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0).max(0.0) as usize;
+                if from >= s.len() {
+                    return Value::int(if search.is_empty() { s.len() as i32 } else { -1 });
+                }
+                let sub: String = s.chars().skip(from).collect();
+                let pos = sub.find(&search).map(|i| {
+                    // Convert byte position back to char position + offset
+                    (sub[..i].chars().count() + from) as i32
+                }).unwrap_or(-1);
                 Value::int(pos)
             }
             "lastIndexOf" => {
@@ -32,15 +40,22 @@ impl Vm {
             }
             "includes" => {
                 let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                Value::boolean(s.contains(&search))
+                let from = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0).max(0.0) as usize;
+                if from >= s.len() { return Value::boolean(search.is_empty()); }
+                let sub: String = s.chars().skip(from).collect();
+                Value::boolean(sub.contains(&search))
             }
             "startsWith" => {
                 let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                Value::boolean(s.starts_with(&search))
+                let from = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0).max(0.0) as usize;
+                let sub: String = s.chars().skip(from).collect();
+                Value::boolean(sub.starts_with(&search))
             }
             "endsWith" => {
                 let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                Value::boolean(s.ends_with(&search))
+                let end_pos = args.get(1).and_then(|v| v.as_number()).map(|n| n as usize).unwrap_or(s.chars().count());
+                let sub: String = s.chars().take(end_pos).collect();
+                Value::boolean(sub.ends_with(&search))
             }
             "slice" => {
                 let len = s.len() as i32;
@@ -60,6 +75,21 @@ impl Vm {
                 end = end.max(0).min(len);
                 if start > end { std::mem::swap(&mut start, &mut end); }
                 let result = &s[start as usize..end as usize];
+                let id = self.interner.intern(result);
+                Value::string(id)
+            }
+            "substr" => {
+                let len = s.len() as i32;
+                let mut start = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                if start < 0 { start = (start + len).max(0); }
+                let start = start.min(len) as usize;
+                let length = args.get(1)
+                    .and_then(|v| v.as_number())
+                    .map(|n| n as i32)
+                    .unwrap_or(len - start as i32)
+                    .max(0) as usize;
+                let end = (start + length).min(s.len());
+                let result = &s[start..end];
                 let id = self.interner.intern(result);
                 Value::string(id)
             }
@@ -83,6 +113,11 @@ impl Vm {
             }
             "trimEnd" => {
                 let id = self.interner.intern(s.trim_end());
+                Value::string(id)
+            }
+            "normalize" => {
+                // No Unicode normalization library: return as-is (sufficient for ASCII)
+                let id = self.interner.intern(s);
                 Value::string(id)
             }
             "split" => {
@@ -208,7 +243,10 @@ impl Vm {
                 Ok(Value::undefined())
             }
             "join" => {
-                let sep = args.first().map(|v| self.value_to_string(*v)).unwrap_or_else(|| ",".into());
+                let sep = args.first()
+                    .filter(|v| !v.is_undefined())
+                    .map(|v| self.value_to_string(*v))
+                    .unwrap_or_else(|| ",".into());
                 if let Some(obj) = self.heap.get(oid)
                     && let ObjectKind::Array(ref elements) = obj.kind {
                         let parts: Vec<String> = elements.iter().map(|v| self.value_to_string(*v)).collect();
@@ -220,9 +258,13 @@ impl Vm {
             }
             "indexOf" => {
                 let search = args.first().copied().unwrap_or(Value::undefined());
+                let from_idx = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
                 if let Some(obj) = self.heap.get(oid)
                     && let ObjectKind::Array(ref elements) = obj.kind {
-                        for (i, elem) in elements.iter().enumerate() {
+                        let len = elements.len() as i32;
+                        let mut start = from_idx as i32;
+                        if start < 0 { start = (len + start).max(0); }
+                        for (i, elem) in elements.iter().enumerate().skip(start as usize) {
                             if self.strict_eq(*elem, search) {
                                 return Ok(Value::int(i as i32));
                             }
@@ -275,12 +317,13 @@ impl Vm {
             }
             "map" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
                 let elements: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 let mut results = Vec::with_capacity(elements.len());
                 for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
                     results.push(result);
                 }
                 let arr = JsObject::array(results);
@@ -289,12 +332,13 @@ impl Vm {
             }
             "filter" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
                 let elements: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 let mut results = Vec::new();
                 for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
                     if result.to_boolean() {
                         results.push(*elem);
                     }
@@ -317,76 +361,83 @@ impl Vm {
             }
             "forEach" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
                 let elements: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 for (i, elem) in elements.iter().enumerate() {
-                    self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
                 }
                 Ok(Value::undefined())
             }
             "find" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
                 let elements: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
                     if result.to_boolean() { return Ok(*elem); }
                 }
                 Ok(Value::undefined())
             }
             "some" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
                 let elements: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
                     if result.to_boolean() { return Ok(Value::boolean(true)); }
                 }
                 Ok(Value::boolean(false))
             }
             "every" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
                 let elements: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
                     if !result.to_boolean() { return Ok(Value::boolean(false)); }
                 }
                 Ok(Value::boolean(true))
             }
             "findIndex" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
                 let elements: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
                     if result.to_boolean() { return Ok(Value::int(i as i32)); }
                 }
                 Ok(Value::int(-1))
             }
             "findLast" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
                 let elements: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 for (i, elem) in elements.iter().enumerate().rev() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
                     if result.to_boolean() { return Ok(*elem); }
                 }
                 Ok(Value::undefined())
             }
             "findLastIndex" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
+                let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
                 let elements: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 for (i, elem) in elements.iter().enumerate().rev() {
-                    let result = self.call_function(callback, &[*elem, Value::int(i as i32)])?;
+                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
                     if result.to_boolean() { return Ok(Value::int(i as i32)); }
                 }
                 Ok(Value::int(-1))
@@ -592,6 +643,76 @@ impl Vm {
                         }
                     }
                 Ok(Value::int(-1))
+            }
+            "toReversed" => {
+                let mut elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                elements.reverse();
+                let arr = JsObject::array(elements);
+                Ok(Value::object_id(self.heap.allocate(arr)))
+            }
+            "toSorted" => {
+                let comparefn = args.first().copied().filter(|v| v.is_function());
+                let mut elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let len = elements.len();
+                for i in 1..len {
+                    let key = elements[i];
+                    let mut j = i;
+                    while j > 0 {
+                        let cmp = if let Some(cfn) = comparefn {
+                            let r = self.call_function(cfn, &[elements[j - 1], key])?;
+                            r.as_number().unwrap_or(0.0)
+                        } else {
+                            let a_str = self.value_to_string(elements[j - 1]);
+                            let b_str = self.value_to_string(key);
+                            if a_str < b_str { -1.0 } else if a_str > b_str { 1.0 } else { 0.0 }
+                        };
+                        if cmp <= 0.0 { break; }
+                        elements[j] = elements[j - 1];
+                        j -= 1;
+                    }
+                    elements[j] = key;
+                }
+                let arr = JsObject::array(elements);
+                Ok(Value::object_id(self.heap.allocate(arr)))
+            }
+            "with" => {
+                let idx_val = args.first().copied().unwrap_or(Value::undefined());
+                let val = args.get(1).copied().unwrap_or(Value::undefined());
+                let mut elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let len = elements.len() as i32;
+                let mut i = self.to_f64(idx_val) as i32;
+                if i < 0 { i += len; }
+                if i < 0 || i >= len {
+                    return Err(VmError::RuntimeError("RangeError: Invalid index".into()));
+                }
+                elements[i as usize] = val;
+                let arr = JsObject::array(elements);
+                Ok(Value::object_id(self.heap.allocate(arr)))
+            }
+            "toSpliced" => {
+                let mut elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let len = elements.len() as i32;
+                let start_val = args.first().copied().unwrap_or(Value::undefined());
+                let mut start = self.to_f64(start_val) as i32;
+                if start < 0 { start = (start + len).max(0); }
+                let start = start.min(len) as usize;
+                let delete_count = if args.len() > 1 {
+                    (self.to_f64(args[1]) as i32).max(0).min(len - start as i32) as usize
+                } else {
+                    elements.len() - start
+                };
+                let new_items: Vec<Value> = args.iter().skip(2).copied().collect();
+                elements.splice(start..start + delete_count, new_items);
+                let arr = JsObject::array(elements);
+                Ok(Value::object_id(self.heap.allocate(arr)))
             }
             "toString" => {
                 // Array.prototype.toString is equivalent to join(",")
@@ -825,6 +946,38 @@ impl Vm {
                 if let Some(n) = v.as_number() {
                     Value::boolean(n.fract() == 0.0 && n.is_finite() && n.abs() <= 9007199254740991.0)
                 } else { Value::boolean(false) }
+            }
+            -534 | -535 => { // String.fromCharCode / String.fromCodePoint
+                let mut result = String::new();
+                for v in args {
+                    let code = self.to_f64(*v) as u32;
+                    if let Some(c) = char::from_u32(code) {
+                        result.push(c);
+                    }
+                }
+                let id = self.interner.intern(&result);
+                Value::string(id)
+            }
+            -536 => { // String.raw
+                let template = args.first().copied().unwrap_or(Value::undefined());
+                let raw_key = self.interner.intern("raw");
+                let raw_arr_val = template.as_object_id()
+                    .and_then(|oid| self.heap.get(oid))
+                    .and_then(|o| o.get_property(raw_key))
+                    .unwrap_or(Value::undefined());
+                let raw_strs: Vec<Value> = raw_arr_val.as_object_id()
+                    .and_then(|oid| self.heap.get(oid))
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let mut result = String::new();
+                for (i, s) in raw_strs.iter().enumerate() {
+                    result.push_str(&self.value_to_string(*s));
+                    if i + 1 < raw_strs.len() && i + 1 < args.len() {
+                        result.push_str(&self.value_to_string(args[i + 1]));
+                    }
+                }
+                let id = self.interner.intern(&result);
+                Value::string(id)
             }
             _ => Value::undefined(),
         }

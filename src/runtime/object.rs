@@ -136,6 +136,8 @@ pub enum ObjectKind {
     WeakSet {
         entries: Vec<ObjectId>,
     },
+    /// Date: milliseconds since UNIX epoch
+    Date(f64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -361,7 +363,8 @@ impl ObjectHeap {
             }
             ObjectKind::Ordinary
             | ObjectKind::KeyIterator(_, _)
-            | ObjectKind::RegExp { .. } => {}
+            | ObjectKind::RegExp { .. }
+            | ObjectKind::Date(_) => {}
         }
 
         refs

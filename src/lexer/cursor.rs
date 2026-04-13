@@ -154,3 +154,17 @@ pub fn is_unicode_id_continue(c: char) -> bool {
 pub fn is_line_terminator(b: u8) -> bool {
     b == b'\n' || b == b'\r'
 }
+
+/// Check if a Unicode char is whitespace (excluding line terminators).
+pub fn is_unicode_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0009}' | '\u{000B}' | '\u{000C}' | '\u{0020}' | '\u{00A0}' | '\u{FEFF}'
+        | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    )
+}
+
+/// Check if a Unicode char is a line terminator.
+pub fn is_unicode_line_terminator(c: char) -> bool {
+    matches!(c, '\u{000A}' | '\u{000D}' | '\u{2028}' | '\u{2029}')
+}

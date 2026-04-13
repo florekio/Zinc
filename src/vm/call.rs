@@ -18,6 +18,10 @@ impl Vm {
             return Ok(Value::undefined());
         }
         let packed = func_val.as_function().unwrap();
+        // Native global function sentinels
+        if (-536..=-500).contains(&packed) {
+            return Ok(self.exec_global_fn(packed, args));
+        }
         let closure_id = ((packed as u32) >> 16) as usize;
         let chunk_idx = (packed & 0xFFFF) as usize;
         if chunk_idx < 1 || chunk_idx >= self.chunks.len() {
@@ -215,6 +219,7 @@ impl Vm {
                     if len >= 2 { self.stack.swap(len - 1, len - 2); }
                 }
                 OpCode::Nop => {}
+                OpCode::InitLet | OpCode::CheckTdz => { let _ = self.read_byte(); }
                 OpCode::Eq => { let b = self.pop()?; let a = self.pop()?; let r = self.abstract_eq(a,b); self.push(Value::boolean(r)); }
                 OpCode::StrictEq => { let b = self.pop()?; let a = self.pop()?; self.push(Value::boolean(self.strict_eq(a,b))); }
                 OpCode::Lt => { let (a,b) = self.pop_numbers()?; self.push(Value::boolean(a<b)); }

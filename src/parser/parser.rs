@@ -6,6 +6,60 @@ use crate::util::interner::{Interner, StringId};
 use super::error::{ParseError, ParseResult};
 use super::statement;
 
+/// Decode \uXXXX and \u{XXXX} escapes in an identifier/string.
+pub(crate) fn decode_unicode_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'u' {
+            i += 2;
+            if i < bytes.len() && bytes[i] == b'{' {
+                i += 1;
+                let mut code = 0u32;
+                while i < bytes.len() && bytes[i] != b'}' {
+                    let d = match bytes[i] {
+                        b'0'..=b'9' => bytes[i] - b'0',
+                        b'a'..=b'f' => bytes[i] - b'a' + 10,
+                        b'A'..=b'F' => bytes[i] - b'A' + 10,
+                        _ => { i += 1; continue; }
+                    };
+                    code = code * 16 + d as u32;
+                    i += 1;
+                }
+                if i < bytes.len() { i += 1; } // skip '}'
+                if let Some(c) = char::from_u32(code) { out.push(c); }
+            } else if i + 4 <= bytes.len() {
+                let mut code = 0u32;
+                let mut valid = true;
+                for j in 0..4 {
+                    let d = match bytes[i + j] {
+                        b'0'..=b'9' => bytes[i + j] - b'0',
+                        b'a'..=b'f' => bytes[i + j] - b'a' + 10,
+                        b'A'..=b'F' => bytes[i + j] - b'A' + 10,
+                        _ => { valid = false; break; }
+                    };
+                    code = code * 16 + d as u32;
+                }
+                if valid {
+                    i += 4;
+                    if let Some(c) = char::from_u32(code) { out.push(c); }
+                }
+            }
+        } else {
+            // Push this UTF-8 byte (via char iteration for correctness)
+            let remaining = &s[i..];
+            if let Some(c) = remaining.chars().next() {
+                out.push(c);
+                i += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// The Zinc parser: recursive descent with Pratt expression parsing.
 pub struct Parser<'a> {
     tokens: Vec<Token>,
@@ -119,9 +173,16 @@ impl<'a> Parser<'a> {
     }
 
     /// Intern the current token's text and return its StringId.
+    /// If the identifier contains \uXXXX escapes, they are decoded.
     pub(crate) fn intern_current(&mut self) -> StringId {
-        let text = self.source[self.current().span.start as usize..self.current().span.end as usize].to_owned();
-        self.interner.intern(&text)
+        let text = &self.source[self.current().span.start as usize..self.current().span.end as usize];
+        if text.contains("\\u") {
+            let decoded = decode_unicode_escapes(text);
+            self.interner.intern(&decoded)
+        } else {
+            let s = text.to_owned();
+            self.interner.intern(&s)
+        }
     }
 
     /// Check if the current token was preceded by a line terminator (for ASI).

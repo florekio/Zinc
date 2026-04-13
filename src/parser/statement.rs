@@ -477,6 +477,56 @@ fn parse_for(p: &mut Parser) -> ParseResult<Statement> {
                     span: Span::new(start, p.pos()),
                 })));
             }
+            // Regular for: for (const [a,b] = init; test; update) body
+            if p.at(TokenKind::Assign) {
+                p.advance();
+                let init_expr = parse_expression(p, 3)?;
+                let mut declarations = vec![VariableDeclarator {
+                    id: pattern,
+                    init: Some(init_expr),
+                    span: Span::new(pat_start, p.pos()),
+                }];
+                // Optional further declarators
+                while p.eat(TokenKind::Comma) {
+                    let d_start = p.pos();
+                    let d_pat = if p.at(TokenKind::LBracket) {
+                        parse_array_pattern(p)?
+                    } else if p.at(TokenKind::LBrace) {
+                        parse_object_pattern(p)?
+                    } else {
+                        let d_name = p.intern_current();
+                        let d_span = p.current().span;
+                        p.expect(TokenKind::Identifier)?;
+                        Pattern::Identifier(Identifier { name: d_name, span: d_span })
+                    };
+                    let d_init = if p.eat(TokenKind::Assign) {
+                        Some(parse_expression(p, 3)?)
+                    } else { None };
+                    declarations.push(VariableDeclarator {
+                        id: d_pat,
+                        init: d_init,
+                        span: Span::new(d_start, p.pos()),
+                    });
+                }
+                let decl = VariableDeclaration {
+                    kind,
+                    declarations,
+                    span: Span::new(var_start, p.pos()),
+                };
+                p.expect(TokenKind::Semicolon)?;
+                let test = if p.at(TokenKind::Semicolon) { None } else { Some(parse_expression(p, 0)?) };
+                p.expect(TokenKind::Semicolon)?;
+                let update = if p.at(TokenKind::RParen) { None } else { Some(parse_expression(p, 0)?) };
+                p.expect(TokenKind::RParen)?;
+                let body = parse_statement(p)?;
+                return Ok(Statement::For(Box::new(ForStatement {
+                    init: Some(ForInit::Variable(decl)),
+                    test,
+                    update,
+                    body,
+                    span: Span::new(start, p.pos()),
+                })));
+            }
             return Err(ParseError::unexpected(p.current().kind, p.current().span));
         }
 
