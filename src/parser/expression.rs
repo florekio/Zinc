@@ -894,6 +894,47 @@ fn parse_property(p: &mut Parser) -> ParseResult<Property> {
         }
     }
 
+    // async method / async generator method / plain generator method
+    // Detect `async foo()`, `async *foo()`, and `*foo()`
+    let is_async_method = text == "async"
+        && p.current_kind() == TokenKind::Identifier
+        && !p.peek().preceded_by_newline
+        && matches!(
+            p.peek().kind,
+            TokenKind::Identifier | TokenKind::String | TokenKind::Number
+            | TokenKind::LBracket | TokenKind::Star
+        )
+        && is_keyword_or_identifier_for_prop(p.peek().kind);
+    if is_async_method {
+        p.advance(); // async
+        let is_generator = p.eat(TokenKind::Star);
+        let (key, computed) = parse_property_key(p)?;
+        let func = parse_function_body(p, true, is_generator)?;
+        return Ok(Property {
+            key,
+            value: func,
+            kind: PropertyKindVal::Init,
+            shorthand: false,
+            computed,
+            method: true,
+            span: Span::new(start, p.pos()),
+        });
+    }
+    if p.at(TokenKind::Star) {
+        p.advance(); // *
+        let (key, computed) = parse_property_key(p)?;
+        let func = parse_function_body(p, false, true)?;
+        return Ok(Property {
+            key,
+            value: func,
+            kind: PropertyKindVal::Init,
+            shorthand: false,
+            computed,
+            method: true,
+            span: Span::new(start, p.pos()),
+        });
+    }
+
     let (key, computed) = parse_property_key(p)?;
 
     // Shorthand property: { x } -> { x: x }
@@ -987,6 +1028,15 @@ fn parse_property_key(p: &mut Parser) -> ParseResult<(PropertyKey, bool)> {
     }
 }
 
+fn is_keyword_or_identifier_for_prop(kind: TokenKind) -> bool {
+    kind == TokenKind::Identifier
+        || kind == TokenKind::String
+        || kind == TokenKind::Number
+        || kind == TokenKind::LBracket
+        || kind == TokenKind::Star
+        || is_keyword_property(kind)
+}
+
 fn is_keyword_property(kind: TokenKind) -> bool {
     matches!(
         kind,
@@ -1067,29 +1117,48 @@ pub fn parse_params(p: &mut Parser) -> ParseResult<Vec<Pattern>> {
         if p.at(TokenKind::DotDotDot) {
             let rest_start = p.pos();
             p.advance();
-            let name = p.intern_current();
-            let name_span = p.current().span;
-            p.expect(TokenKind::Identifier)?;
+            // Rest parameter can be an identifier, array pattern, or object pattern
+            let arg = if p.at(TokenKind::LBracket) {
+                super::statement::parse_array_pattern(p)?
+            } else if p.at(TokenKind::LBrace) {
+                super::statement::parse_object_pattern(p)?
+            } else {
+                let name = p.intern_current();
+                let name_span = p.current().span;
+                p.expect(TokenKind::Identifier)?;
+                Pattern::Identifier(Identifier { name, span: name_span })
+            };
             params.push(Pattern::Rest(Box::new(RestElement {
-                argument: Pattern::Identifier(Identifier { name, span: name_span }),
+                argument: arg,
                 span: Span::new(rest_start, p.pos()),
             })));
             break; // rest must be last
         }
-        let name = p.intern_current();
-        let name_span = p.current().span;
-        p.expect(TokenKind::Identifier)?;
 
+        let param_start = p.pos();
+        // Array or Object destructuring parameter
+        let base = if p.at(TokenKind::LBracket) {
+            super::statement::parse_array_pattern(p)?
+        } else if p.at(TokenKind::LBrace) {
+            super::statement::parse_object_pattern(p)?
+        } else {
+            let name = p.intern_current();
+            let name_span = p.current().span;
+            p.expect(TokenKind::Identifier)?;
+            Pattern::Identifier(Identifier { name, span: name_span })
+        };
+
+        // Optional default value
         if p.eat(TokenKind::Assign) {
             let default_val = parse_expression(p, 3)?;
             let end = expr_span(&default_val).end;
             params.push(Pattern::Assignment(Box::new(AssignmentPattern {
-                left: Pattern::Identifier(Identifier { name, span: name_span }),
+                left: base,
                 right: default_val,
-                span: Span::new(name_span.start, end),
+                span: Span::new(param_start, end),
             })));
         } else {
-            params.push(Pattern::Identifier(Identifier { name, span: name_span }));
+            params.push(base);
         }
 
         if !p.at(TokenKind::RParen) {

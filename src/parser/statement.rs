@@ -999,7 +999,7 @@ fn parse_expression_statement(p: &mut Parser) -> ParseResult<Statement> {
 }
 
 /// Parse an object destructuring pattern: { a, b, c } or { a: x, b: y }
-fn parse_object_pattern(p: &mut Parser) -> ParseResult<Pattern> {
+pub(crate) fn parse_object_pattern(p: &mut Parser) -> ParseResult<Pattern> {
     let start = p.pos();
     p.expect(TokenKind::LBrace)?;
     let mut properties = Vec::new();
@@ -1120,7 +1120,7 @@ fn parse_object_pattern(p: &mut Parser) -> ParseResult<Pattern> {
 }
 
 /// Parse an array destructuring pattern: [ a, b, c ]
-fn parse_array_pattern(p: &mut Parser) -> ParseResult<Pattern> {
+pub(crate) fn parse_array_pattern(p: &mut Parser) -> ParseResult<Pattern> {
     let start = p.pos();
     p.expect(TokenKind::LBracket)?;
     let mut elements = Vec::new();
@@ -1145,13 +1145,33 @@ fn parse_array_pattern(p: &mut Parser) -> ParseResult<Pattern> {
             break;
         }
         if p.at(TokenKind::LBracket) {
-            // Nested array pattern: [[a, b], c]
+            // Nested array pattern: [[a, b], c] with optional default
+            let nested_start = p.pos();
             let nested = parse_array_pattern(p)?;
-            elements.push(Some(nested));
+            if p.eat(TokenKind::Assign) {
+                let default_expr = super::expression::parse_expression(p, 3)?;
+                elements.push(Some(Pattern::Assignment(Box::new(AssignmentPattern {
+                    left: nested,
+                    right: default_expr,
+                    span: Span::new(nested_start, p.pos()),
+                }))));
+            } else {
+                elements.push(Some(nested));
+            }
         } else if p.at(TokenKind::LBrace) {
-            // Nested object pattern: [{a, b}, c]
+            // Nested object pattern: [{a, b}, c] with optional default
+            let nested_start = p.pos();
             let nested = parse_object_pattern(p)?;
-            elements.push(Some(nested));
+            if p.eat(TokenKind::Assign) {
+                let default_expr = super::expression::parse_expression(p, 3)?;
+                elements.push(Some(Pattern::Assignment(Box::new(AssignmentPattern {
+                    left: nested,
+                    right: default_expr,
+                    span: Span::new(nested_start, p.pos()),
+                }))));
+            } else {
+                elements.push(Some(nested));
+            }
         } else {
             let name = p.intern_current();
             let name_span = p.current().span;
