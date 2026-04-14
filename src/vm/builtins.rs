@@ -994,11 +994,30 @@ impl Vm {
     /// Unwrap a wrapper object to its primitive, or return the value as-is.
     /// ToPrimitive with valueOf/toString calls.
     pub(crate) fn coerce_to_primitive(&mut self, val: Value) -> Value {
+        self.coerce_to_primitive_hint(val, "default")
+    }
+
+    pub(crate) fn coerce_to_number_primitive(&mut self, val: Value) -> Value {
+        self.coerce_to_primitive_hint(val, "number")
+    }
+
+    fn coerce_to_primitive_hint(&mut self, val: Value, hint_str: &str) -> Value {
         if let Some(oid) = val.as_object_id() {
             if let Some(obj) = self.heap.get(oid)
                 && let ObjectKind::Wrapper(inner) = &obj.kind {
                     return *inner;
                 }
+            // Check for Symbol.toPrimitive method
+            let sym_key = self.interner.intern(&format!("__sym_{}__", self.sym_to_primitive));
+            if let Some(tp_fn) = self.heap.get_property_chain(oid, sym_key)
+                && tp_fn.is_function()
+            {
+                let hint = self.interner.intern(hint_str);
+                if let Ok(result) = self.call_function_this(tp_fn, val, &[Value::string(hint)])
+                    && !result.is_object() {
+                        return result;
+                    }
+            }
             // Try valueOf()
             let valueof_key = self.interner.intern("valueOf");
             if let Some(vfn) = self.heap.get_property_chain(oid, valueof_key)

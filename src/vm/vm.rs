@@ -977,11 +977,11 @@ impl Vm {
                     let a = self.pop()?;
 
                     // ToPrimitive for objects before type check
-                    let a_prim = if a.is_object() && !self.is_string_wrapper(a) {
-                        self.call_value_of_to_string(a).unwrap_or(a)
+                    let a_prim = if a.is_object() {
+                        self.coerce_to_primitive(a)
                     } else { a };
-                    let b_prim = if b.is_object() && !self.is_string_wrapper(b) {
-                        self.call_value_of_to_string(b).unwrap_or(b)
+                    let b_prim = if b.is_object() {
+                        self.coerce_to_primitive(b)
                     } else { b };
 
                     let a_is_str = a_prim.is_string() || self.is_string_wrapper(a_prim);
@@ -1028,12 +1028,14 @@ impl Vm {
 
                 OpCode::Neg => {
                     let val = self.pop()?;
-                    self.push_number(-self.to_f64(val));
+                    let prim = if val.is_object() { self.coerce_to_number_primitive(val) } else { val };
+                    self.push_number(-self.to_f64(prim));
                 }
 
                 OpCode::Pos => {
                     let val = self.pop()?;
-                    self.push_number(self.to_f64(val));
+                    let prim = if val.is_object() { self.coerce_to_number_primitive(val) } else { val };
+                    self.push_number(self.to_f64(prim));
                 }
 
                 OpCode::Inc => {
