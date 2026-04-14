@@ -121,7 +121,9 @@ impl Vm {
                         return format!("[\n{}\n{close_indent}]", parts.join(",\n"));
                     }
                     _ => {
-                        let props: Vec<_> = obj.properties.iter().filter(|(_, p)| p.is_enumerable()).collect();
+                        let props: Vec<_> = obj.properties.iter()
+                            .filter(|(_, p)| p.is_enumerable() && !p.value.is_undefined() && !p.value.is_function())
+                            .collect();
                         if props.is_empty() { return "{}".into(); }
                         let parts: Vec<String> = props.iter()
                             .map(|&&(k, ref p)| {
