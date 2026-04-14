@@ -899,6 +899,10 @@ fn parse_class_declaration(p: &mut Parser) -> ParseResult<Statement> {
     }))
 }
 
+pub(crate) fn parse_class_body_pub(p: &mut Parser) -> ParseResult<ClassBody> {
+    parse_class_body(p)
+}
+
 fn parse_class_body(p: &mut Parser) -> ParseResult<ClassBody> {
     let start = p.pos();
     p.expect(TokenKind::LBrace)?;

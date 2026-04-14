@@ -244,6 +244,12 @@ impl Vm {
         let date_name = interner.intern("Date");
         globals.insert(date_name, Value::function(-550));
 
+        // Function constructor: `new Function("a", "b", "return a+b")` or `Function("...")`.
+        // We stash a sentinel; Call/Construct handles it by concatenating source,
+        // compiling, and creating a callable function.
+        let function_name = interner.intern("Function");
+        globals.insert(function_name, Value::function(-551));
+
         // globalThis: create a global object whose own property lookups
         // proxy to the globals map. For simplicity we expose a plain object
         // pre-populated with the common primitives; reads/writes go through
@@ -1623,6 +1629,15 @@ impl Vm {
                         self.symbol_descriptions[id as usize] = desc;
                         self.stack.truncate(func_pos);
                         self.push(Value::symbol(id));
+                        continue;
+                    }
+
+                    // Function(...args) — last arg is body, previous args are param names
+                    if func_val.is_function() && func_val.as_function() == Some(-551) {
+                        let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
+                        self.stack.truncate(func_pos);
+                        let result = self.construct_function(&args)?;
+                        self.push(result);
                         continue;
                     }
 
@@ -3576,6 +3591,15 @@ impl Vm {
                         }
                     }
 
+                    // new Function(...args)
+                    if func_val.is_function() && func_val.as_function() == Some(-551) {
+                        let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
+                        self.stack.truncate(func_pos);
+                        let result = self.construct_function(&args)?;
+                        self.push(result);
+                        continue;
+                    }
+
                     // Handle wrapper constructors (new Number, new Boolean, new String)
                     if func_val.is_function() {
                         let sentinel = func_val.as_function().unwrap();
@@ -4901,6 +4925,44 @@ impl Vm {
                 }
             }
         }
+    }
+}
+
+impl Vm {
+    /// Implements `Function(...)` and `new Function(...)`: concatenates params,
+    /// compiles `function(p1,p2,...){ body }`, and returns a callable function value.
+    pub(crate) fn construct_function(&mut self, args: &[Value]) -> Result<Value, VmError> {
+        let params_str = if args.len() > 1 {
+            args[..args.len() - 1]
+                .iter()
+                .map(|v| self.value_to_string(*v))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            String::new()
+        };
+        let body_str = args.last().map(|v| self.value_to_string(*v)).unwrap_or_default();
+        let src = format!("(function({}){{ {} }})", params_str, body_str);
+
+        // Lex, parse, compile
+        let mut lexer = crate::lexer::lexer::Lexer::new(&src, &mut self.interner);
+        let tokens = lexer.tokenize();
+        let mut parser = crate::parser::parser::Parser::new(tokens, &src, &mut self.interner);
+        let program = parser
+            .parse_program()
+            .map_err(|e| VmError::RuntimeError(format!("Function SyntaxError: {e}")))?;
+        let compiler = crate::compiler::compiler::Compiler::new(&mut self.interner);
+        let chunk = compiler
+            .compile_program(&program)
+            .map_err(|e| VmError::RuntimeError(format!("Function CompileError: {e}")))?;
+        let base_idx = self.chunks.len();
+        let mut flat_chunks = Vec::new();
+        Vm::flatten_chunk(chunk, &mut flat_chunks);
+        self.chunks.extend(flat_chunks);
+        // Run the outer wrapper to evaluate the function expression
+        let wrapper_fn = Value::function(base_idx as i32);
+        let result = self.call_function(wrapper_fn, &[])?;
+        Ok(result)
     }
 }
 

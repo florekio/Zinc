@@ -516,6 +516,31 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
         // ---- Function expression ----
         TokenKind::Function => parse_function_expression(p),
 
+        // ---- Class expression ----
+        TokenKind::Class => {
+            let start = p.pos();
+            p.advance(); // class
+            let id = if p.at(TokenKind::Identifier) && !p.at(TokenKind::Extends) {
+                let name = p.intern_current();
+                p.advance();
+                Some(name)
+            } else {
+                None
+            };
+            let super_class = if p.eat(TokenKind::Extends) {
+                Some(parse_expression(p, 0)?)
+            } else {
+                None
+            };
+            let body = super::statement::parse_class_body_pub(p)?;
+            Ok(Expression::Class(Box::new(ClassExpression {
+                id,
+                super_class,
+                body,
+                span: Span::new(start, p.pos()),
+            })))
+        }
+
         // ---- Unary prefix operators ----
         TokenKind::Minus => {
             p.advance();
