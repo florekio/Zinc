@@ -58,10 +58,14 @@ struct LoopCtx {
     continue_target: usize,
     /// Pending break-jump offsets that need patching after the loop.
     break_patches: Vec<usize>,
+    /// Pending continue-jump offsets for `for` loops (patched to the update position).
+    continue_patches: Vec<usize>,
     /// Scope depth when the loop was entered so we know how many locals to pop.
     scope_depth: u32,
     /// Optional label for labeled statements.
     label: Option<StringId>,
+    /// True if this is a `for(;;)` loop with a deferred continue target.
+    has_deferred_continue: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +85,8 @@ pub struct Compiler<'a> {
     enclosing_upvalues: Option<Vec<CompilerUpvalue>>,
     /// Set of global-scope const variable names (to prevent reassignment).
     const_globals: std::collections::HashSet<StringId>,
+    /// Label from an enclosing labeled statement, to be adopted by the next loop.
+    pending_label: Option<StringId>,
 }
 
 impl<'a> Compiler<'a> {
@@ -100,6 +106,7 @@ impl<'a> Compiler<'a> {
             enclosing_locals: None,
             enclosing_upvalues: None,
             const_globals: std::collections::HashSet::new(),
+            pending_label: None,
         }
     }
 
@@ -792,8 +799,10 @@ impl<'a> Compiler<'a> {
         self.loops.push(LoopCtx {
             continue_target: loop_start,
             break_patches: Vec::new(),
+            continue_patches: Vec::new(),
             scope_depth: self.scope_depth,
             label: None,
+            has_deferred_continue: false,
         });
 
         self.compile_expr(&w.test)?;
@@ -815,8 +824,10 @@ impl<'a> Compiler<'a> {
         self.loops.push(LoopCtx {
             continue_target: loop_start,
             break_patches: Vec::new(),
+            continue_patches: Vec::new(),
             scope_depth: self.scope_depth,
             label: None,
+            has_deferred_continue: false,
         });
 
         self.compile_statement(&d.body)?;
@@ -850,12 +861,17 @@ impl<'a> Compiler<'a> {
 
         let loop_start = self.chunk.len();
 
-        // Push a loop context. We'll update continue_target after the body.
+        // Push a loop context. For `for` loops with an update expression,
+        // continues need to jump to the update, not back to the condition.
+        let has_update = f.update.is_some();
+        let label = self.pending_label.take();
         self.loops.push(LoopCtx {
             continue_target: loop_start,
             break_patches: Vec::new(),
+            continue_patches: Vec::new(),
             scope_depth: self.scope_depth,
-            label: None,
+            label,
+            has_deferred_continue: has_update,
         });
 
         // Condition.
@@ -869,10 +885,13 @@ impl<'a> Compiler<'a> {
         // Body.
         self.compile_statement(&f.body)?;
 
-        // `continue` should land right before the update expression.
+        // Patch any deferred continue jumps to land right before the update.
         let continue_target = self.chunk.len();
         if let Some(ctx) = self.loops.last_mut() {
             ctx.continue_target = continue_target;
+            for patch in std::mem::take(&mut ctx.continue_patches) {
+                self.chunk.patch_jump(patch);
+            }
         }
 
         // Update.
@@ -944,8 +963,10 @@ impl<'a> Compiler<'a> {
         self.loops.push(LoopCtx {
             continue_target: loop_start,
             break_patches: Vec::new(),
+            continue_patches: Vec::new(),
             scope_depth: self.scope_depth,
             label: None,
+            has_deferred_continue: false,
         });
         self.compile_statement(&f.body)?;
         self.chunk.emit_loop(loop_start, line);
@@ -1106,8 +1127,10 @@ impl<'a> Compiler<'a> {
         self.loops.push(LoopCtx {
             continue_target: loop_start,
             break_patches: Vec::new(),
+            continue_patches: Vec::new(),
             scope_depth: self.scope_depth,
             label: None,
+            has_deferred_continue: false,
         });
 
         self.compile_statement(&f.body)?;
@@ -1164,8 +1187,10 @@ impl<'a> Compiler<'a> {
         self.loops.push(LoopCtx {
             continue_target: 0, // unused for switch
             break_patches: Vec::new(),
+            continue_patches: Vec::new(),
             scope_depth: self.scope_depth,
             label: None,
+            has_deferred_continue: false,
         });
 
         let mut body_starts: Vec<usize> = Vec::new();
@@ -1270,9 +1295,16 @@ impl<'a> Compiler<'a> {
         if self.loops.is_empty() {
             return Err(format!("'continue' outside of loop at offset {line}"));
         }
-        let ctx = self.loops.last().unwrap();
-        let target = ctx.continue_target;
-        let loop_depth = ctx.scope_depth;
+        // Find the matching loop context (labeled or innermost)
+        let ctx_idx = if let Some(label) = c.label {
+            self.loops.iter().rposition(|ctx| ctx.label == Some(label))
+                .ok_or_else(|| format!("label not found at offset {line}"))?
+        } else {
+            self.loops.len() - 1
+        };
+        let target = self.loops[ctx_idx].continue_target;
+        let loop_depth = self.loops[ctx_idx].scope_depth;
+        let deferred = self.loops[ctx_idx].has_deferred_continue;
 
         let pop_n = self.locals_above_depth(loop_depth);
         if pop_n > 0 && pop_n <= u8::MAX as usize {
@@ -1282,7 +1314,13 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::Pop, line);
             }
         }
-        self.chunk.emit_loop(target, line);
+        if deferred {
+            // Emit a forward jump; it will be patched to the update position later
+            let patch = self.chunk.emit_jump(OpCode::Jump, line);
+            self.loops[ctx_idx].continue_patches.push(patch);
+        } else {
+            self.chunk.emit_loop(target, line);
+        }
         Ok(())
     }
 
@@ -1508,16 +1546,41 @@ impl<'a> Compiler<'a> {
     // ---- labeled ----
 
     fn compile_labeled(&mut self, l: &LabeledStatement) -> Result<(), String> {
-        // Push a label context so `break label` can find it
-        self.loops.push(LoopCtx {
-            continue_target: self.chunk.len(), // not meaningful for non-loop labels
-            break_patches: Vec::new(),
-            scope_depth: self.scope_depth,
-            label: Some(l.label),
-        });
-        self.compile_statement(&l.body)?;
-        // Patch any break jumps targeting this label
-        self.patch_loop_breaks();
+        // If the body is a loop, pass the label to the loop's own LoopCtx
+        // so that `continue label` targets the loop, not this wrapper.
+        let is_loop = matches!(
+            &l.body,
+            Statement::For(_) | Statement::While(_) | Statement::DoWhile(_)
+            | Statement::ForIn(_) | Statement::ForOf(_) | Statement::Labeled(_)
+        );
+        if is_loop {
+            // Store the label so the child loop can pick it up
+            let saved_label = self.pending_label.take();
+            self.pending_label = Some(l.label);
+            // Push a label context for `break label` only
+            self.loops.push(LoopCtx {
+                continue_target: self.chunk.len(),
+                break_patches: Vec::new(),
+                continue_patches: Vec::new(),
+                scope_depth: self.scope_depth,
+                label: Some(l.label),
+                has_deferred_continue: false,
+            });
+            self.compile_statement(&l.body)?;
+            self.patch_loop_breaks();
+            self.pending_label = saved_label;
+        } else {
+            self.loops.push(LoopCtx {
+                continue_target: self.chunk.len(),
+                break_patches: Vec::new(),
+                continue_patches: Vec::new(),
+                scope_depth: self.scope_depth,
+                label: Some(l.label),
+                has_deferred_continue: false,
+            });
+            self.compile_statement(&l.body)?;
+            self.patch_loop_breaks();
+        }
         Ok(())
     }
 

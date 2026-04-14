@@ -244,6 +244,9 @@ impl Vm {
         let date_name = interner.intern("Date");
         globals.insert(date_name, Value::function(-550));
 
+        let regexp_name = interner.intern("RegExp");
+        globals.insert(regexp_name, Value::function(-580));
+
         // Function constructor: `new Function("a", "b", "return a+b")` or `Function("...")`.
         // We stash a sentinel; Call/Construct handles it by concatenating source,
         // compiling, and creating a callable function.
@@ -1632,6 +1635,21 @@ impl Vm {
                         continue;
                     }
 
+                    // RegExp(pattern, flags) — without new, same as new RegExp
+                    if func_val.is_function() && func_val.as_function() == Some(-580) {
+                        let pattern = if argc > 0 { self.value_to_string(self.stack[func_pos + 1]) } else { String::new() };
+                        let flags = if argc > 1 { self.value_to_string(self.stack[func_pos + 2]) } else { String::new() };
+                        let obj = JsObject {
+                            properties: Vec::new(), prototype: None,
+                            kind: ObjectKind::RegExp { pattern, flags },
+                            marked: false, extensible: true,
+                        };
+                        let oid = self.heap.allocate(obj);
+                        self.stack.truncate(func_pos);
+                        self.push(Value::object_id(oid));
+                        continue;
+                    }
+
                     // Function(...args) — last arg is body, previous args are param names
                     if func_val.is_function() && func_val.as_function() == Some(-551) {
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
@@ -2208,7 +2226,10 @@ impl Vm {
                                         } else {
                                             let mut proto = JsObject::ordinary();
                                             let ctor_key = self.interner.intern("constructor");
-                                            proto.set_property(ctor_key, obj_val);
+                                            // constructor is writable+configurable but NOT enumerable
+                                            proto.define_property(ctor_key, Property::with_flags(
+                                                obj_val, Property::WRITABLE | Property::CONFIGURABLE
+                                            ));
                                             let proto_oid = self.heap.allocate(proto);
                                             self.func_prototypes.insert(sentinel, proto_oid);
                                             Value::object_id(proto_oid)
@@ -2966,22 +2987,36 @@ impl Vm {
                         let result = match mn.as_str() {
                             "keys" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
-                                    let keys: Vec<Value> = self.heap.get(oid)
-                                        .map(|o| {
-                                            if let ObjectKind::Array(ref elems) = o.kind {
-                                                (0..elems.len()).map(|i| {
-                                                    let s = self.interner.intern(&i.to_string());
-                                                    Value::string(s)
-                                                }).collect()
+                                    let is_array = self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Array(_))).unwrap_or(false);
+                                    if is_array {
+                                        let len = self.heap.get(oid).and_then(|o| if let ObjectKind::Array(ref e) = o.kind { Some(e.len()) } else { None }).unwrap_or(0);
+                                        let keys: Vec<Value> = (0..len).map(|i| {
+                                            let s = self.interner.intern(&i.to_string());
+                                            Value::string(s)
+                                        }).collect();
+                                        let arr = JsObject::array(keys);
+                                        Value::object_id(self.heap.allocate(arr))
+                                    } else {
+                                        let props: Vec<(StringId, bool)> = self.heap.get(oid)
+                                            .map(|o| o.properties.iter().map(|&(k, ref p)| (k, p.is_enumerable())).collect())
+                                            .unwrap_or_default();
+                                        let mut numeric: Vec<(u64, StringId)> = Vec::new();
+                                        let mut string: Vec<StringId> = Vec::new();
+                                        for (k, en) in props {
+                                            if !en { continue; }
+                                            let name = self.interner.resolve(k);
+                                            if let Ok(n) = name.parse::<u64>() {
+                                                numeric.push((n, k));
                                             } else {
-                                                o.properties.iter()
-                                                    .filter(|(_, p)| p.is_enumerable())
-                                                    .map(|(k, _)| Value::string(*k)).collect()
+                                                string.push(k);
                                             }
-                                        })
-                                        .unwrap_or_default();
-                                    let arr = JsObject::array(keys);
-                                    Value::object_id(self.heap.allocate(arr))
+                                        }
+                                        numeric.sort_by_key(|&(n, _)| n);
+                                        let mut keys: Vec<Value> = numeric.into_iter().map(|(_, k)| Value::string(k)).collect();
+                                        keys.extend(string.into_iter().map(Value::string));
+                                        let arr = JsObject::array(keys);
+                                        Value::object_id(self.heap.allocate(arr))
+                                    }
                                 } else { Value::undefined() }
                             }
                             "values" => {
@@ -3591,6 +3626,21 @@ impl Vm {
                         }
                     }
 
+                    // new RegExp(pattern, flags)
+                    if func_val.is_function() && func_val.as_function() == Some(-580) {
+                        let pattern = if argc > 0 { self.value_to_string(self.stack[func_pos + 1]) } else { String::new() };
+                        let flags = if argc > 1 { self.value_to_string(self.stack[func_pos + 2]) } else { String::new() };
+                        let obj = JsObject {
+                            properties: Vec::new(), prototype: None,
+                            kind: ObjectKind::RegExp { pattern, flags },
+                            marked: false, extensible: true,
+                        };
+                        let oid = self.heap.allocate(obj);
+                        self.stack.truncate(func_pos);
+                        self.push(Value::object_id(oid));
+                        continue;
+                    }
+
                     // new Function(...args)
                     if func_val.is_function() && func_val.as_function() == Some(-551) {
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
@@ -3709,7 +3759,9 @@ impl Vm {
                             if chunk_idx < self.chunks.len() {
                                 let mut proto = JsObject::ordinary();
                                 let ctor_key = self.interner.intern("constructor");
-                                proto.set_property(ctor_key, func_val);
+                                proto.define_property(ctor_key, Property::with_flags(
+                                    func_val, Property::WRITABLE | Property::CONFIGURABLE
+                                ));
                                 let proto_oid = self.heap.allocate(proto);
                                 self.func_prototypes.insert(packed, proto_oid);
                                 new_obj.prototype = Some(proto_oid);
@@ -4125,7 +4177,9 @@ impl Vm {
                     let mut class_obj = JsObject::ordinary();
                     let proto_key = self.interner.intern("prototype");
                     class_obj.set_property(proto_key, Value::object_id(proto_oid));
-                    // Mark as class -- store proto_oid for ClassMethod to find
+                    // Mark as class with default constructor (so typeof returns "function")
+                    let ctor_key = self.interner.intern("__constructor__");
+                    class_obj.set_property(ctor_key, Value::undefined());
                     let class_oid = self.heap.allocate(class_obj);
                     self.push(Value::object_id(class_oid));
                 }

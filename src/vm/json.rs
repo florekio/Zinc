@@ -52,7 +52,7 @@ impl Vm {
 
     // ---- JSON.stringify ----
     pub(crate) fn json_stringify(&self, val: Value) -> String {
-        if val.is_undefined() { return "undefined".into(); }
+        if val.is_undefined() || val.is_function() { return "undefined".into(); }
         if val.is_null() { return "null".into(); }
         if val.is_boolean() { return format!("{}", val.as_bool().unwrap()); }
         if val.is_int() { return format!("{}", val.as_int().unwrap()); }
@@ -70,12 +70,17 @@ impl Vm {
             && let Some(obj) = self.heap.get(oid) {
                 match &obj.kind {
                     ObjectKind::Array(elements) => {
-                        let parts: Vec<String> = elements.iter().map(|v| self.json_stringify(*v)).collect();
+                        // In arrays: undefined/function → "null"
+                        let parts: Vec<String> = elements.iter().map(|v| {
+                            if v.is_undefined() || v.is_function() { "null".into() }
+                            else { self.json_stringify(*v) }
+                        }).collect();
                         return format!("[{}]", parts.join(","));
                     }
                     _ => {
+                        // In objects: skip undefined/function values entirely
                         let parts: Vec<String> = obj.properties.iter()
-                            .filter(|(_, p)| p.is_enumerable())
+                            .filter(|(_, p)| p.is_enumerable() && !p.value.is_undefined() && !p.value.is_function())
                             .map(|&(k, ref p)| {
                                 let key = self.interner.resolve(k);
                                 format!("\"{}\":{}", key, self.json_stringify(p.value))
