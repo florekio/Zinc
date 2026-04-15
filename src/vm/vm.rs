@@ -321,8 +321,14 @@ impl Vm {
 
     pub(crate) fn flatten_chunk(mut chunk: Chunk, out: &mut Vec<Chunk>) {
         let children = std::mem::take(&mut chunk.child_chunks);
+        // Record absolute indices of each direct child before recursing.
+        // The first child will be at out.len() + 1 (after we push self).
+        // Subsequent children follow after their siblings' full subtrees.
+        let self_idx = out.len();
         out.push(chunk);
         for child in children {
+            let child_abs_idx = out.len();
+            out[self_idx].children.push(child_abs_idx);
             Self::flatten_chunk(child, out);
         }
     }
@@ -867,6 +873,12 @@ impl Vm {
     // ---- Main execution loop ----------------------------------------------
 
     pub fn run(&mut self) -> Result<Value, VmError> {
+        self.run_until(0)
+    }
+
+    /// Run the VM until the frame stack depth drops to `stop_depth`.
+    /// Used by `call_function_this` to execute callbacks using the full dispatch loop.
+    pub(crate) fn run_until(&mut self, stop_depth: usize) -> Result<Value, VmError> {
         let mut gc_counter: u32 = 0;
         loop {
             // GC safepoint (check every 1024 instructions)
@@ -875,7 +887,7 @@ impl Vm {
                 self.collect_gc();
             }
 
-            if self.frames.is_empty() {
+            if self.frames.len() <= stop_depth {
                 return Ok(if self.stack.is_empty() {
                     Value::undefined()
                 } else {
@@ -886,11 +898,18 @@ impl Vm {
             let chunk_idx = self.cur_chunk();
             let ip = self.cur_ip();
             if ip >= self.chunks[chunk_idx].code.len() {
-                return Ok(if self.stack.is_empty() {
-                    Value::undefined()
-                } else {
-                    self.pop()?
-                });
+                // Implicit return from function
+                if self.frames.len() <= stop_depth {
+                    return Ok(if self.stack.is_empty() { Value::undefined() } else { self.pop()? });
+                }
+                let frame = self.frames.pop().unwrap();
+                let result = if frame.is_constructor { frame.this_value } else { Value::undefined() };
+                self.stack.truncate(frame.base.saturating_sub(1));
+                if self.frames.len() <= stop_depth {
+                    return Ok(result);
+                }
+                self.push(result);
+                continue;
             }
 
             let byte = self.read_byte();
@@ -1764,7 +1783,8 @@ impl Vm {
                         self.stack.truncate(frame.base.saturating_sub(1));
                         let iter_result = self.make_iter_result(result, true)?;
                         self.push(iter_result);
-                    } else if self.frames.is_empty() {
+                    } else if self.frames.len() <= stop_depth {
+                        self.stack.truncate(frame.base.saturating_sub(1));
                         return Ok(result);
                     } else {
                         self.stack.truncate(frame.base.saturating_sub(1));
@@ -1788,7 +1808,8 @@ impl Vm {
                         self.stack.truncate(frame.base.saturating_sub(1));
                         let iter_result = self.make_iter_result(Value::undefined(), true)?;
                         self.push(iter_result);
-                    } else if self.frames.is_empty() {
+                    } else if self.frames.len() <= stop_depth {
+                        self.stack.truncate(frame.base.saturating_sub(1));
                         return Ok(result);
                     } else {
                         self.stack.truncate(frame.base.saturating_sub(1));
@@ -4111,7 +4132,8 @@ impl Vm {
                 OpCode::Closure => {
                     let child_rel_idx = self.read_u16() as usize;
                     let current = self.cur_chunk();
-                    let abs_idx = current + 1 + child_rel_idx;
+                    let abs_idx = self.chunks[current].children.get(child_rel_idx).copied()
+                        .unwrap_or(current + 1 + child_rel_idx);
 
                     // Read upvalue descriptors from the child chunk
                     let upvalue_count = if abs_idx < self.chunks.len() {
@@ -4166,7 +4188,8 @@ impl Vm {
                         v as usize
                     };
                     let current = self.cur_chunk();
-                    let abs_idx = current + 1 + child_rel_idx;
+                    let abs_idx = self.chunks[current].children.get(child_rel_idx).copied()
+                        .unwrap_or(current + 1 + child_rel_idx);
                     self.push(Value::function(abs_idx as i32));
                 }
 

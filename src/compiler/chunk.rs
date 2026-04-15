@@ -44,6 +44,8 @@ pub struct Chunk {
     pub exception_handlers: Vec<ExceptionHandler>,
     /// Nested function chunks (referenced by Closure opcode).
     pub child_chunks: Vec<Chunk>,
+    /// Absolute chunk indices of direct children (filled during VM flattening).
+    pub children: Vec<usize>,
 }
 
 /// Describes how a closure captures one upvalue.
@@ -90,6 +92,7 @@ impl Chunk {
             upvalue_descriptors: Vec::new(),
             exception_handlers: Vec::new(),
             child_chunks: Vec::new(),
+            children: Vec::new(),
         }
     }
 
