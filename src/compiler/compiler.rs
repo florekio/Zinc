@@ -3123,25 +3123,22 @@ impl<'a> Compiler<'a> {
             PropertyKey::NumberLiteral(_) => StringId(0),
             PropertyKey::Computed(expr) => {
                 // Detect well-known symbol access: Symbol.xxx
-                if let Expression::Member(mem) = expr.as_ref() {
-                    if let Expression::Identifier(obj_id) = &mem.object {
-                        let obj_name = self.interner.resolve(obj_id.name);
-                        if obj_name == "Symbol" {
-                            if let MemberProperty::Identifier(prop_id) = &mem.property {
-                                let prop_name = self.interner.resolve(*prop_id);
-                                let sym_idx: u32 = match prop_name {
-                                    "iterator" => 0,
-                                    "hasInstance" => 1,
-                                    "toPrimitive" => 2,
-                                    "toStringTag" => 3,
-                                    "species" => 4,
-                                    "unscopables" => 5,
-                                    _ => return StringId(0),
-                                };
-                                return self.interner.intern(&format!("__sym_{sym_idx}__"));
-                            }
-                        }
-                    }
+                if let Expression::Member(mem) = expr.as_ref()
+                    && let Expression::Identifier(obj_id) = &mem.object
+                    && self.interner.resolve(obj_id.name) == "Symbol"
+                    && let MemberProperty::Identifier(prop_id) = &mem.property
+                {
+                    let prop_name = self.interner.resolve(*prop_id);
+                    let sym_idx: u32 = match prop_name {
+                        "iterator" => 0,
+                        "hasInstance" => 1,
+                        "toPrimitive" => 2,
+                        "toStringTag" => 3,
+                        "species" => 4,
+                        "unscopables" => 5,
+                        _ => return StringId(0),
+                    };
+                    return self.interner.intern(&format!("__sym_{sym_idx}__"));
                 }
                 StringId(0)
             }
