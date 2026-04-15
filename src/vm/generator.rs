@@ -144,6 +144,7 @@ impl Vm {
                     pending_super_call: false,
                     generator_id: Some(gen_oid),
                     argc: 0,
+                    saved_args: Vec::new(),
                 });
 
                 // For SuspendedYield, the input becomes the result of the yield expression

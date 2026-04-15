@@ -4,9 +4,27 @@ A JavaScript engine written from scratch in Rust with an **experimental ARM64 JI
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**65.5% [Test262](docs/TEST262.md) conformance (4,239 / 6,476 tests)** | **90 tests** | **~19,500 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
+**84.3% [Test262](docs/TEST262.md) conformance (5,461 / 6,476 tests)** | **90 tests** | **~22,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
 
 ![Zinc Playground](web/screenshot.png)
+
+## What's New in v0.2.0
+
+- **84.3% test262 conformance** — up from 65.5% (5,461 / 6,476 tests, +1,222 tests)
+- **Class instance fields** (`x = 0`) and **static fields** (`static count = 0`) now work correctly
+- **`arguments` in arrow functions** now correctly inherits from the enclosing non-arrow scope
+- **Callbacks use the full opcode dispatch loop** — closures, upvalues, nested calls all work inside `map`/`filter`/`reduce`/`forEach`
+- **Closure chunk indices fixed** — deeply nested closures with siblings no longer crash
+- **Arrow function `this` binding** — correctly inherits enclosing `this` when used as callbacks
+- **`Symbol.iterator` class methods** — `[Symbol.iterator]()` in class bodies now compiled as `__sym_0__`
+- **`Symbol.toPrimitive`** coercion supported
+- **`RegExp` constructor** — `new RegExp(pattern, flags)` works as a global
+- **Object.keys numeric ordering** — integer keys sorted numerically first
+- **`typeof class`** → `"function"` (was `"object"`)
+- **`constructor` non-enumerable** on function prototypes
+- **for-of destructuring** — array/object LHS assignment and `var {x=default}` patterns
+- **Labeled continue** fixed (no longer infinite loops)
+- **JSON.stringify** skips `undefined`/function values
 
 ## Try It
 
@@ -127,7 +145,7 @@ bash bench/sunspider/run.sh    # SunSpider benchmarks
 
 ## Test262 Conformance
 
-**65.5%** of tested ECMAScript spec tests pass (4,239 / 6,476). See [TEST262.md](docs/TEST262.md).
+**84.3%** of tested ECMAScript spec tests pass (5,461 / 6,476). See [TEST262.md](docs/TEST262.md).
 
 15 categories with **100% pass rate** including: numeric literals, string literals, boolean literals, compound-assignment, if, return, throw, coalesce, keywords, block, and more.
 
@@ -177,9 +195,9 @@ web/                   WASM playground (HTML + compiled WASM)
 
 ## Stats
 
-- **~19,500 lines** of Rust
+- **~22,000 lines** of Rust
 - **90 tests** passing
-- **65.5%** Test262 conformance (4,239 / 6,476 tests)
+- **84.3%** Test262 conformance (5,461 / 6,476 tests)
 - **1.5 MB** WASM binary (includes regex engine)
 - **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation

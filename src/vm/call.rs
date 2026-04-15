@@ -56,6 +56,7 @@ impl Vm {
             chunk_idx, ip: 0, base: func_pos + 1,
             upvalues, this_value: effective_this, is_constructor: false,
             pending_super_call: false, generator_id: None, argc: args.len(),
+            saved_args: args.to_vec(),
         });
 
         // Run using the full main dispatch loop, stopping when our frame returns.

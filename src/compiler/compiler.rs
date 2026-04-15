@@ -1054,8 +1054,13 @@ impl<'a> Compiler<'a> {
                 if let Some(op) = obj_pat
                     && matches!(&f.left, ForInOfLeft::Variable(_)) {
                     for prop in &op.properties {
-                        if let ObjectPatternProperty::Property { value: Pattern::Identifier(id), .. } = prop {
-                            declare_var(self, id.name);
+                        match prop {
+                            ObjectPatternProperty::Property { value: Pattern::Identifier(id), .. } =>
+                                declare_var(self, id.name),
+                            ObjectPatternProperty::Property { value: Pattern::Assignment(a), .. } => {
+                                if let Pattern::Identifier(id) = &a.left { declare_var(self, id.name); }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1117,43 +1122,111 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::Pop, line);
             }
             LoopVar::ObjectDestructure => {
-                // Collect (key, value_name) from Pattern::Object or Expression::Object
-                let props: Vec<(StringId, StringId)> = match &f.left {
-                    ForInOfLeft::Variable(_) | ForInOfLeft::Pattern(..) => {
-                        let obj_pat = match &f.left {
-                            ForInOfLeft::Variable(decl) => decl.declarations.first().and_then(|d| if let Pattern::Object(o) = &d.id { Some(o) } else { None }),
-                            ForInOfLeft::Pattern(Pattern::Object(o)) => Some(o),
-                            _ => None,
+                // Emit property assignments for Variable/Pattern cases (supports defaults)
+                let obj_pat_exists = matches!(&f.left, ForInOfLeft::Variable(_) | ForInOfLeft::Pattern(Pattern::Object(_)));
+                if obj_pat_exists {
+                    let prop_count = match &f.left {
+                        ForInOfLeft::Variable(decl) => decl.declarations.first()
+                            .and_then(|d| if let Pattern::Object(o) = &d.id { Some(o.properties.len()) } else { None })
+                            .unwrap_or(0),
+                        ForInOfLeft::Pattern(Pattern::Object(o)) => o.properties.len(),
+                        _ => 0,
+                    };
+                    for i in 0..prop_count {
+                        // Re-borrow f.left each iteration to avoid conflicting with &mut self calls
+                        let (key_sid, is_assignment) = match &f.left {
+                            ForInOfLeft::Variable(decl) => {
+                                if let Some(d) = decl.declarations.first() {
+                                    if let Pattern::Object(o) = &d.id {
+                                        if let Some(ObjectPatternProperty::Property { key, value, .. }) = o.properties.get(i) {
+                                            let ks = match key {
+                                                PropertyKey::Identifier(s) | PropertyKey::StringLiteral(s) => *s,
+                                                _ => continue,
+                                            };
+                                            let is_asgn = matches!(value, Pattern::Assignment(_));
+                                            (ks, is_asgn)
+                                        } else { continue }
+                                    } else { continue }
+                                } else { continue }
+                            }
+                            ForInOfLeft::Pattern(Pattern::Object(o)) => {
+                                if let Some(ObjectPatternProperty::Property { key, value, .. }) = o.properties.get(i) {
+                                    let ks = match key {
+                                        PropertyKey::Identifier(s) | PropertyKey::StringLiteral(s) => *s,
+                                        _ => continue,
+                                    };
+                                    (ks, matches!(value, Pattern::Assignment(_)))
+                                } else { continue }
+                            }
+                            _ => continue,
                         };
-                        obj_pat.map(|op| op.properties.iter().filter_map(|p| {
-                            if let ObjectPatternProperty::Property { key, value: Pattern::Identifier(id), .. } = p {
-                                match key {
-                                    PropertyKey::Identifier(s) | PropertyKey::StringLiteral(s) => Some((*s, id.name)),
-                                    _ => None,
-                                }
-                            } else { None }
-                        }).collect()).unwrap_or_default()
+                        self.chunk.emit_op(OpCode::Dup, line);
+                        let key_idx = self.make_string_constant(key_sid);
+                        self.chunk.emit_byte(OpCode::GetProperty as u8, line);
+                        self.chunk.code.push((key_idx >> 8) as u8);
+                        self.chunk.code.push((key_idx & 0xFF) as u8);
+                        if is_assignment {
+                            // Apply default: if value is undefined, use default expr
+                            let (val_name, default_expr) = match &f.left {
+                                ForInOfLeft::Variable(decl) => decl.declarations.first()
+                                    .and_then(|d| if let Pattern::Object(o) = &d.id {
+                                        o.properties.get(i).and_then(|p| if let ObjectPatternProperty::Property { value: Pattern::Assignment(a), .. } = p {
+                                            if let Pattern::Identifier(id) = &a.left { Some((id.name, &a.right as &_)) } else { None }
+                                        } else { None })
+                                    } else { None }),
+                                ForInOfLeft::Pattern(Pattern::Object(o)) => o.properties.get(i)
+                                    .and_then(|p| if let ObjectPatternProperty::Property { value: Pattern::Assignment(a), .. } = p {
+                                        if let Pattern::Identifier(id) = &a.left { Some((id.name, &a.right as &_)) } else { None }
+                                    } else { None }),
+                                _ => None,
+                            }.unzip();
+                            if let (Some(name), Some(default)) = (val_name, default_expr) {
+                                self.chunk.emit_op(OpCode::Dup, line);
+                                self.chunk.emit_op(OpCode::Undefined, line);
+                                self.chunk.emit_op(OpCode::StrictNe, line);
+                                let skip_default = self.chunk.emit_jump(OpCode::JumpIfTrue, line);
+                                self.chunk.emit_op(OpCode::Pop, line);
+                                self.compile_expr(default)?;
+                                self.chunk.patch_jump(skip_default);
+                                self.compile_set_variable(name, line)?;
+                                self.chunk.emit_op(OpCode::Pop, line);
+                            } else {
+                                self.chunk.emit_op(OpCode::Pop, line);
+                            }
+                        } else {
+                            let val_name = match &f.left {
+                                ForInOfLeft::Variable(decl) => decl.declarations.first()
+                                    .and_then(|d| if let Pattern::Object(o) = &d.id {
+                                        o.properties.get(i).and_then(|p| if let ObjectPatternProperty::Property { value: Pattern::Identifier(id), .. } = p {
+                                            Some(id.name)
+                                        } else { None })
+                                    } else { None }),
+                                ForInOfLeft::Pattern(Pattern::Object(o)) => o.properties.get(i)
+                                    .and_then(|p| if let ObjectPatternProperty::Property { value: Pattern::Identifier(id), .. } = p { Some(id.name) } else { None }),
+                                _ => None,
+                            };
+                            if let Some(name) = val_name {
+                                self.compile_set_variable(name, line)?;
+                                self.chunk.emit_op(OpCode::Pop, line);
+                            } else {
+                                self.chunk.emit_op(OpCode::Pop, line);
+                            }
+                        }
                     }
-                    ForInOfLeft::Expression(Expression::Object(obj)) => {
-                        obj.properties.iter().filter_map(|p| {
-                            if let ObjectProperty::Property(prop) = p
-                                && let Expression::Identifier(id) = &prop.value
-                                && let PropertyKey::Identifier(k) = &prop.key {
-                                    return Some((*k, id.name));
-                                }
-                            None
-                        }).collect()
+                } else if let ForInOfLeft::Expression(Expression::Object(obj)) = &f.left {
+                    for prop in &obj.properties {
+                        if let ObjectProperty::Property(p) = prop
+                            && let Expression::Identifier(id) = &p.value
+                            && let PropertyKey::Identifier(k) = &p.key {
+                                self.chunk.emit_op(OpCode::Dup, line);
+                                let key_idx = self.make_string_constant(*k);
+                                self.chunk.emit_byte(OpCode::GetProperty as u8, line);
+                                self.chunk.code.push((key_idx >> 8) as u8);
+                                self.chunk.code.push((key_idx & 0xFF) as u8);
+                                self.compile_set_variable(id.name, line)?;
+                                self.chunk.emit_op(OpCode::Pop, line);
+                            }
                     }
-                    _ => Vec::new(),
-                };
-                for (key_sid, val_name) in &props {
-                    self.chunk.emit_op(OpCode::Dup, line);
-                    let key_idx = self.make_string_constant(*key_sid);
-                    self.chunk.emit_byte(OpCode::GetProperty as u8, line);
-                    self.chunk.code.push((key_idx >> 8) as u8);
-                    self.chunk.code.push((key_idx & 0xFF) as u8);
-                    self.compile_set_variable(*val_name, line)?;
-                    self.chunk.emit_op(OpCode::Pop, line);
                 }
                 self.chunk.emit_op(OpCode::Pop, line);
             }
@@ -3042,12 +3115,36 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn property_key_name(&self, key: &PropertyKey) -> StringId {
+    fn property_key_name(&mut self, key: &PropertyKey) -> StringId {
         match key {
             PropertyKey::Identifier(id)
             | PropertyKey::StringLiteral(id)
             | PropertyKey::Private(id) => *id,
-            _ => StringId(0),
+            PropertyKey::NumberLiteral(_) => StringId(0),
+            PropertyKey::Computed(expr) => {
+                // Detect well-known symbol access: Symbol.xxx
+                if let Expression::Member(mem) = expr.as_ref() {
+                    if let Expression::Identifier(obj_id) = &mem.object {
+                        let obj_name = self.interner.resolve(obj_id.name);
+                        if obj_name == "Symbol" {
+                            if let MemberProperty::Identifier(prop_id) = &mem.property {
+                                let prop_name = self.interner.resolve(*prop_id);
+                                let sym_idx: u32 = match prop_name {
+                                    "iterator" => 0,
+                                    "hasInstance" => 1,
+                                    "toPrimitive" => 2,
+                                    "toStringTag" => 3,
+                                    "species" => 4,
+                                    "unscopables" => 5,
+                                    _ => return StringId(0),
+                                };
+                                return self.interner.intern(&format!("__sym_{sym_idx}__"));
+                            }
+                        }
+                    }
+                }
+                StringId(0)
+            }
         }
     }
 

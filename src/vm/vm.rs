@@ -65,6 +65,9 @@ pub(crate) struct CallFrame {
     pub(crate) generator_id: Option<crate::runtime::object::ObjectId>,
     /// Number of actual arguments passed to this function call.
     pub(crate) argc: usize,
+    /// Snapshot of the actual argument values, captured at call time before
+    /// locals can overwrite the same stack slots (needed for `arguments` object).
+    pub(crate) saved_args: Vec<Value>,
 }
 
 /// An active exception handler (pushed by PushExcHandler).
@@ -285,7 +288,7 @@ impl Vm {
         
         Self {
             chunks,
-            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::undefined(), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0 }],
+            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::undefined(), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0, saved_args: Vec::new() }],
             stack: Vec::with_capacity(256),
             globals,
             interner,
@@ -1300,15 +1303,17 @@ impl Vm {
                         let this_val = self.frames.last().unwrap().this_value;
                         self.push(this_val);
                     } else if name_str == "arguments" && self.frames.len() > 1 {
-                        let frame = self.frames.last().unwrap();
-                        let actual_argc = frame.argc;
-                        let base = frame.base;
-                        let mut args = Vec::new();
-                        for i in 0..actual_argc {
-                            if base + i < self.stack.len() {
-                                args.push(self.stack[base + i]);
-                            }
+                        // Arrow functions don't have their own `arguments` — walk up
+                        // to the nearest non-arrow frame.
+                        let mut frame_idx = self.frames.len() - 1;
+                        while frame_idx > 0
+                            && self.chunks[self.frames[frame_idx].chunk_idx].flags.contains(ChunkFlags::ARROW)
+                        {
+                            frame_idx -= 1;
                         }
+                        // Use saved_args (captured at call time) so locals that share
+                        // stack slots with args don't corrupt the arguments object.
+                        let args = self.frames[frame_idx].saved_args.clone();
                         let arr = JsObject::array(args);
                         let oid = self.heap.allocate(arr);
                         self.push(Value::object_id(oid));
@@ -1552,6 +1557,9 @@ impl Vm {
                                 Value::undefined()
                             };
 
+                            let saved_args: Vec<Value> = (0..argc)
+                                .map(|i| self.stack.get(func_pos + 1 + i).copied().unwrap_or(Value::undefined()))
+                                .collect();
                             self.frames.push(CallFrame {
                                 chunk_idx,
                                 ip: 0,
@@ -1562,6 +1570,7 @@ impl Vm {
                                 pending_super_call: false,
                                 generator_id: None,
                                 argc,
+                                saved_args,
                             });
                             continue;
                         }
@@ -2979,10 +2988,14 @@ impl Vm {
                                     let upvalues = if closure_id < self.closure_upvalues.len() {
                                         self.closure_upvalues[closure_id].clone()
                                     } else { Vec::new() };
+                                    let saved_args: Vec<Value> = (0..argc)
+                                        .map(|i| self.stack.get(obj_pos + 1 + i).copied().unwrap_or(Value::undefined()))
+                                        .collect();
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: obj_pos + 1,
                                         upvalues, this_value: obj_val, is_constructor: false,
-                                        pending_super_call: false, generator_id: None, argc: 0,
+                                        pending_super_call: false, generator_id: None, argc,
+                                        saved_args,
                                     });
                                     continue;
                                 }
@@ -3816,6 +3829,26 @@ impl Vm {
                             new_o.set_property(class_key, func_val);
                         }
 
+                        // Apply instance fields (stored as __ifield_{name}__ on the class)
+                        let ifield_prefix = "__ifield_";
+                        let instance_fields: Vec<(String, Value)> = self.heap.get(class_oid)
+                            .map(|o| o.properties.iter()
+                                .filter_map(|(k, p)| {
+                                    let key_str = self.interner.resolve(*k);
+                                    if key_str.starts_with(ifield_prefix) && key_str.ends_with("__") {
+                                        let inner = &key_str[ifield_prefix.len()..key_str.len() - 2];
+                                        Some((inner.to_owned(), p.value))
+                                    } else { None }
+                                })
+                                .collect())
+                            .unwrap_or_default();
+                        for (field_name, field_val) in instance_fields {
+                            let real_key = self.interner.intern(&field_name);
+                            if let Some(new_o) = self.heap.get_mut(new_oid) {
+                                new_o.set_property(real_key, field_val);
+                            }
+                        }
+
                         if let Some(cv) = ctor_val
                             && cv.is_function() {
                                 // Replace func on stack with this, push ctor as the call target
@@ -3833,10 +3866,14 @@ impl Vm {
                                     let upvalues = if closure_id < self.closure_upvalues.len() {
                                         self.closure_upvalues[closure_id].clone()
                                     } else { Vec::new() };
+                                    let saved_args: Vec<Value> = (0..argc)
+                                        .map(|i| self.stack.get(func_pos + 1 + i).copied().unwrap_or(Value::undefined()))
+                                        .collect();
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: func_pos + 1,
                                         upvalues, this_value: this_val, is_constructor: true,
-                                        pending_super_call: false, generator_id: None, argc: 0,
+                                        pending_super_call: false, generator_id: None, argc,
+                                        saved_args,
                                     });
                                     continue;
                                 }
@@ -3862,6 +3899,9 @@ impl Vm {
                             // Replace the function slot with `this` so local slot -1 is this
                             self.stack[func_pos] = this_val;
 
+                            let saved_args: Vec<Value> = (0..argc)
+                                .map(|i| self.stack.get(func_pos + 1 + i).copied().unwrap_or(Value::undefined()))
+                                .collect();
                             self.frames.push(CallFrame {
                                 chunk_idx,
                                 ip: 0,
@@ -3872,6 +3912,7 @@ impl Vm {
                                 pending_super_call: false,
                                 generator_id: None,
                                 argc,
+                                saved_args,
                             });
                             continue;
                         }
@@ -4252,9 +4293,38 @@ impl Vm {
                         }
                 }
 
-                OpCode::ClassField | OpCode::ClassStaticField | OpCode::ClassPrivateMethod => {
+                OpCode::ClassStaticField => {
+                    let name_idx = self.read_u16() as usize;
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
+                    let name_id = name_val.as_string_id().unwrap();
+                    let field_val = self.pop()?;
+                    let class_val = self.peek()?;
+                    if let Some(class_oid) = class_val.as_object_id()
+                        && let Some(class_obj) = self.heap.get_mut(class_oid) {
+                            class_obj.set_property(name_id, field_val);
+                        }
+                }
+
+                OpCode::ClassField => {
+                    // Instance field: store default value on class under __ifield_{name}__
+                    // Applied to each new instance during Construct.
+                    let name_idx = self.read_u16() as usize;
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
+                    let name_id = name_val.as_string_id().unwrap();
+                    let field_val = self.pop()?;
+                    let class_val = self.peek()?;
+                    if let Some(class_oid) = class_val.as_object_id() {
+                        let field_name = self.interner.resolve(name_id).to_owned();
+                        let ifield_key = self.interner.intern(&format!("__ifield_{field_name}__"));
+                        if let Some(class_obj) = self.heap.get_mut(class_oid) {
+                            class_obj.set_property(ifield_key, field_val);
+                        }
+                    }
+                }
+
+                OpCode::ClassPrivateMethod => {
                     let _ = self.read_u16();
-                    let _val = self.pop()?; // consume field value
+                    let _val = self.pop()?; // private methods not yet supported
                 }
 
                 OpCode::Inherit => {
