@@ -128,6 +128,12 @@ pub struct Vm {
     pub(crate) regex_cache: crate::vm::regexp::RegexCache,
     /// Function prototype cache: maps packed function value → prototype ObjectId
     pub(crate) func_prototypes: HashMap<i32, ObjectId>,
+    /// Singleton Object.prototype object
+    pub(crate) object_prototype: ObjectId,
+    /// Singleton Function.prototype object
+    pub(crate) function_prototype: ObjectId,
+    /// Singleton Array.prototype object
+    pub(crate) array_prototype: ObjectId,
     /// Cached Math object ID for fast dispatch
     pub(crate) math_oid: Option<ObjectId>,
     /// Cached JSON object ID for fast dispatch
@@ -162,6 +168,56 @@ impl Vm {
         Self::flatten_chunk(chunk, &mut chunks);
 
         let mut heap = ObjectHeap::new();
+
+        // Create Object.prototype singleton (root of all prototype chains)
+        let mut obj_proto = JsObject::ordinary();
+        // prototype = null (Object.prototype is the root)
+        let hop_key = interner.intern("hasOwnProperty");
+        obj_proto.define_property(hop_key, Property::with_flags(Value::function(-590), Property::WRITABLE | Property::CONFIGURABLE));
+        let pie_key = interner.intern("propertyIsEnumerable");
+        obj_proto.define_property(pie_key, Property::with_flags(Value::function(-591), Property::WRITABLE | Property::CONFIGURABLE));
+        let tostr_key = interner.intern("toString");
+        obj_proto.define_property(tostr_key, Property::with_flags(Value::function(-592), Property::WRITABLE | Property::CONFIGURABLE));
+        let valueof_key = interner.intern("valueOf");
+        obj_proto.define_property(valueof_key, Property::with_flags(Value::function(-593), Property::WRITABLE | Property::CONFIGURABLE));
+        let ipof_key = interner.intern("isPrototypeOf");
+        obj_proto.define_property(ipof_key, Property::with_flags(Value::function(-594), Property::WRITABLE | Property::CONFIGURABLE));
+        let object_prototype = heap.allocate(obj_proto);
+
+        // Create Function.prototype singleton (prototype = Object.prototype)
+        let mut fn_proto = JsObject::ordinary();
+        fn_proto.prototype = Some(object_prototype);
+        let call_key = interner.intern("call");
+        fn_proto.define_property(call_key, Property::with_flags(Value::function(-595), Property::WRITABLE | Property::CONFIGURABLE));
+        let apply_key = interner.intern("apply");
+        fn_proto.define_property(apply_key, Property::with_flags(Value::function(-596), Property::WRITABLE | Property::CONFIGURABLE));
+        let bind_key = interner.intern("bind");
+        fn_proto.define_property(bind_key, Property::with_flags(Value::function(-597), Property::WRITABLE | Property::CONFIGURABLE));
+        let fn_length_key = interner.intern("length");
+        fn_proto.define_property(fn_length_key, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
+        let fn_name_key = interner.intern("name");
+        let empty_str = interner.intern("");
+        fn_proto.define_property(fn_name_key, Property::with_flags(Value::string(empty_str), Property::CONFIGURABLE));
+        let function_prototype = heap.allocate(fn_proto);
+
+        // Create Array.prototype singleton (prototype = Object.prototype)
+        // Array.prototype methods use sentinels -600 to -629
+        let mut arr_proto = JsObject::ordinary();
+        arr_proto.prototype = Some(object_prototype);
+        for (name, sentinel) in [
+            ("join", -600i32), ("push", -601), ("pop", -602), ("shift", -603),
+            ("unshift", -604), ("indexOf", -605), ("includes", -606), ("forEach", -607),
+            ("map", -608), ("filter", -609), ("reduce", -610), ("some", -611),
+            ("every", -612), ("find", -613), ("findIndex", -614), ("slice", -615),
+            ("concat", -616), ("reverse", -617), ("sort", -618), ("flat", -619),
+            ("flatMap", -620), ("fill", -621), ("splice", -622), ("reduceRight", -623),
+            ("at", -624), ("keys", -625), ("values", -626), ("entries", -627),
+            ("lastIndexOf", -628), ("toString", -629),
+        ] {
+            let k = interner.intern(name);
+            arr_proto.define_property(k, Property::with_flags(Value::function(sentinel), Property::WRITABLE | Property::CONFIGURABLE));
+        }
+        let array_prototype = heap.allocate(arr_proto);
 
         // Create console object with log/warn/error methods
         let mut console_obj = JsObject::ordinary();
@@ -309,6 +365,9 @@ impl Vm {
             module_dir: None,
             regex_cache: crate::vm::regexp::RegexCache::new(),
             func_prototypes: HashMap::new(),
+            object_prototype,
+            function_prototype,
+            array_prototype,
             math_oid: Some(math_oid),
             json_oid: Some(json_oid),
             symbol_descriptions: sym_descs,
@@ -463,6 +522,20 @@ impl Vm {
                 }
             }
         }
+
+        // Root 7: singleton prototype objects
+        roots.push(self.object_prototype);
+        roots.push(self.function_prototype);
+        roots.push(self.array_prototype);
+
+        // Root 8: function prototype cache
+        for &oid in self.func_prototypes.values() {
+            roots.push(oid);
+        }
+
+        // Root 9: math_oid, json_oid
+        if let Some(oid) = self.math_oid { roots.push(oid); }
+        if let Some(oid) = self.json_oid { roots.push(oid); }
 
         self.heap.mark_from_roots(&roots);
         self.heap.sweep();
@@ -726,7 +799,29 @@ impl Vm {
                     ObjectKind::RegExp { pattern, flags } => {
                         format!("/{pattern}/{flags}")
                     }
-                    _ => "[object Object]".into(),
+                    _ => {
+                        // Check for Error-like objects: scan properties for "message" string
+                        if let Some(obj) = self.heap.get(oid) {
+                            let mut msg_val: Option<Value> = None;
+                            let mut name_val: Option<Value> = None;
+                            for &(k, ref prop) in &obj.properties {
+                                let ks = self.interner.resolve(k);
+                                if ks == "message" { msg_val = Some(prop.value); }
+                                else if ks == "name" { name_val = Some(prop.value); }
+                            }
+                            if let Some(mv) = msg_val {
+                                if mv.is_string() {
+                                    let msg = self.interner.resolve(mv.as_string_id().unwrap()).to_owned();
+                                    let name = name_val
+                                        .and_then(|v| v.as_string_id())
+                                        .map(|id| self.interner.resolve(id).to_owned())
+                                        .unwrap_or_else(|| "Error".to_owned());
+                                    return format!("{name}: {msg}");
+                                }
+                            }
+                        }
+                        "[object Object]".into()
+                    }
                 }
             } else {
                 "[object Object]".into()
@@ -1741,6 +1836,14 @@ impl Vm {
                             self.push(result);
                             continue;
                         }
+                        if (-629..=-590).contains(&sentinel) {
+                            // Native this-dependent methods called standalone (this=undefined)
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
+                            let result = self.exec_native_method(sentinel, Value::undefined(), &args);
+                            self.stack.truncate(func_pos);
+                            self.push(result);
+                            continue;
+                        }
                     }
 
                     // Bound function object: unwrap target + bound args/this
@@ -1753,11 +1856,17 @@ impl Vm {
                             } else { None }
                         });
                         if let Some((target_oid, this_val, bound_args)) = bound_info {
-                            // Resolve target to function value
+                            // Resolve target to function value (Bytecode or NativeSentinel)
                             let target_fn = self.heap.get(target_oid).and_then(|o| {
-                                if let ObjectKind::Function(crate::runtime::object::FunctionKind::Bytecode { chunk_idx, .. }) = &o.kind {
-                                    Some(Value::function(*chunk_idx as i32))
-                                } else { None }
+                                match &o.kind {
+                                    ObjectKind::Function(crate::runtime::object::FunctionKind::Bytecode { chunk_idx, .. }) => {
+                                        Some(Value::function(*chunk_idx as i32))
+                                    }
+                                    ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { sentinel }) => {
+                                        Some(Value::function(*sentinel))
+                                    }
+                                    _ => None,
+                                }
                             });
                             if let Some(fn_val) = target_fn {
                                 let call_args: Vec<Value> = bound_args.into_iter()
@@ -1953,9 +2062,14 @@ impl Vm {
                     let obj_val = self.pop()?;
                     let result = if let Some(oid) = obj_val.as_object_id() {
                         if let Some(key_id) = key.as_string_id() {
-                            self.heap.get_mut(oid)
-                                .map(|o| o.delete_property(key_id))
-                                .unwrap_or(true)
+                            let key_str = self.interner.resolve(key_id).to_owned();
+                            let getter_key = self.interner.intern(&format!("__get_{key_str}__"));
+                            let setter_key = self.interner.intern(&format!("__set_{key_str}__"));
+                            // Delete the direct property and any accessor properties
+                            let r1 = self.heap.get_mut(oid).map(|o| o.delete_property(key_id)).unwrap_or(true);
+                            let r2 = self.heap.get_mut(oid).map(|o| o.delete_property(getter_key)).unwrap_or(true);
+                            let r3 = self.heap.get_mut(oid).map(|o| o.delete_property(setter_key)).unwrap_or(true);
+                            r1 && r2 && r3
                         } else {
                             true
                         }
@@ -2248,6 +2362,21 @@ impl Vm {
                                 "raw" => Value::function(-536),
                                 _ => Value::undefined(),
                             },
+                            -507 => match name_str {
+                                // Array static properties
+                                "prototype" => Value::object_id(self.array_prototype),
+                                _ => Value::undefined(),
+                            },
+                            -508 => match name_str {
+                                // Object static properties
+                                "prototype" => Value::object_id(self.object_prototype),
+                                _ => Value::undefined(),
+                            },
+                            -551 => match name_str {
+                                // Function static properties
+                                "prototype" => Value::object_id(self.function_prototype),
+                                _ => Value::undefined(),
+                            },
                             _ => {
                                 // User-defined function properties
                                 match name_str {
@@ -2257,6 +2386,7 @@ impl Vm {
                                             Value::object_id(proto_oid)
                                         } else {
                                             let mut proto = JsObject::ordinary();
+                                            proto.prototype = Some(self.object_prototype);
                                             let ctor_key = self.interner.intern("constructor");
                                             // constructor is writable+configurable but NOT enumerable
                                             proto.define_property(ctor_key, Property::with_flags(
@@ -2730,12 +2860,22 @@ impl Vm {
                                 // Create a bound function object
                                 let func_obj_id = if let Some(oid) = obj_val.as_object_id() { oid }
                                     else {
-                                        // Wrap the function value in an object
                                         let packed = obj_val.as_function().unwrap();
-                                        let chunk_idx = (packed & 0xFFFF) as usize;
-                                        let name = if chunk_idx < self.chunks.len() { self.chunks[chunk_idx].name } else { self.interner.intern("<bound>") };
-                                        let fobj = JsObject::function_bytecode(chunk_idx, name);
-                                        self.heap.allocate(fobj)
+                                        if packed < 0 {
+                                            // Native sentinel — wrap as NativeSentinel to preserve dispatch
+                                            let fobj = JsObject {
+                                                properties: Vec::new(), prototype: None,
+                                                kind: ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { sentinel: packed }),
+                                                marked: false, extensible: true,
+                                            };
+                                            self.heap.allocate(fobj)
+                                        } else {
+                                            // User bytecode function — wrap as Bytecode
+                                            let chunk_idx = (packed & 0xFFFF) as usize;
+                                            let name = if chunk_idx < self.chunks.len() { self.chunks[chunk_idx].name } else { self.interner.intern("<bound>") };
+                                            let fobj = JsObject::function_bytecode(chunk_idx, name);
+                                            self.heap.allocate(fobj)
+                                        }
                                     };
                                 let bound = JsObject {
                                     properties: Vec::new(), prototype: None,
@@ -2922,7 +3062,13 @@ impl Vm {
                             "hasOwnProperty" => {
                                 let key = if argc > 0 { self.value_to_string(self.stack[obj_pos + 1]) } else { String::new() };
                                 let key_id = self.interner.intern(&key);
-                                let has = self.heap.get(oid).map(|o| o.has_own_property(key_id)).unwrap_or(false);
+                                let getter_key = self.interner.intern(&format!("__get_{key}__"));
+                                let setter_key = self.interner.intern(&format!("__set_{key}__"));
+                                let has = self.heap.get(oid).map(|o| {
+                                    o.has_own_property(key_id)
+                                        || o.has_own_property(getter_key)
+                                        || o.has_own_property(setter_key)
+                                }).unwrap_or(false);
                                 self.stack.truncate(obj_pos);
                                 self.push(Value::boolean(has));
                                 continue;
@@ -2976,6 +3122,36 @@ impl Vm {
                                 let closure_id = ((packed as u32) >> 16) as usize;
                                 let chunk_idx = (packed & 0xFFFF) as usize;
                                 if chunk_idx >= 1 && chunk_idx < self.chunks.len() {
+                                    // Generator methods: create a generator object instead of executing
+                                    if self.chunks[chunk_idx].flags.contains(crate::compiler::chunk::ChunkFlags::GENERATOR) {
+                                        let saved_upvalues: Vec<Value> = if closure_id < self.closure_upvalues.len() {
+                                            self.closure_upvalues[closure_id].iter().map(|uv| {
+                                                match &uv.location {
+                                                    UpvalueLocation::Open(idx) => self.stack.get(*idx).copied().unwrap_or(Value::undefined()),
+                                                    UpvalueLocation::Closed(v) => *v,
+                                                }
+                                            }).collect()
+                                        } else { Vec::new() };
+                                        let expected = self.chunks[chunk_idx].param_count as usize;
+                                        let saved_stack: Vec<Value> = (0..expected.max(argc))
+                                            .map(|i| {
+                                                if i < argc { self.stack[obj_pos + 1 + i] }
+                                                else { Value::undefined() }
+                                            }).collect();
+                                        let mut gen_obj = JsObject::ordinary();
+                                        gen_obj.kind = ObjectKind::Generator {
+                                            state: GeneratorState::SuspendedStart,
+                                            chunk_idx,
+                                            ip: 0,
+                                            saved_stack,
+                                            saved_upvalues,
+                                            this_value: obj_val,
+                                        };
+                                        let gen_oid = self.heap.allocate(gen_obj);
+                                        self.stack.truncate(obj_pos);
+                                        self.push(Value::object_id(gen_oid));
+                                        continue;
+                                    }
                                     // Restructure stack: [obj, args...] -> [args...]
                                     // Put closure in func_pos, shift args
                                     self.stack[obj_pos] = mv;
@@ -3199,7 +3375,25 @@ impl Vm {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                                     let key_str = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_default();
                                     let key_id = self.interner.intern(&key_str);
-                                    if let Some(obj) = self.heap.get(oid)
+                                    // Check for accessor properties first
+                                    let getter_key_str = format!("__get_{key_str}__");
+                                    let setter_key_str = format!("__set_{key_str}__");
+                                    let getter_key = self.interner.intern(&getter_key_str);
+                                    let setter_key = self.interner.intern(&setter_key_str);
+                                    let getter = self.heap.get(oid).and_then(|o| o.get_property(getter_key));
+                                    let setter = self.heap.get(oid).and_then(|o| o.get_property(setter_key));
+                                    if getter.is_some() || setter.is_some() {
+                                        let mut desc = JsObject::ordinary();
+                                        let get_key = self.interner.intern("get");
+                                        let set_key = self.interner.intern("set");
+                                        let en_key = self.interner.intern("enumerable");
+                                        let cf_key = self.interner.intern("configurable");
+                                        desc.set_property(get_key, getter.unwrap_or(Value::undefined()));
+                                        desc.set_property(set_key, setter.unwrap_or(Value::undefined()));
+                                        desc.set_property(en_key, Value::boolean(false));
+                                        desc.set_property(cf_key, Value::boolean(true));
+                                        Value::object_id(self.heap.allocate(desc))
+                                    } else if let Some(obj) = self.heap.get(oid)
                                         && let Some(prop) = obj.get_property_descriptor(key_id) {
                                             let mut desc = JsObject::ordinary();
                                             let val_key = self.interner.intern("value");
@@ -3216,9 +3410,26 @@ impl Vm {
                             }
                             "getOwnPropertyNames" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
-                                    let names: Vec<Value> = self.heap.get(oid)
-                                        .map(|o| o.properties.iter().map(|(k, _)| Value::string(*k)).collect())
+                                    let raw_props: Vec<StringId> = self.heap.get(oid)
+                                        .map(|o| o.properties.iter().map(|(k, _)| *k).collect())
                                         .unwrap_or_default();
+                                    let mut seen = std::collections::HashSet::new();
+                                    let mut names: Vec<Value> = Vec::new();
+                                    for k in raw_props {
+                                        let s = self.interner.resolve(k).to_owned();
+                                        // Convert __get_X__ / __set_X__ → X
+                                        let real = if s.starts_with("__get_") && s.ends_with("__") {
+                                            s[6..s.len()-2].to_owned()
+                                        } else if s.starts_with("__set_") && s.ends_with("__") {
+                                            s[6..s.len()-2].to_owned()
+                                        } else {
+                                            s.clone()
+                                        };
+                                        if seen.insert(real.clone()) {
+                                            let id = self.interner.intern(&real);
+                                            names.push(Value::string(id));
+                                        }
+                                    }
                                     let arr = JsObject::array(names);
                                     Value::object_id(self.heap.allocate(arr))
                                 } else { Value::undefined() }
@@ -3299,10 +3510,22 @@ impl Vm {
                                 Value::boolean(result)
                             }
                             "getPrototypeOf" => {
-                                if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
-                                    self.heap.get(oid)
-                                        .and_then(|o| o.prototype.map(Value::object_id))
-                                        .unwrap_or(Value::null())
+                                let arg = args.first().copied().unwrap_or(Value::undefined());
+                                if let Some(oid) = arg.as_object_id() {
+                                    // Class/function objects get Function.prototype as their proto
+                                    let is_fn_obj = self.heap.get(oid)
+                                        .map(|o| matches!(&o.kind, ObjectKind::Function(_)))
+                                        .unwrap_or(false);
+                                    if is_fn_obj {
+                                        Value::object_id(self.function_prototype)
+                                    } else {
+                                        self.heap.get(oid)
+                                            .and_then(|o| o.prototype.map(Value::object_id))
+                                            .unwrap_or(Value::null())
+                                    }
+                                } else if arg.is_function() {
+                                    // Sentinel functions → Function.prototype
+                                    Value::object_id(self.function_prototype)
                                 } else { Value::null() }
                             }
                             "setPrototypeOf" => {
@@ -3334,7 +3557,14 @@ impl Vm {
                                 if let Some(oid) = target.as_object_id() {
                                     let key_str = self.value_to_string(key_val);
                                     let key_id = self.interner.intern(&key_str);
-                                    Value::boolean(self.heap.get(oid).map(|o| o.has_own_property(key_id)).unwrap_or(false))
+                                    let getter_key = self.interner.intern(&format!("__get_{key_str}__"));
+                                    let setter_key = self.interner.intern(&format!("__set_{key_str}__"));
+                                    let has = self.heap.get(oid).map(|o| {
+                                        o.has_own_property(key_id)
+                                            || o.has_own_property(getter_key)
+                                            || o.has_own_property(setter_key)
+                                    }).unwrap_or(false);
+                                    Value::boolean(has)
                                 } else { Value::boolean(false) }
                             }
                             "fromEntries" => {
@@ -3794,6 +4024,7 @@ impl Vm {
                             let chunk_idx = (packed & 0xFFFF) as usize;
                             if chunk_idx < self.chunks.len() {
                                 let mut proto = JsObject::ordinary();
+                                proto.prototype = Some(self.object_prototype);
                                 let ctor_key = self.interner.intern("constructor");
                                 proto.define_property(ctor_key, Property::with_flags(
                                     func_val, Property::WRITABLE | Property::CONFIGURABLE
@@ -4235,9 +4466,11 @@ impl Vm {
                 }
 
                 OpCode::Class => {
-                    let _name_idx = self.read_u16();
+                    let name_idx = self.read_u16() as usize;
+                    let class_name_id = self.chunks[self.cur_chunk()].constants[name_idx].as_string_id().unwrap_or_else(|| self.interner.intern(""));
                     // Create a constructor placeholder and prototype object
-                    let proto = JsObject::ordinary();
+                    let mut proto = JsObject::ordinary();
+                    proto.prototype = Some(self.object_prototype);
                     let proto_oid = self.heap.allocate(proto);
                     // The class itself is represented as an ordinary object with a __proto__ property
                     let mut class_obj = JsObject::ordinary();
@@ -4246,7 +4479,18 @@ impl Vm {
                     // Mark as class with default constructor (so typeof returns "function")
                     let ctor_key = self.interner.intern("__constructor__");
                     class_obj.set_property(ctor_key, Value::undefined());
+                    // Set name: non-writable, non-enumerable, configurable
+                    let name_key = self.interner.intern("name");
+                    class_obj.define_property(name_key, Property::with_flags(Value::string(class_name_id), Property::CONFIGURABLE));
+                    // Set length: 0 default (updated when constructor is found)
+                    let length_key = self.interner.intern("length");
+                    class_obj.define_property(length_key, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
                     let class_oid = self.heap.allocate(class_obj);
+                    // Set proto.constructor = class (non-enumerable, writable, configurable)
+                    let constructor_key = self.interner.intern("constructor");
+                    if let Some(proto) = self.heap.get_mut(proto_oid) {
+                        proto.define_property(constructor_key, Property::with_flags(Value::object_id(class_oid), Property::WRITABLE | Property::CONFIGURABLE));
+                    }
                     self.push(Value::object_id(class_oid));
                 }
 
@@ -4267,14 +4511,25 @@ impl Vm {
                                 let constructor_name = self.interner.intern("constructor");
                                 if name_id == constructor_name {
                                     // Store constructor on the class object itself
+                                    // Also update `length` from constructor's formal_length
+                                    let formal_length = if let Some(packed) = method_val.as_function() {
+                                        let chunk_idx = (packed & 0xFFFF) as usize;
+                                        if chunk_idx < self.chunks.len() {
+                                            self.chunks[chunk_idx].formal_length as i32
+                                        } else { 0 }
+                                    } else { 0 };
                                     if let Some(class_obj) = self.heap.get_mut(class_oid) {
                                         let ctor_key = self.interner.intern("__constructor__");
                                         class_obj.set_property(ctor_key, method_val);
+                                        let length_key = self.interner.intern("length");
+                                        class_obj.define_property(length_key, Property::with_flags(Value::int(formal_length), Property::CONFIGURABLE));
                                     }
                                 } else {
-                                    // Add method to prototype
+                                    // Add method to prototype: non-enumerable, writable, configurable
                                     if let Some(proto) = self.heap.get_mut(proto_oid) {
-                                        proto.set_property(name_id, method_val);
+                                        proto.define_property(name_id, Property::with_flags(
+                                            method_val, Property::WRITABLE | Property::CONFIGURABLE
+                                        ));
                                     }
                                 }
                             }
@@ -4289,7 +4544,10 @@ impl Vm {
                     let class_val = self.peek()?;
                     if let Some(class_oid) = class_val.as_object_id()
                         && let Some(class_obj) = self.heap.get_mut(class_oid) {
-                            class_obj.set_property(name_id, method_val);
+                            // Static methods: non-enumerable, writable, configurable
+                            class_obj.define_property(name_id, Property::with_flags(
+                                method_val, Property::WRITABLE | Property::CONFIGURABLE
+                            ));
                         }
                 }
 

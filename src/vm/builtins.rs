@@ -982,6 +982,112 @@ impl Vm {
             _ => Value::undefined(),
         }
     }
+    /// Execute a native method sentinel that requires `this` context.
+    /// Sentinels -590 to -599: Object.prototype / Function.prototype methods.
+    /// Sentinels -600 to -629: Array.prototype methods.
+    pub(crate) fn exec_native_method(&mut self, sentinel: i32, this_val: Value, args: &[Value]) -> Value {
+        match sentinel {
+            -590 => { // Object.prototype.hasOwnProperty — also checks __get_X__/__set_X__
+                let key = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
+                let key_id = self.interner.intern(&key);
+                let getter_key = self.interner.intern(&format!("__get_{key}__"));
+                let setter_key = self.interner.intern(&format!("__set_{key}__"));
+                if let Some(oid) = this_val.as_object_id() {
+                    let has = self.heap.get(oid).map(|o| {
+                        o.has_own_property(key_id)
+                            || o.has_own_property(getter_key)
+                            || o.has_own_property(setter_key)
+                    }).unwrap_or(false);
+                    Value::boolean(has)
+                } else { Value::boolean(false) }
+            }
+            -591 => { // Object.prototype.propertyIsEnumerable
+                let key = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
+                let key_id = self.interner.intern(&key);
+                if let Some(oid) = this_val.as_object_id() {
+                    let is_enum = self.heap.get(oid)
+                        .and_then(|o| o.get_property_descriptor(key_id))
+                        .map(|p| p.is_enumerable())
+                        .unwrap_or(false);
+                    Value::boolean(is_enum)
+                } else { Value::boolean(false) }
+            }
+            -592 => { // Object.prototype.toString
+                if let Some(oid) = this_val.as_object_id() {
+                    if let Some(obj) = self.heap.get(oid) {
+                        let tag = match &obj.kind {
+                            ObjectKind::Array(_) => "Array",
+                            ObjectKind::Function(_) => "Function",
+                            _ => "Object",
+                        };
+                        let s = self.interner.intern(&format!("[object {tag}]"));
+                        return Value::string(s);
+                    }
+                }
+                let s = self.interner.intern("[object Object]");
+                Value::string(s)
+            }
+            -593 => { // Object.prototype.valueOf
+                this_val
+            }
+            -594 => { // Object.prototype.isPrototypeOf
+                let target = args.first().copied().unwrap_or(Value::undefined());
+                if let Some(proto_oid) = this_val.as_object_id() {
+                    if let Some(target_oid) = target.as_object_id() {
+                        let mut current_proto = self.heap.get(target_oid).and_then(|o| o.prototype);
+                        loop {
+                            match current_proto {
+                                None => break Value::boolean(false),
+                                Some(oid) if oid == proto_oid => break Value::boolean(true),
+                                Some(oid) => {
+                                    current_proto = self.heap.get(oid).and_then(|o| o.prototype);
+                                }
+                            }
+                        }
+                    } else { Value::boolean(false) }
+                } else { Value::boolean(false) }
+            }
+            -595 => { // Function.prototype.call — called with this=fn, args=[thisArg, ...rest]
+                let this_arg = args.first().copied().unwrap_or(Value::undefined());
+                let call_args: Vec<Value> = args.get(1..).unwrap_or_default().to_vec();
+                self.call_function_this(this_val, this_arg, &call_args).unwrap_or(Value::undefined())
+            }
+            -596 => { // Function.prototype.apply — called with this=fn, args=[thisArg, argsArray]
+                let this_arg = args.first().copied().unwrap_or(Value::undefined());
+                let call_args = if let Some(arr_val) = args.get(1)
+                    && let Some(arr_oid) = arr_val.as_object_id()
+                    && let Some(obj) = self.heap.get(arr_oid)
+                    && let ObjectKind::Array(ref e) = obj.kind { e.clone() } else { vec![] };
+                self.call_function_this(this_val, this_arg, &call_args).unwrap_or(Value::undefined())
+            }
+            -597 => { // Function.prototype.bind — should be intercepted by CallMethod, fallback here
+                Value::undefined()
+            }
+            // Array.prototype methods: dispatch via exec_array_method using this_val as array
+            sentinel if (-629..=-600).contains(&sentinel) => {
+                let method_name = match sentinel {
+                    -600 => "join", -601 => "push", -602 => "pop", -603 => "shift",
+                    -604 => "unshift", -605 => "indexOf", -606 => "includes", -607 => "forEach",
+                    -608 => "map", -609 => "filter", -610 => "reduce", -611 => "some",
+                    -612 => "every", -613 => "find", -614 => "findIndex", -615 => "slice",
+                    -616 => "concat", -617 => "reverse", -618 => "sort", -619 => "flat",
+                    -620 => "flatMap", -621 => "fill", -622 => "splice", -623 => "reduceRight",
+                    -624 => "at", -625 => "keys", -626 => "values", -627 => "entries",
+                    -628 => "lastIndexOf", -629 => "toString",
+                    _ => return Value::undefined(),
+                };
+                let method_id = self.interner.intern(method_name);
+                // For array-like objects (including actual arrays)
+                if let Some(oid) = this_val.as_object_id() {
+                    self.exec_array_method(oid, method_id, args).unwrap_or(Value::undefined())
+                } else {
+                    Value::undefined()
+                }
+            }
+            _ => Value::undefined(),
+        }
+    }
+
     /// Check if a value is a String wrapper object.
     pub(crate) fn is_string_wrapper(&self, val: Value) -> bool {
         if let Some(oid) = val.as_object_id()

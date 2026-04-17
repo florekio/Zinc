@@ -985,6 +985,31 @@ fn parse_property(p: &mut Parser) -> ParseResult<Property> {
         });
     }
 
+    // Shorthand with default for destructuring: { x = 1 }
+    if !computed
+        && matches!(&key, PropertyKey::Identifier(_))
+        && p.at(TokenKind::Assign)
+    {
+        let name = match &key { PropertyKey::Identifier(id) => *id, _ => unreachable!() };
+        p.advance(); // =
+        let default_val = parse_expression(p, 3)?;
+        let id_span = Span::new(start, p.pos());
+        return Ok(Property {
+            key,
+            value: Expression::Assignment(Box::new(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left: AssignmentTarget::Identifier(Identifier { name, span: id_span }),
+                right: default_val,
+                span: id_span,
+            })),
+            kind: PropertyKindVal::Init,
+            shorthand: true,
+            computed: false,
+            method: false,
+            span: Span::new(start, p.pos()),
+        });
+    }
+
     // Method shorthand: { foo() {} }
     if p.at(TokenKind::LParen) {
         let func = parse_function_body(p, false, false)?;
@@ -1322,20 +1347,38 @@ fn expr_to_assignment_target(expr: Expression) -> ParseResult<AssignmentTarget> 
             // Convert object expression to object destructuring pattern
             let mut properties = Vec::new();
             for prop in obj.properties {
-                if let ObjectProperty::Property(p) = prop
-                    && let Expression::Identifier(id) = p.value {
-                        let key = match p.key {
-                            PropertyKey::Identifier(s) | PropertyKey::StringLiteral(s) => s,
-                            _ => continue,
-                        };
-                        properties.push(ObjectPatternProperty::Property {
-                            key: PropertyKey::Identifier(key),
-                            value: Pattern::Identifier(id),
-                            computed: false,
-                            shorthand: p.shorthand,
-                            span: p.span,
-                        });
-                    }
+                if let ObjectProperty::Property(p) = prop {
+                    let key_sid = match &p.key {
+                        PropertyKey::Identifier(s) | PropertyKey::StringLiteral(s) => *s,
+                        _ => continue,
+                    };
+                    let value_pat = match p.value {
+                        Expression::Identifier(id) => Pattern::Identifier(id),
+                        Expression::Assignment(a) => {
+                            // { x = default } or { key: x = default }
+                            let left_pat = match a.left {
+                                AssignmentTarget::Identifier(id) => Pattern::Identifier(id),
+                                AssignmentTarget::Pattern(p) => p,
+                                _ => continue,
+                            };
+                            Pattern::Assignment(Box::new(AssignmentPattern {
+                                left: left_pat,
+                                right: a.right,
+                                span: a.span,
+                            }))
+                        }
+                        Expression::Object(o) => object_expr_to_pattern(o)?,
+                        Expression::Array(a) => array_expr_to_pattern(a)?,
+                        _ => continue,
+                    };
+                    properties.push(ObjectPatternProperty::Property {
+                        key: PropertyKey::Identifier(key_sid),
+                        value: value_pat,
+                        computed: p.computed,
+                        shorthand: p.shorthand,
+                        span: p.span,
+                    });
+                }
             }
             Ok(AssignmentTarget::Pattern(Pattern::Object(ObjectPattern {
                 properties,

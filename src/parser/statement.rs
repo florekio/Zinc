@@ -921,9 +921,23 @@ fn parse_class_body(p: &mut Parser) -> ParseResult<ClassBody> {
             p.advance();
         }
 
-        // Check for getter/setter
+        // Check for async methods
+        let is_async = p.current_text() == "async"
+            && p.current_kind() == TokenKind::Identifier
+            && !matches!(p.peek().kind, TokenKind::LParen | TokenKind::Assign | TokenKind::Semicolon);
+        if is_async {
+            p.advance(); // consume "async"
+        }
+
+        // Check for generator methods (* before method name)
+        let is_generator = p.at(TokenKind::Star);
+        if is_generator {
+            p.advance(); // consume *
+        }
+
+        // Check for getter/setter (not valid with async or generator)
         let text = p.current_text().to_owned();
-        if (text == "get" || text == "set") && p.current_kind() == TokenKind::Identifier {
+        if !is_async && !is_generator && (text == "get" || text == "set") && p.current_kind() == TokenKind::Identifier {
             let next = p.peek().kind;
             if next != TokenKind::LParen {
                 let method_kind = if text == "get" {
@@ -950,14 +964,14 @@ fn parse_class_body(p: &mut Parser) -> ParseResult<ClassBody> {
 
         // Constructor or method
         if p.at(TokenKind::LParen) {
-            let is_constructor = !computed
+            let is_constructor = !computed && !is_async && !is_generator
                 && matches!(&key, PropertyKey::Identifier(id) if p.interner.resolve(*id) == "constructor");
             let method_kind = if is_constructor {
                 MethodKind::Constructor
             } else {
                 MethodKind::Method
             };
-            let value = expression::parse_function_body_expr(p, false, false)?;
+            let value = expression::parse_function_body_expr(p, is_async, is_generator)?;
             body.push(ClassMember::Method(MethodDefinition {
                 key,
                 value,
@@ -1058,11 +1072,29 @@ pub(crate) fn parse_object_pattern(p: &mut Parser) -> ParseResult<Pattern> {
         p.advance(); // consume identifier (or keyword used as property)
 
         if p.eat(TokenKind::Colon) {
-            // Renamed: { a: x }, { a: {b} }, { a: [x, y] }, { a: x = 5 }
+            // Renamed: { a: x }, { a: {b} }, { a: [x, y] }, { a: x = 5 }, { a: [x] = def }
             let value_pat = if p.at(TokenKind::LBrace) {
-                parse_object_pattern(p)?
+                let inner = parse_object_pattern(p)?;
+                if p.eat(TokenKind::Assign) {
+                    let default_expr = super::expression::parse_expression(p, 3)?;
+                    let end = p.pos();
+                    Pattern::Assignment(Box::new(AssignmentPattern {
+                        left: inner,
+                        right: default_expr,
+                        span: Span::new(prop_start, end),
+                    }))
+                } else { inner }
             } else if p.at(TokenKind::LBracket) {
-                parse_array_pattern(p)?
+                let inner = parse_array_pattern(p)?;
+                if p.eat(TokenKind::Assign) {
+                    let default_expr = super::expression::parse_expression(p, 3)?;
+                    let end = p.pos();
+                    Pattern::Assignment(Box::new(AssignmentPattern {
+                        left: inner,
+                        right: default_expr,
+                        span: Span::new(prop_start, end),
+                    }))
+                } else { inner }
             } else {
                 let value_name = p.intern_current();
                 let value_span = p.current().span;
@@ -1139,11 +1171,19 @@ pub(crate) fn parse_array_pattern(p: &mut Parser) -> ParseResult<Pattern> {
         if p.at(TokenKind::DotDotDot) {
             let rest_start = p.pos();
             p.advance();
-            let name = p.intern_current();
-            let name_span = p.current().span;
-            p.expect(TokenKind::Identifier)?;
+            // Support ...[pattern] and ...{pattern} and ...identifier
+            let argument = if p.at(TokenKind::LBracket) {
+                parse_array_pattern(p)?
+            } else if p.at(TokenKind::LBrace) {
+                parse_object_pattern(p)?
+            } else {
+                let name = p.intern_current();
+                let name_span = p.current().span;
+                p.expect(TokenKind::Identifier)?;
+                Pattern::Identifier(Identifier { name, span: name_span })
+            };
             elements.push(Some(Pattern::Rest(Box::new(RestElement {
-                argument: Pattern::Identifier(Identifier { name, span: name_span }),
+                argument,
                 span: Span::new(rest_start, p.pos()),
             }))));
             break;

@@ -15,9 +15,13 @@ impl Vm {
             return Ok(Value::undefined());
         }
         let packed = func_val.as_function().unwrap();
-        // Native global function sentinels
+        // Native global function sentinels (no this)
         if (-536..=-500).contains(&packed) {
             return Ok(self.exec_global_fn(packed, args));
+        }
+        // Native this-dependent method sentinels (-590 to -599 and -600 to -629 for Array.prototype)
+        if (-629..=-590).contains(&packed) {
+            return Ok(self.exec_native_method(packed, this_value, args));
         }
         let closure_id = ((packed as u32) >> 16) as usize;
         let chunk_idx = (packed & 0xFFFF) as usize;

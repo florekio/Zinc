@@ -159,6 +159,8 @@ pub enum FunctionKind {
         this_val: Value,
         args: Vec<Value>,
     },
+    /// Native sentinel function (negative i32 ID), for binding native methods
+    NativeSentinel { sentinel: i32 },
 }
 
 /// Extract an ObjectId from a Value, if it references one.

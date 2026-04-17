@@ -182,7 +182,8 @@ fn should_skip(source: &str, meta: &TestMeta) -> bool {
     for inc in &meta.includes {
         match inc.as_str() {
             "compareArray.js" | "deepEqual.js" | "nans.js"
-            | "decimalToHexString.js" | "isConstructor.js" => {} // safe to include
+            | "decimalToHexString.js" | "isConstructor.js"
+            | "propertyHelper.js" => {} // safe to include
             _ => return true, // skip tests needing other includes
         }
     }
@@ -194,6 +195,17 @@ fn should_skip(source: &str, meta: &TestMeta) -> bool {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let verbose = args.contains(&"--verbose".to_string()) || args.contains(&"-v".to_string());
+    let filter = args.windows(2)
+        .find(|w| w[0] == "--filter" || w[0] == "--category")
+        .map(|w| w[1].clone());
+    let output_path = args.windows(2)
+        .find(|w| w[0] == "--output" || w[0] == "-o")
+        .map(|w| w[1].clone());
+    let mut output_file: Option<std::fs::File> = output_path.as_ref()
+        .map(|p| std::fs::File::create(p).expect("cannot open output file"));
+
     let test_root = Path::new("test262/test/language");
     let harness_root = Path::new("test262/harness");
     if !test_root.exists() {
@@ -304,6 +316,14 @@ fn main() {
         "statements/for-of",
         "statements/const",
         "statements/let",
+        "statements/class",
+        "statements/function",
+        "statements/for-in",
+        "expressions/array",
+        "expressions/in",
+        "expressions/instanceof",
+        "expressions/new",
+        "expressions/call",
         "directive-prologue",
         "future-reserved-words",
         "reserved-words",
@@ -321,6 +341,12 @@ fn main() {
     let start = Instant::now();
 
     for category in &categories {
+        if let Some(ref f) = filter {
+            if !category.contains(f.as_str()) {
+                continue;
+            }
+        }
+
         let dir = test_root.join(category);
         if !dir.exists() {
             continue;
@@ -353,21 +379,25 @@ fn main() {
 
             let result = run_test(&source, &meta, &harness_cache);
 
-            if meta.is_negative {
-                if result.is_err() {
-                    passed += 1;
-                    cat_passed += 1;
-                } else {
-                    failed += 1;
-                    cat_failed += 1;
-                }
+            let pass = if meta.is_negative { result.is_err() } else { result.is_ok() };
+            if pass {
+                passed += 1;
+                cat_passed += 1;
             } else {
-                if result.is_ok() {
-                    passed += 1;
-                    cat_passed += 1;
-                } else {
-                    failed += 1;
-                    cat_failed += 1;
+                failed += 1;
+                cat_failed += 1;
+                if verbose || output_file.is_some() {
+                    let fname = file.file_name().unwrap_or_default().to_string_lossy();
+                    let err_msg = match result {
+                        Ok(_) => "expected failure but passed".to_string(),
+                        Err(e) => e,
+                    };
+                    let fail_line = format!("FAIL {}/{}: {}\n", category, fname, err_msg);
+                    if verbose { eprint!("{}", fail_line); }
+                    if let Some(ref mut f) = output_file {
+                        use std::io::Write;
+                        let _ = f.write_all(fail_line.as_bytes());
+                    }
                 }
             }
         }
@@ -394,6 +424,10 @@ fn main() {
     println!("Skipped: {}", skipped);
     println!("Time: {:.2}s", elapsed.as_secs_f64());
     println!();
+    if let Some(ref mut f) = output_file {
+        use std::io::Write;
+        let _ = writeln!(f, "TOTAL {passed}/{total} ({pct:.1}%) skipped={skipped} time={:.2}s", elapsed.as_secs_f64());
+    }
 }
 
 fn collect_js_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -428,7 +462,8 @@ assert.notSameValue = function(a, b, msg) {
     if (a === b) throw new Test262Error(msg || "expected not " + b);
 };
 assert.throws = function(err, fn, msg) {
-    try { fn(); throw new Test262Error(msg || "expected exception"); } catch(e) { }
+    try { fn(); } catch(e) { return; }
+    throw new Test262Error(msg || "expected exception");
 };
 function $ERROR(msg) { throw new Test262Error(msg); }
 var $262 = {};
@@ -460,13 +495,16 @@ var $262 = {};
 
     let full_source_clone = full_source.clone();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut engine = Engine::new();
-            engine.eval(&full_source_clone)
-        }));
-        let _ = tx.send(result);
-    });
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut engine = Engine::new();
+                engine.eval(&full_source_clone)
+            }));
+            let _ = tx.send(result);
+        })
+        .expect("thread spawn failed");
 
     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
         Ok(Ok(Ok(_))) => Ok(()),
