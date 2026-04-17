@@ -493,23 +493,26 @@ var $262 = {};
 
     let full_source = parts.join("\n");
 
-    let full_source_clone = full_source.clone();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .stack_size(2 * 1024 * 1024)
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut engine = Engine::new();
-                engine.eval(&full_source_clone)
+                engine.eval(&full_source)
             }));
             let _ = tx.send(result);
         })
         .expect("thread spawn failed");
 
     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Ok(Ok(_))) => Ok(()),
-        Ok(Ok(Err(e))) => Err(format!("{e}")),
-        Ok(Err(_)) => Err("panic".to_string()),
-        Err(_) => Err("timeout".to_string()),
+        Ok(Ok(Ok(_))) => { let _ = handle.join(); Ok(()) }
+        Ok(Ok(Err(e))) => { let _ = handle.join(); Err(format!("{e}")) }
+        Ok(Err(_)) => { let _ = handle.join(); Err("panic".to_string()) }
+        Err(_) => {
+            // Timeout: detach thread (can't kill it). Stack reclaimed when it eventually exits.
+            drop(handle);
+            Err("timeout".to_string())
+        }
     }
 }
