@@ -2730,11 +2730,49 @@ impl Vm {
                     }
                 }
 
-                OpCode::GetPrivate | OpCode::SetPrivate => {
-                    let _ = self.read_u16();
-                    return Err(VmError::RuntimeError(format!(
-                        "{opcode:?} not yet implemented"
-                    )));
+                OpCode::GetPrivate => {
+                    let name_idx = self.read_u16() as usize;
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
+                    let name_id = name_val.as_string_id().unwrap();
+                    let obj_val = self.pop()?;
+                    if let Some(oid) = obj_val.as_object_id() {
+                        let name_str = self.interner.resolve(name_id).to_owned();
+                        // Check for private getter (__get_#name__)
+                        let getter_key_str = format!("__get_{}__", name_str);
+                        let getter_key = self.interner.intern(&getter_key_str);
+                        let getter_fn = self.heap.get_property_chain(oid, getter_key);
+                        if let Some(gfn) = getter_fn && gfn.is_function() {
+                            let result = self.call_function_this(gfn, obj_val, &[])?;
+                            self.push(result);
+                        } else {
+                            let val = self.heap.get_property_chain(oid, name_id)
+                                .unwrap_or(Value::undefined());
+                            self.push(val);
+                        }
+                    } else {
+                        self.push(Value::undefined());
+                    }
+                }
+
+                OpCode::SetPrivate => {
+                    let name_idx = self.read_u16() as usize;
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
+                    let name_id = name_val.as_string_id().unwrap();
+                    let value = self.pop()?;
+                    let obj_val = self.pop()?;
+                    if let Some(oid) = obj_val.as_object_id() {
+                        let name_str = self.interner.resolve(name_id).to_owned();
+                        // Check for private setter (__set_#name__)
+                        let setter_key_str = format!("__set_{}__", name_str);
+                        let setter_key = self.interner.intern(&setter_key_str);
+                        let setter_fn = self.heap.get_property_chain(oid, setter_key);
+                        if let Some(sfn) = setter_fn && sfn.is_function() {
+                            let _ = self.call_function_this(sfn, obj_val, &[value]);
+                        } else if let Some(obj) = self.heap.get_mut(oid) {
+                            obj.set_property(name_id, value);
+                        }
+                    }
+                    self.push(value);
                 }
 
                 OpCode::CallMethod => {
@@ -3151,6 +3189,26 @@ impl Vm {
                                 continue;
                             }
                             "toString" => {
+                                // Check for Error-like object: has `name` and `message` → "Name: message"
+                                let error_str = if let Some(o) = self.heap.get(oid) {
+                                    let name_key = self.interner.intern("name");
+                                    let msg_key = self.interner.intern("message");
+                                    let name_v = o.get_property(name_key);
+                                    let msg_v = o.get_property(msg_key);
+                                    if let (Some(nv), Some(mv)) = (name_v, msg_v) {
+                                        let name_s = self.value_to_string(nv);
+                                        let msg_s = self.value_to_string(mv);
+                                        if !name_s.is_empty() {
+                                            Some(if msg_s.is_empty() { name_s } else { format!("{name_s}: {msg_s}") })
+                                        } else { None }
+                                    } else { None }
+                                } else { None };
+                                if let Some(s) = error_str {
+                                    let id = self.interner.intern(&s);
+                                    self.stack.truncate(obj_pos);
+                                    self.push(Value::string(id));
+                                    continue;
+                                }
                                 // Return [object Type] string
                                 let tag = if let Some(o) = self.heap.get(oid) {
                                     match &o.kind {
@@ -4645,8 +4703,24 @@ impl Vm {
                 }
 
                 OpCode::ClassPrivateMethod => {
-                    let _ = self.read_u16();
-                    let _val = self.pop()?; // private methods not yet supported
+                    let name_idx = self.read_u16() as usize;
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
+                    let name_id = name_val.as_string_id().unwrap();
+                    let method_val = self.pop()?;
+                    let class_val = self.peek()?;
+                    if let Some(class_oid) = class_val.as_object_id() {
+                        let proto_key = self.interner.intern("prototype");
+                        let proto_oid = self.heap.get(class_oid)
+                            .and_then(|o| o.get_property(proto_key))
+                            .and_then(|v| v.as_object_id());
+                        if let Some(proto_oid) = proto_oid {
+                            if let Some(proto) = self.heap.get_mut(proto_oid) {
+                                proto.define_property(name_id, Property::with_flags(
+                                    method_val, Property::WRITABLE | Property::CONFIGURABLE
+                                ));
+                            }
+                        }
+                    }
                 }
 
                 OpCode::Inherit => {

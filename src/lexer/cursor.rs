@@ -1,3 +1,5 @@
+use unicode_id_start;
+
 /// A cursor over source code bytes with position tracking.
 pub struct Cursor<'a> {
     source: &'a str,
@@ -141,12 +143,12 @@ pub fn is_id_continue(b: u8) -> bool {
 
 /// Check if a character is a Unicode identifier start (ID_Start or $ or _).
 pub fn is_unicode_id_start(c: char) -> bool {
-    c == '$' || c == '_' || c.is_alphabetic()
+    c == '$' || c == '_' || unicode_id_start::is_id_start(c)
 }
 
 /// Check if a character is a Unicode identifier continue (ID_Continue or $ or \u200C or \u200D).
 pub fn is_unicode_id_continue(c: char) -> bool {
-    c == '$' || c == '\u{200C}' || c == '\u{200D}' || c.is_alphanumeric() || c == '_'
+    c == '$' || c == '\u{200C}' || c == '\u{200D}' || unicode_id_start::is_id_continue(c)
 }
 
 /// Check if a byte is a line terminator.

@@ -6,6 +6,18 @@ use crate::util::interner::{Interner, StringId};
 use super::error::{ParseError, ParseResult};
 use super::statement;
 
+/// Future reserved words that are valid identifiers in non-strict mode.
+pub(crate) const FUTURE_RESERVED_WORDS_NON_STRICT: &[TokenKind] = &[
+    TokenKind::Implements,
+    TokenKind::Interface,
+    TokenKind::Package,
+    TokenKind::Private,
+    TokenKind::Protected,
+    TokenKind::Public,
+    TokenKind::Static,
+    TokenKind::Let,
+];
+
 /// Decode \uXXXX and \u{XXXX} escapes in an identifier/string.
 pub(crate) fn decode_unicode_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -69,6 +81,8 @@ pub struct Parser<'a> {
     pub errors: Vec<ParseError>,
     /// Nesting depth inside generator function bodies.
     pub(crate) generator_depth: u32,
+    /// Nesting depth inside async function bodies.
+    pub(crate) async_depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -80,12 +94,18 @@ impl<'a> Parser<'a> {
             interner,
             errors: Vec::new(),
             generator_depth: 0,
+            async_depth: 0,
         }
     }
 
     /// True when `yield` must be treated as a keyword (inside a generator body).
     pub(crate) fn in_generator(&self) -> bool {
         self.generator_depth > 0
+    }
+
+    /// True when `await` must be treated as a keyword (inside an async body).
+    pub(crate) fn in_async(&self) -> bool {
+        self.async_depth > 0
     }
 
     /// Parse a complete program (script).
@@ -182,7 +202,7 @@ impl<'a> Parser<'a> {
 
     /// Intern the current token's text and return its StringId.
     /// If the identifier contains \uXXXX escapes, they are decoded.
-    /// Intern + advance for a binding identifier (identifier or `yield` outside generators).
+    /// Intern + advance for a binding identifier (identifier, `yield` outside generators, or `let` in non-strict).
     pub(crate) fn expect_binding_identifier(&mut self) -> ParseResult<StringId> {
         if self.at(TokenKind::Identifier) {
             let name = self.intern_current();
@@ -192,6 +212,20 @@ impl<'a> Parser<'a> {
             let name = self.interner.intern("yield");
             self.advance();
             Ok(name)
+        } else if !self.in_async() && self.at(TokenKind::Await) {
+            let name = self.interner.intern("await");
+            self.advance();
+            Ok(name)
+        } else if self.at(TokenKind::Undefined) {
+            let name = self.interner.intern("undefined");
+            self.advance();
+            Ok(name)
+        } else if self.at_any(FUTURE_RESERVED_WORDS_NON_STRICT) {
+            // Future reserved words are valid identifiers in non-strict mode
+            let name = self.current_text().to_owned();
+            let id = self.interner.intern(&name);
+            self.advance();
+            Ok(id)
         } else {
             Err(ParseError::expected("Identifier", self.current_kind(), self.current().span))
         }

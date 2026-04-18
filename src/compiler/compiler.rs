@@ -66,6 +66,8 @@ struct LoopCtx {
     label: Option<StringId>,
     /// True if this is a `for(;;)` loop with a deferred continue target.
     has_deferred_continue: bool,
+    /// Number of active try/finally handlers when this loop was entered.
+    try_depth: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +91,9 @@ pub struct Compiler<'a> {
     pending_label: Option<StringId>,
     /// Name hint for anonymous function expressions (used for class methods).
     pending_function_name: Option<StringId>,
+    /// Stack of active finally blocks (None if try has no finally). Used to
+    /// inline finally code before break/continue that exits the try block.
+    finally_stack: Vec<Option<std::rc::Rc<Vec<Statement>>>>,
 }
 
 impl<'a> Compiler<'a> {
@@ -110,6 +115,7 @@ impl<'a> Compiler<'a> {
             const_globals: std::collections::HashSet::new(),
             pending_label: None,
             pending_function_name: None,
+            finally_stack: Vec::new(),
         }
     }
 
@@ -497,6 +503,7 @@ impl<'a> Compiler<'a> {
             scope_depth: self.scope_depth,
             label: None,
             has_deferred_continue: false,
+            try_depth: self.finally_stack.len(),
         });
 
         self.compile_expr(&w.test)?;
@@ -522,6 +529,7 @@ impl<'a> Compiler<'a> {
             scope_depth: self.scope_depth,
             label: None,
             has_deferred_continue: false,
+            try_depth: self.finally_stack.len(),
         });
 
         self.compile_statement(&d.body)?;
@@ -566,6 +574,7 @@ impl<'a> Compiler<'a> {
             scope_depth: self.scope_depth,
             label,
             has_deferred_continue: has_update,
+            try_depth: self.finally_stack.len(),
         });
 
         // Condition.
@@ -661,6 +670,7 @@ impl<'a> Compiler<'a> {
             scope_depth: self.scope_depth,
             label: None,
             has_deferred_continue: false,
+            try_depth: self.finally_stack.len(),
         });
         self.compile_statement(&f.body)?;
         self.chunk.emit_loop(loop_start, line);
@@ -813,6 +823,7 @@ impl<'a> Compiler<'a> {
             scope_depth: self.scope_depth,
             label: None,
             has_deferred_continue: false,
+            try_depth: self.finally_stack.len(),
         });
 
         self.compile_statement(&f.body)?;
@@ -873,6 +884,7 @@ impl<'a> Compiler<'a> {
             scope_depth: self.scope_depth,
             label: None,
             has_deferred_continue: false,
+            try_depth: self.finally_stack.len(),
         });
 
         let mut body_starts: Vec<usize> = Vec::new();
@@ -942,6 +954,30 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    // ---- finally inlining helper ----
+
+    /// Inline finally blocks for all try handlers entered after `target_try_depth`.
+    /// Called before break/continue jumps so that finally blocks always execute.
+    fn compile_inline_finallys(&mut self, target_try_depth: usize, line: u32) -> Result<(), String> {
+        let depth = self.finally_stack.len();
+        if depth <= target_try_depth {
+            return Ok(());
+        }
+        // Collect Rc clones first to release the borrow on self.finally_stack
+        let finallys: Vec<Option<std::rc::Rc<Vec<Statement>>>> =
+            self.finally_stack[target_try_depth..depth].iter().rev().cloned().collect();
+        for finally_opt in finallys {
+            self.chunk.emit_op(OpCode::PopExcHandler, line);
+            if let Some(stmts_rc) = finally_opt {
+                let stmts = (*stmts_rc).clone();
+                for stmt in &stmts {
+                    self.compile_statement(stmt)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ---- break ----
 
     fn compile_break(&mut self, b: &BreakStatement) -> Result<(), String> {
@@ -957,6 +993,7 @@ impl<'a> Compiler<'a> {
             self.loops.len() - 1
         };
         let loop_depth = self.loops[target_idx].scope_depth;
+        let target_try_depth = self.loops[target_idx].try_depth;
         let pop_n = self.locals_above_depth(loop_depth);
         if pop_n > 0 && pop_n <= u8::MAX as usize {
             self.chunk.emit_op_u8(OpCode::PopN, pop_n as u8, line);
@@ -965,6 +1002,7 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::Pop, line);
             }
         }
+        self.compile_inline_finallys(target_try_depth, line)?;
         let patch = self.chunk.emit_jump(OpCode::Jump, line);
         self.loops[target_idx].break_patches.push(patch);
         Ok(())
@@ -986,6 +1024,7 @@ impl<'a> Compiler<'a> {
         };
         let target = self.loops[ctx_idx].continue_target;
         let loop_depth = self.loops[ctx_idx].scope_depth;
+        let target_try_depth = self.loops[ctx_idx].try_depth;
         let deferred = self.loops[ctx_idx].has_deferred_continue;
 
         let pop_n = self.locals_above_depth(loop_depth);
@@ -996,6 +1035,7 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::Pop, line);
             }
         }
+        self.compile_inline_finallys(target_try_depth, line)?;
         if deferred {
             // Emit a forward jump; it will be patched to the update position later
             let patch = self.chunk.emit_jump(OpCode::Jump, line);
@@ -1362,10 +1402,16 @@ impl<'a> Compiler<'a> {
             .code
             .extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
 
+        // Track the finally block so break/continue can inline it.
+        let finally_rc = t.finalizer.as_ref().map(|f| std::rc::Rc::new(f.body.clone()));
+        self.finally_stack.push(finally_rc);
+
         // Compile try block (no scope — var declarations should be global/function-scoped).
         for stmt in &t.block.body {
             self.compile_statement(stmt)?;
         }
+
+        self.finally_stack.pop();
 
         self.chunk.emit_op(OpCode::PopExcHandler, line);
         let skip_catch = self.chunk.emit_jump(OpCode::Jump, line);
@@ -1505,10 +1551,12 @@ impl<'a> Compiler<'a> {
                         _ => key_id,
                     };
                     let idx = self.make_string_constant(actual_key);
-                    let op = if m.is_static {
-                        OpCode::ClassStaticMethod
-                    } else {
-                        OpCode::ClassMethod
+                    let is_private = matches!(&m.key, PropertyKey::Private(_));
+                    let op = match (is_private, m.is_static) {
+                        (true,  false) => OpCode::ClassPrivateMethod,
+                        (true,  true)  => OpCode::ClassStaticMethod, // static private: #-key avoids collision
+                        (false, false) => OpCode::ClassMethod,
+                        (false, true)  => OpCode::ClassStaticMethod,
                     };
                     self.chunk.emit_op_u16(op, idx, line);
                 }
@@ -1555,6 +1603,7 @@ impl<'a> Compiler<'a> {
                 scope_depth: self.scope_depth,
                 label: Some(l.label),
                 has_deferred_continue: false,
+                try_depth: self.finally_stack.len(),
             });
             self.compile_statement(&l.body)?;
             self.patch_loop_breaks();
@@ -1567,6 +1616,7 @@ impl<'a> Compiler<'a> {
                 scope_depth: self.scope_depth,
                 label: Some(l.label),
                 has_deferred_continue: false,
+                try_depth: self.finally_stack.len(),
             });
             self.compile_statement(&l.body)?;
             self.patch_loop_breaks();
@@ -2885,6 +2935,13 @@ impl<'a> Compiler<'a> {
                 MemberProperty::Identifier(name) => {
                     let idx = self.make_string_constant(*name);
                     // Emit method name index as a u16 right after CallMethod
+                    self.chunk.emit_byte(OpCode::CallMethod as u8, line);
+                    self.chunk.emit_byte(argc, line);
+                    self.chunk.code.push((idx >> 8) as u8);
+                    self.chunk.code.push((idx & 0xFF) as u8);
+                }
+                MemberProperty::PrivateIdentifier(name) => {
+                    let idx = self.make_string_constant(*name);
                     self.chunk.emit_byte(OpCode::CallMethod as u8, line);
                     self.chunk.emit_byte(argc, line);
                     self.chunk.code.push((idx >> 8) as u8);

@@ -94,20 +94,31 @@ pub fn parse_expression(p: &mut Parser, min_bp: u8) -> ParseResult<Expression> {
             // Member access and calls bind very tightly
             TokenKind::Dot if 30 >= min_bp => {
                 p.advance();
-                let prop_name = p.intern_current();
-                // Keywords are valid after dot, so accept any token as property name
-                if p.at(TokenKind::Identifier) || is_keyword_property(p.current_kind()) {
-                    p.advance();
-                } else {
-                    return Err(ParseError::expected("property name", p.current_kind(), p.current().span));
-                }
                 let start = expr_span(&left).start;
-                left = Expression::Member(Box::new(MemberExpression {
-                    object: left,
-                    property: MemberProperty::Identifier(prop_name),
-                    computed: false,
-                    span: Span::new(start, p.pos()),
-                }));
+                if p.at(TokenKind::PrivateIdentifier) {
+                    let name = p.intern_current();
+                    p.advance();
+                    left = Expression::Member(Box::new(MemberExpression {
+                        object: left,
+                        property: MemberProperty::PrivateIdentifier(name),
+                        computed: false,
+                        span: Span::new(start, p.pos()),
+                    }));
+                } else {
+                    let prop_name = p.intern_current();
+                    // Keywords are valid after dot, so accept any token as property name
+                    if p.at(TokenKind::Identifier) || is_keyword_property(p.current_kind()) {
+                        p.advance();
+                    } else {
+                        return Err(ParseError::expected("property name", p.current_kind(), p.current().span));
+                    }
+                    left = Expression::Member(Box::new(MemberExpression {
+                        object: left,
+                        property: MemberProperty::Identifier(prop_name),
+                        computed: false,
+                        span: Span::new(start, p.pos()),
+                    }));
+                }
                 continue;
             }
             TokenKind::LBracket if 30 >= min_bp => {
@@ -697,6 +708,12 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
         }
 
         // ---- await ----
+        TokenKind::Await if !p.in_async() => {
+            let name = p.interner.intern("await");
+            let span = p.current().span;
+            p.advance();
+            Ok(Expression::Identifier(Identifier { name, span }))
+        }
         TokenKind::Await => {
             p.advance();
             let argument = parse_expression(p, 27)?;
@@ -826,6 +843,14 @@ fn parse_optional_chain_element(p: &mut Parser, optional: bool) -> ParseResult<O
             computed: true,
             optional,
         })
+    } else if p.at(TokenKind::PrivateIdentifier) {
+        let name = p.intern_current();
+        p.advance();
+        Ok(OptionalChainElement::Member {
+            property: MemberProperty::PrivateIdentifier(name),
+            computed: false,
+            optional,
+        })
     } else {
         let prop_name = p.intern_current();
         p.advance();
@@ -900,11 +925,7 @@ fn parse_property(p: &mut Parser) -> ParseResult<Property> {
     let text = p.current_text().to_owned();
     if (text == "get" || text == "set") && p.current_kind() == TokenKind::Identifier {
         let next = p.peek().kind;
-        if next == TokenKind::Identifier
-            || next == TokenKind::String
-            || next == TokenKind::Number
-            || next == TokenKind::LBracket
-        {
+        if is_keyword_or_identifier_for_prop(next) && next != TokenKind::Star {
             let kind_val = if text == "get" {
                 PropertyKindVal::Get
             } else {
@@ -1071,6 +1092,14 @@ fn parse_property_key(p: &mut Parser) -> ParseResult<(PropertyKey, bool)> {
             let value = p.parse_number(&text);
             Ok((PropertyKey::NumberLiteral(value), false))
         }
+        TokenKind::BigInt => {
+            // BigInt literal as property key: strip the trailing `n`, parse as number
+            let text = p.current_text().to_owned();
+            p.advance();
+            let without_n = &text[..text.len() - 1];
+            let value = p.parse_number(without_n);
+            Ok((PropertyKey::NumberLiteral(value), false))
+        }
         TokenKind::LBracket => {
             p.advance(); // [
             let expr = parse_expression(p, 0)?;
@@ -1136,6 +1165,15 @@ fn is_keyword_property(kind: TokenKind) -> bool {
             | TokenKind::Null
             | TokenKind::Undefined
             | TokenKind::Of
+            | TokenKind::Extends
+            | TokenKind::Debugger
+            | TokenKind::Enum
+            | TokenKind::Implements
+            | TokenKind::Interface
+            | TokenKind::Package
+            | TokenKind::Private
+            | TokenKind::Protected
+            | TokenKind::Public
     )
 }
 
@@ -1154,9 +1192,13 @@ fn parse_function_expression(p: &mut Parser) -> ParseResult<Expression> {
     };
 
     let params = parse_params(p)?;
-    if is_generator { p.generator_depth += 1; }
+    let saved_gen = p.generator_depth;
+    let saved_async = p.async_depth;
+    p.generator_depth = if is_generator { 1 } else { 0 };
+    p.async_depth = 0;
     let body = parse_block_statement(p)?;
-    if is_generator { p.generator_depth -= 1; }
+    p.generator_depth = saved_gen;
+    p.async_depth = saved_async;
 
     Ok(Expression::Function(Box::new(FunctionExpression {
         id,
@@ -1182,9 +1224,8 @@ pub fn parse_params(p: &mut Parser) -> ParseResult<Vec<Pattern>> {
             } else if p.at(TokenKind::LBrace) {
                 super::statement::parse_object_pattern(p)?
             } else {
-                let name = p.intern_current();
                 let name_span = p.current().span;
-                p.expect(TokenKind::Identifier)?;
+                let name = p.expect_binding_identifier()?;
                 Pattern::Identifier(Identifier { name, span: name_span })
             };
             params.push(Pattern::Rest(Box::new(RestElement {
@@ -1201,9 +1242,8 @@ pub fn parse_params(p: &mut Parser) -> ParseResult<Vec<Pattern>> {
         } else if p.at(TokenKind::LBrace) {
             super::statement::parse_object_pattern(p)?
         } else {
-            let name = p.intern_current();
             let name_span = p.current().span;
-            p.expect(TokenKind::Identifier)?;
+            let name = p.expect_binding_identifier()?;
             Pattern::Identifier(Identifier { name, span: name_span })
         };
 
@@ -1247,9 +1287,13 @@ pub fn parse_block_statement(p: &mut Parser) -> ParseResult<BlockStatement> {
 fn parse_function_body(p: &mut Parser, is_async: bool, is_generator: bool) -> ParseResult<Expression> {
     let start = p.pos();
     let params = parse_params(p)?;
-    if is_generator { p.generator_depth += 1; }
+    let saved_gen = p.generator_depth;
+    let saved_async = p.async_depth;
+    p.generator_depth = if is_generator { 1 } else { 0 };
+    p.async_depth = if is_async { 1 } else { 0 };
     let body = parse_block_statement(p)?;
-    if is_generator { p.generator_depth -= 1; }
+    p.generator_depth = saved_gen;
+    p.async_depth = saved_async;
     Ok(Expression::Function(Box::new(FunctionExpression {
         id: None,
         params,
@@ -1524,6 +1568,11 @@ fn object_expr_to_pattern(o: ObjectExpression) -> ParseResult<Pattern> {
 
 /// Parse a property key in class body (re-exported for statement.rs).
 pub fn parse_property_key_for_class(p: &mut Parser) -> ParseResult<(PropertyKey, bool)> {
+    if p.at(TokenKind::PrivateIdentifier) {
+        let name = p.intern_current(); // "#fieldname" including the '#'
+        p.advance();
+        return Ok((PropertyKey::Private(name), false));
+    }
     parse_property_key(p)
 }
 

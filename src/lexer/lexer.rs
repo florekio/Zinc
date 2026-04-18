@@ -110,7 +110,46 @@ impl<'a> Lexer<'a> {
             b';' => { self.cursor.advance(); TokenKind::Semicolon }
             b',' => { self.cursor.advance(); TokenKind::Comma }
             b'~' => { self.cursor.advance(); TokenKind::Tilde }
-            b'#' => { self.cursor.advance(); TokenKind::Hash }
+            b'#' => {
+                self.cursor.advance(); // consume '#'
+                let is_id_start = self.cursor.peek_char()
+                    .map(|c| super::cursor::is_unicode_id_start(c) || c == '_' || c == '$')
+                    .unwrap_or(false);
+                let is_escape_start = self.cursor.peek() == Some(b'\\')
+                    && self.cursor.peek_at(1) == Some(b'u');
+                if is_id_start || is_escape_start {
+                    while self.cursor.peek_char()
+                        .map(|c| super::cursor::is_unicode_id_continue(c) || c == '$')
+                        .unwrap_or(false)
+                    {
+                        self.cursor.advance_char();
+                    }
+                    // Also consume \uXXXX escape sequences within the name
+                    while self.cursor.peek() == Some(b'\\') && self.cursor.peek_at(1) == Some(b'u') {
+                        self.cursor.advance(); // '\'
+                        self.cursor.advance(); // 'u'
+                        if self.cursor.peek() == Some(b'{') {
+                            self.cursor.advance(); // '{'
+                            while self.cursor.peek().map(|b| b != b'}').unwrap_or(false) {
+                                self.cursor.advance();
+                            }
+                            if self.cursor.peek() == Some(b'}') { self.cursor.advance(); }
+                        } else {
+                            for _ in 0..4 { self.cursor.advance(); }
+                        }
+                        // Continue scanning normal id_continue chars after escape
+                        while self.cursor.peek_char()
+                            .map(|c| super::cursor::is_unicode_id_continue(c) || c == '$')
+                            .unwrap_or(false)
+                        {
+                            self.cursor.advance_char();
+                        }
+                    }
+                    TokenKind::PrivateIdentifier
+                } else {
+                    TokenKind::Hash
+                }
+            }
 
             b':' => { self.cursor.advance(); TokenKind::Colon }
 
@@ -734,6 +773,7 @@ impl<'a> Lexer<'a> {
                 | TokenKind::True
                 | TokenKind::False
                 | TokenKind::Null
+                | TokenKind::Undefined
                 | TokenKind::This
                 | TokenKind::PlusPlus
                 | TokenKind::MinusMinus

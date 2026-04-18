@@ -89,7 +89,8 @@ pub enum TokenKind {
     QuestionDot,  // ?.
     QuestionQuestion, // ??
     Arrow,        // =>
-    Hash,         // #  (private fields)
+    Hash,         // #  (bare hash, error recovery)
+    PrivateIdentifier, // #name  (private field/method name)
 
     // Assignment
     Assign,           // =

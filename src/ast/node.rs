@@ -2,7 +2,7 @@ use crate::ast::span::Span;
 use crate::util::interner::StringId;
 
 /// Root AST node: a complete program.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Program {
     pub body: Vec<Statement>,
     pub source_type: SourceType,
@@ -19,7 +19,7 @@ pub enum SourceType {
 // Statements
 // ============================================================
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Statement {
     Block(BlockStatement),
     Variable(VariableDeclaration),
@@ -46,19 +46,19 @@ pub enum Statement {
     Export(Box<ExportDeclaration>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BlockStatement {
     pub body: Vec<Statement>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExpressionStatement {
     pub expression: Expression,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IfStatement {
     pub test: Expression,
     pub consequent: Statement,
@@ -66,21 +66,21 @@ pub struct IfStatement {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WhileStatement {
     pub test: Expression,
     pub body: Statement,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DoWhileStatement {
     pub body: Statement,
     pub test: Expression,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ForStatement {
     pub init: Option<ForInit>,
     pub test: Option<Expression>,
@@ -89,13 +89,13 @@ pub struct ForStatement {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ForInit {
     Variable(VariableDeclaration),
     Expression(Expression),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ForInStatement {
     pub left: ForInOfLeft,
     pub right: Expression,
@@ -103,7 +103,7 @@ pub struct ForInStatement {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ForOfStatement {
     pub left: ForInOfLeft,
     pub right: Expression,
@@ -112,21 +112,21 @@ pub struct ForOfStatement {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ForInOfLeft {
     Variable(VariableDeclaration),
     Pattern(Pattern),
     Expression(Expression),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SwitchStatement {
     pub discriminant: Expression,
     pub cases: Vec<SwitchCase>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SwitchCase {
     /// None for `default:`
     pub test: Option<Expression>,
@@ -134,31 +134,31 @@ pub struct SwitchCase {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReturnStatement {
     pub argument: Option<Expression>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BreakStatement {
     pub label: Option<StringId>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ContinueStatement {
     pub label: Option<StringId>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ThrowStatement {
     pub argument: Expression,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TryStatement {
     pub block: BlockStatement,
     pub handler: Option<CatchClause>,
@@ -166,21 +166,21 @@ pub struct TryStatement {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CatchClause {
     pub param: Option<Pattern>,
     pub body: BlockStatement,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WithStatement {
     pub object: Expression,
     pub body: Statement,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LabeledStatement {
     pub label: StringId,
     pub body: Statement,
@@ -191,7 +191,7 @@ pub struct LabeledStatement {
 // Declarations
 // ============================================================
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VariableDeclaration {
     pub kind: VarKind,
     pub declarations: Vec<VariableDeclarator>,
@@ -205,14 +205,14 @@ pub enum VarKind {
     Const,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VariableDeclarator {
     pub id: Pattern,
     pub init: Option<Expression>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FunctionDeclaration {
     pub id: Option<StringId>,
     pub params: Vec<Pattern>,
@@ -222,7 +222,7 @@ pub struct FunctionDeclaration {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClassDeclaration {
     pub id: Option<StringId>,
     pub super_class: Option<Expression>,
@@ -230,20 +230,20 @@ pub struct ClassDeclaration {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClassBody {
     pub body: Vec<ClassMember>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ClassMember {
     Method(MethodDefinition),
     Property(ClassProperty),
     StaticBlock(BlockStatement),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MethodDefinition {
     pub key: PropertyKey,
     pub value: Expression, // should be FunctionExpression
@@ -261,7 +261,7 @@ pub enum MethodKind {
     Constructor,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClassProperty {
     pub key: PropertyKey,
     pub value: Option<Expression>,
@@ -274,7 +274,7 @@ pub struct ClassProperty {
 // Expressions
 // ============================================================
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Expression {
     // Literals
     NumberLiteral(NumberLiteral),
@@ -320,39 +320,39 @@ pub enum Expression {
     Super(Span),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NumberLiteral {
     pub value: f64,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StringLiteral {
     pub value: StringId,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BooleanLiteral {
     pub value: bool,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RegExpLiteral {
     pub pattern: StringId,
     pub flags: StringId,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TemplateLiteral {
     pub quasis: Vec<TemplateElement>,
     pub expressions: Vec<Expression>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TemplateElement {
     pub raw: StringId,
     pub cooked: Option<StringId>,
@@ -360,32 +360,32 @@ pub struct TemplateElement {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Identifier {
     pub name: StringId,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ArrayExpression {
     /// None elements represent elision (holes): [1,,3]
     pub elements: Vec<Option<Expression>>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ObjectExpression {
     pub properties: Vec<ObjectProperty>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ObjectProperty {
     Property(Property),
     SpreadElement(SpreadElement),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Property {
     pub key: PropertyKey,
     pub value: Expression,
@@ -396,7 +396,7 @@ pub struct Property {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PropertyKey {
     Identifier(StringId),
     StringLiteral(StringId),
@@ -412,7 +412,7 @@ pub enum PropertyKindVal {
     Set,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FunctionExpression {
     pub id: Option<StringId>,
     pub params: Vec<Pattern>,
@@ -422,7 +422,7 @@ pub struct FunctionExpression {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ArrowFunctionExpression {
     pub params: Vec<Pattern>,
     pub body: ArrowBody,
@@ -430,13 +430,13 @@ pub struct ArrowFunctionExpression {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ArrowBody {
     Expression(Expression),
     Block(BlockStatement),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClassExpression {
     pub id: Option<StringId>,
     pub super_class: Option<Expression>,
@@ -444,7 +444,7 @@ pub struct ClassExpression {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UnaryExpression {
     pub operator: UnaryOperator,
     pub argument: Expression,
@@ -463,7 +463,7 @@ pub enum UnaryOperator {
     Delete,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UpdateExpression {
     pub operator: UpdateOperator,
     pub argument: Expression,
@@ -477,7 +477,7 @@ pub enum UpdateOperator {
     Decrement,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BinaryExpression {
     pub operator: BinaryOperator,
     pub left: Expression,
@@ -511,7 +511,7 @@ pub enum BinaryOperator {
     InstanceOf,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LogicalExpression {
     pub operator: LogicalOperator,
     pub left: Expression,
@@ -526,7 +526,7 @@ pub enum LogicalOperator {
     NullishCoalescing,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConditionalExpression {
     pub test: Expression,
     pub consequent: Expression,
@@ -534,7 +534,7 @@ pub struct ConditionalExpression {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AssignmentExpression {
     pub operator: AssignmentOperator,
     pub left: AssignmentTarget,
@@ -562,20 +562,20 @@ pub enum AssignmentOperator {
     NullishAssign,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AssignmentTarget {
     Identifier(Identifier),
     Member(Box<MemberExpression>),
     Pattern(Pattern),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SequenceExpression {
     pub expressions: Vec<Expression>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemberExpression {
     pub object: Expression,
     pub property: MemberProperty,
@@ -583,42 +583,42 @@ pub struct MemberExpression {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum MemberProperty {
     Identifier(StringId),
     Expression(Expression),
     PrivateIdentifier(StringId),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CallExpression {
     pub callee: Expression,
     pub arguments: Vec<Expression>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NewExpression {
     pub callee: Expression,
     pub arguments: Vec<Expression>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TaggedTemplateExpression {
     pub tag: Expression,
     pub quasi: TemplateLiteral,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OptionalChainExpression {
     pub base: Expression,
     pub chain: Vec<OptionalChainElement>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum OptionalChainElement {
     Member {
         property: MemberProperty,
@@ -631,33 +631,33 @@ pub enum OptionalChainElement {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SpreadElement {
     pub argument: Expression,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct YieldExpression {
     pub argument: Option<Expression>,
     pub delegate: bool,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AwaitExpression {
     pub argument: Expression,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MetaProperty {
     pub meta: StringId,
     pub property: StringId,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ImportExpression {
     pub source: Expression,
     pub span: Span,
@@ -667,7 +667,7 @@ pub struct ImportExpression {
 // Patterns (destructuring)
 // ============================================================
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Pattern {
     Identifier(Identifier),
     Array(ArrayPattern),
@@ -676,20 +676,20 @@ pub enum Pattern {
     Rest(Box<RestElement>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ArrayPattern {
     /// None elements represent holes
     pub elements: Vec<Option<Pattern>>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ObjectPattern {
     pub properties: Vec<ObjectPatternProperty>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ObjectPatternProperty {
     Property {
         key: PropertyKey,
@@ -701,14 +701,14 @@ pub enum ObjectPatternProperty {
     Rest(RestElement),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AssignmentPattern {
     pub left: Pattern,
     pub right: Expression,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RestElement {
     pub argument: Pattern,
     pub span: Span,
@@ -718,7 +718,7 @@ pub struct RestElement {
 // Modules (import/export)
 // ============================================================
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ImportDeclaration {
     /// import x from 'mod'; import {a, b} from 'mod'; etc.
     Standard {
@@ -728,7 +728,7 @@ pub enum ImportDeclaration {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ImportSpecifier {
     /// import x from 'mod'
     Default { local: StringId, span: Span },
@@ -742,7 +742,7 @@ pub enum ImportSpecifier {
     Namespace { local: StringId, span: Span },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ExportDeclaration {
     /// export { x, y }
     Named {
@@ -768,7 +768,7 @@ pub enum ExportDeclaration {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExportSpecifier {
     pub local: StringId,
     pub exported: StringId,

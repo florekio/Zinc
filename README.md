@@ -4,27 +4,22 @@ A JavaScript engine written from scratch in Rust with an **experimental ARM64 JI
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**84.3% [Test262](docs/TEST262.md) conformance (5,461 / 6,476 tests)** | **90 tests** | **~22,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
+**92.3% [Test262](docs/TEST262.md) conformance (9,052 / 9,805 tests)** | **90 tests** | **~22,500 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
 
 ![Zinc Playground](web/screenshot.png)
 
-## What's New in v0.2.0
+## What's New in v0.3.0
 
-- **84.3% test262 conformance** — up from 65.5% (5,461 / 6,476 tests, +1,222 tests)
-- **Class instance fields** (`x = 0`) and **static fields** (`static count = 0`) now work correctly
-- **`arguments` in arrow functions** now correctly inherits from the enclosing non-arrow scope
-- **Callbacks use the full opcode dispatch loop** — closures, upvalues, nested calls all work inside `map`/`filter`/`reduce`/`forEach`
-- **Closure chunk indices fixed** — deeply nested closures with siblings no longer crash
-- **Arrow function `this` binding** — correctly inherits enclosing `this` when used as callbacks
-- **`Symbol.iterator` class methods** — `[Symbol.iterator]()` in class bodies now compiled as `__sym_0__`
-- **`Symbol.toPrimitive`** coercion supported
-- **`RegExp` constructor** — `new RegExp(pattern, flags)` works as a global
-- **Object.keys numeric ordering** — integer keys sorted numerically first
-- **`typeof class`** → `"function"` (was `"object"`)
-- **`constructor` non-enumerable** on function prototypes
-- **for-of destructuring** — array/object LHS assignment and `var {x=default}` patterns
-- **Labeled continue** fixed (no longer infinite loops)
-- **JSON.stringify** skips `undefined`/function values
+- **92.3% test262 conformance** — up from 84.3% (9,052 / 9,805 active tests, +3,591 tests passing)
+- **Private class fields and methods** (`#field`, `#method()`) — full `#`-prefixed syntax with private instance fields, static fields, private methods, private getters/setters, and Unicode-escaped private names (`#\u{6F}_`)
+- **try/finally + break/continue** — `finally` blocks now always execute even when `break` or `continue` exits the `try` body; nested finally blocks inline correctly
+- **Generator/async scope isolation** — `yield` and `await` are valid identifiers inside nested non-generator/non-async functions, even when those are inside a generator or async body
+- **Future reserved words as identifiers** — `implements`, `interface`, `package`, `private`, `protected`, `public`, `static`, `let` are valid variable names in non-strict mode
+- **`undefined` as binding identifier** — `var undefined` and `for (var undefined of ...)` now parse correctly
+- **Unicode identifiers** — proper Unicode ID_Start/ID_Continue via the `unicode-id-start` crate (fixes identifiers like `℘`, `ZW_\u200C_NJ`)
+- **Regex/division disambiguation** — `/` after `undefined`, `null`, `true`, `false` is now correctly treated as division, not the start of a regex literal
+- **Error.prototype.toString()** — error objects now stringify as `"TypeError: message"` instead of `"[object Object]"`
+- **AST nodes derive Clone** — all AST types now implement `Clone`, enabling finally-block inlining
 
 ## Try It
 
@@ -74,7 +69,7 @@ See [JIT.md](docs/JIT.md) for technical details.
 | **Variables** | `var` (with hoisting), `let`, `const` with block scoping and TDZ, const reassignment prevention |
 | **Control flow** | `if`/`else`, `while`, `do-while`, `for`, `for...in`, `for...of`, `switch`/`case`, labeled `break`/`continue` |
 | **Functions** | Declarations, expressions, arrow functions, closures, recursion, default params, rest params, `Function.prototype.call`/`apply`/`bind`, `Function.length`, `Function.name` |
-| **Classes** | `class`, `constructor`, `extends`, `super()`, instance methods, static methods, getters/setters, private fields, `new`, prototype chain inheritance |
+| **Classes** | `class`, `constructor`, `extends`, `super()`, instance methods, static methods, getters/setters, private fields (`#field`, `#method()`), `new`, prototype chain inheritance |
 | **Objects** | Literals, property get/set, computed properties, getters/setters, `this` binding, prototype chain, spread (`{...obj}`), `Object.keys`/`values`/`entries`/`assign`/`create`/`defineProperty`/`freeze`/`seal`/`is`/`getPrototypeOf`/`setPrototypeOf`/`getOwnPropertyNames`/`getOwnPropertyDescriptor`/`hasOwn` |
 | **Arrays** | Literals, indexed access, spread (`[...arr]`), `.length`, `.push`, `.pop`, `.map`, `.filter`, `.reduce`, `.reduceRight`, `.forEach`, `.find`, `.findIndex`, `.findLast`, `.findLastIndex`, `.some`, `.every`, `.join`, `.indexOf`, `.lastIndexOf`, `.includes`, `.reverse`, `.shift`, `.unshift`, `.splice`, `.slice`, `.concat`, `.sort`, `.fill`, `.copyWithin`, `.flat`, `.flatMap`, `.at`, `.keys`, `.values`, `.entries`, `Array.from`, `Array.of`, `Array.isArray` |
 | **Strings** | 25+ methods: `.charAt`, `.charCodeAt`, `.codePointAt`, `.indexOf`, `.lastIndexOf`, `.includes`, `.startsWith`, `.endsWith`, `.slice`, `.substring`, `.toUpperCase`, `.toLowerCase`, `.trim`, `.trimStart`, `.trimEnd`, `.split`, `.replace`, `.replaceAll`, `.match`, `.search`, `.repeat`, `.padStart`, `.padEnd`, `.concat`, `.at`, `.toString`, `String.fromCharCode`, `String.fromCodePoint` |
@@ -145,7 +140,7 @@ bash bench/sunspider/run.sh    # SunSpider benchmarks
 
 ## Test262 Conformance
 
-**84.3%** of tested ECMAScript spec tests pass (5,461 / 6,476). See [TEST262.md](docs/TEST262.md).
+**92.3%** of tested ECMAScript spec tests pass (9,052 / 9,805 active tests). See [TEST262.md](docs/TEST262.md).
 
 15 categories with **100% pass rate** including: numeric literals, string literals, boolean literals, compound-assignment, if, return, throw, coalesce, keywords, block, and more.
 
@@ -195,9 +190,9 @@ web/                   WASM playground (HTML + compiled WASM)
 
 ## Stats
 
-- **~22,000 lines** of Rust
+- **~22,500 lines** of Rust
 - **90 tests** passing
-- **84.3%** Test262 conformance (5,461 / 6,476 tests)
+- **92.3%** Test262 conformance (9,052 / 9,805 active tests)
 - **1.5 MB** WASM binary (includes regex engine)
 - **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation

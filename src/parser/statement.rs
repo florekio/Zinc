@@ -529,9 +529,8 @@ fn parse_for(p: &mut Parser) -> ParseResult<Statement> {
             return Err(ParseError::unexpected(p.current().kind, p.current().span));
         }
 
-        let name = p.intern_current();
         let name_span = p.current().span;
-        p.expect(TokenKind::Identifier)?;
+        let name = p.expect_binding_identifier()?;
 
         // for-in / for-of
         if p.at(TokenKind::In) {
@@ -858,9 +857,13 @@ fn parse_function_declaration(p: &mut Parser, is_async: bool) -> ParseResult<Sta
     };
 
     let params = parse_params(p)?;
-    if is_generator { p.generator_depth += 1; }
+    let saved_gen = p.generator_depth;
+    let saved_async = p.async_depth;
+    p.generator_depth = if is_generator { 1 } else { 0 };
+    p.async_depth = if is_async { 1 } else { 0 };
     let body = parse_block_statement(p)?;
-    if is_generator { p.generator_depth -= 1; }
+    p.generator_depth = saved_gen;
+    p.async_depth = saved_async;
 
     Ok(Statement::Function(FunctionDeclaration {
         id,
