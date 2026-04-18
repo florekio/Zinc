@@ -1406,6 +1406,7 @@ fn expr_to_params(expr: Expression) -> ParseResult<Vec<Pattern>> {
         Expression::Assignment(a) => {
             let left = match a.left {
                 AssignmentTarget::Identifier(id) => Pattern::Identifier(id),
+                AssignmentTarget::Pattern(p) => p,
                 _ => {
                     return Err(ParseError::new("Invalid parameter", a.span));
                 }
@@ -1477,15 +1478,24 @@ fn array_expr_to_pattern(arr: ArrayExpression) -> ParseResult<Pattern> {
 fn object_expr_to_pattern(o: ObjectExpression) -> ParseResult<Pattern> {
     let mut props = Vec::new();
     for prop in o.properties {
-        if let ObjectProperty::Property(p) = prop {
-            let value = expr_to_param(p.value)?;
-            props.push(ObjectPatternProperty::Property {
-                key: p.key,
-                value,
-                computed: p.computed,
-                shorthand: p.shorthand,
-                span: p.span,
-            });
+        match prop {
+            ObjectProperty::Property(p) => {
+                let value = expr_to_param(p.value)?;
+                props.push(ObjectPatternProperty::Property {
+                    key: p.key,
+                    value,
+                    computed: p.computed,
+                    shorthand: p.shorthand,
+                    span: p.span,
+                });
+            }
+            ObjectProperty::SpreadElement(s) => {
+                let arg = expr_to_param(s.argument)?;
+                props.push(ObjectPatternProperty::Rest(RestElement {
+                    argument: arg,
+                    span: s.span,
+                }));
+            }
         }
     }
     Ok(Pattern::Object(ObjectPattern { properties: props, span: o.span }))

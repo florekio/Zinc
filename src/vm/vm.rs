@@ -149,6 +149,10 @@ pub struct Vm {
     pub(crate) sym_to_string_tag: u32,
     pub(crate) sym_species: u32,
     pub(crate) sym_unscopables: u32,
+    /// Fuel counter: instructions executed (incremented in 1024-step chunks).
+    pub(crate) steps: u64,
+    /// Max instructions before returning an error. 0 = unlimited.
+    pub(crate) max_steps: u64,
 }
 
 impl Vm {
@@ -378,6 +382,8 @@ impl Vm {
             sym_to_string_tag: 3,
             sym_species: 4,
             sym_unscopables: 5,
+            steps: 0,
+            max_steps: 0,
         }
     }
 
@@ -809,8 +815,8 @@ impl Vm {
                                 if ks == "message" { msg_val = Some(prop.value); }
                                 else if ks == "name" { name_val = Some(prop.value); }
                             }
-                            if let Some(mv) = msg_val {
-                                if mv.is_string() {
+                            if let Some(mv) = msg_val
+                                && mv.is_string() {
                                     let msg = self.interner.resolve(mv.as_string_id().unwrap()).to_owned();
                                     let name = name_val
                                         .and_then(|v| v.as_string_id())
@@ -818,7 +824,6 @@ impl Vm {
                                         .unwrap_or_else(|| "Error".to_owned());
                                     return format!("{name}: {msg}");
                                 }
-                            }
                         }
                         "[object Object]".into()
                     }
@@ -979,10 +984,16 @@ impl Vm {
     pub(crate) fn run_until(&mut self, stop_depth: usize) -> Result<Value, VmError> {
         let mut gc_counter: u32 = 0;
         loop {
-            // GC safepoint (check every 1024 instructions)
+            // GC safepoint + fuel check (every 1024 instructions)
             gc_counter = gc_counter.wrapping_add(1);
-            if gc_counter & 0x3FF == 0 && self.heap.needs_gc() {
-                self.collect_gc();
+            if gc_counter & 0x3FF == 0 {
+                if self.heap.needs_gc() { self.collect_gc(); }
+                if self.max_steps > 0 {
+                    self.steps += 1024;
+                    if self.steps > self.max_steps {
+                        return Err(VmError::RuntimeError("execution limit exceeded".into()));
+                    }
+                }
             }
 
             if self.frames.len() <= stop_depth {
@@ -3418,9 +3429,7 @@ impl Vm {
                                     for k in raw_props {
                                         let s = self.interner.resolve(k).to_owned();
                                         // Convert __get_X__ / __set_X__ → X
-                                        let real = if s.starts_with("__get_") && s.ends_with("__") {
-                                            s[6..s.len()-2].to_owned()
-                                        } else if s.starts_with("__set_") && s.ends_with("__") {
+                                        let real = if (s.starts_with("__get_") || s.starts_with("__set_")) && s.ends_with("__") {
                                             s[6..s.len()-2].to_owned()
                                         } else {
                                             s.clone()

@@ -1013,8 +1013,8 @@ impl Vm {
                 } else { Value::boolean(false) }
             }
             -592 => { // Object.prototype.toString
-                if let Some(oid) = this_val.as_object_id() {
-                    if let Some(obj) = self.heap.get(oid) {
+                if let Some(oid) = this_val.as_object_id()
+                    && let Some(obj) = self.heap.get(oid) {
                         let tag = match &obj.kind {
                             ObjectKind::Array(_) => "Array",
                             ObjectKind::Function(_) => "Function",
@@ -1023,7 +1023,6 @@ impl Vm {
                         let s = self.interner.intern(&format!("[object {tag}]"));
                         return Value::string(s);
                     }
-                }
                 let s = self.interner.intern("[object Object]");
                 Value::string(s)
             }

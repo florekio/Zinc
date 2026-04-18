@@ -8,13 +8,20 @@ use crate::vm::vm::{Vm, VmError};
 /// The Zinc JavaScript Engine: orchestrates lexer -> parser -> compiler -> VM.
 pub struct Engine {
     interner: Interner,
+    max_steps: u64,
 }
 
 impl Engine {
     pub fn new() -> Self {
         Self {
             interner: Interner::new(),
+            max_steps: 0,
         }
+    }
+
+    /// Set a fuel limit (max VM instructions). 0 = unlimited (the default).
+    pub fn set_max_steps(&mut self, n: u64) {
+        self.max_steps = n;
     }
 
     /// Evaluate a JavaScript source string and return the result.
@@ -52,6 +59,7 @@ impl Engine {
         // We swap it out and swap it back after.
         let interner = std::mem::take(&mut self.interner);
         let mut vm = Vm::new(chunk, interner);
+        vm.max_steps = self.max_steps;
         let result = vm.run().map_err(EngineError::RuntimeError);
         // Drain microtask queue (Promise .then callbacks)
         let _ = vm.drain_microtasks();

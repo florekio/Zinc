@@ -3,3 +3,4 @@
 .claude/
 .playwright-mcp/
 test262/
+failures*.log

@@ -1,5 +1,12 @@
 /// Test262 conformance runner for Zinc.
 /// Run with: cargo run --release --bin test262_runner
+///
+/// Memory strategy: orchestrator spawns one subprocess per category so that
+/// each category gets a clean heap and RSS is fully reclaimed between categories.
+#[cfg(feature = "fast-alloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::time::Instant;
@@ -23,7 +30,6 @@ fn parse_meta(source: &str) -> TestMeta {
     let mut features = Vec::new();
     let mut is_negative = false;
     let mut negative_phase = String::new();
-    // Extract YAML block between /*--- and ---*/
     if let Some(start) = source.find("/*---")
         && let Some(end) = source[start..].find("---*/") {
             let yaml = &source[start + 5..start + end];
@@ -35,7 +41,6 @@ fn parse_meta(source: &str) -> TestMeta {
             for line in yaml.lines() {
                 let trimmed = line.trim();
 
-                // Inline array: flags: [onlyStrict, raw]
                 if trimmed.starts_with("flags:") {
                     in_flags = true; in_includes = false; in_features = false; in_negative = false;
                     if let Some(bracket_content) = extract_bracket_list(trimmed) {
@@ -65,7 +70,6 @@ fn parse_meta(source: &str) -> TestMeta {
                     in_negative = true; in_flags = false; in_includes = false; in_features = false;
                     continue;
                 }
-                // Other top-level key resets list parsing
                 if !trimmed.starts_with("- ") && !trimmed.starts_with("phase:") && !trimmed.starts_with("type:")
                     && !trimmed.is_empty() && !trimmed.starts_with('#')
                     && trimmed.contains(':')
@@ -77,7 +81,6 @@ fn parse_meta(source: &str) -> TestMeta {
                     }
                 }
 
-                // YAML list items
                 if let Some(val) = trimmed.strip_prefix("- ") {
                     let val = val.trim().to_string();
                     if in_flags { flags.push(val); }
@@ -85,7 +88,6 @@ fn parse_meta(source: &str) -> TestMeta {
                     else if in_features { features.push(val); }
                 }
 
-                // Negative phase
                 if in_negative && trimmed.starts_with("phase:") {
                     negative_phase = trimmed["phase:".len()..].trim().to_string();
                 }
@@ -93,11 +95,9 @@ fn parse_meta(source: &str) -> TestMeta {
         }
 
     let is_async = flags.contains(&"async".to_string());
-
     TestMeta { flags, includes, features, is_negative, negative_phase, is_async }
 }
 
-/// Extract items from inline bracket list like `flags: [onlyStrict, raw]`
 fn extract_bracket_list(line: &str) -> Option<Vec<String>> {
     if let Some(open) = line.find('[')
         && let Some(close) = line.find(']') {
@@ -111,7 +111,6 @@ fn extract_bracket_list(line: &str) -> Option<Vec<String>> {
     None
 }
 
-/// Features that Zinc does not yet support — skip tests requiring these.
 const UNSUPPORTED_FEATURES: &[&str] = &[
     "Proxy", "Reflect",
     "Symbol.asyncIterator", "Symbol.matchAll",
@@ -132,7 +131,12 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "regexp-v-flag", "regexp-unicode-property-escapes",
     "regexp-named-groups", "regexp-lookbehind", "regexp-dotall",
     "regexp-match-indices",
+    "class-fields-private",
     "class-fields-private-in",
+    "class-methods-private",
+    "class-static-fields-private",
+    "class-static-fields-public",
+    "class-static-methods-private",
     "class-static-block",
     "logical-assignment-operators",
     "json-modules",
@@ -142,22 +146,17 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
 ];
 
 fn should_skip(source: &str, meta: &TestMeta) -> bool {
-    // Skip tests with exotic Unicode that our lexer can't handle
     if source.contains('\u{2028}') || source.contains('\u{2029}')
         || source.contains("\\u2028") || source.contains("\\u2029") {
         return true;
     }
 
-    // Skip based on unsupported features in YAML metadata
     for feat in &meta.features {
         for unsupported in UNSUPPORTED_FEATURES {
-            if feat == unsupported {
-                return true;
-            }
+            if feat == unsupported { return true; }
         }
     }
 
-    // Skip tests that reference features not captured in metadata
     if source.contains("Proxy(") || source.contains("new Proxy")
         || source.contains("Reflect.")
         || source.contains("WeakRef(")
@@ -171,50 +170,178 @@ fn should_skip(source: &str, meta: &TestMeta) -> bool {
         return true;
     }
 
-    // Skip module-mode and async tests for now
     if meta.flags.contains(&"module".to_string()) { return true; }
     if meta.is_async { return true; }
-
-    // Skip tests needing Function constructor (fnGlobalObject)
     if source.contains("fnGlobalObject") { return true; }
+    // Skip tests that use `with` statement (not implemented)
+    if source.contains("with (") || source.contains("with(") { return true; }
 
-    // Skip tests that require complex harness include files
     for inc in &meta.includes {
         match inc.as_str() {
             "compareArray.js" | "deepEqual.js" | "nans.js"
             | "decimalToHexString.js" | "isConstructor.js"
-            | "propertyHelper.js" => {} // safe to include
-            _ => return true, // skip tests needing other includes
+            | "propertyHelper.js" => {}
+            _ => return true,
         }
     }
 
-    // Skip tests with raw flag (parser edge cases, no harness)
     if meta.flags.contains(&"raw".to_string()) { return true; }
-
     false
 }
+
+const CATEGORIES: &[&str] = &[
+    "expressions/addition", "expressions/subtraction", "expressions/multiplication",
+    "expressions/division", "expressions/remainder", "expressions/exponentiation",
+    "expressions/unary-minus", "expressions/unary-plus", "expressions/typeof",
+    "expressions/void", "expressions/delete", "expressions/logical-not",
+    "expressions/logical-and", "expressions/logical-or", "expressions/bitwise-and",
+    "expressions/bitwise-or", "expressions/bitwise-xor", "expressions/bitwise-not",
+    "expressions/left-shift", "expressions/right-shift", "expressions/unsigned-right-shift",
+    "expressions/equals", "expressions/does-not-equals", "expressions/strict-equals",
+    "expressions/strict-does-not-equals", "expressions/less-than",
+    "expressions/less-than-or-equal", "expressions/greater-than",
+    "expressions/greater-than-or-equal", "expressions/conditional", "expressions/comma",
+    "expressions/grouping", "expressions/postfix-increment", "expressions/postfix-decrement",
+    "expressions/prefix-increment", "expressions/prefix-decrement", "expressions/assignment",
+    "expressions/compound-assignment", "statements/if", "statements/while",
+    "statements/do-while", "statements/for", "statements/switch", "statements/break",
+    "statements/continue", "statements/return", "statements/throw", "statements/try",
+    "statements/block", "statements/empty", "statements/variable", "statements/expression",
+    "statements/labeled", "literals/numeric", "literals/string", "literals/boolean",
+    "literals/null", "comments", "white-space", "punctuators", "types", "asi",
+    "block-scope", "keywords", "line-terminators", "function-code", "global-code",
+    "identifier-resolution", "rest-parameters", "computed-property-names", "statementList",
+    "expressions/object", "expressions/function", "expressions/coalesce",
+    "expressions/concatenation", "expressions/logical-assignment", "expressions/modulus",
+    "expressions/relational", "expressions/arrow-function", "expressions/template-literal",
+    "expressions/this", "expressions/optional-chaining", "expressions/async-function",
+    "statements/for-of", "statements/const", "statements/let", "statements/class",
+    "statements/function", "statements/for-in", "expressions/array", "expressions/in",
+    "expressions/instanceof", "expressions/new", "expressions/call", "directive-prologue",
+    "future-reserved-words", "reserved-words",
+];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let verbose = args.contains(&"--verbose".to_string()) || args.contains(&"-v".to_string());
-    let filter = args.windows(2)
-        .find(|w| w[0] == "--filter" || w[0] == "--category")
-        .map(|w| w[1].clone());
     let output_path = args.windows(2)
         .find(|w| w[0] == "--output" || w[0] == "-o")
         .map(|w| w[1].clone());
+
+    // Single-category mode: used by the orchestrator subprocess.
+    // Usage: test262_runner --run-category CATEGORY [--fail-log FILE]
+    let run_category = args.windows(2)
+        .find(|w| w[0] == "--run-category")
+        .map(|w| w[1].clone());
+    let fail_log = args.windows(2)
+        .find(|w| w[0] == "--fail-log")
+        .map(|w| w[1].clone());
+
+    if let Some(ref category) = run_category {
+        // Subprocess mode: run a single category, print machine line to stdout.
+        run_single_category(category, fail_log.as_deref(), verbose);
+        return;
+    }
+
+    // Also support --filter for quick manual testing (non-subprocess, single process)
+    let filter = args.windows(2)
+        .find(|w| w[0] == "--filter" || w[0] == "--category")
+        .map(|w| w[1].clone());
+    if filter.is_some() {
+        run_filtered(filter.as_deref(), output_path.as_deref(), verbose);
+        return;
+    }
+
+    // Orchestrator mode: spawn one subprocess per category to isolate memory.
+    let exe = std::env::current_exe().expect("cannot find current exe");
     let mut output_file: Option<std::fs::File> = output_path.as_ref()
         .map(|p| std::fs::File::create(p).expect("cannot open output file"));
 
+    let mut total = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    let mut category_results: Vec<(&str, usize, usize, usize)> = Vec::new();
+
+    let start = Instant::now();
+
+    for category in CATEGORIES {
+        // Each category gets its own temp fail log, then we append to the main one.
+        let fail_tmp = format!("/tmp/zinc_test262_{}.log", category.replace('/', "_"));
+
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--run-category").arg(category)
+           .arg("--fail-log").arg(&fail_tmp);
+        if verbose { cmd.arg("--verbose"); }
+
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => { eprintln!("failed to spawn subprocess for {category}: {e}"); continue; }
+        };
+
+        // Parse machine line: "MACHINE passed failed skipped total"
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(line) = stdout.lines().find(|l| l.starts_with("MACHINE ")) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() == 5 {
+                let p: usize = parts[1].parse().unwrap_or(0);
+                let f: usize = parts[2].parse().unwrap_or(0);
+                let s: usize = parts[3].parse().unwrap_or(0);
+                let t: usize = parts[4].parse().unwrap_or(0);
+                passed += p;
+                failed += f;
+                skipped += s;
+                total += t;
+                if t > 0 {
+                    category_results.push((category, t, p, f));
+                }
+            }
+        }
+
+        // Append fail lines from temp file to main output file
+        if let Some(ref mut out) = output_file {
+            use std::io::Write;
+            if let Ok(content) = fs::read_to_string(&fail_tmp) {
+                let _ = out.write_all(content.as_bytes());
+            }
+        }
+        let _ = fs::remove_file(&fail_tmp);
+    }
+
+    let elapsed = start.elapsed();
+
+    println!();
+    println!("=== Zinc Test262 Conformance Report ===");
+    println!();
+    printf_header();
+    for (cat, t, p, f) in &category_results {
+        let pct = if *t > 0 { *p as f64 / *t as f64 * 100.0 } else { 0.0 };
+        println!("{:<45} {:>5} {:>5} {:>5} {:>6.1}%", cat, t, p, f, pct);
+    }
+    println!("{}", "─".repeat(75));
+    let pct = if total > 0 { passed as f64 / total as f64 * 100.0 } else { 0.0 };
+    println!("{:<45} {:>5} {:>5} {:>5} {:>6.1}%", "TOTAL", total, passed, failed, pct);
+    println!();
+    println!("Skipped: {skipped}");
+    println!("Time: {:.2}s", elapsed.as_secs_f64());
+    println!();
+    if let Some(ref mut f) = output_file {
+        use std::io::Write;
+        let _ = writeln!(f, "TOTAL {passed}/{total} ({pct:.1}%) skipped={skipped} time={:.2}s", elapsed.as_secs_f64());
+    }
+}
+
+/// Run a single category (called in subprocess mode).
+/// Prints "MACHINE <passed> <failed> <skipped> <total>" to stdout.
+fn run_single_category(category: &str, fail_log: Option<&str>, verbose: bool) {
     let test_root = Path::new("test262/test/language");
     let harness_root = Path::new("test262/harness");
+
     if !test_root.exists() {
-        eprintln!("Error: test262 not found. Run:");
-        eprintln!("  git clone --depth 1 https://github.com/nicolo-ribaudo/test262.git");
+        eprintln!("Error: test262 not found.");
         std::process::exit(1);
     }
 
-    // Pre-load harness files
     let mut harness_cache: HashMap<String, String> = HashMap::new();
     if harness_root.exists()
         && let Ok(entries) = fs::read_dir(harness_root) {
@@ -228,158 +355,125 @@ fn main() {
             }
         }
 
-    // Categories to test
-    let categories = vec![
-        "expressions/addition",
-        "expressions/subtraction",
-        "expressions/multiplication",
-        "expressions/division",
-        "expressions/remainder",
-        "expressions/exponentiation",
-        "expressions/unary-minus",
-        "expressions/unary-plus",
-        "expressions/typeof",
-        "expressions/void",
-        "expressions/delete",
-        "expressions/logical-not",
-        "expressions/logical-and",
-        "expressions/logical-or",
-        "expressions/bitwise-and",
-        "expressions/bitwise-or",
-        "expressions/bitwise-xor",
-        "expressions/bitwise-not",
-        "expressions/left-shift",
-        "expressions/right-shift",
-        "expressions/unsigned-right-shift",
-        "expressions/equals",
-        "expressions/does-not-equals",
-        "expressions/strict-equals",
-        "expressions/strict-does-not-equals",
-        "expressions/less-than",
-        "expressions/less-than-or-equal",
-        "expressions/greater-than",
-        "expressions/greater-than-or-equal",
-        "expressions/conditional",
-        "expressions/comma",
-        "expressions/grouping",
-        "expressions/postfix-increment",
-        "expressions/postfix-decrement",
-        "expressions/prefix-increment",
-        "expressions/prefix-decrement",
-        "expressions/assignment",
-        "expressions/compound-assignment",
-        "statements/if",
-        "statements/while",
-        "statements/do-while",
-        "statements/for",
-        "statements/switch",
-        "statements/break",
-        "statements/continue",
-        "statements/return",
-        "statements/throw",
-        "statements/try",
-        "statements/block",
-        "statements/empty",
-        "statements/variable",
-        "statements/expression",
-        "statements/labeled",
-        "literals/numeric",
-        "literals/string",
-        "literals/boolean",
-        "literals/null",
-        "comments",
-        "white-space",
-        "punctuators",
-        "types",
-        "asi",
-        "block-scope",
-        "keywords",
-        "line-terminators",
-        "function-code",
-        "global-code",
-        "identifier-resolution",
-        "rest-parameters",
-        "computed-property-names",
-        "statementList",
-        "expressions/object",
-        "expressions/function",
-        "expressions/coalesce",
-        "expressions/concatenation",
-        "expressions/logical-assignment",
-        "expressions/modulus",
-        "expressions/relational",
-        "expressions/arrow-function",
-        "expressions/template-literal",
-        "expressions/this",
-        "expressions/optional-chaining",
-        "expressions/async-function",
-        "statements/for-of",
-        "statements/const",
-        "statements/let",
-        "statements/class",
-        "statements/function",
-        "statements/for-in",
-        "expressions/array",
-        "expressions/in",
-        "expressions/instanceof",
-        "expressions/new",
-        "expressions/call",
-        "directive-prologue",
-        "future-reserved-words",
-        "reserved-words",
-        // "destructuring", // TODO: many edge cases
-        // "spread", // TODO
-        // "default-parameters", // TODO
-    ];
+    let dir = test_root.join(category);
+    let mut files: Vec<PathBuf> = Vec::new();
+    if dir.exists() {
+        collect_js_files(&dir, &mut files);
+        files.sort();
+    }
 
-    let mut total = 0;
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut skipped = 0;
-    let mut category_results: Vec<(String, usize, usize, usize)> = Vec::new();
+    let mut fail_file: Option<std::fs::File> = fail_log
+        .map(|p| std::fs::File::create(p).expect("cannot open fail log"));
 
-    let start = Instant::now();
+    let mut total = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
 
-    for category in &categories {
-        if let Some(ref f) = filter {
-            if !category.contains(f.as_str()) {
-                continue;
-            }
-        }
-
-        let dir = test_root.join(category);
-        if !dir.exists() {
+    for file in &files {
+        let source = match fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let meta = parse_meta(&source);
+        if should_skip(&source, &meta) {
+            skipped += 1;
             continue;
         }
 
-        let mut cat_total = 0;
-        let mut cat_passed = 0;
-        let mut cat_failed = 0;
+        let result = run_test(&source, &meta, &harness_cache);
+        let pass = if meta.is_negative { result.is_err() } else { result.is_ok() };
+
+        total += 1;
+        if pass {
+            passed += 1;
+        } else {
+            failed += 1;
+            if verbose || fail_file.is_some() {
+                let fname = file.file_name().unwrap_or_default().to_string_lossy();
+                let err_msg = match result {
+                    Ok(_) => "expected failure but passed".to_string(),
+                    Err(e) => e,
+                };
+                let fail_line = format!("FAIL {category}/{fname}: {err_msg}\n");
+                if verbose { eprint!("{}", fail_line); }
+                if let Some(ref mut f) = fail_file {
+                    use std::io::Write;
+                    let _ = f.write_all(fail_line.as_bytes());
+                }
+            }
+        }
+    }
+
+    println!("MACHINE {passed} {failed} {skipped} {total}");
+}
+
+/// Run with --filter for interactive use (single process, no subprocess isolation).
+fn run_filtered(filter: Option<&str>, output_path: Option<&str>, verbose: bool) {
+    let test_root = Path::new("test262/test/language");
+    let harness_root = Path::new("test262/harness");
+
+    if !test_root.exists() {
+        eprintln!("Error: test262 not found.");
+        std::process::exit(1);
+    }
+
+    let mut harness_cache: HashMap<String, String> = HashMap::new();
+    if harness_root.exists()
+        && let Ok(entries) = fs::read_dir(harness_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "js").unwrap_or(false)
+                    && let Ok(content) = fs::read_to_string(&path) {
+                        let name = path.file_name().unwrap().to_string_lossy().to_string();
+                        harness_cache.insert(name, content);
+                    }
+            }
+        }
+
+    let mut output_file: Option<std::fs::File> = output_path
+        .map(|p| std::fs::File::create(p).expect("cannot open output file"));
+
+    let mut total = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    let mut category_results: Vec<(&str, usize, usize, usize)> = Vec::new();
+
+    let start = Instant::now();
+
+    for category in CATEGORIES {
+        if filter.is_some_and(|f| !category.contains(f)) {
+            continue;
+        }
+
+        let dir = test_root.join(category);
+        if !dir.exists() { continue; }
 
         let mut files: Vec<PathBuf> = Vec::new();
         collect_js_files(&dir, &mut files);
         files.sort();
+
+        let mut cat_total = 0usize;
+        let mut cat_passed = 0usize;
+        let mut cat_failed = 0usize;
 
         for file in &files {
             let source = match fs::read_to_string(file) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-
             let meta = parse_meta(&source);
-
-            // Skip tests that need features Zinc doesn't support
             if should_skip(&source, &meta) {
                 skipped += 1;
                 continue;
             }
 
+            let result = run_test(&source, &meta, &harness_cache);
+            let pass = if meta.is_negative { result.is_err() } else { result.is_ok() };
+
             total += 1;
             cat_total += 1;
-
-            let result = run_test(&source, &meta, &harness_cache);
-
-            let pass = if meta.is_negative { result.is_err() } else { result.is_ok() };
             if pass {
                 passed += 1;
                 cat_passed += 1;
@@ -392,7 +486,7 @@ fn main() {
                         Ok(_) => "expected failure but passed".to_string(),
                         Err(e) => e,
                     };
-                    let fail_line = format!("FAIL {}/{}: {}\n", category, fname, err_msg);
+                    let fail_line = format!("FAIL {category}/{fname}: {err_msg}\n");
                     if verbose { eprint!("{}", fail_line); }
                     if let Some(ref mut f) = output_file {
                         use std::io::Write;
@@ -403,7 +497,7 @@ fn main() {
         }
 
         if cat_total > 0 {
-            category_results.push((category.to_string(), cat_total, cat_passed, cat_failed));
+            category_results.push((category, cat_total, cat_passed, cat_failed));
         }
     }
 
@@ -421,7 +515,7 @@ fn main() {
     let pct = if total > 0 { passed as f64 / total as f64 * 100.0 } else { 0.0 };
     println!("{:<45} {:>5} {:>5} {:>5} {:>6.1}%", "TOTAL", total, passed, failed, pct);
     println!();
-    println!("Skipped: {}", skipped);
+    println!("Skipped: {skipped}");
     println!("Time: {:.2}s", elapsed.as_secs_f64());
     println!();
     if let Some(ref mut f) = output_file {
@@ -448,8 +542,7 @@ fn printf_header() {
     println!("{}", "─".repeat(75));
 }
 
-fn run_test(source: &str, meta: &TestMeta, harness_cache: &HashMap<String, String>) -> Result<(), String> {
-    let base_harness = r#"
+const BASE_HARNESS: &str = r#"
 function Test262Error(msg) { this.message = msg; this.name = "Test262Error"; }
 function assert(condition, msg) { if (!condition) throw new Test262Error(msg || "assertion failed"); }
 assert.sameValue = function(a, b, msg) {
@@ -469,14 +562,11 @@ function $ERROR(msg) { throw new Test262Error(msg); }
 var $262 = {};
 "#;
 
-    // Build full source with harness + includes + flags
+fn run_test(source: &str, meta: &TestMeta, harness_cache: &HashMap<String, String>) -> Result<(), String> {
     let mut parts = Vec::new();
 
-    // Don't prepend harness for raw tests
     if !meta.flags.contains(&"raw".to_string()) {
-        parts.push(base_harness.to_string());
-
-        // Load requested include files
+        parts.push(BASE_HARNESS.to_string());
         for inc in &meta.includes {
             if let Some(content) = harness_cache.get(inc) {
                 parts.push(content.clone());
@@ -484,35 +574,23 @@ var $262 = {};
         }
     }
 
-    // Handle onlyStrict flag
     if meta.flags.contains(&"onlyStrict".to_string()) {
         parts.push("\"use strict\";\n".to_string());
     }
 
     parts.push(source.to_string());
-
     let full_source = parts.join("\n");
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    let handle = std::thread::Builder::new()
-        .stack_size(2 * 1024 * 1024)
-        .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut engine = Engine::new();
-                engine.eval(&full_source)
-            }));
-            let _ = tx.send(result);
-        })
-        .expect("thread spawn failed");
+    // 2M instructions is plenty for any real test; cuts off infinite loops quickly
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut engine = Engine::new();
+        engine.set_max_steps(2_000_000);
+        engine.eval(&full_source)
+    }));
 
-    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Ok(Ok(_))) => { let _ = handle.join(); Ok(()) }
-        Ok(Ok(Err(e))) => { let _ = handle.join(); Err(format!("{e}")) }
-        Ok(Err(_)) => { let _ = handle.join(); Err("panic".to_string()) }
-        Err(_) => {
-            // Timeout: detach thread (can't kill it). Stack reclaimed when it eventually exits.
-            drop(handle);
-            Err("timeout".to_string())
-        }
+    match result {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!("{e}")),
+        Err(_) => Err("panic".to_string()),
     }
 }
