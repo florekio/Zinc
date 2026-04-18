@@ -67,6 +67,8 @@ pub struct Parser<'a> {
     source: &'a str,
     pub(crate) interner: &'a mut Interner,
     pub errors: Vec<ParseError>,
+    /// Nesting depth inside generator function bodies.
+    pub(crate) generator_depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -77,7 +79,13 @@ impl<'a> Parser<'a> {
             source,
             interner,
             errors: Vec::new(),
+            generator_depth: 0,
         }
+    }
+
+    /// True when `yield` must be treated as a keyword (inside a generator body).
+    pub(crate) fn in_generator(&self) -> bool {
+        self.generator_depth > 0
     }
 
     /// Parse a complete program (script).
@@ -174,6 +182,21 @@ impl<'a> Parser<'a> {
 
     /// Intern the current token's text and return its StringId.
     /// If the identifier contains \uXXXX escapes, they are decoded.
+    /// Intern + advance for a binding identifier (identifier or `yield` outside generators).
+    pub(crate) fn expect_binding_identifier(&mut self) -> ParseResult<StringId> {
+        if self.at(TokenKind::Identifier) {
+            let name = self.intern_current();
+            self.advance();
+            Ok(name)
+        } else if !self.in_generator() && self.at(TokenKind::Yield) {
+            let name = self.interner.intern("yield");
+            self.advance();
+            Ok(name)
+        } else {
+            Err(ParseError::expected("Identifier", self.current_kind(), self.current().span))
+        }
+    }
+
     pub(crate) fn intern_current(&mut self) -> StringId {
         let text = &self.source[self.current().span.start as usize..self.current().span.end as usize];
         if text.contains("\\u") {

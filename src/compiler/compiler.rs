@@ -2024,29 +2024,28 @@ impl<'a> Compiler<'a> {
         // Emit default parameter initialization code.
         // For each parameter with a default value, check if undefined and assign default.
         for (i, param) in params.iter().enumerate() {
-            if let Pattern::Assignment(a) = param
-                && let Pattern::Identifier(_) = &a.left {
-                    let line = 0;
-                    self.chunk.emit_op(OpCode::GetLocal, line);
-                    self.chunk.code.push(i as u8);
-                    self.chunk.emit_op(OpCode::Undefined, line);
-                    self.chunk.emit_op(OpCode::StrictNe, line);
-                    let jump_idx = self.chunk.code.len();
-                    self.chunk.emit_op(OpCode::JumpIfTrue, line);
-                    self.chunk.code.push(0);
-                    self.chunk.code.push(0);
-                    // Default value expression
-                    self.compile_expr(&a.right)?;
-                    // Set the local
-                    self.chunk.emit_op(OpCode::SetLocal, line);
-                    self.chunk.code.push(i as u8);
-                    self.chunk.emit_op(OpCode::Pop, line);
-                    // Patch the jump
-                    let target = self.chunk.code.len();
-                    let offset = (target as i16) - (jump_idx as i16) - 3;
-                    self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
-                    self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
-                }
+            if let Pattern::Assignment(a) = param {
+                let line = 0;
+                self.chunk.emit_op(OpCode::GetLocal, line);
+                self.chunk.code.push(i as u8);
+                self.chunk.emit_op(OpCode::Undefined, line);
+                self.chunk.emit_op(OpCode::StrictNe, line);
+                let jump_idx = self.chunk.code.len();
+                self.chunk.emit_op(OpCode::JumpIfTrue, line);
+                self.chunk.code.push(0);
+                self.chunk.code.push(0);
+                // Default value expression
+                self.compile_expr(&a.right)?;
+                // Set the local
+                self.chunk.emit_op(OpCode::SetLocal, line);
+                self.chunk.code.push(i as u8);
+                self.chunk.emit_op(OpCode::Pop, line);
+                // Patch the jump
+                let target = self.chunk.code.len();
+                let offset = (target as i16) - (jump_idx as i16) - 3;
+                self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
+                self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
+            }
         }
 
         // Emit CollectRest for rest parameters
@@ -2205,26 +2204,25 @@ impl<'a> Compiler<'a> {
 
         // Emit default parameter initialization for arrow functions
         for (i, param) in params.iter().enumerate() {
-            if let Pattern::Assignment(a) = param
-                && let Pattern::Identifier(_) = &a.left {
-                    let line = 0;
-                    self.chunk.emit_op(OpCode::GetLocal, line);
-                    self.chunk.code.push(i as u8);
-                    self.chunk.emit_op(OpCode::Undefined, line);
-                    self.chunk.emit_op(OpCode::StrictNe, line);
-                    let jump_idx = self.chunk.code.len();
-                    self.chunk.emit_op(OpCode::JumpIfTrue, line);
-                    self.chunk.code.push(0);
-                    self.chunk.code.push(0);
-                    self.compile_expr(&a.right)?;
-                    self.chunk.emit_op(OpCode::SetLocal, line);
-                    self.chunk.code.push(i as u8);
-                    self.chunk.emit_op(OpCode::Pop, line);
-                    let target = self.chunk.code.len();
-                    let offset = (target as i16) - (jump_idx as i16) - 3;
-                    self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
-                    self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
-                }
+            if let Pattern::Assignment(a) = param {
+                let line = 0;
+                self.chunk.emit_op(OpCode::GetLocal, line);
+                self.chunk.code.push(i as u8);
+                self.chunk.emit_op(OpCode::Undefined, line);
+                self.chunk.emit_op(OpCode::StrictNe, line);
+                let jump_idx = self.chunk.code.len();
+                self.chunk.emit_op(OpCode::JumpIfTrue, line);
+                self.chunk.code.push(0);
+                self.chunk.code.push(0);
+                self.compile_expr(&a.right)?;
+                self.chunk.emit_op(OpCode::SetLocal, line);
+                self.chunk.code.push(i as u8);
+                self.chunk.emit_op(OpCode::Pop, line);
+                let target = self.chunk.code.len();
+                let offset = (target as i16) - (jump_idx as i16) - 3;
+                self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
+                self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
+            }
         }
 
         // Emit CollectRest for rest parameters

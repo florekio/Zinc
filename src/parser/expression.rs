@@ -660,6 +660,13 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
         }
 
         // ---- yield ----
+        // Outside a generator, `yield` is a valid identifier in non-strict mode.
+        TokenKind::Yield if !p.in_generator() => {
+            let name = p.interner.intern("yield");
+            let span = p.current().span;
+            p.advance();
+            Ok(Expression::Identifier(Identifier { name, span }))
+        }
         TokenKind::Yield => {
             p.advance();
             let delegate = p.eat(TokenKind::Star);
@@ -1147,7 +1154,9 @@ fn parse_function_expression(p: &mut Parser) -> ParseResult<Expression> {
     };
 
     let params = parse_params(p)?;
+    if is_generator { p.generator_depth += 1; }
     let body = parse_block_statement(p)?;
+    if is_generator { p.generator_depth -= 1; }
 
     Ok(Expression::Function(Box::new(FunctionExpression {
         id,
@@ -1238,7 +1247,9 @@ pub fn parse_block_statement(p: &mut Parser) -> ParseResult<BlockStatement> {
 fn parse_function_body(p: &mut Parser, is_async: bool, is_generator: bool) -> ParseResult<Expression> {
     let start = p.pos();
     let params = parse_params(p)?;
+    if is_generator { p.generator_depth += 1; }
     let body = parse_block_statement(p)?;
+    if is_generator { p.generator_depth -= 1; }
     Ok(Expression::Function(Box::new(FunctionExpression {
         id: None,
         params,
@@ -1312,30 +1323,35 @@ fn expr_to_assignment_target(expr: Expression) -> ParseResult<AssignmentTarget> 
             let mut elements = Vec::new();
             for elem in arr.elements {
                 match elem {
-                    Some(Expression::Identifier(id)) => elements.push(Some(Pattern::Identifier(id))),
-                    Some(Expression::Assignment(a)) => {
-                        if let AssignmentTarget::Identifier(id) = a.left {
-                            elements.push(Some(Pattern::Assignment(Box::new(AssignmentPattern {
-                                left: Pattern::Identifier(id),
-                                right: a.right,
-                                span: a.span,
-                            }))));
-                        } else {
-                            elements.push(None);
-                        }
-                    }
-                    Some(Expression::Spread(s)) => {
-                        if let Expression::Identifier(id) = s.argument {
-                            elements.push(Some(Pattern::Rest(Box::new(RestElement {
-                                argument: Pattern::Identifier(id),
-                                span: s.span,
-                            }))));
-                        } else {
-                            elements.push(None);
-                        }
-                    }
                     None => elements.push(None),
-                    _ => elements.push(None),
+                    Some(Expression::Spread(s)) => {
+                        match expr_to_param(s.argument) {
+                            Ok(inner) => elements.push(Some(Pattern::Rest(Box::new(RestElement {
+                                argument: inner,
+                                span: s.span,
+                            })))),
+                            Err(_) => elements.push(None), // e.g. ...x.y — valid target but not a pattern
+                        }
+                    }
+                    Some(Expression::Assignment(a)) => {
+                        let left_pat = match a.left {
+                            AssignmentTarget::Identifier(id) => Pattern::Identifier(id),
+                            AssignmentTarget::Pattern(p) => p,
+                            _ => { elements.push(None); continue; }
+                        };
+                        elements.push(Some(Pattern::Assignment(Box::new(AssignmentPattern {
+                            left: left_pat,
+                            right: a.right,
+                            span: a.span,
+                        }))));
+                    }
+                    // Nested destructuring patterns
+                    Some(Expression::Array(a)) => elements.push(Some(array_expr_to_pattern(a)?)),
+                    Some(Expression::Object(o)) => elements.push(Some(object_expr_to_pattern(o)?)),
+                    // Simple identifier
+                    Some(Expression::Identifier(id)) => elements.push(Some(Pattern::Identifier(id))),
+                    // Member expressions and other valid assignment targets become holes
+                    Some(_) => elements.push(None),
                 }
             }
             Ok(AssignmentTarget::Pattern(Pattern::Array(ArrayPattern {
@@ -1460,12 +1476,17 @@ fn array_expr_to_pattern(arr: ArrayExpression) -> ParseResult<Pattern> {
         if let Some(e) = e_opt {
             match e {
                 Expression::Spread(s) => {
-                    let inner = expr_to_param(s.argument)?;
-                    elements.push(Some(Pattern::Rest(Box::new(RestElement {
-                        argument: inner,
-                        span: s.span,
-                    }))));
+                    match expr_to_param(s.argument) {
+                        Ok(inner) => elements.push(Some(Pattern::Rest(Box::new(RestElement {
+                            argument: inner,
+                            span: s.span,
+                        })))),
+                        Err(_) => elements.push(None),
+                    }
                 }
+                // Member expressions in patterns are valid assignment targets but can't
+                // be represented as Pattern — treat as hole.
+                Expression::Member(_) => elements.push(None),
                 other => elements.push(Some(expr_to_param(other)?)),
             }
         } else {

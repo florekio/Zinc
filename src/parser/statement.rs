@@ -325,9 +325,8 @@ fn parse_variable_declaration(p: &mut Parser) -> ParseResult<Statement> {
             // Array destructuring pattern: [ a, b, c ]
             parse_array_pattern(p)?
         } else {
-            let name = p.intern_current();
             let name_span = p.current().span;
-            p.expect(TokenKind::Identifier)?;
+            let name = p.expect_binding_identifier()?;
             Pattern::Identifier(Identifier { name, span: name_span })
         };
 
@@ -859,7 +858,9 @@ fn parse_function_declaration(p: &mut Parser, is_async: bool) -> ParseResult<Sta
     };
 
     let params = parse_params(p)?;
+    if is_generator { p.generator_depth += 1; }
     let body = parse_block_statement(p)?;
+    if is_generator { p.generator_depth -= 1; }
 
     Ok(Statement::Function(FunctionDeclaration {
         id,

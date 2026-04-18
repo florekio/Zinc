@@ -563,6 +563,42 @@ impl Vm {
         self.stack.push(value);
     }
 
+    /// Throw a TypeError as a JS exception (caught by try/catch) or propagate as VmError.
+    pub(crate) fn throw_type_error(&mut self, msg: &str) -> Result<(), VmError> {
+        if let Some(handler) = self.exc_handlers.pop() {
+            let mut err = crate::runtime::object::JsObject::ordinary();
+            let msg_key = self.interner.intern("message");
+            let msg_id = self.interner.intern(msg);
+            err.set_property(msg_key, Value::string(msg_id));
+            let name_key = self.interner.intern("name");
+            let type_error = self.interner.intern("TypeError");
+            err.set_property(name_key, Value::string(type_error));
+            // Also set up prototype chain for instanceof TypeError
+            let proto = self.get_type_error_prototype();
+            if let Some(proto_id) = proto {
+                err.prototype = Some(proto_id);
+            }
+            let oid = self.heap.allocate(err);
+            while self.frames.len() > handler.frame_idx + 1 {
+                self.frames.pop();
+            }
+            self.stack.truncate(handler.stack_depth);
+            self.push(Value::object_id(oid));
+            self.frames.last_mut().unwrap().ip = handler.catch_target as usize;
+            Ok(())
+        } else {
+            Err(VmError::TypeError(msg.to_owned()))
+        }
+    }
+
+    fn get_type_error_prototype(&mut self) -> Option<crate::runtime::object::ObjectId> {
+        let type_error_name = self.interner.intern("TypeError");
+        let proto_key = self.interner.intern("prototype");
+        let ctor = self.globals.get(&type_error_name).copied()?;
+        let oid = ctor.as_object_id()?;
+        self.heap.get(oid)?.get_property(proto_key).and_then(|v| v.as_object_id())
+    }
+
     #[inline(always)]
     pub(crate) fn pop(&mut self) -> Result<Value, VmError> {
         self.stack
@@ -1891,7 +1927,26 @@ impl Vm {
                         }
                     }
 
-                    // Unknown function - pop everything, push undefined
+                    // Only throw TypeError for explicit non-callable primitives.
+                    // Leave undefined alone to avoid breaking unimplemented built-ins.
+                    let is_explicit_nonfunc = func_val.is_null()
+                        || func_val.as_bool().is_some()
+                        || func_val.is_number()
+                        || func_val.is_int()
+                        || (func_val.is_string() && func_val.as_string_id().is_some());
+                    if is_explicit_nonfunc {
+                        let type_name = if func_val.is_null() { "null".to_owned() }
+                            else if let Some(b) = func_val.as_bool() { b.to_string() }
+                            else if func_val.is_string() {
+                                let sid = func_val.as_string_id().unwrap();
+                                format!("\"{}\"", self.interner.resolve(sid))
+                            } else { self.value_to_string(func_val) };
+                        let msg = format!("{type_name} is not a function");
+                        self.stack.truncate(func_pos);
+                        self.throw_type_error(&msg)?;
+                        continue;
+                    }
+                    // Unknown/undefined — silently return undefined
                     self.stack.truncate(func_pos);
                     self.push(Value::undefined());
                 }
@@ -3782,7 +3837,7 @@ impl Vm {
                         continue;
                     }
 
-                    // Generic method call - pop everything, push undefined
+                    // Generic method call fallthrough - push undefined
                     self.stack.truncate(obj_pos);
                     self.push(Value::undefined());
                 }

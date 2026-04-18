@@ -979,6 +979,30 @@ impl Vm {
                 let id = self.interner.intern(&result);
                 Value::string(id)
             }
+            // Error constructors called without `new`
+            -514..=-510 => {
+                let error_type = match sentinel {
+                    -510 => "Error",
+                    -511 => "TypeError",
+                    -512 => "RangeError",
+                    -513 => "ReferenceError",
+                    -514 => "SyntaxError",
+                    _ => "Error",
+                };
+                let msg = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
+                let mut err_obj = crate::runtime::object::JsObject::ordinary();
+                let msg_key = self.interner.intern("message");
+                let msg_id = self.interner.intern(&msg);
+                err_obj.set_property(msg_key, Value::string(msg_id));
+                let name_key = self.interner.intern("name");
+                let name_id = self.interner.intern(error_type);
+                err_obj.set_property(name_key, Value::string(name_id));
+                let stack_key = self.interner.intern("stack");
+                let stack_str = format!("{error_type}: {msg}");
+                let stack_id = self.interner.intern(&stack_str);
+                err_obj.set_property(stack_key, Value::string(stack_id));
+                Value::object_id(self.heap.allocate(err_obj))
+            }
             _ => Value::undefined(),
         }
     }
