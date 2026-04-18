@@ -4713,13 +4713,12 @@ impl Vm {
                         let proto_oid = self.heap.get(class_oid)
                             .and_then(|o| o.get_property(proto_key))
                             .and_then(|v| v.as_object_id());
-                        if let Some(proto_oid) = proto_oid {
-                            if let Some(proto) = self.heap.get_mut(proto_oid) {
+                        if let Some(proto_oid) = proto_oid
+                            && let Some(proto) = self.heap.get_mut(proto_oid) {
                                 proto.define_property(name_id, Property::with_flags(
                                     method_val, Property::WRITABLE | Property::CONFIGURABLE
                                 ));
                             }
-                        }
                     }
                 }
 

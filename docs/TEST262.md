@@ -6,12 +6,14 @@ Run with: `cargo run --release --bin test262_runner`
 
 ## Results
 
-**65.5% pass rate** — 4,239 of 6,476 tests pass (1,227 additional tests skipped).
+**92.3% pass rate** — 9,052 of 9,805 active tests pass (2,760 tests skipped).
 
-### Perfect Scores (100%) — 15 categories
+### Perfect Scores (100%)
 
 | Category | Tests |
 |----------|-------|
+| future-reserved-words | 55 |
+| reserved-words | 25 |
 | literals/numeric | 157 |
 | literals/string | 67 |
 | expressions/coalesce | 22 |
@@ -28,47 +30,52 @@ Run with: `cargo run --release --bin test262_runner`
 | expressions/comma | 4 |
 | statements/empty | 2 |
 
-### Strong Categories (90%+)
+### Major Categories (latest run)
 
 | Category | Total | Pass | Rate |
 |----------|-------|------|------|
-| asi | 102 | 100 | 98.0% |
-| block-scope | 126 | 122 | 96.8% |
-| statements/if | 63 | 60 | 95.2% |
-| expressions/async-function | 37 | 35 | 94.6% |
-| statements/break | 18 | 17 | 94.4% |
-| comments | 27 | 25 | 92.6% |
-| left-shift | 40 | 36 | 90.0% |
-
-### Major Categories
-
-| Category | Total | Pass | Rate |
-|----------|-------|------|------|
-| expressions/assignment | 385 | 249 | 64.7% |
-| expressions/compound-assignment | 443 | 340 | 76.7% |
-| expressions/object | 756 | 237 | 31.3% |
-| expressions/function | 234 | 81 | 34.6% |
-| expressions/arrow-function | 313 | 148 | 47.3% |
-| statements/for | 344 | 105 | 30.5% |
-| statements/for-of | 592 | 381 | 64.4% |
-| statements/try | 184 | 97 | 52.7% |
-| statements/variable | 155 | 100 | 64.5% |
-| statements/switch | 93 | 77 | 82.8% |
-| function-code | 217 | 159 | 73.3% |
-| types | 109 | 87 | 79.8% |
+| statements/class | 1444 | 1308 | 90.6% |
+| statements/for-of | 630 | 562 | 89.2% |
+| statements/function | 412 | 362 | 87.9% |
+| statements/for-in | 113 | 95 | 84.1% |
+| statements/const | 125 | 117 | 93.6% |
+| statements/let | 134 | 125 | 93.3% |
+| expressions/optional-chaining | 31 | 29 | 93.5% |
+| expressions/async-function | 38 | 35 | 92.1% |
+| expressions/array | 40 | 28 | 70.0% |
+| expressions/in | 16 | 9 | 56.2% |
+| expressions/instanceof | 38 | 21 | 55.3% |
+| directive-prologue | 57 | 47 | 82.5% |
 
 ### Skipped Features
 
-Tests requiring these features are skipped (1,227 tests):
-- Proxy, Reflect
-- SharedArrayBuffer, Atomics
-- async iteration, for-await-of
-- dynamic import, import.meta
-- Various stage 3/4 proposals (decorators, explicit resource management, etc.)
+Tests requiring these features are currently skipped (2,760 tests):
+
+- `Proxy`, `Reflect`
+- `SharedArrayBuffer`, `Atomics`
+- Async iteration, `for-await-of`
+- Dynamic `import()`, `import.meta`
+- `Intl`, `Temporal`
+- `WeakRef`, `FinalizationRegistry`
+- Private class field brand checks (`#x in obj`)
+- Regex advanced features (named groups, lookbehind, dotall, unicode properties)
+- Logical assignment operators (`&&=`, `||=`, `??=`)
+- Class static blocks
+- Various stage 3/4 proposals (decorators, explicit resource management, iterator helpers, set methods)
+- ES Modules
+
+### History
+
+| Version | Active Tests | Passing | Rate |
+|---------|-------------|---------|------|
+| v0.1.0  | ~4,000      | ~2,600  | 65.5% |
+| v0.2.0  | 6,476       | 5,461   | 84.3% |
+| v0.3.0  | 9,805       | 9,052   | 92.3% |
 
 ### Running
 
 ```bash
 git clone --depth 1 https://github.com/nicolo-ribaudo/test262.git
 cargo run --release --bin test262_runner
+cargo run --release --bin test262_runner -- -o failures.log  # save failures
 ```
