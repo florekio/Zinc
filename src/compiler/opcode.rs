@@ -502,8 +502,6 @@ impl OpCode {
             | OpCode::GetGlobal
             | OpCode::SetGlobal
             | OpCode::DefineGlobal
-            | OpCode::GetProperty
-            | OpCode::SetProperty
             | OpCode::GetElement
             | OpCode::SetElement
             | OpCode::GetSuper
@@ -524,6 +522,9 @@ impl OpCode {
             | OpCode::ExportAllFrom
             | OpCode::SetFunctionName
             | OpCode::CollectRest => 3,
+
+            // 5 bytes: opcode + u16 name_idx + u16 ic_slot
+            OpCode::GetProperty | OpCode::SetProperty => 5,
 
             // 4 bytes (u16 + u16)
             OpCode::PushExcHandler | OpCode::GetModuleVar => 5,

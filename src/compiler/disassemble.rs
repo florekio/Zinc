@@ -119,7 +119,14 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
             offset + 3
         }
 
-        OpCode::GetProperty | OpCode::SetProperty | OpCode::GetSuper
+        OpCode::GetProperty | OpCode::SetProperty => {
+            let idx = chunk.read_u16(offset + 1);
+            let ic = chunk.read_u16(offset + 3);
+            out.push_str(&format!("{op:<20} [{idx}] ic:{ic}\n"));
+            offset + 5
+        }
+
+        OpCode::GetSuper
         | OpCode::GetPrivate | OpCode::SetPrivate
         | OpCode::DefineMethod | OpCode::Class
         | OpCode::ClassStaticMethod | OpCode::ClassMethod

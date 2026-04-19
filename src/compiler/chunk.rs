@@ -46,6 +46,12 @@ pub struct Chunk {
     pub child_chunks: Vec<Chunk>,
     /// Absolute chunk indices of direct children (filled during VM flattening).
     pub children: Vec<usize>,
+    /// Monomorphic property inline cache: one byte per GetProperty/SetProperty callsite.
+    /// Index via ic_slot embedded in the instruction. 0xFF = cold (not yet cached).
+    /// Value = index into obj.properties Vec at the last successful lookup.
+    pub property_ic: Vec<u8>,
+    /// Number of IC slots allocated so far for this chunk.
+    pub ic_slot_count: u16,
 }
 
 /// Describes how a closure captures one upvalue.
@@ -93,7 +99,18 @@ impl Chunk {
             exception_handlers: Vec::new(),
             child_chunks: Vec::new(),
             children: Vec::new(),
+            property_ic: Vec::new(),
+            ic_slot_count: 0,
         }
+    }
+
+    /// Allocate an IC slot for a GetProperty/SetProperty instruction.
+    /// Returns the slot index (to be embedded in bytecode).
+    pub fn alloc_ic_slot(&mut self) -> u16 {
+        let slot = self.ic_slot_count;
+        self.ic_slot_count += 1;
+        self.property_ic.push(0xFF); // 0xFF = cold
+        slot
     }
 
     // ---- Emit helpers ----

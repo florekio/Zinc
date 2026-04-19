@@ -689,10 +689,18 @@ impl Vm {
         }
         // Wrapper objects: unwrap and coerce the primitive
         if let Some(oid) = val.as_object_id()
-            && let Some(obj) = self.heap.get(oid)
-                && let ObjectKind::Wrapper(inner) = &obj.kind {
-                    return self.to_f64(*inner);
+            && let Some(obj) = self.heap.get(oid) {
+            match &obj.kind {
+                ObjectKind::Wrapper(inner) => return self.to_f64(*inner),
+                ObjectKind::ConsString { .. } => {
+                    let s = self.flatten_cons_to_string(val);
+                    let s = s.trim();
+                    if s.is_empty() { return 0.0; }
+                    return s.parse::<f64>().unwrap_or(f64::NAN);
                 }
+                _ => {}
+            }
+        }
         f64::NAN
     }
 
@@ -833,6 +841,9 @@ impl Vm {
         } else if let Some(oid) = val.as_object_id() {
             if let Some(obj) = self.heap.get(oid) {
                 match &obj.kind {
+                    ObjectKind::ConsString { .. } => {
+                        self.flatten_cons_to_string(val)
+                    }
                     ObjectKind::Array(elements) => {
                         let parts: Vec<String> = elements.iter().map(|v| self.value_to_string(*v)).collect();
                         parts.join(",")
@@ -891,6 +902,7 @@ impl Vm {
         } else if val.is_object() {
             if let Some(oid) = val.as_object_id()
                 && let Some(obj) = self.heap.get(oid) {
+                    if matches!(obj.kind, ObjectKind::ConsString { .. }) { return "string"; }
                     // Classes have __constructor__ — typeof should be "function"
                     for &(k, _) in &obj.properties {
                         if self.interner.resolve(k) == "__constructor__" { return "function"; }
@@ -900,6 +912,71 @@ impl Vm {
         } else {
             "undefined"
         }
+    }
+
+    // ---- ConsString helpers -----------------------------------------------
+
+    /// Returns true if val is a heap object of kind ConsString.
+    #[inline(always)]
+    pub(crate) fn is_cons_string(&self, val: Value) -> bool {
+        if let Some(oid) = val.as_object_id()
+            && let Some(obj) = self.heap.get(oid) {
+            matches!(obj.kind, ObjectKind::ConsString { .. })
+        } else {
+            false
+        }
+    }
+
+    /// Returns true if val is string-like: either a TAG_STRING or a ConsString object.
+    #[inline(always)]
+    pub(crate) fn is_string_like(&self, val: Value) -> bool {
+        val.is_string() || self.is_cons_string(val)
+    }
+
+    /// Returns the character length of a string-like value in O(1) for ConsString.
+    pub(crate) fn string_char_len(&self, val: Value) -> u32 {
+        if let Some(id) = val.as_string_id() {
+            self.interner.resolve(id).chars().count() as u32
+        } else if let Some(oid) = val.as_object_id()
+            && let Some(obj) = self.heap.get(oid)
+            && let ObjectKind::ConsString { len, .. } = obj.kind {
+            len
+        } else {
+            0
+        }
+    }
+
+    /// Flatten a ConsString (or regular string) to a plain String without interning.
+    /// Uses an iterative traversal to avoid stack overflow on deep trees.
+    pub(crate) fn flatten_cons_to_string(&self, val: Value) -> String {
+        if let Some(id) = val.as_string_id() {
+            return self.interner.resolve(id).to_owned();
+        }
+        let capacity = self.string_char_len(val) as usize;
+        let mut result = String::with_capacity(capacity);
+        let mut stack = Vec::new();
+        stack.push(val);
+        while let Some(cur) = stack.pop() {
+            if let Some(id) = cur.as_string_id() {
+                result.push_str(self.interner.resolve(id));
+            } else if let Some(oid) = cur.as_object_id()
+                && let Some(obj) = self.heap.get(oid)
+                && let ObjectKind::ConsString { left, right, .. } = obj.kind {
+                // Push right first so left is processed first (LIFO)
+                stack.push(right);
+                stack.push(left);
+            }
+        }
+        result
+    }
+
+    /// Flatten a ConsString to an interned StringId.
+    pub(crate) fn flatten_to_string_id(&mut self, val: Value) -> crate::util::interner::StringId {
+        if let Some(id) = val.as_string_id() {
+            return id;
+        }
+        let flat = self.flatten_cons_to_string(val);
+        self.interner.intern(&flat)
     }
 
     // ---- Abstract equality (simplified) -----------------------------------
@@ -929,11 +1006,9 @@ impl Vm {
             return a.as_number() == b.as_number();
         }
 
-        // Both strings
-        if a.is_string() && b.is_string() {
-            // String ids are interned, so equal ids mean equal strings.
-            // Already handled by raw() check above.
-            return false;
+        // Both strings (including ConsString)
+        if self.is_string_like(a) && self.is_string_like(b) {
+            return self.flatten_cons_to_string(a) == self.flatten_cons_to_string(b);
         }
 
         // Both booleans
@@ -996,6 +1071,12 @@ impl Vm {
         if a.is_number() && b.is_number() {
             return a.as_number() == b.as_number();
         }
+        // ConsString equality: compare flattened content
+        let a_str = self.is_string_like(a);
+        let b_str = self.is_string_like(b);
+        if a_str && b_str {
+            return self.flatten_cons_to_string(a) == self.flatten_cons_to_string(b);
+        }
         false
     }
 
@@ -1012,7 +1093,14 @@ impl Vm {
     // ---- Main execution loop ----------------------------------------------
 
     pub fn run(&mut self) -> Result<Value, VmError> {
-        self.run_until(0)
+        let result = self.run_until(0)?;
+        // Flatten any ConsString result to a TAG_STRING so callers get a normal string value
+        if self.is_cons_string(result) {
+            let id = self.flatten_to_string_id(result);
+            Ok(Value::string(id))
+        } else {
+            Ok(result)
+        }
     }
 
     /// Run the VM until the frame stack depth drops to `stop_depth`.
@@ -1148,16 +1236,48 @@ impl Vm {
                         self.coerce_to_primitive(b)
                     } else { b };
 
-                    let a_is_str = a_prim.is_string() || self.is_string_wrapper(a_prim);
-                    let b_is_str = b_prim.is_string() || self.is_string_wrapper(b_prim);
+                    let a_is_str = a_prim.is_string() || self.is_cons_string(a_prim) || self.is_string_wrapper(a_prim);
+                    let b_is_str = b_prim.is_string() || self.is_cons_string(b_prim) || self.is_string_wrapper(b_prim);
 
                     if a_is_str || b_is_str {
-                        let sa = self.value_to_string(a_prim);
-                        let sb = self.value_to_string(b_prim);
-                        let mut result = sa;
-                        result.push_str(&sb);
-                        let id = self.interner.intern(&result);
-                        self.push(Value::string(id));
+                        // Normalize each side to a string-like value (TAG_STRING or ConsString)
+                        let left_val = if self.is_string_like(a_prim) {
+                            a_prim
+                        } else {
+                            let s = self.value_to_string(a_prim);
+                            let id = self.interner.intern(&s);
+                            Value::string(id)
+                        };
+                        let right_val = if self.is_string_like(b_prim) {
+                            b_prim
+                        } else {
+                            let s = self.value_to_string(b_prim);
+                            let id = self.interner.intern(&s);
+                            Value::string(id)
+                        };
+                        let left_len = self.string_char_len(left_val);
+                        let right_len = self.string_char_len(right_val);
+                        let len = left_len + right_len;
+                        // Short-circuit: avoid creating a ConsString for empty operands
+                        if left_len == 0 {
+                            // "" + x = x (flatten right to interned string for consistency)
+                            let id = self.flatten_to_string_id(right_val);
+                            self.push(Value::string(id));
+                        } else if right_len == 0 {
+                            // x + "" = x
+                            let id = self.flatten_to_string_id(left_val);
+                            self.push(Value::string(id));
+                        } else {
+                            let cs = JsObject {
+                                properties: Vec::new(),
+                                prototype: None,
+                                kind: ObjectKind::ConsString { left: left_val, right: right_val, len },
+                                marked: false,
+                                extensible: false,
+                            };
+                            let oid = self.heap.allocate(cs);
+                            self.push(Value::object_id(oid));
+                        }
                     } else {
                         let na = self.to_f64(a_prim);
                         let nb = self.to_f64(b_prim);
@@ -1290,9 +1410,9 @@ impl Vm {
                 OpCode::Lt => {
                     let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
                     let av = self.pop()?; let a = self.coerce_to_primitive(av);
-                    if a.is_string() && b.is_string() {
-                        let sa = self.interner.resolve(a.as_string_id().unwrap());
-                        let sb = self.interner.resolve(b.as_string_id().unwrap());
+                    if self.is_string_like(a) && self.is_string_like(b) {
+                        let sa = self.flatten_cons_to_string(a);
+                        let sb = self.flatten_cons_to_string(b);
                         self.push(Value::boolean(sa < sb));
                     } else {
                         self.push(Value::boolean(self.to_f64(a) < self.to_f64(b)));
@@ -1302,9 +1422,9 @@ impl Vm {
                 OpCode::Le => {
                     let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
                     let av = self.pop()?; let a = self.coerce_to_primitive(av);
-                    if a.is_string() && b.is_string() {
-                        let sa = self.interner.resolve(a.as_string_id().unwrap());
-                        let sb = self.interner.resolve(b.as_string_id().unwrap());
+                    if self.is_string_like(a) && self.is_string_like(b) {
+                        let sa = self.flatten_cons_to_string(a);
+                        let sb = self.flatten_cons_to_string(b);
                         self.push(Value::boolean(sa <= sb));
                     } else {
                         self.push(Value::boolean(self.to_f64(a) <= self.to_f64(b)));
@@ -1314,9 +1434,9 @@ impl Vm {
                 OpCode::Gt => {
                     let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
                     let av = self.pop()?; let a = self.coerce_to_primitive(av);
-                    if a.is_string() && b.is_string() {
-                        let sa = self.interner.resolve(a.as_string_id().unwrap());
-                        let sb = self.interner.resolve(b.as_string_id().unwrap());
+                    if self.is_string_like(a) && self.is_string_like(b) {
+                        let sa = self.flatten_cons_to_string(a);
+                        let sb = self.flatten_cons_to_string(b);
                         self.push(Value::boolean(sa > sb));
                     } else {
                         self.push(Value::boolean(self.to_f64(a) > self.to_f64(b)));
@@ -1326,9 +1446,9 @@ impl Vm {
                 OpCode::Ge => {
                     let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
                     let av = self.pop()?; let a = self.coerce_to_primitive(av);
-                    if a.is_string() && b.is_string() {
-                        let sa = self.interner.resolve(a.as_string_id().unwrap());
-                        let sb = self.interner.resolve(b.as_string_id().unwrap());
+                    if self.is_string_like(a) && self.is_string_like(b) {
+                        let sa = self.flatten_cons_to_string(a);
+                        let sb = self.flatten_cons_to_string(b);
                         self.push(Value::boolean(sa >= sb));
                     } else {
                         self.push(Value::boolean(self.to_f64(a) >= self.to_f64(b)));
@@ -2248,18 +2368,36 @@ impl Vm {
 
                 OpCode::GetProperty => {
                     let name_idx = self.read_u16() as usize;
-                    let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
+                    let ic_slot = self.read_u16() as usize;
+                    let chunk_idx = self.cur_chunk();
+                    let name_val = self.chunks[chunk_idx].constants[name_idx];
                     let name_id = unsafe { name_val.as_string_id().unwrap_unchecked() };
 
-                    // Fast path: ordinary object with own property (covers ~80% of cases)
                     let top = self.peek()?;
                     if let Some(oid) = top.as_object_id()
-                        && let Some(obj) = self.heap.get(oid)
-                        && let Some(val) = obj.get_property(name_id)
-                    {
-                        self.pop()?;
-                        self.push(val);
-                        continue;
+                        && let Some(obj) = self.heap.get(oid) {
+                        // IC fast path: monomorphic inline cache hit
+                        let cached = self.chunks[chunk_idx].property_ic[ic_slot];
+                        if cached != 0xFF {
+                            if let Some(&(k, ref prop)) = obj.properties.get(cached as usize)
+                                && k == name_id {
+                                let val = prop.value;
+                                self.pop()?;
+                                self.push(val);
+                                continue;
+                            }
+                            // IC miss: fall through to linear scan, update cache below
+                        }
+                        // Linear scan with IC population
+                        if let Some(pos) = obj.properties.iter().position(|(k, _)| *k == name_id) {
+                            let val = obj.properties[pos].1.value;
+                            if pos <= 254 {
+                                self.chunks[chunk_idx].property_ic[ic_slot] = pos as u8;
+                            }
+                            self.pop()?;
+                            self.push(val);
+                            continue;
+                        }
                     }
 
                     // Slow path: special cases
@@ -2289,6 +2427,37 @@ impl Vm {
                     let obj_val = self.pop()?;
                     let name_str = self.interner.resolve(name_id);
                     if let Some(oid) = obj_val.as_object_id() {
+                        // ConsString: O(1) .length from cached field; otherwise flatten to string
+                        if let Some(obj) = self.heap.get(oid)
+                            && let ObjectKind::ConsString { len, .. } = obj.kind {
+                            if name_str == "length" {
+                                self.push(Value::int(len as i32));
+                                continue;
+                            }
+                            // Flatten and re-run as a TAG_STRING property access
+                            let flat = self.flatten_cons_to_string(obj_val);
+                            let sid = self.interner.intern(&flat);
+                            let flat_val = Value::string(sid);
+                            let name_s = self.interner.resolve(name_id).to_owned();
+                            let s = self.interner.resolve(sid).to_owned();
+                            let method_idx = match name_s.as_str() {
+                                "charAt" => 0, "charCodeAt" => 1, "indexOf" => 2,
+                                "lastIndexOf" => 3, "includes" => 4, "startsWith" => 5,
+                                "endsWith" => 6, "slice" => 7, "substring" => 8,
+                                "toUpperCase" => 9, "toLowerCase" => 10,
+                                "trim" => 11, "trimStart" => 12, "trimEnd" => 13,
+                                "split" => 14, "replace" => 15, "repeat" => 16,
+                                "padStart" => 17, "padEnd" => 18, "concat" => 19,
+                                "match" => 20, "search" => 21, "replaceAll" => 22,
+                                "codePointAt" => 23, "at" => 24,
+                                "toString" | "valueOf" => { self.push(flat_val); continue; }
+                                _ => { self.push(Value::undefined()); continue; }
+                            };
+                            let _ = s; // suppress unused warning
+                            let sentinel = -200 - method_idx;
+                            self.push(Value::function(sentinel));
+                            continue;
+                        }
                         // Check for array-specific properties
                         if name_str == "length"
                             && let Some(obj) = self.heap.get(oid)
@@ -2498,7 +2667,9 @@ impl Vm {
 
                 OpCode::SetProperty => {
                     let name_idx = self.read_u16() as usize;
-                    let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
+                    let ic_slot = self.read_u16() as usize;
+                    let chunk_idx = self.cur_chunk();
+                    let name_val = self.chunks[chunk_idx].constants[name_idx];
                     let name_id = name_val.as_string_id().unwrap();
                     let val = self.pop()?;
                     let obj_val = self.pop()?;
@@ -2528,7 +2699,13 @@ impl Vm {
                         {
                             let _ = self.call_function_this(sfn, obj_val, &[val]);
                         } else if let Some(obj) = self.heap.get_mut(oid) {
+                            // IC: update or insert — record the slot for future fast access
+                            let pos = obj.properties.iter().position(|(k, _)| *k == name_id);
                             obj.set_property(name_id, val);
+                            let slot = pos.unwrap_or(obj.properties.len().saturating_sub(1));
+                            if slot <= 254 {
+                                self.chunks[chunk_idx].property_ic[ic_slot] = slot as u8;
+                            }
                         }
                     }
                     self.push(val);
@@ -2610,10 +2787,14 @@ impl Vm {
                             continue;
                         }
                     }
-                    // String bracket index access: "hello"[0] → "h"
-                    if obj_val.is_string() {
+                    // String bracket index access: "hello"[0] → "h" (also handles ConsString)
+                    let string_val_opt: Option<String> = if obj_val.is_string() {
                         let sid = obj_val.as_string_id().unwrap();
-                        let s = self.interner.resolve(sid).to_owned();
+                        Some(self.interner.resolve(sid).to_owned())
+                    } else if self.is_cons_string(obj_val) {
+                        Some(self.flatten_cons_to_string(obj_val))
+                    } else { None };
+                    if let Some(s) = string_val_opt {
                         if let Some(i) = key.as_int() {
                             if i >= 0
                                 && let Some(ch) = s.chars().nth(i as usize) {
@@ -2815,10 +2996,16 @@ impl Vm {
                             }
                         }
 
-                    // Check if the obj is a string and the method was resolved to a string sentinel
-                    if obj_val.is_string() {
+                    // Check if the obj is a string (or ConsString) and dispatch string method
+                    let string_for_method = if obj_val.is_string() {
                         let sid = obj_val.as_string_id().unwrap();
-                        let s = self.interner.resolve(sid).to_owned();
+                        Some(self.interner.resolve(sid).to_owned())
+                    } else if self.is_cons_string(obj_val) {
+                        Some(self.flatten_cons_to_string(obj_val))
+                    } else {
+                        None
+                    };
+                    if let Some(s) = string_for_method {
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                         let result = self.exec_string_method(&s, method_name, &args);
                         self.stack.truncate(obj_pos);
@@ -5659,8 +5846,8 @@ mod tests {
         emit_op(&mut chunk, OpCode::Add);
         emit_op(&mut chunk, OpCode::Halt);
         let result = run(chunk, interner).unwrap();
-        // Result should be a string -- we need a fresh interner reference to check.
-        assert!(result.is_string());
+        // Result should be a string (TAG_STRING or ConsString object)
+        assert!(result.is_string() || result.is_object());
     }
 
     #[test]

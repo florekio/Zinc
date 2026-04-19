@@ -138,6 +138,9 @@ pub enum ObjectKind {
     },
     /// Date: milliseconds since UNIX epoch
     Date(f64),
+    /// Lazy concatenated string. Left and right are either TAG_STRING (StringId)
+    /// or another ConsString ObjectId. `len` caches the total char count for O(1) .length.
+    ConsString { left: Value, right: Value, len: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -362,6 +365,10 @@ impl ObjectHeap {
             }
             ObjectKind::WeakSet { .. } => {
                 // Do not trace entries (weak references)
+            }
+            ObjectKind::ConsString { left, right, .. } => {
+                if let Some(oid) = trace_value(*left) { refs.push(oid); }
+                if let Some(oid) = trace_value(*right) { refs.push(oid); }
             }
             ObjectKind::Ordinary
             | ObjectKind::KeyIterator(_, _)

@@ -1123,6 +1123,8 @@ impl Vm {
     /// Unwrap a wrapper object to its primitive, or return the value as-is.
     /// ToPrimitive with valueOf/toString calls.
     pub(crate) fn coerce_to_primitive(&mut self, val: Value) -> Value {
+        // ConsString is already a string primitive — no coercion needed
+        if self.is_cons_string(val) { return val; }
         self.coerce_to_primitive_hint(val, "default")
     }
 

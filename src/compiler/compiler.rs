@@ -179,6 +179,26 @@ impl<'a> Compiler<'a> {
         self.chunk.emit_op_u16(OpCode::Const, idx, line);
     }
 
+    /// Emit GetProperty with an embedded IC slot (5 bytes total).
+    fn emit_get_property(&mut self, name_idx: u16, line: u32) {
+        let ic_slot = self.chunk.alloc_ic_slot();
+        self.chunk.emit_byte(OpCode::GetProperty as u8, line);
+        self.chunk.code.push((name_idx >> 8) as u8);
+        self.chunk.code.push((name_idx & 0xFF) as u8);
+        self.chunk.code.push((ic_slot >> 8) as u8);
+        self.chunk.code.push((ic_slot & 0xFF) as u8);
+    }
+
+    /// Emit SetProperty with an embedded IC slot (5 bytes total).
+    fn emit_set_property(&mut self, name_idx: u16, line: u32) {
+        let ic_slot = self.chunk.alloc_ic_slot();
+        self.chunk.emit_byte(OpCode::SetProperty as u8, line);
+        self.chunk.code.push((name_idx >> 8) as u8);
+        self.chunk.code.push((name_idx & 0xFF) as u8);
+        self.chunk.code.push((ic_slot >> 8) as u8);
+        self.chunk.code.push((ic_slot & 0xFF) as u8);
+    }
+
     /// How many locals sit above the given scope depth?
     fn locals_above_depth(&self, depth: u32) -> usize {
         self.locals
@@ -797,9 +817,7 @@ impl<'a> Compiler<'a> {
                                     && let PropertyKey::Identifier(k) = &p.key {
                                         self.chunk.emit_op(OpCode::Dup, line);
                                         let key_idx = self.make_string_constant(*k);
-                                        self.chunk.emit_byte(OpCode::GetProperty as u8, line);
-                                        self.chunk.code.push((key_idx >> 8) as u8);
-                                        self.chunk.code.push((key_idx & 0xFF) as u8);
+                                        self.emit_get_property(key_idx, line);
                                         self.compile_set_variable(id.name, line)?;
                                         self.chunk.emit_op(OpCode::Pop, line);
                                     }
@@ -1135,7 +1153,7 @@ impl<'a> Compiler<'a> {
                     match key {
                         PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => {
                             let idx = self.make_string_constant(*id);
-                            self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                            self.emit_get_property(idx, line);
                         }
                         PropertyKey::Computed(expr) => {
                             self.compile_expr(expr)?;
@@ -1241,7 +1259,7 @@ impl<'a> Compiler<'a> {
                     match key {
                         PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => {
                             let idx = self.make_string_constant(*id);
-                            self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                            self.emit_get_property(idx, line);
                         }
                         PropertyKey::Computed(expr) => {
                             self.compile_expr(expr)?;
@@ -1340,7 +1358,7 @@ impl<'a> Compiler<'a> {
                             match key {
                                 PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => {
                                     let idx = self.make_string_constant(*id);
-                                    self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                                    self.emit_get_property(idx, line);
                                 }
                                 PropertyKey::Computed(expr) => {
                                     self.compile_expr(expr)?;
@@ -1656,14 +1674,14 @@ impl<'a> Compiler<'a> {
                                 self.chunk.emit_op(OpCode::Dup, line);
                                 let key = self.interner.intern("default");
                                 let idx = self.make_string_constant(key);
-                                self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                                self.emit_get_property(idx, line);
                                 let name_idx = self.make_string_constant(*local);
                                 self.chunk.emit_op_u16(OpCode::DefineGlobal, name_idx, line);
                             }
                             ImportSpecifier::Named { imported, local, .. } => {
                                 self.chunk.emit_op(OpCode::Dup, line);
                                 let idx = self.make_string_constant(*imported);
-                                self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                                self.emit_get_property(idx, line);
                                 let name_idx = self.make_string_constant(*local);
                                 self.chunk.emit_op_u16(OpCode::DefineGlobal, name_idx, line);
                             }
@@ -1701,9 +1719,7 @@ impl<'a> Compiler<'a> {
                     // Stack: [value, exports_obj]
                     // Need: SetProperty on exports_obj
                     self.chunk.emit_op(OpCode::Swap, line);
-                    self.chunk.emit_byte(OpCode::SetProperty as u8, line);
-                    self.chunk.code.push((name_idx >> 8) as u8);
-                    self.chunk.code.push((name_idx & 0xFF) as u8);
+                    self.emit_set_property(name_idx, line);
                     self.chunk.emit_op(OpCode::Pop, line);
                 }
             }
@@ -1719,9 +1735,7 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::Swap, line);
                 let default_key = self.interner.intern("default");
                 let default_idx = self.make_string_constant(default_key);
-                self.chunk.emit_byte(OpCode::SetProperty as u8, line);
-                self.chunk.code.push((default_idx >> 8) as u8);
-                self.chunk.code.push((default_idx & 0xFF) as u8);
+                self.emit_set_property(default_idx, line);
                 self.chunk.emit_op(OpCode::Pop, line);
             }
             ExportDeclaration::Named { specifiers, span, .. } => {
@@ -1734,9 +1748,7 @@ impl<'a> Compiler<'a> {
                     self.chunk.emit_op_u16(OpCode::GetGlobal, local_idx, line);
                     let exported_idx = self.make_string_constant(spec.exported);
                     self.chunk.emit_op(OpCode::Swap, line);
-                    self.chunk.emit_byte(OpCode::SetProperty as u8, line);
-                    self.chunk.code.push((exported_idx >> 8) as u8);
-                    self.chunk.code.push((exported_idx & 0xFF) as u8);
+                    self.emit_set_property(exported_idx, line);
                     self.chunk.emit_op(OpCode::Pop, line);
                 }
             }
@@ -1908,7 +1920,7 @@ impl<'a> Compiler<'a> {
                             match key {
                                 PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => {
                                     let idx = self.make_string_constant(*id);
-                                    self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                                    self.emit_get_property(idx, line);
                                 }
                                 PropertyKey::Computed(expr) => {
                                     self.compile_expr(expr)?;
@@ -2575,15 +2587,15 @@ impl<'a> Compiler<'a> {
                     MemberProperty::Identifier(name) => {
                         let idx = self.make_string_constant(*name);
                         self.chunk.emit_op(OpCode::Dup, line);
-                        self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                        self.emit_get_property(idx, line);
                         if u.prefix {
                             self.chunk.emit_op(inc_op, line);
-                            self.chunk.emit_op_u16(OpCode::SetProperty, idx, line);
+                            self.emit_set_property(idx, line);
                         } else {
                             self.chunk.emit_op(OpCode::Dup, line);
                             self.chunk.emit_op(OpCode::Rot3, line);
                             self.chunk.emit_op(inc_op, line);
-                            self.chunk.emit_op_u16(OpCode::SetProperty, idx, line);
+                            self.emit_set_property(idx, line);
                             self.chunk.emit_op(OpCode::Pop, line);
                         }
                     }
@@ -2743,7 +2755,7 @@ impl<'a> Compiler<'a> {
                                 };
                                 self.chunk.emit_op(OpCode::Dup, line);
                                 let key_idx = self.make_string_constant(key_sid);
-                                self.chunk.emit_op_u16(OpCode::GetProperty, key_idx, line);
+                                self.emit_get_property(key_idx, line);
                                 match value {
                                     Pattern::Identifier(id) => {
                                         self.compile_set_variable(id.name, line)?;
@@ -2794,13 +2806,13 @@ impl<'a> Compiler<'a> {
                 let idx = self.make_string_constant(*name);
                 if op != AssignmentOperator::Assign {
                     self.chunk.emit_op(OpCode::Dup, line);
-                    self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                    self.emit_get_property(idx, line);
                     self.compile_expr(rhs)?;
                     self.emit_compound_arith(op, line)?;
                 } else {
                     self.compile_expr(rhs)?;
                 }
-                self.chunk.emit_op_u16(OpCode::SetProperty, idx, line);
+                self.emit_set_property(idx, line);
             }
             MemberProperty::Expression(key) => {
                 self.compile_expr(key)?;
@@ -2873,7 +2885,7 @@ impl<'a> Compiler<'a> {
             match &m.property {
                 MemberProperty::Identifier(name) => {
                     let idx = self.make_string_constant(*name);
-                    self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                    self.emit_get_property(idx, line);
                 }
                 MemberProperty::Expression(key) => {
                     self.compile_expr(key)?;
@@ -2888,7 +2900,7 @@ impl<'a> Compiler<'a> {
         match &m.property {
             MemberProperty::Identifier(name) => {
                 let idx = self.make_string_constant(*name);
-                self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                self.emit_get_property(idx, line);
             }
             MemberProperty::Expression(key) => {
                 self.compile_expr(key)?;
@@ -2917,7 +2929,7 @@ impl<'a> Compiler<'a> {
                     // Get the method from super class
                     self.chunk.emit_op(OpCode::GetSuperClass, line);
                     let idx = self.make_string_constant(*name);
-                    self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                    self.emit_get_property(idx, line);
                     // Push args
                     for arg in &c.arguments {
                         self.compile_expr(arg)?;
@@ -3264,7 +3276,7 @@ impl<'a> Compiler<'a> {
                     match property {
                         MemberProperty::Identifier(id) => {
                             let idx = self.make_string_constant(*id);
-                            self.chunk.emit_op_u16(OpCode::GetProperty, idx, line);
+                            self.emit_get_property(idx, line);
                         }
                         MemberProperty::Expression(e) => {
                             self.compile_expr(e)?;
