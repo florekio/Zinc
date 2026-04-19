@@ -21,6 +21,8 @@ pub const X23: u32 = 23; // callee-saved, extra temp
 pub const X24: u32 = 24; // callee-saved, extra local
 pub const X25: u32 = 25; // callee-saved, extra local
 pub const X26: u32 = 26; // callee-saved, extra local
+pub const X27: u32 = 27; // callee-saved, globals pointer (partial JIT)
+pub const X28: u32 = 28; // callee-saved, scratch
 pub const X29: u32 = 29; // frame pointer
 pub const X30: u32 = 30; // link register (return address)
 pub const SP: u32 = 31;  // stack pointer (in some encodings)
@@ -311,6 +313,11 @@ impl Assembler {
     pub fn ldr_imm(&mut self, rt: u32, rn: u32, imm12: u32) {
         let scaled = imm12 / 8;
         self.emit(0xF9400000 | (scaled << 10) | (rn << 5) | rt);
+    }
+
+    /// SXTW Xd, Wn — sign-extend the low 32 bits of Xn into Xd (SBFM Xd, Xn, #0, #31)
+    pub fn sxtw(&mut self, rd: u32, rn: u32) {
+        self.emit(0x93407C00 | (rn << 5) | rd);
     }
 
     // ---- Patch helpers ----

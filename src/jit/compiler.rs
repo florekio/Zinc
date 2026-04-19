@@ -4,6 +4,7 @@
 /// branches, and recursive calls. No objects, strings, closures, or GC.
 use crate::compiler::chunk::Chunk;
 use crate::compiler::opcode::OpCode;
+use crate::runtime::value::Value;
 
 use super::arm64::*;
 use super::executable_memory::ExecutableBuffer;
@@ -28,6 +29,11 @@ impl JitFunction {
     /// Call the JIT-compiled function with three integer arguments.
     pub fn call3(&self, arg0: i64, arg1: i64, arg2: i64) -> i64 {
         unsafe { (self.buffer.as_fn3())(arg0, arg1, arg2) }
+    }
+
+    /// Call a globals-only JIT function: takes a pointer to the compact i64 globals buffer.
+    pub fn call_globals(&self, globals: *mut i64) {
+        unsafe { (self.buffer.as_fn_globals())(globals) }
     }
 
     /// How many parameters does the JIT function expect?
@@ -1051,4 +1057,463 @@ fn can_jit(chunk: &Chunk) -> bool {
         ip += op.instruction_size();
     }
     true
+}
+
+// ============================================================
+// Partial JIT: top-level scripts with global variable loops
+// ============================================================
+
+/// Find the bytecode boundary for partial JIT of a top-level chunk.
+///
+/// Returns the ip immediately after the last `Loop` opcode that appears in a
+/// JIT-able sequence.  Everything from 0 to (boundary - 1) will be JIT-compiled;
+/// the interpreter resumes at `boundary`, which is exactly where the loop's
+/// JumpIfFalse exit jumps.  Returns 0 if no suitable loop was found.
+fn find_jit_boundary(chunk: &Chunk, globals_vec: &[Value]) -> usize {
+    let code = &chunk.code;
+    let mut ip = 0;
+    let mut last_loop_end: usize = 0; // ip just after the most recent Loop opcode
+    while ip < code.len() {
+        let op = match OpCode::from_byte(code[ip]) {
+            Some(op) => op,
+            None => break,
+        };
+        match op {
+            // Loop opcode: update the "end" pointer and keep scanning for outer loops
+            OpCode::Loop => { last_loop_end = ip + op.instruction_size(); }
+            // These opcodes are always JIT-able
+            OpCode::Nop | OpCode::Halt
+            | OpCode::Zero | OpCode::One | OpCode::True | OpCode::False | OpCode::Undefined
+            | OpCode::Const | OpCode::Pop
+            | OpCode::GetLocal | OpCode::SetLocal
+            | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Rem
+            | OpCode::Neg | OpCode::Inc | OpCode::Dec
+            | OpCode::BitAnd | OpCode::BitOr | OpCode::BitXor | OpCode::BitNot
+            | OpCode::Shl | OpCode::Shr | OpCode::UShr
+            | OpCode::Lt | OpCode::Le | OpCode::Gt | OpCode::Ge
+            | OpCode::Eq | OpCode::Ne | OpCode::StrictEq | OpCode::StrictNe
+            | OpCode::JumpIfFalse | OpCode::JumpIfTrue | OpCode::Jump
+            | OpCode::Return | OpCode::ReturnUndefined
+            | OpCode::SetGlobal | OpCode::DefineGlobal => {}
+            // GetGlobal: ok unless the current value is a non-numeric object/function
+            OpCode::GetGlobal => {
+                let name_idx = chunk.read_u16(ip + 1) as usize;
+                if name_idx < chunk.constants.len() {
+                    if let Some(name_id) = chunk.constants[name_idx].as_string_id() {
+                        let slot = name_id.0 as usize;
+                        let val = if slot < globals_vec.len() { globals_vec[slot] } else { Value::null() };
+                        if val.is_object() || val.is_string() || val.is_function() || val.is_symbol() {
+                            break; // stop scanning — but use last_loop_end as boundary
+                        }
+                    }
+                }
+            }
+            // Function calls make the JIT unsafe (side effects, object mutation, wrong globals)
+            OpCode::Call | OpCode::CallMethod | OpCode::SpreadCall | OpCode::Construct | OpCode::SpreadConstruct => return 0,
+            _ => break, // non-JIT-able opcode
+        }
+        ip += op.instruction_size();
+    }
+    last_loop_end
+}
+
+/// Collect the unique StringId.0 values for all globals in [0, max_ip),
+/// in order of first occurrence. These become the compact index 0, 1, 2, ...
+fn scan_globals_for_partial(chunk: &Chunk, max_ip: usize) -> Vec<u32> {
+    let code = &chunk.code;
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    let mut ip = 0;
+    while ip < max_ip.min(code.len()) {
+        let op = match OpCode::from_byte(code[ip]) {
+            Some(op) => op,
+            None => break,
+        };
+        if matches!(op, OpCode::GetGlobal | OpCode::SetGlobal | OpCode::DefineGlobal) {
+            let name_idx = chunk.read_u16(ip + 1) as usize;
+            if name_idx < chunk.constants.len() {
+                if let Some(name_id) = chunk.constants[name_idx].as_string_id() {
+                    if seen.insert(name_id.0) {
+                        result.push(name_id.0);
+                    }
+                }
+            }
+        }
+        ip += op.instruction_size();
+    }
+    result
+}
+
+/// Try to JIT-compile the loop portion of a top-level (0-param) chunk.
+///
+/// Returns `(JitFunction, stop_ip, globals_order)` where:
+/// - `JitFunction` is the compiled loop, called with `call_globals(*mut i64)`
+/// - `stop_ip` is the bytecode offset where the interpreter should resume
+/// - `globals_order` maps compact slot i → StringId.0 for write-back
+pub fn jit_compile_partial(chunk: &Chunk, globals_vec: &[Value]) -> Option<(JitFunction, usize, Vec<u32>)> {
+    // Only top-level (0-param) chunks for now
+    if chunk.param_count != 0 { return None; }
+
+    let boundary = find_jit_boundary(chunk, globals_vec);
+    if boundary == 0 { return None; }
+
+    // No division (integer JIT truncates, confuses results)
+    if chunk.code[..boundary].contains(&(OpCode::Div as u8)) { return None; }
+
+    let globals_order = scan_globals_for_partial(chunk, boundary);
+    if globals_order.is_empty() { return None; }
+
+    let globals_map: std::collections::HashMap<u32, usize> =
+        globals_order.iter().enumerate().map(|(i, &sid)| (sid, i)).collect();
+
+    let jit_fn = emit_loop_function_with_globals(chunk, boundary, &globals_map)?;
+    Some((jit_fn, boundary, globals_order))
+}
+
+/// Emit the callee-restore epilogue for the globals JIT (restores X19-X27, pops frame).
+fn emit_globals_epilogue(asm: &mut Assembler) {
+    asm.ldr_imm(X19, SP, 16);
+    asm.ldr_imm(X20, SP, 24);
+    asm.ldr_imm(X21, SP, 32);
+    asm.ldr_imm(X22, SP, 40);
+    asm.ldr_imm(X23, SP, 48);
+    asm.ldr_imm(X24, SP, 56);
+    asm.ldr_imm(X25, SP, 64);
+    asm.ldr_imm(X26, SP, 72);
+    asm.ldr_imm(X27, SP, 80);
+    asm.ldp_post(X29, X30, SP, 96);
+    asm.ret();
+}
+
+/// Emit ARM64 for the JIT-able prefix [0, boundary) of a top-level chunk.
+/// X0 on entry = pointer to the compact i64 globals buffer.
+fn emit_loop_function_with_globals(
+    chunk: &Chunk,
+    boundary: usize,
+    globals_map: &std::collections::HashMap<u32, usize>,
+) -> Option<JitFunction> {
+    let code = &chunk.code;
+    let constants = &chunk.constants;
+
+    let mut asm = Assembler::new();
+    let mut stack_top: usize = 0;
+    let mut last_cmp: Option<OpCode> = None;
+
+    let mut bc_to_arm: Vec<(usize, usize)> = Vec::new();
+    let mut forward_patches: Vec<(usize, usize)> = Vec::new();  // (target_bc, arm_off)
+    let mut epilogue_patches: Vec<usize> = Vec::new();          // arm_offs → epilogue
+
+    // ---- Prologue: save frame + callee-saved regs, grab globals ptr ----
+    asm.stp_pre(X29, X30, SP, -96);
+    asm.mov_reg(X29, SP);
+    asm.str_imm(X19, SP, 16);
+    asm.str_imm(X20, SP, 24);
+    asm.str_imm(X21, SP, 32);
+    asm.str_imm(X22, SP, 40);
+    asm.str_imm(X23, SP, 48);
+    asm.str_imm(X24, SP, 56);
+    asm.str_imm(X25, SP, 64);
+    asm.str_imm(X26, SP, 72);
+    asm.str_imm(X27, SP, 80);
+    asm.mov_reg(X27, X0);   // X27 = compact globals ptr (callee-saved)
+
+    let mut ip = 0;
+    while ip < boundary.min(code.len()) {
+        bc_to_arm.push((ip, asm.offset()));
+
+        let op = OpCode::from_byte(code[ip])?;
+        match op {
+            OpCode::Nop | OpCode::Halt => {}
+
+            OpCode::Zero | OpCode::Undefined | OpCode::False => {
+                let r = reg_for(stack_top)?;
+                asm.movz(r, 0);
+                stack_top += 1;
+            }
+            OpCode::One | OpCode::True => {
+                let r = reg_for(stack_top)?;
+                asm.movz(r, 1);
+                stack_top += 1;
+            }
+            OpCode::Const => {
+                let idx = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as usize;
+                let val = if idx < constants.len() {
+                    let v = constants[idx];
+                    if let Some(i) = v.as_int() { i as i64 }
+                    else if let Some(f) = v.as_number() { f as i64 }
+                    else { return None; }
+                } else { return None; };
+                let r = reg_for(stack_top)?;
+                if (0..=0xFFFF).contains(&val) {
+                    asm.movz(r, val as u16);
+                } else {
+                    asm.mov_imm64(r, val as u64);
+                }
+                stack_top += 1;
+            }
+
+            OpCode::GetLocal => {
+                let slot = code[ip + 1] as usize;
+                let src = reg_for(slot)?;
+                let dst = reg_for(stack_top)?;
+                asm.mov_reg(dst, src);
+                stack_top += 1;
+            }
+            OpCode::SetLocal => {
+                let slot = code[ip + 1] as usize;
+                if stack_top == 0 { return None; }
+                let src = reg_for(stack_top - 1)?;
+                let dst = reg_for(slot)?;
+                asm.mov_reg(dst, src);
+                // SetLocal leaves value on stack (no pop)
+            }
+
+            OpCode::GetGlobal => {
+                let name_idx = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as usize;
+                let name_id = constants.get(name_idx)?.as_string_id()?;
+                let compact_idx = *globals_map.get(&name_id.0)?;
+                let dst = reg_for(stack_top)?;
+                // Load raw i64 from compact buffer — no unboxing needed (caller pre-unboxed)
+                asm.ldr_imm(dst, X27, (compact_idx * 8) as u32);
+                stack_top += 1;
+            }
+            OpCode::SetGlobal => {
+                let name_idx = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as usize;
+                let name_id = constants.get(name_idx)?.as_string_id()?;
+                let compact_idx = *globals_map.get(&name_id.0)?;
+                if stack_top == 0 { return None; }
+                let src = reg_for(stack_top - 1)?;  // peek — SetGlobal leaves value on stack
+                asm.str_imm(src, X27, (compact_idx * 8) as u32);
+            }
+            OpCode::DefineGlobal => {
+                let name_idx = ((code[ip + 1] as u16) << 8 | code[ip + 2] as u16) as usize;
+                let name_id = constants.get(name_idx)?.as_string_id()?;
+                let compact_idx = *globals_map.get(&name_id.0)?;
+                if stack_top == 0 { return None; }
+                stack_top -= 1;  // DefineGlobal pops
+                let src = reg_for(stack_top)?;
+                asm.str_imm(src, X27, (compact_idx * 8) as u32);
+            }
+
+            OpCode::Pop => { stack_top = stack_top.saturating_sub(1); }
+
+            // Arithmetic
+            OpCode::Add => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.add_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Sub => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.sub_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Mul => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.mul(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Rem => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                // a % b: use X0 as scratch (globals ptr already saved to X27)
+                asm.sdiv(X0, ra, rb);
+                asm.mul(X0, X0, rb);
+                asm.sub_reg(ra, ra, X0);
+                stack_top -= 1;
+            }
+            OpCode::Neg => {
+                if stack_top < 1 { return None; }
+                let r = reg_for(stack_top - 1)?;
+                asm.sub_reg(r, XZR, r);
+            }
+            OpCode::Inc => {
+                if stack_top < 1 { return None; }
+                let r = reg_for(stack_top - 1)?;
+                asm.add_imm(r, r, 1);
+            }
+            OpCode::Dec => {
+                if stack_top < 1 { return None; }
+                let r = reg_for(stack_top - 1)?;
+                asm.sub_imm(r, r, 1);
+            }
+
+            // Bitwise
+            OpCode::BitAnd => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.and_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::BitOr => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.orr_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::BitXor => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.eor_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::BitNot => {
+                if stack_top < 1 { return None; }
+                let r = reg_for(stack_top - 1)?;
+                asm.mvn(r, r);
+            }
+            OpCode::Shl => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.lsl_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::Shr => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.asr_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+            OpCode::UShr => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.lsr_reg(ra, ra, rb);
+                stack_top -= 1;
+            }
+
+            // Comparisons
+            OpCode::Lt | OpCode::Le | OpCode::Gt | OpCode::Ge
+            | OpCode::Eq | OpCode::Ne | OpCode::StrictEq | OpCode::StrictNe => {
+                if stack_top < 2 { return None; }
+                let rb = reg_for(stack_top - 1)?;
+                let ra = reg_for(stack_top - 2)?;
+                asm.cmp_reg(ra, rb);
+                stack_top -= 2;
+                last_cmp = Some(op);
+                stack_top += 1; // placeholder for boolean result
+            }
+
+            // Branches
+            OpCode::JumpIfFalse => {
+                let offset = chunk.read_i16(ip + 1);
+                let target_bc = (ip as isize + 3 + offset as isize) as usize;
+                stack_top -= 1;
+                let arm_off = asm.offset();
+                if let Some(cmp) = last_cmp.take() {
+                    match cmp {
+                        OpCode::Lt => asm.b_ge(0),
+                        OpCode::Le => asm.b_gt(0),
+                        OpCode::Gt => asm.b_le(0),
+                        OpCode::Ge => asm.b_lt(0),
+                        OpCode::Eq | OpCode::StrictEq => asm.b_ne(0),
+                        OpCode::Ne | OpCode::StrictNe => asm.b_eq(0),
+                        _ => return None,
+                    }
+                } else {
+                    let r = reg_for(stack_top)?;
+                    asm.cbz(r, 0);
+                }
+                if target_bc >= boundary {
+                    epilogue_patches.push(arm_off);
+                } else {
+                    forward_patches.push((target_bc, arm_off));
+                }
+            }
+            OpCode::JumpIfTrue => {
+                let offset = chunk.read_i16(ip + 1);
+                let target_bc = (ip as isize + 3 + offset as isize) as usize;
+                stack_top -= 1;
+                let arm_off = asm.offset();
+                if let Some(cmp) = last_cmp.take() {
+                    match cmp {
+                        OpCode::Lt => asm.b_lt(0),
+                        OpCode::Le => asm.b_le(0),
+                        OpCode::Gt => asm.b_gt(0),
+                        OpCode::Ge => asm.b_ge(0),
+                        OpCode::Eq | OpCode::StrictEq => asm.b_eq(0),
+                        OpCode::Ne | OpCode::StrictNe => asm.b_ne(0),
+                        _ => return None,
+                    }
+                } else {
+                    let r = reg_for(stack_top)?;
+                    asm.cbnz(r, 0);
+                }
+                if target_bc >= boundary {
+                    epilogue_patches.push(arm_off);
+                } else {
+                    forward_patches.push((target_bc, arm_off));
+                }
+            }
+            OpCode::Jump => {
+                let offset = chunk.read_i16(ip + 1);
+                let target_bc = (ip as isize + 3 + offset as isize) as usize;
+                let arm_off = asm.offset();
+                asm.b(0);
+                if target_bc >= boundary {
+                    epilogue_patches.push(arm_off);
+                } else {
+                    forward_patches.push((target_bc, arm_off));
+                }
+            }
+            OpCode::Loop => {
+                let back = chunk.read_u16(ip + 1) as usize;
+                let target_bc = ip + 3 - back;
+                let target_arm = bc_to_arm.iter()
+                    .find(|(bc, _)| *bc == target_bc)
+                    .map(|(_, arm)| *arm)?;
+                let current = asm.offset();
+                asm.b(target_arm as i32 - current as i32);
+            }
+
+            // Return (inline epilogue + ret)
+            OpCode::Return => {
+                stack_top = stack_top.saturating_sub(1);
+                emit_globals_epilogue(&mut asm);
+            }
+            OpCode::ReturnUndefined => {
+                emit_globals_epilogue(&mut asm);
+            }
+
+            _ => return None,
+        }
+        ip += op.instruction_size();
+    }
+
+    // ---- Epilogue (normal loop-exit path) ----
+    let epilogue_off = asm.offset();
+    emit_globals_epilogue(&mut asm);
+
+    // ---- Patch forward in-range jumps ----
+    for (target_bc, arm_off) in &forward_patches {
+        let target_arm = bc_to_arm.iter()
+            .find(|(bc, _)| *bc == *target_bc)
+            .map(|(_, arm)| *arm);
+        if let Some(target) = target_arm {
+            asm.patch_branch(*arm_off, target);
+        } else {
+            return None;
+        }
+    }
+
+    // ---- Patch loop-exit jumps to epilogue ----
+    for arm_off in &epilogue_patches {
+        asm.patch_branch(*arm_off, epilogue_off);
+    }
+
+    let mut buffer = ExecutableBuffer::new(asm.code.len().max(4096))?;
+    buffer.write_code(&asm.code);
+    Some(JitFunction { buffer, param_count: 0 })
 }

@@ -1093,6 +1093,9 @@ impl Vm {
     // ---- Main execution loop ----------------------------------------------
 
     pub fn run(&mut self) -> Result<Value, VmError> {
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        self.try_partial_jit();
+
         let result = self.run_until(0)?;
         // Flatten any ConsString result to a TAG_STRING so callers get a normal string value
         if self.is_cons_string(result) {
@@ -1101,6 +1104,50 @@ impl Vm {
         } else {
             Ok(result)
         }
+    }
+
+    /// Attempt to JIT-compile and run the loop portion of chunk 0.
+    /// If successful, updates globals and advances the initial frame's IP
+    /// so the interpreter resumes after the JIT-ed bytecode.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn try_partial_jit(&mut self) {
+        use crate::compiler::opcode::OpCode;
+        let chunk0 = &self.chunks[0];
+        if !chunk0.code.contains(&(OpCode::Loop as u8)) { return; }
+
+        let result = crate::jit::compiler::jit_compile_partial(chunk0, &self.globals_vec);
+        let (jit_fn, stop_ip, globals_order) = match result {
+            Some(r) => r,
+            None => return,
+        };
+
+        // Pre-unbox each global to i64
+        let mut jit_globals: Vec<i64> = globals_order.iter().map(|&sid| {
+            let val = if (sid as usize) < self.globals_vec.len() {
+                self.globals_vec[sid as usize]
+            } else {
+                Value::null()
+            };
+            jit_unbox(val)
+        }).collect();
+
+        // Run the JIT loop
+        jit_fn.call_globals(jit_globals.as_mut_ptr());
+
+        // Write results back into globals_vec and the HashMap
+        for (i, &sid) in globals_order.iter().enumerate() {
+            let val = jit_rebox(jit_globals[i]);
+            let idx = sid as usize;
+            if idx >= self.globals_vec.len() {
+                self.globals_vec.resize(idx + 1, Value::null());
+            }
+            self.globals_vec[idx] = val;
+            self.globals.insert(crate::util::interner::StringId(sid), val);
+        }
+        self.global_version += 1;
+
+        // Skip the JIT-ed bytes in the interpreter
+        self.frames[0].ip = stop_ip;
     }
 
     /// Run the VM until the frame stack depth drops to `stop_depth`.
@@ -5724,6 +5771,30 @@ fn format_iso(ms: f64) -> String {
 }
 
 // ---- Standalone JSON parser (avoids &mut self borrow issues) ----
+
+/// Unbox a NaN-tagged Value to a raw i64 for the globals JIT buffer.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn jit_unbox(val: Value) -> i64 {
+    if val.is_int() {
+        val.as_int().unwrap_or(0) as i64
+    } else if val.is_boolean() {
+        if val.as_bool().unwrap_or(false) { 1 } else { 0 }
+    } else if let Some(f) = val.as_number() {
+        f as i64
+    } else {
+        0  // null, undefined, object → 0
+    }
+}
+
+/// Rebox a raw i64 from the globals JIT buffer back to a NaN-tagged Value.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn jit_rebox(v: i64) -> Value {
+    if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+        Value::int(v as i32)
+    } else {
+        Value::number(v as f64)
+    }
+}
 
 /// Format an unsigned integer in a given radix (2-36).
 fn radix_fmt(mut n: u64, radix: u32) -> String {
