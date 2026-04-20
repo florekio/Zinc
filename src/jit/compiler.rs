@@ -1098,13 +1098,13 @@ fn find_jit_boundary(chunk: &Chunk, globals_vec: &[Value]) -> usize {
             // GetGlobal: ok unless the current value is a non-numeric object/function
             OpCode::GetGlobal => {
                 let name_idx = chunk.read_u16(ip + 1) as usize;
-                if name_idx < chunk.constants.len() {
-                    if let Some(name_id) = chunk.constants[name_idx].as_string_id() {
-                        let slot = name_id.0 as usize;
-                        let val = if slot < globals_vec.len() { globals_vec[slot] } else { Value::null() };
-                        if val.is_object() || val.is_string() || val.is_function() || val.is_symbol() {
-                            break; // stop scanning — but use last_loop_end as boundary
-                        }
+                if name_idx < chunk.constants.len()
+                    && let Some(name_id) = chunk.constants[name_idx].as_string_id()
+                {
+                    let slot = name_id.0 as usize;
+                    let val = if slot < globals_vec.len() { globals_vec[slot] } else { Value::null() };
+                    if val.is_object() || val.is_string() || val.is_function() || val.is_symbol() {
+                        break; // stop scanning — but use last_loop_end as boundary
                     }
                 }
             }
@@ -1131,12 +1131,11 @@ fn scan_globals_for_partial(chunk: &Chunk, max_ip: usize) -> Vec<u32> {
         };
         if matches!(op, OpCode::GetGlobal | OpCode::SetGlobal | OpCode::DefineGlobal) {
             let name_idx = chunk.read_u16(ip + 1) as usize;
-            if name_idx < chunk.constants.len() {
-                if let Some(name_id) = chunk.constants[name_idx].as_string_id() {
-                    if seen.insert(name_id.0) {
-                        result.push(name_id.0);
-                    }
-                }
+            if name_idx < chunk.constants.len()
+                && let Some(name_id) = chunk.constants[name_idx].as_string_id()
+                && seen.insert(name_id.0)
+            {
+                result.push(name_id.0);
             }
         }
         ip += op.instruction_size();

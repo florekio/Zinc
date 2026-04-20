@@ -64,6 +64,15 @@ impl Vm {
         });
 
         // Run using the full main dispatch loop, stopping when our frame returns.
-        self.run_until(stop_depth)
+        let result = self.run_until(stop_depth);
+        if result.is_err() {
+            // Clean up any frames and stack slots that weren't popped due to the error.
+            // This keeps the VM in a consistent state when the caller swallows the error.
+            while self.frames.len() > stop_depth {
+                self.frames.pop();
+            }
+            self.stack.truncate(func_pos);
+        }
+        result
     }
 }

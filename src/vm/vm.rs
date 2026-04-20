@@ -9,6 +9,17 @@ use crate::runtime::value::Value;
 use crate::util::interner::{Interner, StringId};
 
 // ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Returns true for implementation-internal property keys (e.g. __class__, __get_x__,
+/// __priv_#x__). These should not appear in for-in enumeration or Object.keys().
+#[inline(always)]
+fn is_internal_key(s: &str) -> bool {
+    s.starts_with("__") && s.ends_with("__")
+}
+
+// ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
@@ -863,11 +874,11 @@ impl Vm {
                                 else if ks == "name" { name_val = Some(prop.value); }
                             }
                             if let Some(mv) = msg_val
-                                && mv.is_string() {
-                                    let msg = self.interner.resolve(mv.as_string_id().unwrap()).to_owned();
+                                && (mv.is_string() || self.is_cons_string(mv)) {
+                                    let msg = self.flatten_cons_to_string(mv);
                                     let name = name_val
-                                        .and_then(|v| v.as_string_id())
-                                        .map(|id| self.interner.resolve(id).to_owned())
+                                        .map(|v| self.flatten_cons_to_string(v))
+                                        .filter(|s| !s.is_empty())
                                         .unwrap_or_else(|| "Error".to_owned());
                                     return format!("{name}: {msg}");
                                 }
@@ -2425,15 +2436,14 @@ impl Vm {
                         && let Some(obj) = self.heap.get(oid) {
                         // IC fast path: monomorphic inline cache hit
                         let cached = self.chunks[chunk_idx].property_ic[ic_slot];
-                        if cached != 0xFF {
-                            if let Some(&(k, ref prop)) = obj.properties.get(cached as usize)
-                                && k == name_id {
-                                let val = prop.value;
-                                self.pop()?;
-                                self.push(val);
-                                continue;
-                            }
-                            // IC miss: fall through to linear scan, update cache below
+                        if cached != 0xFF
+                            && let Some(&(k, ref prop)) = obj.properties.get(cached as usize)
+                            && k == name_id
+                        {
+                            let val = prop.value;
+                            self.pop()?;
+                            self.push(val);
+                            continue;
                         }
                         // Linear scan with IC population
                         if let Some(pos) = obj.properties.iter().position(|(k, _)| *k == name_id) {
@@ -2973,7 +2983,11 @@ impl Vm {
                             let result = self.call_function_this(gfn, obj_val, &[])?;
                             self.push(result);
                         } else {
-                            let val = self.heap.get_property_chain(oid, name_id)
+                            // Private fields: stored as __priv_#name__ (fields) or
+                            // literal #name (methods on prototype). Try mangled first.
+                            let priv_key = self.interner.intern(&format!("__priv_{}__", name_str));
+                            let val = self.heap.get_property_chain(oid, priv_key)
+                                .or_else(|| self.heap.get_property_chain(oid, name_id))
                                 .unwrap_or(Value::undefined());
                             self.push(val);
                         }
@@ -2996,8 +3010,11 @@ impl Vm {
                         let setter_fn = self.heap.get_property_chain(oid, setter_key);
                         if let Some(sfn) = setter_fn && sfn.is_function() {
                             let _ = self.call_function_this(sfn, obj_val, &[value]);
-                        } else if let Some(obj) = self.heap.get_mut(oid) {
-                            obj.set_property(name_id, value);
+                        } else {
+                            let priv_key = self.interner.intern(&format!("__priv_{}__", name_str));
+                            if let Some(obj) = self.heap.get_mut(oid) {
+                                obj.set_property(priv_key, value);
+                            }
                         }
                     }
                     self.push(value);
@@ -3575,6 +3592,7 @@ impl Vm {
                                         for (k, en) in props {
                                             if !en { continue; }
                                             let name = self.interner.resolve(k);
+                                            if is_internal_key(name) { continue; }
                                             if let Ok(n) = name.parse::<u64>() {
                                                 numeric.push((n, k));
                                             } else {
@@ -3597,7 +3615,8 @@ impl Vm {
                                                 elems.clone()
                                             } else {
                                                 o.properties.iter()
-                                                    .filter(|(_, p)| p.is_enumerable())
+                                                    .filter(|(k, p)| p.is_enumerable()
+                                                        && !is_internal_key(self.interner.resolve(*k)))
                                                     .map(|(_, p)| p.value).collect()
                                             }
                                         })
@@ -3610,7 +3629,8 @@ impl Vm {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                                     let pairs: Vec<(Value, Value)> = self.heap.get(oid)
                                         .map(|o| o.properties.iter()
-                                            .filter(|(_, p)| p.is_enumerable())
+                                            .filter(|(k, p)| p.is_enumerable()
+                                                && !is_internal_key(self.interner.resolve(*k)))
                                             .map(|&(k, ref p)| (Value::string(k), p.value)).collect())
                                         .unwrap_or_default();
                                     let mut entries = Vec::new();
@@ -3629,7 +3649,8 @@ impl Vm {
                                         if let Some(src_oid) = source_val.as_object_id() {
                                             let props: Vec<(StringId, Value)> = self.heap.get(src_oid)
                                                 .map(|o| o.properties.iter()
-                                                    .filter(|(_, p)| p.is_enumerable())
+                                                    .filter(|(k, p)| p.is_enumerable()
+                                                        && !is_internal_key(self.interner.resolve(*k)))
                                                     .map(|&(k, ref p)| (k, p.value)).collect())
                                                 .unwrap_or_default();
                                             for (k, v) in props {
@@ -3778,6 +3799,9 @@ impl Vm {
                                         // Convert __get_X__ / __set_X__ → X
                                         let real = if (s.starts_with("__get_") || s.starts_with("__set_")) && s.ends_with("__") {
                                             s[6..s.len()-2].to_owned()
+                                        } else if is_internal_key(&s) {
+                                            // Skip other internal keys (__class__, __priv_#x__, etc.)
+                                            continue;
                                         } else {
                                             s.clone()
                                         };
@@ -4430,7 +4454,15 @@ impl Vm {
                                 .collect())
                             .unwrap_or_default();
                         for (field_name, field_val) in instance_fields {
-                            let real_key = self.interner.intern(&field_name);
+                            // Private fields (#name) are stored under __priv_#name__ to avoid
+                            // being visible via hasOwnProperty("#name").
+                            // Public fields (no #) keep their plain names.
+                            let store_name = if field_name.starts_with('#') {
+                                format!("__priv_{}__", field_name)
+                            } else {
+                                field_name.clone()
+                            };
+                            let real_key = self.interner.intern(&store_name);
                             if let Some(new_o) = self.heap.get_mut(new_oid) {
                                 new_o.set_property(real_key, field_val);
                             }
@@ -4915,7 +4947,13 @@ impl Vm {
                     let class_val = self.peek()?;
                     if let Some(class_oid) = class_val.as_object_id()
                         && let Some(class_obj) = self.heap.get_mut(class_oid) {
-                            class_obj.set_property(name_id, field_val);
+                            let name_str = self.interner.resolve(name_id).to_owned();
+                            let store_key = if name_str.starts_with('#') {
+                                self.interner.intern(&format!("__priv_{}__", name_str))
+                            } else {
+                                name_id
+                            };
+                            class_obj.set_property(store_key, field_val);
                         }
                 }
 
@@ -5094,7 +5132,9 @@ impl Vm {
                                         if depth > 64 { break; }
                                         if let Some(obj) = self.heap.get(cid) {
                                             for &(k, ref p) in &obj.properties {
-                                                if p.is_enumerable() && seen.insert(k) {
+                                                let ks = self.interner.resolve(k);
+                                                if p.is_enumerable() && seen.insert(k)
+                                                    && !is_internal_key(ks) {
                                                     all_keys.push(k);
                                                 }
                                             }
@@ -5474,14 +5514,50 @@ impl Vm {
                     let source = self.pop()?;
                     let mut rest = JsObject::ordinary();
                     if let Some(src_oid) = source.as_object_id() {
-                        let props: Vec<(StringId, Value)> = self.heap.get(src_oid)
+                        // Collect visible (public, enumerable) property names, resolving
+                        // getter keys (__get_X__) to their visible name X.
+                        let raw: Vec<(StringId, StringId)> = self.heap.get(src_oid)
                             .map(|o| o.properties.iter()
-                                .filter(|(k, p)| p.is_enumerable() && !excluded.contains(k))
-                                .map(|&(k, ref p)| (k, p.value))
+                                .filter(|(_, p)| p.is_enumerable())
+                                .filter_map(|&(k, _)| {
+                                    let s = self.interner.resolve(k);
+                                    if is_internal_key(s) && !s.starts_with("__get_") { return None; }
+                                    Some((k, k))
+                                })
                                 .collect())
                             .unwrap_or_default();
-                        for (k, v) in props {
-                            rest.set_property(k, v);
+                        // Build the set of visible names and getter keys
+                        let mut visible: Vec<(StringId, StringId)> = Vec::new(); // (visible_key, raw_key)
+                        let mut seen = std::collections::HashSet::new();
+                        for (raw_k, _) in &raw {
+                            let s = self.interner.resolve(*raw_k).to_owned();
+                            let vis_name = if s.starts_with("__get_") && s.ends_with("__") {
+                                s[6..s.len()-2].to_owned()
+                            } else {
+                                s.clone()
+                            };
+                            let vis_id = self.interner.intern(&vis_name);
+                            if excluded.contains(&vis_id) { continue; }
+                            if seen.insert(vis_name) {
+                                visible.push((vis_id, *raw_k));
+                            }
+                        }
+                        for (vis_key, raw_key) in visible {
+                            let raw_s = self.interner.resolve(raw_key).to_owned();
+                            // If this is a getter key, call the getter to get the value
+                            let value = if raw_s.starts_with("__get_") && raw_s.ends_with("__") {
+                                let getter_fn = self.heap.get_property_chain(src_oid, raw_key);
+                                if let Some(gfn) = getter_fn && gfn.is_function() {
+                                    self.call_function_this(gfn, source, &[])?
+                                } else {
+                                    Value::undefined()
+                                }
+                            } else {
+                                self.heap.get(src_oid)
+                                    .and_then(|o| o.get_property(raw_key))
+                                    .unwrap_or(Value::undefined())
+                            };
+                            rest.set_property(vis_key, value);
                         }
                     }
                     let oid = self.heap.allocate(rest);
