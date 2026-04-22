@@ -160,6 +160,10 @@ pub struct Vm {
     pub(crate) sym_to_string_tag: u32,
     pub(crate) sym_species: u32,
     pub(crate) sym_unscopables: u32,
+    /// Per-function property overrides/deletions: key = (sentinel, StringId), None = deleted, Some(v) = overridden.
+    pub(crate) fn_property_overrides: HashMap<(i32, StringId), Option<Value>>,
+    /// Dynamic exclusion buffer for object rest destructuring with computed keys.
+    pub(crate) computed_exclusions: Vec<Value>,
     /// Fuel counter: instructions executed (incremented in 1024-step chunks).
     pub(crate) steps: u64,
     /// Max instructions before returning an error. 0 = unlimited.
@@ -393,6 +397,8 @@ impl Vm {
             sym_to_string_tag: 3,
             sym_species: 4,
             sym_unscopables: 5,
+            fn_property_overrides: HashMap::new(),
+            computed_exclusions: Vec::new(),
             steps: 0,
             max_steps: 0,
         }
@@ -922,6 +928,42 @@ impl Vm {
             "object"
         } else {
             "undefined"
+        }
+    }
+
+    // ---- Function own-property helpers ------------------------------------
+
+    /// Get a function's own property value, consulting the override table.
+    /// Returns None if the property doesn't exist (or was deleted).
+    pub(crate) fn fn_get_own_prop(&mut self, sentinel: i32, key: StringId) -> Option<Value> {
+        let key_str = self.interner.resolve(key).to_owned();
+        // Check the override table first
+        if let Some(ov) = self.fn_property_overrides.get(&(sentinel, key)) {
+            return *ov; // None = deleted, Some(v) = overridden
+        }
+        // Fall back to defaults
+        let chunk_idx = (sentinel & 0xFFFF) as usize;
+        match key_str.as_str() {
+            "name" => {
+                if chunk_idx > 0 && chunk_idx < self.chunks.len() {
+                    let name_sid = self.chunks[chunk_idx].name;
+                    let name_s = self.interner.resolve(name_sid).to_owned();
+                    let visible = if name_s.starts_with('<') { String::new() } else { name_s };
+                    let vsid = self.interner.intern(&visible);
+                    Some(Value::string(vsid))
+                } else {
+                    let empty = self.interner.intern("");
+                    Some(Value::string(empty))
+                }
+            }
+            "length" => {
+                if chunk_idx > 0 && chunk_idx < self.chunks.len() {
+                    Some(Value::int(self.chunks[chunk_idx].formal_length as i32))
+                } else {
+                    Some(Value::int(0))
+                }
+            }
+            _ => None,
         }
     }
 
@@ -2305,11 +2347,15 @@ impl Vm {
                     let key = self.pop()?;
                     let obj_val = self.pop()?;
                     let result = if let Some(oid) = obj_val.as_object_id() {
-                        if let Some(key_id) = key.as_string_id() {
+                        let resolved_key = if key.is_symbol() {
+                            Some(self.interner.intern(&format!("__sym_{}__", key.as_symbol_id().unwrap())))
+                        } else {
+                            key.as_string_id()
+                        };
+                        if let Some(key_id) = resolved_key {
                             let key_str = self.interner.resolve(key_id).to_owned();
                             let getter_key = self.interner.intern(&format!("__get_{key_str}__"));
                             let setter_key = self.interner.intern(&format!("__set_{key_str}__"));
-                            // Delete the direct property and any accessor properties
                             let r1 = self.heap.get_mut(oid).map(|o| o.delete_property(key_id)).unwrap_or(true);
                             let r2 = self.heap.get_mut(oid).map(|o| o.delete_property(getter_key)).unwrap_or(true);
                             let r3 = self.heap.get_mut(oid).map(|o| o.delete_property(setter_key)).unwrap_or(true);
@@ -2317,6 +2363,15 @@ impl Vm {
                         } else {
                             true
                         }
+                    } else if obj_val.is_function() {
+                        if let Some(key_id) = key.as_string_id() {
+                            let sentinel = obj_val.as_function().unwrap();
+                            let key_s = self.interner.resolve(key_id).to_owned();
+                            if matches!(key_s.as_str(), "name" | "length") {
+                                self.fn_property_overrides.insert((sentinel, key_id), None);
+                            }
+                        }
+                        true
                     } else {
                         true
                     };
@@ -2689,24 +2744,9 @@ impl Vm {
                                             Value::object_id(proto_oid)
                                         }
                                     }
-                                    "name" => {
-                                        let chunk_idx = (sentinel & 0xFFFF) as usize;
-                                        if chunk_idx < self.chunks.len() {
-                                            let name = self.chunks[chunk_idx].name;
-                                            Value::string(name)
-                                        } else {
-                                            let s = self.interner.intern("");
-                                            Value::string(s)
-                                        }
-                                    }
-                                    "length" => {
-                                        let chunk_idx = (sentinel & 0xFFFF) as usize;
-                                        if chunk_idx < self.chunks.len() {
-                                            // Function.length = params before first default
-                                            Value::int(self.chunks[chunk_idx].formal_length as i32)
-                                        } else {
-                                            Value::int(0)
-                                        }
+                                    "name" | "length" => {
+                                        self.fn_get_own_prop(sentinel, name_id)
+                                            .unwrap_or(Value::undefined())
                                     }
                                     "call" | "apply" | "bind" => {
                                         // Return function sentinel for method dispatch
@@ -2873,6 +2913,38 @@ impl Vm {
                                 self.push(Value::int(s.chars().count() as i32));
                                 continue;
                             }
+                        }
+                    }
+                    // Function bracket access: fn['name'], fn['length'], fn['prototype']
+                    if obj_val.is_function()
+                        && let Some(key_id) = key.as_string_id() {
+                        {
+                            let sentinel = obj_val.as_function().unwrap();
+                            let name_str = self.interner.resolve(key_id).to_owned();
+                            let result = match name_str.as_str() {
+                                "name" | "length" => {
+                                    self.fn_get_own_prop(sentinel, key_id).unwrap_or(Value::undefined())
+                                }
+                                "prototype" => {
+                                    if let Some(&proto_oid) = self.func_prototypes.get(&sentinel) {
+                                        Value::object_id(proto_oid)
+                                    } else {
+                                        let mut proto = JsObject::ordinary();
+                                        proto.prototype = Some(self.object_prototype);
+                                        let ctor_key = self.interner.intern("constructor");
+                                        proto.define_property(ctor_key, Property::with_flags(
+                                            obj_val, Property::WRITABLE | Property::CONFIGURABLE
+                                        ));
+                                        let proto_oid = self.heap.allocate(proto);
+                                        self.func_prototypes.insert(sentinel, proto_oid);
+                                        Value::object_id(proto_oid)
+                                    }
+                                }
+                                "call" | "apply" | "bind" => obj_val,
+                                _ => Value::undefined(),
+                            };
+                            self.push(result);
+                            continue;
                         }
                     }
                     self.push(Value::undefined());
@@ -3415,7 +3487,12 @@ impl Vm {
                         let mn = self.interner.resolve(method_name).to_owned();
                         match mn.as_str() {
                             "hasOwnProperty" => {
-                                let key = if argc > 0 { self.value_to_string(self.stack[obj_pos + 1]) } else { String::new() };
+                                let key_val = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
+                                let key = if key_val.is_symbol() {
+                                    format!("__sym_{}__", key_val.as_symbol_id().unwrap())
+                                } else {
+                                    self.value_to_string(key_val)
+                                };
                                 let key_id = self.interner.intern(&key);
                                 let getter_key = self.interner.intern(&format!("__get_{key}__"));
                                 let setter_key = self.interner.intern(&format!("__set_{key}__"));
@@ -3429,7 +3506,12 @@ impl Vm {
                                 continue;
                             }
                             "propertyIsEnumerable" => {
-                                let key = if argc > 0 { self.value_to_string(self.stack[obj_pos + 1]) } else { String::new() };
+                                let key_val = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
+                                let key = if key_val.is_symbol() {
+                                    format!("__sym_{}__", key_val.as_symbol_id().unwrap())
+                                } else {
+                                    self.value_to_string(key_val)
+                                };
                                 let key_id = self.interner.intern(&key);
                                 let is_enum = self.heap.get(oid)
                                     .and_then(|o| o.get_property_descriptor(key_id))
@@ -3488,9 +3570,31 @@ impl Vm {
                         }
                     }
 
+                    // hasOwnProperty on function values
+                    if obj_val.is_function() {
+                        let mn = self.interner.resolve(method_name).to_owned();
+                        if mn == "hasOwnProperty" {
+                            let key = if argc > 0 { self.value_to_string(self.stack[obj_pos + 1]) } else { String::new() };
+                            let key_id = self.interner.intern(&key);
+                            let sentinel = obj_val.as_function().unwrap();
+                            let has = self.fn_get_own_prop(sentinel, key_id).is_some();
+                            self.stack.truncate(obj_pos);
+                            self.push(Value::boolean(has));
+                            continue;
+                        }
+                    }
+
                     // Try to call as a closure method on an object (walk prototype chain)
                     if let Some(oid) = obj_val.as_object_id() {
-                        let method_val = self.heap.get_property_chain(oid, method_name);
+                        // For private names (#x), try mangled key first
+                        let method_name_s = self.interner.resolve(method_name).to_owned();
+                        let method_val = if method_name_s.starts_with('#') {
+                            let mangled = self.interner.intern(&format!("__priv_{}__", method_name_s));
+                            self.heap.get_property_chain(oid, mangled)
+                                .or_else(|| self.heap.get_property_chain(oid, method_name))
+                        } else {
+                            self.heap.get_property_chain(oid, method_name)
+                        };
                         if let Some(mv) = method_val
                             && mv.is_function() {
                                 let packed = mv.as_function().unwrap();
@@ -3751,8 +3855,15 @@ impl Vm {
                                 args.first().copied().unwrap_or(Value::undefined())
                             }
                             "getOwnPropertyDescriptor" => {
-                                if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
-                                    let key_str = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_default();
+                                let first_arg = args.first().copied().unwrap_or(Value::undefined());
+                                let key_arg = args.get(1).copied().unwrap_or(Value::undefined());
+                                // For symbol keys, use __sym_N__ encoding; otherwise stringify
+                                let key_str = if key_arg.is_symbol() {
+                                    format!("__sym_{}__", key_arg.as_symbol_id().unwrap())
+                                } else {
+                                    self.value_to_string(key_arg)
+                                };
+                                if let Some(oid) = first_arg.as_object_id() {
                                     let key_id = self.interner.intern(&key_str);
                                     // Check for accessor properties first
                                     let getter_key_str = format!("__get_{key_str}__");
@@ -3785,6 +3896,40 @@ impl Vm {
                                             desc.set_property(cf_key, Value::boolean(prop.is_configurable()));
                                             Value::object_id(self.heap.allocate(desc))
                                         } else { Value::undefined() }
+                                } else if first_arg.is_function() {
+                                    let sentinel = first_arg.as_function().unwrap();
+                                    let key_id = self.interner.intern(&key_str);
+                                    let prop_val = if matches!(key_str.as_str(), "name" | "length") {
+                                        self.fn_get_own_prop(sentinel, key_id)
+                                            .map(|v| (v, false, false, true))
+                                    } else if key_str == "prototype" {
+                                        let proto_val = if let Some(&proto_oid) = self.func_prototypes.get(&sentinel) {
+                                            Value::object_id(proto_oid)
+                                        } else {
+                                            let mut proto = JsObject::ordinary();
+                                            proto.prototype = Some(self.object_prototype);
+                                            let ctor_key = self.interner.intern("constructor");
+                                            proto.define_property(ctor_key, Property::with_flags(
+                                                first_arg, Property::WRITABLE | Property::CONFIGURABLE
+                                            ));
+                                            let proto_oid = self.heap.allocate(proto);
+                                            self.func_prototypes.insert(sentinel, proto_oid);
+                                            Value::object_id(proto_oid)
+                                        };
+                                        Some((proto_val, true, false, false))
+                                    } else { None };
+                                    if let Some((val, writable, enumerable, configurable)) = prop_val {
+                                        let mut desc = JsObject::ordinary();
+                                        let val_key = self.interner.intern("value");
+                                        let wr_key = self.interner.intern("writable");
+                                        let en_key = self.interner.intern("enumerable");
+                                        let cf_key = self.interner.intern("configurable");
+                                        desc.set_property(val_key, val);
+                                        desc.set_property(wr_key, Value::boolean(writable));
+                                        desc.set_property(en_key, Value::boolean(enumerable));
+                                        desc.set_property(cf_key, Value::boolean(configurable));
+                                        Value::object_id(self.heap.allocate(desc))
+                                    } else { Value::undefined() }
                                 } else { Value::undefined() }
                             }
                             "getOwnPropertyNames" => {
@@ -4631,6 +4776,17 @@ impl Vm {
                             }
                 }
 
+                OpCode::ArrayAppend => {
+                    let val = self.pop()?;
+                    let arr_val = self.peek()?;
+                    if let Some(oid) = arr_val.as_object_id()
+                        && let Some(obj) = self.heap.get_mut(oid)
+                        && let ObjectKind::Array(ref mut elements) = obj.kind
+                    {
+                        elements.push(val);
+                    }
+                }
+
                 OpCode::ArraySpread => {
                     let source = self.pop()?;
                     let target = self.peek()?;
@@ -4739,6 +4895,28 @@ impl Vm {
                             && let Some(obj) = self.heap.get_mut(oid) {
                                 obj.set_property(name_id, val);
                             }
+                        // If the value is an anonymous function and the key is a Symbol,
+                        // set the function's name to '[description]' or ''
+                        if val.is_function() && key.is_symbol() {
+                            let sym_id = key.as_symbol_id().unwrap() as usize;
+                            let sentinel = val.as_function().unwrap();
+                            let chunk_idx = (sentinel & 0xFFFF) as usize;
+                            let is_anon = if chunk_idx > 0 && chunk_idx < self.chunks.len() {
+                                let n = self.interner.resolve(self.chunks[chunk_idx].name).to_owned();
+                                n.is_empty() || n.starts_with('<')
+                            } else { true };
+                            if is_anon {
+                                let fn_name = if let Some(Some(desc)) = self.symbol_descriptions.get(sym_id) {
+                                    let desc_str = self.interner.resolve(*desc).to_owned();
+                                    format!("[{desc_str}]")
+                                } else {
+                                    String::new()
+                                };
+                                let fn_name_sid = self.interner.intern(&fn_name);
+                                let name_key = self.interner.intern("name");
+                                self.fn_property_overrides.insert((sentinel, name_key), Some(Value::string(fn_name_sid)));
+                            }
+                        }
                     }
                 }
 
@@ -4932,8 +5110,12 @@ impl Vm {
                     let class_val = self.peek()?;
                     if let Some(class_oid) = class_val.as_object_id()
                         && let Some(class_obj) = self.heap.get_mut(class_oid) {
+                            let name_str = self.interner.resolve(name_id).to_owned();
+                            let store_key = if name_str.starts_with('#') {
+                                self.interner.intern(&format!("__priv_{}__", name_str))
+                            } else { name_id };
                             // Static methods: non-enumerable, writable, configurable
-                            class_obj.define_property(name_id, Property::with_flags(
+                            class_obj.define_property(store_key, Property::with_flags(
                                 method_val, Property::WRITABLE | Property::CONFIGURABLE
                             ));
                         }
@@ -4974,6 +5156,43 @@ impl Vm {
                     }
                 }
 
+                OpCode::ClassFieldComputed => {
+                    // Instance field with computed key: stack has [key, value] (key under value)
+                    let field_val = self.pop()?;
+                    let key_val = self.pop()?;
+                    let class_val = self.peek()?;
+                    if let Some(class_oid) = class_val.as_object_id() {
+                        let field_name = if key_val.is_symbol() {
+                            format!("__sym_{}__", key_val.as_symbol_id().unwrap())
+                        } else {
+                            self.value_to_string(key_val)
+                        };
+                        let ifield_key = self.interner.intern(&format!("__ifield_{field_name}__"));
+                        if let Some(class_obj) = self.heap.get_mut(class_oid) {
+                            class_obj.set_property(ifield_key, field_val);
+                        }
+                    }
+                }
+
+                OpCode::ClassStaticFieldComputed => {
+                    // Static field with computed key: stack has [key, value]
+                    let field_val = self.pop()?;
+                    let key_val = self.pop()?;
+                    let class_val = self.peek()?;
+                    if let Some(class_oid) = class_val.as_object_id() {
+                        let store_key = if key_val.is_symbol() {
+                            let sym_name = format!("__sym_{}__", key_val.as_symbol_id().unwrap());
+                            self.interner.intern(&sym_name)
+                        } else {
+                            let field_name = self.value_to_string(key_val);
+                            self.interner.intern(&field_name)
+                        };
+                        if let Some(class_obj) = self.heap.get_mut(class_oid) {
+                            class_obj.set_property(store_key, field_val);
+                        }
+                    }
+                }
+
                 OpCode::ClassPrivateMethod => {
                     let name_idx = self.read_u16() as usize;
                     let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
@@ -4985,9 +5204,13 @@ impl Vm {
                         let proto_oid = self.heap.get(class_oid)
                             .and_then(|o| o.get_property(proto_key))
                             .and_then(|v| v.as_object_id());
+                        let name_str = self.interner.resolve(name_id).to_owned();
+                        let store_key = if name_str.starts_with('#') {
+                            self.interner.intern(&format!("__priv_{}__", name_str))
+                        } else { name_id };
                         if let Some(proto_oid) = proto_oid
                             && let Some(proto) = self.heap.get_mut(proto_oid) {
-                                proto.define_property(name_id, Property::with_flags(
+                                proto.define_property(store_key, Property::with_flags(
                                     method_val, Property::WRITABLE | Property::CONFIGURABLE
                                 ));
                             }
@@ -5501,6 +5724,11 @@ impl Vm {
                     )));
                 }
 
+                OpCode::PushComputedExclude => {
+                    let key = self.pop()?;
+                    self.computed_exclusions.push(key);
+                }
+
                 OpCode::ObjectRest => {
                     // u8 num_excluded_keys, then (u16 key_idx) * num
                     let n = self.read_byte() as usize;
@@ -5510,6 +5738,13 @@ impl Vm {
                         if let Some(sid) = self.chunks[self.cur_chunk()].constants[idx].as_string_id() {
                             excluded.insert(sid);
                         }
+                    }
+                    // Also consume any dynamic (computed) exclusions
+                    let dyn_excl = std::mem::take(&mut self.computed_exclusions);
+                    for key_val in dyn_excl {
+                        let key_str = self.value_to_string(key_val);
+                        let sid = self.interner.intern(&key_str);
+                        excluded.insert(sid);
                     }
                     let source = self.pop()?;
                     let mut rest = JsObject::ordinary();

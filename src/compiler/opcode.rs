@@ -241,6 +241,14 @@ pub enum OpCode {
     ClassPrivateMethod = 0xBE,
     /// Push super constructor for super() calls
     GetSuperConstructor = 0xBF,
+    /// Define instance field with computed key: pops [key, value] from stack
+    ClassFieldComputed = 0xF6,
+    /// Push TOS key to the VM's computed-exclusion buffer (for object rest)
+    PushComputedExclude = 0xFB,
+    /// Append TOS to the array at TOS-1 (array stays on stack)
+    ArrayAppend = 0xFC,
+    /// Define static field with computed key: pops [key, value] from stack
+    ClassStaticFieldComputed = 0xF8,
 
     // ---- Exception Handling ----
     /// Throw TOS as exception
@@ -373,9 +381,7 @@ impl OpCode {
             | 0xD8..=0xDD
             | 0xE0..=0xE5
             | 0xE8..=0xEF
-            | 0xF0..=0xF5
-            | 0xF7
-            | 0xF9..=0xFA
+            | 0xF0..=0xFC
             | 0xFF
         )
     }
@@ -466,6 +472,10 @@ impl OpCode {
             | OpCode::WithEnter
             | OpCode::WithExit
             | OpCode::GetSuperElem
+            | OpCode::ClassFieldComputed
+            | OpCode::ClassStaticFieldComputed
+            | OpCode::PushComputedExclude
+            | OpCode::ArrayAppend
             | OpCode::Halt => 1,
 
             // 2 bytes (u8 operand)

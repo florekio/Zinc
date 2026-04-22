@@ -1012,7 +1012,12 @@ impl Vm {
     pub(crate) fn exec_native_method(&mut self, sentinel: i32, this_val: Value, args: &[Value]) -> Value {
         match sentinel {
             -590 => { // Object.prototype.hasOwnProperty — also checks __get_X__/__set_X__
-                let key = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
+                let key_val = args.first().copied().unwrap_or(Value::undefined());
+                let key = if key_val.is_symbol() {
+                    format!("__sym_{}__", key_val.as_symbol_id().unwrap())
+                } else {
+                    self.value_to_string(key_val)
+                };
                 let key_id = self.interner.intern(&key);
                 let getter_key = self.interner.intern(&format!("__get_{key}__"));
                 let setter_key = self.interner.intern(&format!("__set_{key}__"));
@@ -1023,10 +1028,19 @@ impl Vm {
                             || o.has_own_property(setter_key)
                     }).unwrap_or(false);
                     Value::boolean(has)
+                } else if this_val.is_function() {
+                    let sentinel = this_val.as_function().unwrap();
+                    let has = self.fn_get_own_prop(sentinel, key_id).is_some();
+                    Value::boolean(has)
                 } else { Value::boolean(false) }
             }
             -591 => { // Object.prototype.propertyIsEnumerable
-                let key = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
+                let key_val = args.first().copied().unwrap_or(Value::undefined());
+                let key = if key_val.is_symbol() {
+                    format!("__sym_{}__", key_val.as_symbol_id().unwrap())
+                } else {
+                    self.value_to_string(key_val)
+                };
                 let key_id = self.interner.intern(&key);
                 if let Some(oid) = this_val.as_object_id() {
                     let is_enum = self.heap.get(oid)

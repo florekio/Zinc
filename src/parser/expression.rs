@@ -1407,37 +1407,42 @@ fn expr_to_assignment_target(expr: Expression) -> ParseResult<AssignmentTarget> 
             // Convert object expression to object destructuring pattern
             let mut properties = Vec::new();
             for prop in obj.properties {
-                if let ObjectProperty::Property(p) = prop {
-                    let key_sid = match &p.key {
-                        PropertyKey::Identifier(s) | PropertyKey::StringLiteral(s) => *s,
-                        _ => continue,
-                    };
-                    let value_pat = match p.value {
-                        Expression::Identifier(id) => Pattern::Identifier(id),
-                        Expression::Assignment(a) => {
-                            // { x = default } or { key: x = default }
-                            let left_pat = match a.left {
-                                AssignmentTarget::Identifier(id) => Pattern::Identifier(id),
-                                AssignmentTarget::Pattern(p) => p,
-                                _ => continue,
-                            };
-                            Pattern::Assignment(Box::new(AssignmentPattern {
-                                left: left_pat,
-                                right: a.right,
-                                span: a.span,
-                            }))
-                        }
-                        Expression::Object(o) => object_expr_to_pattern(o)?,
-                        Expression::Array(a) => array_expr_to_pattern(a)?,
-                        _ => continue,
-                    };
-                    properties.push(ObjectPatternProperty::Property {
-                        key: PropertyKey::Identifier(key_sid),
-                        value: value_pat,
-                        computed: p.computed,
-                        shorthand: p.shorthand,
-                        span: p.span,
-                    });
+                match prop {
+                    ObjectProperty::SpreadElement(s) => {
+                        let arg = expr_to_param(s.argument)?;
+                        properties.push(ObjectPatternProperty::Rest(RestElement {
+                            argument: arg,
+                            span: s.span,
+                        }));
+                    }
+                    ObjectProperty::Property(p) => {
+                        let value_pat = match p.value {
+                            Expression::Identifier(id) => Pattern::Identifier(id),
+                            Expression::Assignment(a) => {
+                                // { x = default } or { key: x = default }
+                                let left_pat = match a.left {
+                                    AssignmentTarget::Identifier(id) => Pattern::Identifier(id),
+                                    AssignmentTarget::Pattern(p) => p,
+                                    _ => continue,
+                                };
+                                Pattern::Assignment(Box::new(AssignmentPattern {
+                                    left: left_pat,
+                                    right: a.right,
+                                    span: a.span,
+                                }))
+                            }
+                            Expression::Object(o) => object_expr_to_pattern(o)?,
+                            Expression::Array(a) => array_expr_to_pattern(a)?,
+                            _ => continue,
+                        };
+                        properties.push(ObjectPatternProperty::Property {
+                            key: p.key,
+                            value: value_pat,
+                            computed: p.computed,
+                            shorthand: p.shorthand,
+                            span: p.span,
+                        });
+                    }
                 }
             }
             Ok(AssignmentTarget::Pattern(Pattern::Object(ObjectPattern {
