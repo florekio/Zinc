@@ -82,6 +82,10 @@ pub enum ObjectKind {
     Function(FunctionKind),
     /// Array iterator: (source_array_id, current_index)
     ArrayIterator(ObjectId, usize),
+    /// Map iterator: (source_map_id, current_index)
+    MapIterator(ObjectId, usize),
+    /// Set iterator: (source_set_id, current_index)
+    SetIterator(ObjectId, usize),
     /// Object key iterator: (list of key StringIds, current_index)
     KeyIterator(Vec<crate::util::interner::StringId>, usize),
     /// Primitive wrapper object (new Number(5), new Boolean(true), new String("x"))
@@ -294,7 +298,9 @@ impl ObjectHeap {
                     if let Some(oid) = trace_value(*val) { refs.push(oid); }
                 }
             }
-            ObjectKind::ArrayIterator(source_id, _) => {
+            ObjectKind::ArrayIterator(source_id, _)
+            | ObjectKind::MapIterator(source_id, _)
+            | ObjectKind::SetIterator(source_id, _) => {
                 refs.push(*source_id);
             }
             ObjectKind::Wrapper(val) => {

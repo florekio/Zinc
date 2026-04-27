@@ -560,6 +560,11 @@ var $262 = {};
 fn run_test(source: &str, meta: &TestMeta, harness_cache: &HashMap<String, String>) -> Result<(), String> {
     let mut parts = Vec::new();
 
+    // For onlyStrict tests, the directive must come first so the whole script is strict.
+    if meta.flags.contains(&"onlyStrict".to_string()) {
+        parts.push("\"use strict\";\n".to_string());
+    }
+
     if !meta.flags.contains(&"raw".to_string()) {
         parts.push(BASE_HARNESS.to_string());
         for inc in &meta.includes {
@@ -567,10 +572,6 @@ fn run_test(source: &str, meta: &TestMeta, harness_cache: &HashMap<String, Strin
                 parts.push(content.clone());
             }
         }
-    }
-
-    if meta.flags.contains(&"onlyStrict".to_string()) {
-        parts.push("\"use strict\";\n".to_string());
     }
 
     parts.push(source.to_string());

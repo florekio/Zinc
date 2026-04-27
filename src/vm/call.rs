@@ -19,6 +19,20 @@ impl Vm {
         if (-536..=-500).contains(&packed) {
             return Ok(self.exec_global_fn(packed, args));
         }
+        // Math method sentinels (-700 to -726)
+        if (-726..=-700).contains(&packed) {
+            return Ok(self.exec_math_sentinel(packed, args));
+        }
+        // Date() called as function (not constructor) returns current date string
+        if packed == -550 {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as f64)
+                .unwrap_or(0.0);
+            let s = crate::vm::vm::format_date(ms);
+            let id = self.interner.intern(&s);
+            return Ok(Value::string(id));
+        }
         // Native this-dependent method sentinels (-590 to -599 and -600 to -629 for Array.prototype)
         if (-629..=-590).contains(&packed) {
             return Ok(self.exec_native_method(packed, this_value, args));

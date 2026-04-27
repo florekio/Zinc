@@ -406,38 +406,47 @@ impl<'a> Compiler<'a> {
                             self.pending_function_name = Some(name);
                         }
                         self.compile_expr(init)?;
-                    } else {
-                        self.chunk.emit_op(OpCode::Undefined, line);
-                    }
 
-                    if self.scope_depth == 0 {
-                        if decl.kind == VarKind::Const {
-                            self.const_globals.insert(name);
-                        }
-                        let idx = self.make_string_constant(name);
-                        self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
-                    } else if decl.kind == VarKind::Var {
-                        // `var` hoists to function/global scope — look for existing binding
-                        if let Some(slot) = self.resolve_local(name) {
-                            if slot <= u8::MAX as usize {
-                                self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
-                            } else {
-                                self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
+                        if self.scope_depth == 0 {
+                            if decl.kind == VarKind::Const {
+                                self.const_globals.insert(name);
                             }
-                            self.chunk.emit_op(OpCode::Pop, line);
-                        } else {
-                            // Not found as local — must be a global (hoisted at program start)
                             let idx = self.make_string_constant(name);
-                            self.chunk.emit_op_u16(OpCode::SetGlobal, idx, line);
-                            self.chunk.emit_op(OpCode::Pop, line);
+                            self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
+                        } else if decl.kind == VarKind::Var {
+                            if let Some(slot) = self.resolve_local(name) {
+                                if slot <= u8::MAX as usize {
+                                    self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
+                                } else {
+                                    self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
+                                }
+                                self.chunk.emit_op(OpCode::Pop, line);
+                            } else {
+                                let idx = self.make_string_constant(name);
+                                self.chunk.emit_op_u16(OpCode::SetGlobal, idx, line);
+                                self.chunk.emit_op(OpCode::Pop, line);
+                            }
+                        } else {
+                            self.add_local(name);
+                            self.mark_initialized();
+                            if decl.kind == VarKind::Const {
+                                self.locals.last_mut().unwrap().is_const = true;
+                            }
+                            if decl.kind == VarKind::Let || decl.kind == VarKind::Const {
+                                let slot = (self.locals.len() - 1) as u8;
+                                self.chunk.emit_op_u8(OpCode::InitLet, slot, line);
+                            }
                         }
+                    } else if decl.kind == VarKind::Var {
+                        // var without init: hoisting already initialized to undefined; no-op
                     } else {
+                        // let/const without init: create binding initialized to undefined
+                        self.chunk.emit_op(OpCode::Undefined, line);
                         self.add_local(name);
                         self.mark_initialized();
                         if decl.kind == VarKind::Const {
                             self.locals.last_mut().unwrap().is_const = true;
                         }
-                        // TDZ bookkeeping for let/const.
                         if decl.kind == VarKind::Let || decl.kind == VarKind::Const {
                             let slot = (self.locals.len() - 1) as u8;
                             self.chunk.emit_op_u8(OpCode::InitLet, slot, line);
@@ -658,7 +667,7 @@ impl<'a> Compiler<'a> {
         };
         if let Some(name) = var_name {
             self.chunk.emit_op(OpCode::Undefined, line);
-            if self.scope_depth <= 1 {
+            if is_var || self.scope_depth == 0 {
                 let idx = self.make_string_constant(name);
                 self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
             } else {
@@ -713,6 +722,7 @@ impl<'a> Compiler<'a> {
     fn compile_for_of(&mut self, f: &ForOfStatement) -> Result<(), String> {
         let line = f.span.start;
         let is_var = matches!(&f.left, ForInOfLeft::Variable(decl) if decl.kind == VarKind::Var);
+        let is_let_const = matches!(&f.left, ForInOfLeft::Variable(decl) if decl.kind != VarKind::Var);
         if !is_var { self.begin_scope(); }
 
         // Determine the loop variable pattern
@@ -739,12 +749,14 @@ impl<'a> Compiler<'a> {
             ForInOfLeft::Expression(Expression::Array(_)) => LoopVar::ArrayDestructure,
             ForInOfLeft::Expression(Expression::Object(_)) => LoopVar::ObjectDestructure,
             ForInOfLeft::Expression(Expression::Identifier(id)) => LoopVar::Simple(id.name),
+            ForInOfLeft::Expression(Expression::Member(_)) => LoopVar::None,
             _ => LoopVar::None,
         };
         // Pre-declare loop variable(s)
+        // var always goes to globals (hoisted); let/const at depth>0 become locals.
         let declare_var = |this: &mut Self, name: StringId| {
             this.chunk.emit_op(OpCode::Undefined, line);
-            if this.scope_depth <= 1 {
+            if is_var || this.scope_depth == 0 {
                 let idx = this.make_string_constant(name);
                 this.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
             } else {
@@ -752,8 +764,15 @@ impl<'a> Compiler<'a> {
                 this.mark_initialized();
             }
         };
+        // For `let/const x of arr`: use per-iteration fresh binding instead of pre-declaring x.
+        let fresh_binding_simple = is_let_const && matches!(&loop_var, LoopVar::Simple(_));
         match &loop_var {
-            LoopVar::Simple(name) => declare_var(self, *name),
+            LoopVar::Simple(name) => {
+                // Only pre-declare for Variable (new declaration), not Expression (existing var).
+                if !fresh_binding_simple && matches!(&f.left, ForInOfLeft::Variable(_)) {
+                    declare_var(self, *name);
+                }
+            }
             LoopVar::ArrayDestructure | LoopVar::ObjectDestructure => {
                 if matches!(&f.left, ForInOfLeft::Variable(_)) {
                     let pat = match &f.left {
@@ -774,6 +793,13 @@ impl<'a> Compiler<'a> {
         self.compile_expr(&f.right)?;
         self.chunk.emit_op(OpCode::GetIterator, line);
 
+        // For fresh-binding-simple: track iterator as anonymous local so slot accounting is correct.
+        if fresh_binding_simple {
+            let anon = self.interner.intern("(for-of-iter)");
+            self.add_local(anon);
+            self.mark_initialized();
+        }
+
         let loop_start = self.chunk.len();
 
         // Call iterator.next()
@@ -787,8 +813,15 @@ impl<'a> Compiler<'a> {
         self.chunk.emit_op(OpCode::IteratorValue, line);
         match &loop_var {
             LoopVar::Simple(name) => {
-                self.compile_set_variable(*name, line)?;
-                self.chunk.emit_op(OpCode::Pop, line);
+                if fresh_binding_simple {
+                    // Value is at TOS; open a per-iteration scope and bind x to it.
+                    self.begin_scope();
+                    self.add_local(*name);
+                    self.mark_initialized();
+                } else {
+                    self.compile_set_variable(*name, line)?;
+                    self.chunk.emit_op(OpCode::Pop, line);
+                }
             }
             LoopVar::ArrayDestructure | LoopVar::ObjectDestructure => {
                 let pat = match &f.left {
@@ -801,40 +834,27 @@ impl<'a> Compiler<'a> {
                 } else {
                     // Expression-based LHS: route through compile_assign_pat
                     match &f.left {
-                        ForInOfLeft::Expression(Expression::Array(arr)) => {
-                            // Convert array expression to a Pattern::Array for compile_assign_pat
-                            let mut pats: Vec<Option<crate::ast::node::Pattern>> = Vec::new();
-                            for elem in &arr.elements {
-                                match elem {
-                                    None => pats.push(None),
-                                    Some(Expression::Identifier(id)) => pats.push(Some(crate::ast::node::Pattern::Identifier(id.clone()))),
-                                    Some(Expression::Assignment(a)) => {
-                                        let left_pat = match &a.left {
-                                            crate::ast::node::AssignmentTarget::Identifier(id) => {
-                                                Some(crate::ast::node::Pattern::Identifier(id.clone()))
-                                            }
-                                            _ => None,
-                                        };
-                                        if let Some(lp) = left_pat {
-                                            pats.push(Some(crate::ast::node::Pattern::Assignment(Box::new(crate::ast::node::AssignmentPattern {
-                                                left: lp,
-                                                right: a.right.clone(),
-                                                span: a.span,
-                                            }))));
-                                        } else {
-                                            pats.push(None);
-                                        }
-                                    }
-                                    _ => pats.push(None),
-                                }
+                        ForInOfLeft::Expression(expr @ Expression::Array(_)) => {
+                            if let Some(pat) = Self::expr_to_pattern(expr) {
+                                self.compile_assign_pat(&pat, line)?;
+                            } else {
+                                self.chunk.emit_op(OpCode::Pop, line);
                             }
-                            let arr_pat = crate::ast::node::Pattern::Array(crate::ast::node::ArrayPattern {
-                                elements: pats,
-                                span: arr.span,
-                            });
-                            self.compile_assign_pat(&arr_pat, line)?;
                         }
                         ForInOfLeft::Expression(Expression::Object(obj)) => {
+                            // RequireObjectCoercible: throw if null/undefined
+                            self.chunk.emit_op(OpCode::Dup, line);
+                            let nullish_j = self.chunk.emit_jump(OpCode::JumpIfNullishPeek, line);
+                            self.chunk.emit_op(OpCode::Pop, line);
+                            let skip_t = self.chunk.emit_jump(OpCode::Jump, line);
+                            self.chunk.patch_jump(nullish_j);
+                            self.chunk.emit_op(OpCode::Pop, line);
+                            self.chunk.emit_op(OpCode::Pop, line);
+                            let mid = self.interner.intern("Cannot destructure property of null or undefined");
+                            self.emit_constant(Value::string(mid), line);
+                            self.chunk.emit_op(OpCode::Throw, line);
+                            self.chunk.patch_jump(skip_t);
+
                             // Collect excluded keys for any rest element
                             let has_rest = obj.properties.iter().any(|p| matches!(p, ObjectProperty::SpreadElement(_)));
                             let excluded_keys: Vec<StringId> = if has_rest {
@@ -860,10 +880,12 @@ impl<'a> Compiler<'a> {
                                                     }
                                                     PropertyKey::Computed(expr) => {
                                                         self.compile_expr(expr)?;
+                                                        if has_rest { self.chunk.emit_op(OpCode::Dup, line); self.chunk.emit_op(OpCode::PushComputedExclude, line); }
                                                         self.chunk.emit_op(OpCode::GetElement, line);
                                                     }
                                                     PropertyKey::NumberLiteral(n) => {
                                                         self.emit_constant(Value::number(*n), line);
+                                                        if has_rest { self.chunk.emit_op(OpCode::Dup, line); self.chunk.emit_op(OpCode::PushComputedExclude, line); }
                                                         self.chunk.emit_op(OpCode::GetElement, line);
                                                     }
                                                     _ => { self.chunk.emit_op(OpCode::Pop, line); continue; }
@@ -871,8 +893,8 @@ impl<'a> Compiler<'a> {
                                                 self.compile_set_variable(id.name, line)?;
                                                 self.chunk.emit_op(OpCode::Pop, line);
                                             }
-                                            Expression::Assignment(a) => {
-                                                // { key = default } or { key: target = default }
+                                            Expression::Assignment(a) if matches!(&a.left, crate::ast::node::AssignmentTarget::Identifier(_)) => {
+                                                // { key = default } or { key: identifier = default }
                                                 if let crate::ast::node::AssignmentTarget::Identifier(var_id) = &a.left {
                                                     self.chunk.emit_op(OpCode::Dup, line);
                                                     match &p.key {
@@ -882,10 +904,12 @@ impl<'a> Compiler<'a> {
                                                         }
                                                         PropertyKey::Computed(expr) => {
                                                             self.compile_expr(expr)?;
+                                                            if has_rest { self.chunk.emit_op(OpCode::Dup, line); self.chunk.emit_op(OpCode::PushComputedExclude, line); }
                                                             self.chunk.emit_op(OpCode::GetElement, line);
                                                         }
                                                         PropertyKey::NumberLiteral(n) => {
                                                             self.emit_constant(Value::number(*n), line);
+                                                            if has_rest { self.chunk.emit_op(OpCode::Dup, line); self.chunk.emit_op(OpCode::PushComputedExclude, line); }
                                                             self.chunk.emit_op(OpCode::GetElement, line);
                                                         }
                                                         _ => { self.chunk.emit_op(OpCode::Pop, line); continue; }
@@ -898,7 +922,30 @@ impl<'a> Compiler<'a> {
                                                     self.chunk.emit_op(OpCode::Pop, line);
                                                 }
                                             }
-                                            _ => {}
+                                            val_expr => {
+                                                // Nested pattern (object/array/assignment with pattern left)
+                                                if let Some(nested_pat) = Self::expr_to_pattern(val_expr) {
+                                                    self.chunk.emit_op(OpCode::Dup, line);
+                                                    match &p.key {
+                                                        PropertyKey::Identifier(k) | PropertyKey::StringLiteral(k) => {
+                                                            let key_idx = self.make_string_constant(*k);
+                                                            self.emit_get_property(key_idx, line);
+                                                        }
+                                                        PropertyKey::Computed(expr) => {
+                                                            self.compile_expr(expr)?;
+                                                            if has_rest { self.chunk.emit_op(OpCode::Dup, line); self.chunk.emit_op(OpCode::PushComputedExclude, line); }
+                                                            self.chunk.emit_op(OpCode::GetElement, line);
+                                                        }
+                                                        PropertyKey::NumberLiteral(n) => {
+                                                            self.emit_constant(Value::number(*n), line);
+                                                            if has_rest { self.chunk.emit_op(OpCode::Dup, line); self.chunk.emit_op(OpCode::PushComputedExclude, line); }
+                                                            self.chunk.emit_op(OpCode::GetElement, line);
+                                                        }
+                                                        _ => { self.chunk.emit_op(OpCode::Pop, line); continue; }
+                                                    }
+                                                    self.compile_assign_pat(&nested_pat, line)?;
+                                                }
+                                            }
                                         }
                                     }
                                     ObjectProperty::SpreadElement(spread) => {
@@ -951,16 +998,38 @@ impl<'a> Compiler<'a> {
                 }
             }
             LoopVar::None => {
-                self.chunk.emit_op(OpCode::Pop, line);
+                if let ForInOfLeft::Expression(Expression::Member(m)) = &f.left {
+                    // Stack: [..., iter_value] — assign to member target
+                    self.compile_expr(&m.object)?;
+                    self.chunk.emit_op(OpCode::Swap, line);
+                    match &m.property {
+                        MemberProperty::Identifier(name) => {
+                            let idx = self.make_string_constant(*name);
+                            self.emit_set_property(idx, line);
+                        }
+                        MemberProperty::Expression(key) => {
+                            self.compile_expr(key)?;
+                            self.chunk.emit_op(OpCode::Swap, line);
+                            self.chunk.emit_op(OpCode::SetElement, line);
+                        }
+                        _ => {}
+                    }
+                    self.chunk.emit_op(OpCode::Pop, line);
+                } else {
+                    self.chunk.emit_op(OpCode::Pop, line);
+                }
             }
         }
 
-        // Compile body with loop context for break/continue
+        // Compile body with loop context for break/continue.
+        // For fresh-binding-simple: scope_depth - 1 is the outer (iter_anon) depth, so that
+        // break/continue correctly pop the per-iteration binding before jumping.
+        let loop_scope_depth = if fresh_binding_simple { self.scope_depth - 1 } else { self.scope_depth };
         self.loops.push(LoopCtx {
             continue_target: loop_start,
             break_patches: Vec::new(),
             continue_patches: Vec::new(),
-            scope_depth: self.scope_depth,
+            scope_depth: loop_scope_depth,
             label: None,
             has_deferred_continue: false,
             try_depth: self.finally_stack.len(),
@@ -968,13 +1037,21 @@ impl<'a> Compiler<'a> {
 
         self.compile_statement(&f.body)?;
 
+        // For fresh-binding-simple: close per-iteration scope before looping back.
+        if fresh_binding_simple {
+            self.end_scope();
+        }
+
         // Loop back
         self.chunk.emit_loop(loop_start, line);
 
-        // Exit: pop the result and iterator
+        // Exit: pop the result (and iterator for non-fresh-binding).
+        // For fresh-binding-simple the outer end_scope() below handles the iterator.
         self.chunk.patch_jump(exit_jump);
         self.chunk.emit_op(OpCode::Pop, line); // pop result
-        self.chunk.emit_op(OpCode::Pop, line); // pop iterator
+        if !fresh_binding_simple {
+            self.chunk.emit_op(OpCode::Pop, line); // pop iterator
+        }
 
         // Patch break jumps
         self.patch_loop_breaks();
@@ -1474,6 +1551,85 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// Convert a destructuring expression (LHS of for-of) into the equivalent
+    /// Pattern so it can be compiled via `compile_assign_pat`.
+    /// Returns `None` for elisions/unsupported forms.
+    fn expr_to_pattern(expr: &Expression) -> Option<Pattern> {
+        match expr {
+            Expression::Identifier(id) => Some(Pattern::Identifier(id.clone())),
+            Expression::Array(arr) => {
+                let mut elems: Vec<Option<Pattern>> = Vec::new();
+                for elem in &arr.elements {
+                    match elem {
+                        None => elems.push(None),
+                        Some(e) => elems.push(Self::expr_to_pattern(e)),
+                    }
+                }
+                Some(Pattern::Array(crate::ast::node::ArrayPattern {
+                    elements: elems,
+                    span: arr.span,
+                }))
+            }
+            Expression::Object(obj) => {
+                let mut props = Vec::new();
+                for p in &obj.properties {
+                    match p {
+                        ObjectProperty::Property(prop) => {
+                            let key = prop.key.clone();
+                            let val_pat = Self::expr_to_pattern(&prop.value)
+                                .unwrap_or(Pattern::Identifier(
+                                    crate::ast::node::Identifier { name: crate::util::interner::StringId(0), span: prop.span }
+                                ));
+                            props.push(ObjectPatternProperty::Property {
+                                key,
+                                value: val_pat,
+                                computed: false,
+                                shorthand: prop.shorthand,
+                                span: prop.span,
+                            });
+                        }
+                        ObjectProperty::SpreadElement(s) => {
+                            if let Some(arg) = Self::expr_to_pattern(&s.argument) {
+                                props.push(ObjectPatternProperty::Rest(crate::ast::node::RestElement {
+                                    argument: arg,
+                                    span: s.span,
+                                }));
+                            }
+                        }
+                    }
+                }
+                Some(Pattern::Object(crate::ast::node::ObjectPattern {
+                    properties: props,
+                    span: obj.span,
+                }))
+            }
+            Expression::Member(m) => Some(Pattern::Member(m.clone())),
+            Expression::Assignment(a) => {
+                let left_pat = match &a.left {
+                    crate::ast::node::AssignmentTarget::Identifier(id) => Some(Pattern::Identifier(id.clone())),
+                    crate::ast::node::AssignmentTarget::Member(m) => Some(Pattern::Member(m.clone())),
+                    crate::ast::node::AssignmentTarget::Pattern(p) => Some(p.clone()),
+                };
+                left_pat.map(|lp| {
+                    Pattern::Assignment(Box::new(crate::ast::node::AssignmentPattern {
+                        left: lp,
+                        right: a.right.clone(),
+                        span: a.span,
+                    }))
+                })
+            }
+            Expression::Spread(s) => {
+                Self::expr_to_pattern(&s.argument).map(|arg| {
+                    Pattern::Rest(Box::new(crate::ast::node::RestElement {
+                        argument: arg,
+                        span: s.span,
+                    }))
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Destructure the value on top of stack into `pat`, consuming the value.
     /// Leaf identifiers must already be declared; uses compile_set_variable to assign.
     fn compile_assign_pat(&mut self, pat: &Pattern, line: u32) -> Result<(), String> {
@@ -1537,10 +1693,9 @@ impl<'a> Compiler<'a> {
                             self.chunk.patch_jump(skip_jump);
                             // Stack: [..., iter, value_or_undefined]
                             if let Pattern::Assignment(a) = pat {
-                                if let Pattern::Identifier(id) = &a.left {
-                                    if Self::is_anonymous_fn_def(&a.right) {
+                                if let Pattern::Identifier(id) = &a.left
+                                    && Self::is_anonymous_fn_def(&a.right) {
                                         self.pending_function_name = Some(id.name);
-                                    }
                                 }
                                 self.emit_default_check(&a.right, line)?;
                                 self.compile_assign_pat(&a.left, line)?;
@@ -1552,10 +1707,29 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 if !had_rest {
-                    self.chunk.emit_op(OpCode::Pop, line); // pop iterator
+                    self.chunk.emit_op(OpCode::IteratorClose, line);
                 }
             }
             Pattern::Object(inner) => {
+                // RequireObjectCoercible: throw TypeError if source is null or undefined
+                // JumpIfNullishPeek jumps when value IS nullish
+                self.chunk.emit_op(OpCode::Dup, line);
+                let nullish_jump = self.chunk.emit_jump(OpCode::JumpIfNullishPeek, line);
+                // Not nullish path: pop dup and skip error
+                self.chunk.emit_op(OpCode::Pop, line);
+                let skip_throw = self.chunk.emit_jump(OpCode::Jump, line);
+                // Nullish path (jump target):
+                self.chunk.patch_jump(nullish_jump);
+                self.chunk.emit_op(OpCode::Pop, line); // pop dup
+                self.chunk.emit_op(OpCode::Pop, line); // pop source
+                let msg_id = self.interner.intern("Cannot destructure property of null or undefined");
+                self.emit_constant(Value::string(msg_id), line);
+                self.chunk.emit_op(OpCode::Throw, line);
+                // End of check (not nullish path resumes here):
+                self.chunk.patch_jump(skip_throw);
+                // Stack: [..., source]
+
+                let has_rest_obj = inner.properties.iter().any(|p| matches!(p, ObjectPatternProperty::Rest(_)));
                 let excluded: Vec<StringId> = inner.properties.iter().filter_map(|p| {
                     if let ObjectPatternProperty::Property { key, .. } = p {
                         match key {
@@ -1575,19 +1749,20 @@ impl<'a> Compiler<'a> {
                                 }
                                 PropertyKey::Computed(expr) => {
                                     self.compile_expr(expr)?;
+                                    if has_rest_obj { self.chunk.emit_op(OpCode::Dup, line); self.chunk.emit_op(OpCode::PushComputedExclude, line); }
                                     self.chunk.emit_op(OpCode::GetElement, line);
                                 }
                                 PropertyKey::NumberLiteral(n) => {
                                     self.emit_constant(Value::number(*n), line);
+                                    if has_rest_obj { self.chunk.emit_op(OpCode::Dup, line); self.chunk.emit_op(OpCode::PushComputedExclude, line); }
                                     self.chunk.emit_op(OpCode::GetElement, line);
                                 }
                                 _ => { self.chunk.emit_op(OpCode::Pop, line); continue; }
                             }
                             if let Pattern::Assignment(a) = value {
-                                if let Pattern::Identifier(target_id) = &a.left {
-                                    if Self::is_anonymous_fn_def(&a.right) {
+                                if let Pattern::Identifier(target_id) = &a.left
+                                    && Self::is_anonymous_fn_def(&a.right) {
                                         self.pending_function_name = Some(target_id.name);
-                                    }
                                 }
                                 self.emit_default_check(&a.right, line)?;
                                 self.compile_assign_pat(&a.left, line)?;
@@ -1613,6 +1788,31 @@ impl<'a> Compiler<'a> {
             Pattern::Assignment(a) => {
                 self.emit_default_check(&a.right, line)?;
                 self.compile_assign_pat(&a.left, line)?;
+            }
+            Pattern::Member(m) => {
+                // Stack: [..., val]
+                self.compile_expr(&m.object)?;
+                // Stack: [..., val, obj]
+                self.chunk.emit_op(OpCode::Swap, line);
+                // Stack: [..., obj, val]
+                match &m.property {
+                    crate::ast::node::MemberProperty::Identifier(name) => {
+                        let idx = self.make_string_constant(*name);
+                        self.emit_set_property(idx, line);
+                    }
+                    crate::ast::node::MemberProperty::Expression(key) => {
+                        self.compile_expr(key)?;
+                        // Stack: [..., obj, val, key]
+                        self.chunk.emit_op(OpCode::Swap, line);
+                        // Stack: [..., obj, key, val]
+                        self.chunk.emit_op(OpCode::SetElement, line);
+                    }
+                    crate::ast::node::MemberProperty::PrivateIdentifier(name) => {
+                        let idx = self.make_string_constant(*name);
+                        self.chunk.emit_op_u16(OpCode::SetPrivate, idx, line);
+                    }
+                }
+                self.chunk.emit_op(OpCode::Pop, line);
             }
             _ => { self.chunk.emit_op(OpCode::Pop, line); }
         }
@@ -2122,10 +2322,9 @@ impl<'a> Compiler<'a> {
                                 self.chunk.emit_op(OpCode::JumpIfTrue, line);
                                 self.chunk.code.push(0); self.chunk.code.push(0);
                                 self.chunk.emit_op(OpCode::Pop, line);
-                                if let Pattern::Identifier(id) = &a.left {
-                                    if Self::is_anonymous_fn_def(&a.right) {
+                                if let Pattern::Identifier(id) = &a.left
+                                    && Self::is_anonymous_fn_def(&a.right) {
                                         self.pending_function_name = Some(id.name);
-                                    }
                                 }
                                 self.compile_expr(&a.right)?;
                                 let target = self.chunk.code.len();
@@ -2343,7 +2542,7 @@ impl<'a> Compiler<'a> {
                         }
                     }
                 }
-                Pattern::Array(_) | Pattern::Object(_) => {
+                Pattern::Array(_) | Pattern::Object(_) | Pattern::Member(_) => {
                     let anon = self.interner.intern(&format!("__param{param_idx}__"));
                     self.add_local(anon);
                     self.mark_initialized();
@@ -2524,7 +2723,7 @@ impl<'a> Compiler<'a> {
                         }
                     }
                 }
-                Pattern::Array(_) | Pattern::Object(_) => {
+                Pattern::Array(_) | Pattern::Object(_) | Pattern::Member(_) => {
                     let anon = self.interner.intern(&format!("__param{param_idx}__"));
                     self.add_local(anon);
                     self.mark_initialized();
@@ -3009,10 +3208,9 @@ impl<'a> Compiler<'a> {
                                         self.chunk.emit_op(OpCode::JumpIfFalse, line);
                                         self.chunk.code.push(0); self.chunk.code.push(0);
                                         self.chunk.emit_op(OpCode::Pop, line);
-                                        if let Pattern::Identifier(id) = &a.left {
-                                            if Self::is_anonymous_fn_def(&a.right) {
+                                        if let Pattern::Identifier(id) = &a.left
+                                            && Self::is_anonymous_fn_def(&a.right) {
                                                 self.pending_function_name = Some(id.name);
-                                            }
                                         }
                                         self.compile_expr(&a.right)?;
                                         let target = self.chunk.code.len();
@@ -3086,10 +3284,9 @@ impl<'a> Compiler<'a> {
                                         self.chunk.emit_op(OpCode::JumpIfFalse, line);
                                         self.chunk.code.push(0); self.chunk.code.push(0);
                                         self.chunk.emit_op(OpCode::Pop, line);
-                                        if let Pattern::Identifier(id) = &a.left {
-                                            if Self::is_anonymous_fn_def(&a.right) {
+                                        if let Pattern::Identifier(id) = &a.left
+                                            && Self::is_anonymous_fn_def(&a.right) {
                                                 self.pending_function_name = Some(id.name);
-                                            }
                                         }
                                         self.compile_expr(&a.right)?;
                                         let target = self.chunk.code.len();
@@ -3283,6 +3480,19 @@ impl<'a> Compiler<'a> {
                     self.chunk.emit_op_u8(OpCode::Call, argc, line);
                     return Ok(());
                 }
+            // Computed member call obj[expr](args): evaluate obj+key, GetElement, then Call.
+            // This must happen before args are evaluated to keep the stack order correct.
+            if let MemberProperty::Expression(key_expr) = &m.property {
+                self.compile_expr(&m.object)?;
+                self.compile_expr(key_expr)?;
+                self.chunk.emit_op(OpCode::GetElement, line);
+                for arg in &c.arguments {
+                    self.compile_expr(arg)?;
+                }
+                self.chunk.emit_op_u8(OpCode::Call, argc, line);
+                return Ok(());
+            }
+
             self.compile_expr(&m.object)?; // push obj
             for arg in &c.arguments {
                 self.compile_expr(arg)?;
@@ -3305,7 +3515,7 @@ impl<'a> Compiler<'a> {
                     self.chunk.code.push((idx & 0xFF) as u8);
                 }
                 _ => {
-                    // Computed property method call - simplified
+                    // Other computed forms (shouldn't normally reach here)
                     self.chunk.emit_byte(OpCode::CallMethod as u8, line);
                     self.chunk.emit_byte(argc, line);
                     self.chunk.code.push(0);
@@ -3405,6 +3615,10 @@ impl<'a> Compiler<'a> {
                     self.chunk
                         .emit_op_u32(OpCode::SetArrayItem, i as u32, line);
                 }
+            } else {
+                // Hole element (e.g. [,]): emit undefined to preserve array length
+                self.chunk.emit_op(OpCode::Undefined, line);
+                self.chunk.emit_op_u32(OpCode::SetArrayItem, i as u32, line);
             }
         }
         Ok(())
@@ -3767,6 +3981,7 @@ fn collect_binding_names_into(pat: &Pattern, out: &mut Vec<StringId>) {
         }
         Pattern::Rest(r) => collect_binding_names_into(&r.argument, out),
         Pattern::Assignment(a) => collect_binding_names_into(&a.left, out),
+        Pattern::Member(_) => {}
     }
 }
 

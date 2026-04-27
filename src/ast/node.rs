@@ -674,6 +674,7 @@ pub enum Pattern {
     Object(ObjectPattern),
     Assignment(Box<AssignmentPattern>),
     Rest(Box<RestElement>),
+    Member(Box<MemberExpression>),
 }
 
 #[derive(Debug, Clone)]

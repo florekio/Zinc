@@ -756,11 +756,76 @@ impl Vm {
                 let new_oid = self.heap.allocate(arr);
                 Ok(Value::object_id(new_oid))
             }
+            "hasOwnProperty" => {
+                let key = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
+                let has = if let Ok(idx) = key.parse::<usize>() {
+                    self.heap.get(oid).map(|o| {
+                        if let ObjectKind::Array(ref elems) = o.kind { idx < elems.len() } else { false }
+                    }).unwrap_or(false)
+                } else {
+                    let key_id = self.interner.intern(&key);
+                    self.heap.get(oid).map(|o| o.has_own_property(key_id)).unwrap_or(false)
+                };
+                Ok(Value::boolean(has))
+            }
+            "propertyIsEnumerable" => {
+                let key = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
+                let is_enum = if let Ok(idx) = key.parse::<usize>() {
+                    self.heap.get(oid).map(|o| {
+                        if let ObjectKind::Array(ref elems) = o.kind { idx < elems.len() } else { false }
+                    }).unwrap_or(false)
+                } else {
+                    let key_id = self.interner.intern(&key);
+                    self.heap.get(oid)
+                        .and_then(|o| o.get_property_descriptor(key_id))
+                        .map(|p| p.is_enumerable())
+                        .unwrap_or(false)
+                };
+                Ok(Value::boolean(is_enum))
+            }
+            "isPrototypeOf" => {
+                let target = args.first().copied().unwrap_or(Value::undefined());
+                let result = self.is_prototype_of(Value::object_id(oid), target);
+                Ok(Value::boolean(result))
+            }
+            "valueOf" => Ok(Value::object_id(oid)),
+            "toLocaleString" => {
+                // Array toLocaleString: join with ","
+                let elements: Vec<Value> = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
+                    .unwrap_or_default();
+                let parts: Vec<String> = elements.iter().map(|v| {
+                    if v.is_null() || v.is_undefined() { String::new() } else { self.value_to_string(*v) }
+                }).collect();
+                let result = parts.join(",");
+                let id = self.interner.intern(&result);
+                Ok(Value::string(id))
+            }
             _ => Ok(Value::undefined()),
         }
     }
 
     /// Helper to flatten an array to a given depth.
+    /// Walk the prototype chain of `target` to see if `proto` appears.
+    pub(crate) fn is_prototype_of(&self, proto: Value, target: Value) -> bool {
+        let proto_oid = match proto.as_object_id() {
+            Some(oid) => oid,
+            None => return false,
+        };
+        let start_oid = match target.as_object_id() {
+            Some(oid) => oid,
+            None => return false,
+        };
+        let mut current = self.heap.get(start_oid).and_then(|o| o.prototype);
+        loop {
+            match current {
+                None => return false,
+                Some(oid) if oid == proto_oid => return true,
+                Some(oid) => current = self.heap.get(oid).and_then(|o| o.prototype),
+            }
+        }
+    }
+
     fn flatten_array(&self, elements: &[Value], depth: usize) -> Vec<Value> {
         let mut result = Vec::new();
         for elem in elements {
@@ -864,6 +929,69 @@ impl Vm {
                 let x = a() as i32 as i64;
                 let y = b() as i32 as i64;
                 ((x * y) as i32) as f64
+            }
+            _ => return Value::undefined(),
+        };
+        Value::number(result)
+    }
+
+    // ---- Math sentinel dispatch (-700 to -726) ----
+    pub(crate) fn exec_math_sentinel(&mut self, sentinel: i32, args: &[Value]) -> Value {
+        let a0 = args.first().map(|v| self.to_f64(*v)).unwrap_or(f64::NAN);
+        let a1 = args.get(1).map(|v| self.to_f64(*v)).unwrap_or(f64::NAN);
+        let result = match sentinel {
+            -700 => a0.sin(),
+            -701 => a0.cos(),
+            -702 => a0.abs(),
+            -703 => a0.floor(),
+            -704 => a0.ceil(),
+            -705 => a0.round(),
+            -706 => a0.sqrt(),
+            -707 => a0.powf(a1),
+            -708 => { // max
+                if args.is_empty() { return Value::number(f64::NEG_INFINITY); }
+                let mut m = f64::NEG_INFINITY;
+                for arg in args { let n = self.to_f64(*arg); if n.is_nan() { return Value::number(f64::NAN); } else if n > m { m = n; } }
+                m
+            }
+            -709 => { // min
+                if args.is_empty() { return Value::number(f64::INFINITY); }
+                let mut m = f64::INFINITY;
+                for arg in args { let n = self.to_f64(*arg); if n.is_nan() { return Value::number(f64::NAN); } else if n < m { m = n; } }
+                m
+            }
+            -710 => a0.exp(),
+            -711 => a0.ln(),
+            -712 => a0.log2(),
+            -713 => a0.log10(),
+            -714 => { // random
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().subsec_nanos();
+                return Value::number(t as f64 / u32::MAX as f64);
+            }
+            -715 => a0.trunc(),
+            -716 => a0.signum(),
+            -717 => a0.cbrt(),
+            -718 => { // hypot
+                let sum: f64 = args.iter().map(|v| { let n = self.to_f64(*v); n * n }).sum();
+                sum.sqrt()
+            }
+            -719 => a0.atan2(a1),
+            -720 => a0.atan(),
+            -721 => a0.asin(),
+            -722 => a0.acos(),
+            -723 => a0.tan(),
+            -724 => { // clz32
+                if a0.is_nan() || a0.is_infinite() { 32.0 }
+                else { (a0 as u32).leading_zeros() as f64 }
+            }
+            -725 => { // imul
+                let x = a0 as i32 as i64; let y = a1 as i32 as i64;
+                ((x * y) as i32) as f64
+            }
+            -726 => { // fround
+                a0 as f32 as f64
             }
             _ => return Value::undefined(),
         };
@@ -979,24 +1107,46 @@ impl Vm {
                 let id = self.interner.intern(&result);
                 Value::string(id)
             }
+            -507 => { // Array.isArray
+                let v = args.first().copied().unwrap_or(Value::undefined());
+                let is_arr = v.as_object_id()
+                    .and_then(|oid| self.heap.get(oid))
+                    .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
+                    .unwrap_or(false);
+                Value::boolean(is_arr)
+            }
+            -508 => { // Object(v) — coerce to object
+                let arg = args.first().copied().unwrap_or(Value::undefined());
+                if arg.is_object() {
+                    return arg;
+                }
+                let mut obj = crate::runtime::object::JsObject::ordinary();
+                obj.prototype = Some(self.object_prototype);
+                if !arg.is_null() && !arg.is_undefined() {
+                    let prim_key = self.interner.intern("__primitive__");
+                    obj.set_property(prim_key, arg);
+                }
+                Value::object_id(self.heap.allocate(obj))
+            }
             // Error constructors called without `new`
-            -514..=-510 => {
+            -516..=-510 => {
                 let error_type = match sentinel {
                     -510 => "Error",
                     -511 => "TypeError",
                     -512 => "RangeError",
                     -513 => "ReferenceError",
                     -514 => "SyntaxError",
+                    -515 => "EvalError",
+                    -516 => "URIError",
                     _ => "Error",
                 };
                 let msg = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
                 let mut err_obj = crate::runtime::object::JsObject::ordinary();
+                err_obj.prototype = self.func_prototypes.get(&sentinel).copied()
+                    .or(Some(self.object_prototype));
                 let msg_key = self.interner.intern("message");
                 let msg_id = self.interner.intern(&msg);
                 err_obj.set_property(msg_key, Value::string(msg_id));
-                let name_key = self.interner.intern("name");
-                let name_id = self.interner.intern(error_type);
-                err_obj.set_property(name_key, Value::string(name_id));
                 let stack_key = self.interner.intern("stack");
                 let stack_str = format!("{error_type}: {msg}");
                 let stack_id = self.interner.intern(&stack_str);

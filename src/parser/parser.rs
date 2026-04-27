@@ -347,7 +347,7 @@ fn unescape_string(s: &str) -> String {
                 Some('0') if !matches!(chars.peek(), Some('0'..='9')) => result.push('\0'),
                 Some('u') => {
                     // \uXXXX or \u{XXXX}
-                    if chars.peek() == Some(&'{') {
+                    let code = if chars.peek() == Some(&'{') {
                         chars.next(); // skip {
                         let mut hex = String::new();
                         while let Some(&c) = chars.peek() {
@@ -355,19 +355,43 @@ fn unescape_string(s: &str) -> String {
                             hex.push(c);
                             chars.next();
                         }
-                        if let Ok(code) = u32::from_str_radix(&hex, 16)
-                            && let Some(ch) = char::from_u32(code) {
-                                result.push(ch);
-                            }
+                        u32::from_str_radix(&hex, 16).ok()
                     } else {
                         let mut hex = String::with_capacity(4);
                         for _ in 0..4 {
                             if let Some(c) = chars.next() { hex.push(c); }
                         }
-                        if let Ok(code) = u32::from_str_radix(&hex, 16)
-                            && let Some(ch) = char::from_u32(code) {
-                                result.push(ch);
+                        u32::from_str_radix(&hex, 16).ok()
+                    };
+                    if let Some(code) = code {
+                        // Check for surrogate pair: high surrogate followed by \uDC00-\uDFFF
+                        if (0xD800..=0xDBFF).contains(&code) {
+                            // Peek at chars: expect \uDC00-\uDFFF
+                            let mut saved_chars = chars.clone();
+                            if saved_chars.next() == Some('\\') && saved_chars.next() == Some('u') {
+                                let mut low_hex = String::with_capacity(4);
+                                for _ in 0..4 {
+                                    if let Some(c) = saved_chars.next() { low_hex.push(c); }
+                                }
+                                if let Ok(low) = u32::from_str_radix(&low_hex, 16)
+                                    && (0xDC00..=0xDFFF).contains(&low) {
+                                    // Consume the low surrogate escape from chars
+                                    chars.next(); // '\'
+                                    chars.next(); // 'u'
+                                    for _ in 0..4 { chars.next(); }
+                                    let cp = 0x10000 + (code - 0xD800) * 0x400 + (low - 0xDC00);
+                                    if let Some(ch) = char::from_u32(cp) { result.push(ch); }
+                                    continue;
+                                }
                             }
+                            // Lone high surrogate: use U+FFFD replacement character
+                            result.push('\u{FFFD}');
+                        } else if (0xDC00..=0xDFFF).contains(&code) {
+                            // Lone low surrogate: use U+FFFD replacement character
+                            result.push('\u{FFFD}');
+                        } else if let Some(ch) = char::from_u32(code) {
+                            result.push(ch);
+                        }
                     }
                 }
                 Some('x') => {
