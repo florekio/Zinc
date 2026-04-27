@@ -560,7 +560,8 @@ var $262 = {};
 fn run_test(source: &str, meta: &TestMeta, harness_cache: &HashMap<String, String>) -> Result<(), String> {
     let mut parts = Vec::new();
 
-    // For onlyStrict tests, the directive must come first so the whole script is strict.
+    // "use strict" must be the very first directive to be effective.
+    // For onlyStrict tests we prepend it so the entire script (harness + source) runs in strict mode.
     if meta.flags.contains(&"onlyStrict".to_string()) {
         parts.push("\"use strict\";\n".to_string());
     }

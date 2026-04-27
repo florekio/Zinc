@@ -151,6 +151,8 @@ pub struct Vm {
     pub(crate) number_prototype: ObjectId,
     /// Singleton String.prototype object
     pub(crate) string_prototype: ObjectId,
+    /// Singleton globalThis object — used as the default `this` for non-strict function calls
+    pub(crate) global_this_oid: ObjectId,
     /// Cached Math object ID for fast dispatch
     pub(crate) math_oid: Option<ObjectId>,
     /// Cached JSON object ID for fast dispatch
@@ -305,18 +307,19 @@ impl Vm {
         let console_name = interner.intern("console");
         globals.insert(console_name, Value::object_id(console_oid));
 
-        // Create Math object with constants and methods
+        // Create Math object with constants and methods.
+        // Per spec, Math.{PI,E,LN2,LN10,SQRT2,...} are non-writable, non-enumerable, non-configurable.
         let mut math_obj = JsObject::ordinary();
         let pi_name = interner.intern("PI");
-        math_obj.set_property(pi_name, Value::number(std::f64::consts::PI));
+        math_obj.define_property(pi_name, Property::with_flags(Value::number(std::f64::consts::PI), 0));
         let e_name = interner.intern("E");
-        math_obj.set_property(e_name, Value::number(std::f64::consts::E));
+        math_obj.define_property(e_name, Property::with_flags(Value::number(std::f64::consts::E), 0));
         let ln2_name = interner.intern("LN2");
-        math_obj.set_property(ln2_name, Value::number(std::f64::consts::LN_2));
+        math_obj.define_property(ln2_name, Property::with_flags(Value::number(std::f64::consts::LN_2), 0));
         let ln10_name = interner.intern("LN10");
-        math_obj.set_property(ln10_name, Value::number(std::f64::consts::LN_10));
+        math_obj.define_property(ln10_name, Property::with_flags(Value::number(std::f64::consts::LN_10), 0));
         let sqrt2_name = interner.intern("SQRT2");
-        math_obj.set_property(sqrt2_name, Value::number(std::f64::consts::SQRT_2));
+        math_obj.define_property(sqrt2_name, Property::with_flags(Value::number(std::f64::consts::SQRT_2), 0));
         // Math methods as sentinel functions (-700 range)
         for (name, sentinel) in [
             ("sin", -700i32), ("cos", -701), ("abs", -702), ("floor", -703),
@@ -468,6 +471,7 @@ impl Vm {
             boolean_prototype,
             number_prototype,
             string_prototype,
+            global_this_oid,
             math_oid: Some(math_oid),
             json_oid: Some(json_oid),
             symbol_descriptions: sym_descs,
@@ -785,6 +789,23 @@ impl Vm {
             // Handle binary literals: 0b, 0B
             if s.starts_with("0b") || s.starts_with("0B") {
                 return u64::from_str_radix(&s[2..], 2).map(|v| v as f64).unwrap_or(f64::NAN);
+            }
+            // Spec allows only `Infinity`, `+Infinity`, `-Infinity` (case-sensitive).
+            // Rust's parser accepts "inf"/"INFINITY" too, so guard against that.
+            match s {
+                "Infinity" | "+Infinity" => return f64::INFINITY,
+                "-Infinity" => return f64::NEG_INFINITY,
+                _ => {}
+            }
+            if s.eq_ignore_ascii_case("inf")
+                || s.eq_ignore_ascii_case("infinity")
+                || s.eq_ignore_ascii_case("+inf")
+                || s.eq_ignore_ascii_case("+infinity")
+                || s.eq_ignore_ascii_case("-inf")
+                || s.eq_ignore_ascii_case("-infinity")
+                || s.eq_ignore_ascii_case("nan")
+            {
+                return f64::NAN;
             }
             return s.parse::<f64>().unwrap_or(f64::NAN);
         }
@@ -1294,6 +1315,32 @@ impl Vm {
         let s = self.interner.resolve(id).trim();
         if s.is_empty() {
             return Some(0.0);
+        }
+        // Handle hex/octal/binary literal strings: "0xff", "0o17", "0b1010".
+        if s.len() > 2 {
+            let (sign, body) = match s.as_bytes()[0] {
+                b'+' => (1.0, &s[1..]),
+                b'-' => (-1.0, &s[1..]),
+                _ => (1.0, s),
+            };
+            if body.len() > 2 && body.as_bytes()[0] == b'0' {
+                let radix = match body.as_bytes()[1] {
+                    b'x' | b'X' => Some(16),
+                    b'o' | b'O' => Some(8),
+                    b'b' | b'B' => Some(2),
+                    _ => None,
+                };
+                if let Some(r) = radix
+                    && let Ok(n) = u64::from_str_radix(&body[2..], r)
+                {
+                    return Some(sign * n as f64);
+                }
+            }
+        }
+        match s {
+            "Infinity" | "+Infinity" => return Some(f64::INFINITY),
+            "-Infinity" => return Some(f64::NEG_INFINITY),
+            _ => {}
         }
         s.parse::<f64>().ok()
     }
@@ -1854,13 +1901,6 @@ impl Vm {
                     let name_id = name_val.as_string_id().ok_or_else(|| {
                         VmError::RuntimeError("expected string constant for variable name".into())
                     })?;
-                    // In strict mode, assigning to an undeclared variable is a ReferenceError
-                    if self.is_strict() && !self.globals.contains_key(&name_id) {
-                        let var_name = self.interner.resolve(name_id).to_owned();
-                        let err = self.make_native_error("ReferenceError", &format!("{var_name} is not defined"));
-                        self.handle_throw(err)?;
-                        continue;
-                    }
                     let val = self.peek()?;
                     self.globals.insert(name_id, val);
                     // Sync to fast Vec
@@ -2060,8 +2100,12 @@ impl Vm {
                             } else if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
                                 // Arrow functions inherit `this` from enclosing scope
                                 self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined())
-                            } else {
+                            } else if self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT) {
                                 Value::undefined()
+                            } else {
+                                // Non-strict function called without explicit this binding:
+                                // `this` is coerced to the global object.
+                                Value::object_id(self.global_this_oid)
                             };
 
                             let saved_args: Vec<Value> = (0..argc)
@@ -2239,14 +2283,27 @@ impl Vm {
                                 return Err(VmError::RuntimeError(format!("eval CompileError: {e}")));
                             }
                         };
-                        // Flatten and add chunks to VM
+                        // Flatten and add chunks to VM. Adjust children indices to be absolute
+                        // by adding base_idx (flatten_chunk uses indices relative to its output vec).
                         let base_idx = self.chunks.len();
                         let mut flat_chunks = Vec::new();
                         Vm::flatten_chunk(chunk, &mut flat_chunks);
+                        for c in &mut flat_chunks {
+                            for child in &mut c.children {
+                                *child += base_idx;
+                            }
+                        }
                         self.chunks.extend(flat_chunks);
-                        // Execute as a function call
+                        // Execute inheriting the current `this` binding (spec requirement)
                         let eval_fn = Value::function(base_idx as i32);
-                        let result = self.call_function(eval_fn, &[])?;
+                        let current_this = self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined());
+                        let frames_before = self.frames.len();
+                        let stack_before = self.stack.len();
+                        let result = self.call_function_this(eval_fn, current_this, &[])?;
+                        // Eval chunks end in Halt, which doesn't unwind the call frame.
+                        // Clean up leftover frame and stack slots.
+                        while self.frames.len() > frames_before { self.frames.pop(); }
+                        self.stack.truncate(stack_before);
                         self.push(result);
                         continue;
                     }
@@ -2395,10 +2452,15 @@ impl Vm {
                 }
 
                 OpCode::Return => {
-                    let result = self.pop()?;
+                    let mut result = self.pop()?;
                     let frame = self.frames.pop().unwrap();
                     if !self.closure_upvalues.is_empty() {
                         self.close_upvalues_above(frame.base.saturating_sub(1));
+                    }
+                    // Constructor return semantics: if the return value is not an object,
+                    // return `this` instead (per ES spec, [[Construct]] step 13).
+                    if frame.is_constructor && !result.is_object() && !result.is_function() {
+                        result = frame.this_value;
                     }
                     // Generator return: mark completed, produce {value, done: true}
                     if let Some(gid) = frame.generator_id {
@@ -2462,10 +2524,14 @@ impl Vm {
 
                 // ---- Miscellaneous ---------------------------------------
                 OpCode::Halt => {
-                    return Ok(if self.stack.is_empty() {
-                        Value::undefined()
-                    } else {
+                    // Only pop a value that belongs to the current frame.
+                    // Eval/script chunks may end with no value on top of their own frame;
+                    // do not steal the function value sitting in the parent slot.
+                    let frame_base = self.frames.last().map(|f| f.base).unwrap_or(0);
+                    return Ok(if self.stack.len() > frame_base {
                         self.pop()?
+                    } else {
+                        Value::undefined()
                     });
                 }
 
@@ -2713,35 +2779,43 @@ impl Vm {
                 OpCode::In => {
                     let obj = self.pop()?;
                     let key = self.pop()?;
-                    // RHS must be an object or function — throw TypeError for primitives
-                    if !obj.is_object() && !obj.is_function() {
+                    // RHS must be an object or function — throw TypeError for primitives.
+                    if obj.is_boolean() || obj.is_string() || self.is_cons_string(obj)
+                        || obj.is_null() || obj.is_undefined() || obj.is_number() || obj.is_int()
+                        || obj.is_symbol()
+                    {
                         let err = self.make_native_error("TypeError", "Cannot use 'in' operator to search for the property in a non-object");
                         self.handle_throw(err)?;
                         continue;
                     }
-                    // Coerce key to string
-                    let key_str = self.value_to_string(key);
-                    let key_id = self.interner.intern(&key_str);
                     let result = if let Some(oid) = obj.as_object_id() {
-                        // Walk prototype chain for 'in' operator
-                        self.heap.get_property_chain(oid, key_id).is_some()
+                        if let Some(kid) = key.as_string_id() {
+                            // Walk prototype chain for 'in' operator
+                            self.heap.get_property_chain(oid, kid).is_some()
+                        } else if let Some(idx) = key.as_int() {
+                            // Numeric key: check array elements
+                            self.heap.get(oid)
+                                .map(|o| if let ObjectKind::Array(ref elems) = o.kind {
+                                    idx >= 0 && (idx as usize) < elems.len()
+                                } else { false })
+                                .unwrap_or(false)
+                        } else {
+                            let key_str = self.value_to_string(key);
+                            let key_id = self.interner.intern(&key_str);
+                            self.heap.get_property_chain(oid, key_id).is_some()
+                        }
                     } else if obj.is_function() {
-                        // Sentinel function: check known static properties
+                        // Sentinel constructors: check well-known static properties
                         let sentinel = obj.as_function().unwrap();
+                        let key_str = self.value_to_string(key);
                         match (sentinel, key_str.as_str()) {
-                            (-505, "NaN") | (-505, "POSITIVE_INFINITY") | (-505, "NEGATIVE_INFINITY")
-                            | (-505, "MAX_VALUE") | (-505, "MIN_VALUE") | (-505, "MAX_SAFE_INTEGER")
-                            | (-505, "MIN_SAFE_INTEGER") | (-505, "EPSILON")
-                            | (-505, "isNaN") | (-505, "isFinite") | (-505, "isInteger")
-                            | (-505, "isSafeInteger") | (-505, "parseInt") | (-505, "parseFloat") => true,
+                            (-505, "MAX_VALUE") | (-505, "MIN_VALUE") | (-505, "NaN")
+                            | (-505, "POSITIVE_INFINITY") | (-505, "NEGATIVE_INFINITY")
+                            | (-505, "EPSILON") | (-505, "MAX_SAFE_INTEGER") | (-505, "MIN_SAFE_INTEGER")
+                            | (-505, "isFinite") | (-505, "isInteger") | (-505, "isNaN") | (-505, "isSafeInteger")
+                            | (-505, "parseFloat") | (-505, "parseInt") => true,
                             (-504, "fromCharCode") | (-504, "fromCodePoint") | (-504, "raw") => true,
-                            (-507, "prototype") | (-508, "prototype") | (-551, "prototype") => true,
-                            _ => {
-                                self.fn_property_overrides.contains_key(&(sentinel, key_id))
-                                    || key_str == "prototype"
-                                    || key_str == "length"
-                                    || key_str == "name"
-                            }
+                            _ => false,
                         }
                     } else { false };
                     self.push(Value::boolean(result));
@@ -2848,26 +2922,28 @@ impl Vm {
                                     _ => {}
                                 }
                         }
-                        // Check for array methods (push, pop, etc.)
-                        if matches!(name_str,
-                            "push" | "pop" | "join" | "indexOf" | "lastIndexOf"
-                            | "includes" | "map" | "filter" | "forEach"
-                            | "find" | "findIndex" | "findLast" | "findLastIndex"
-                            | "some" | "every" | "reduce" | "reduceRight"
-                            | "reverse" | "shift" | "unshift"
-                            | "splice" | "slice" | "concat" | "sort"
-                            | "fill" | "copyWithin" | "flat" | "flatMap"
-                            | "at" | "keys" | "values" | "entries" | "toString"
-                            | "toSorted" | "toReversed" | "toSpliced" | "with"
-                        ) {
-                            // Store as function sentinel for typeof correctness
-                            let sentinel = -((oid.0 as i32 + 1) * 1000 + name_id.0 as i32);
-                            self.push(Value::function(sentinel));
-                            // Also push the object back since CallMethod expects it
-                            // Actually -- the object was already popped. For CallMethod,
-                            // the compiler pushes obj first, then looks up the method.
-                            // Let me just store the sentinel and handle in CallMethod.
-                            continue;
+                        // For arrays, expose Array.prototype methods as the same sentinel function
+                        // values so that `arr.method === Array.prototype.method` holds.
+                        if let Some(obj) = self.heap.get(oid)
+                            && matches!(&obj.kind, ObjectKind::Array(_))
+                        {
+                            let proto_sentinel = match name_str {
+                                "join" => Some(-600i32), "push" => Some(-601), "pop" => Some(-602),
+                                "shift" => Some(-603), "unshift" => Some(-604), "indexOf" => Some(-605),
+                                "includes" => Some(-606), "forEach" => Some(-607), "map" => Some(-608),
+                                "filter" => Some(-609), "reduce" => Some(-610), "some" => Some(-611),
+                                "every" => Some(-612), "find" => Some(-613), "findIndex" => Some(-614),
+                                "slice" => Some(-615), "concat" => Some(-616), "reverse" => Some(-617),
+                                "sort" => Some(-618), "flat" => Some(-619), "flatMap" => Some(-620),
+                                "fill" => Some(-621), "splice" => Some(-622), "reduceRight" => Some(-623),
+                                "at" => Some(-624), "keys" => Some(-625), "values" => Some(-626),
+                                "entries" => Some(-627), "lastIndexOf" => Some(-628), "toString" => Some(-629),
+                                _ => None,
+                            };
+                            if let Some(s) = proto_sentinel {
+                                self.push(Value::function(s));
+                                continue;
+                            }
                         }
                         // Check for RegExp properties
                         if let Some(obj) = self.heap.get(oid)
@@ -3882,13 +3958,25 @@ impl Vm {
                     if let Some(oid) = obj_val.as_object_id() {
                         // For private names (#x), try mangled key first
                         let method_name_s = self.interner.resolve(method_name).to_owned();
-                        let method_val = if method_name_s.starts_with('#') {
+                        let mut method_val = if method_name_s.starts_with('#') {
                             let mangled = self.interner.intern(&format!("__priv_{}__", method_name_s));
                             self.heap.get_property_chain(oid, mangled)
                                 .or_else(|| self.heap.get_property_chain(oid, method_name))
                         } else {
                             self.heap.get_property_chain(oid, method_name)
                         };
+                        // If no direct method found, check for a getter (`__get_<name>__`):
+                        // call the getter and use its return value as the method to invoke.
+                        if method_val.is_none() {
+                            let getter_key = self.interner.intern(&format!("__get_{method_name_s}__"));
+                            if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
+                                && gfn.is_function()
+                            {
+                                if let Ok(rv) = self.call_function_this(gfn, obj_val, &[]) {
+                                    method_val = Some(rv);
+                                }
+                            }
+                        }
                         if let Some(mv) = method_val
                             && mv.is_function() {
                                 let packed = mv.as_function().unwrap();
@@ -4592,39 +4680,6 @@ impl Vm {
                         continue;
                     }
 
-                    // Function values with custom properties (e.g. assert.throws where assert is a function)
-                    if obj_val.is_function() {
-                        let sentinel = obj_val.as_function().unwrap();
-                        let method_fn = self.fn_property_overrides.get(&(sentinel, method_name)).copied();
-                        if let Some(Some(mv)) = method_fn && mv.is_function() {
-                            let packed = mv.as_function().unwrap();
-                            let closure_id = ((packed as u32) >> 16) as usize;
-                            let chunk_idx = (packed & 0xFFFF) as usize;
-                            if chunk_idx >= 1 && chunk_idx < self.chunks.len() {
-                                self.stack[obj_pos] = mv;
-                                let mut actual_argc = argc;
-                                let expected = self.chunks[chunk_idx].param_count as usize;
-                                while actual_argc < expected {
-                                    self.push(Value::undefined());
-                                    actual_argc += 1;
-                                }
-                                let upvalues = if closure_id < self.closure_upvalues.len() {
-                                    self.closure_upvalues[closure_id].clone()
-                                } else { Vec::new() };
-                                let saved_args: Vec<Value> = (0..argc)
-                                    .map(|i| self.stack.get(obj_pos + 1 + i).copied().unwrap_or(Value::undefined()))
-                                    .collect();
-                                self.frames.push(CallFrame {
-                                    chunk_idx, ip: 0, base: obj_pos + 1,
-                                    upvalues, this_value: obj_val, is_constructor: false,
-                                    pending_super_call: false, generator_id: None, argc,
-                                    saved_args,
-                                });
-                                continue;
-                            }
-                        }
-                    }
-
                     // Generic method call fallthrough - push undefined
                     self.stack.truncate(obj_pos);
                     self.push(Value::undefined());
@@ -4768,19 +4823,53 @@ impl Vm {
                         continue;
                     }
 
+                    // new Array(...): construct an Array. Single-numeric-arg form sets length;
+                    // otherwise the args become the elements.
+                    if func_val.is_function() && func_val.as_function() == Some(-507) {
+                        let elements: Vec<Value> = if argc == 1 {
+                            let only = self.stack[func_pos + 1];
+                            if let Some(n) = only.as_number()
+                                && n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64
+                            {
+                                vec![Value::undefined(); n as usize]
+                            } else if let Some(n) = only.as_int() {
+                                if n >= 0 { vec![Value::undefined(); n as usize] } else { vec![only] }
+                            } else {
+                                vec![only]
+                            }
+                        } else {
+                            (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect()
+                        };
+                        let arr_obj = JsObject::array(elements);
+                        let oid = self.heap.allocate(arr_obj);
+                        if let Some(o) = self.heap.get_mut(oid) {
+                            o.prototype = Some(self.array_prototype);
+                        }
+                        self.stack.truncate(func_pos);
+                        self.push(Value::object_id(oid));
+                        continue;
+                    }
+
                     // Handle wrapper constructors (new Number, new Boolean, new String)
                     if func_val.is_function() {
                         let sentinel = func_val.as_function().unwrap();
-                        if (-507..=-504).contains(&sentinel) {
+                        if (-506..=-504).contains(&sentinel) {
+                            // Per spec, new Number() / new String() / new Boolean() with no args
+                            // returns 0 / "" / false respectively (not NaN/undefined-coerced).
+                            let no_args = argc == 0;
                             let arg = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
                             let wrapped = match sentinel {
                                 -504 => { // String
-                                    let s = self.value_to_string(arg);
+                                    let s = if no_args { String::new() } else { self.value_to_string(arg) };
                                     let id = self.interner.intern(&s);
                                     Value::string(id)
                                 }
-                                -505 => Value::number(self.to_f64(arg)), // Number
-                                -506 => Value::boolean(arg.to_boolean()), // Boolean
+                                -505 => { // Number
+                                    if no_args { Value::number(0.0) } else { Value::number(self.to_f64(arg)) }
+                                }
+                                -506 => { // Boolean
+                                    if no_args { Value::boolean(false) } else { Value::boolean(arg.to_boolean()) }
+                                }
                                 _ => arg,
                             };
                             let mut obj = JsObject::ordinary();
@@ -4910,8 +4999,31 @@ impl Vm {
                     if let Some(class_oid) = func_val.as_object_id() {
                         let ctor_key = self.interner.intern("__constructor__");
                         let proto_key = self.interner.intern("prototype");
-                        let ctor_val = self.heap.get(class_oid)
-                            .and_then(|o| o.get_property(ctor_key));
+                        let super_key = self.interner.intern("__super__");
+                        // Default constructor for derived classes: walk __super__ chain to find
+                        // an explicit constructor and call it with the same args (forwarding).
+                        // Note: Class opcode sets __constructor__ to undefined as a placeholder.
+                        // A real ctor is a function value; treat undefined as "no constructor".
+                        let mut ctor_val = self.heap.get(class_oid)
+                            .and_then(|o| o.get_property(ctor_key))
+                            .filter(|v| v.is_function());
+                        if ctor_val.is_none() {
+                            // Default constructor for derived classes: walk __super__ chain.
+                            let mut cur = self.heap.get(class_oid)
+                                .and_then(|o| o.get_property(super_key))
+                                .and_then(|v| v.as_object_id());
+                            while let Some(sid) = cur {
+                                if let Some(obj) = self.heap.get(sid) {
+                                    if let Some(cv) = obj.get_property(ctor_key)
+                                        && cv.is_function()
+                                    {
+                                        ctor_val = Some(cv);
+                                        break;
+                                    }
+                                    cur = obj.get_property(super_key).and_then(|v| v.as_object_id());
+                                } else { break; }
+                            }
+                        }
                         let proto_val = self.heap.get(class_oid)
                             .and_then(|o| o.get_property(proto_key));
 
@@ -5416,8 +5528,8 @@ impl Vm {
                             .and_then(|o| o.get_property(proto_key));
                         if let Some(pv) = proto_val
                             && let Some(proto_oid) = pv.as_object_id() {
-                                // Check if this is the constructor
-                                let constructor_name = self.interner.intern("constructor");
+                                // Check if this is the constructor (sentinel name emitted by the compiler)
+                                let constructor_name = self.interner.intern("\u{0}ctor");
                                 if name_id == constructor_name {
                                     // Store constructor on the class object itself
                                     // Also update `length` from constructor's formal_length
@@ -5597,26 +5709,36 @@ impl Vm {
                 }
 
                 OpCode::GetSuperClass => {
-                    // Push parent class prototype: this.__class__.__super__.prototype
+                    // Resolve `super` in a method:
+                    //   - In an instance method, `this` is an instance; super is `this.__class__.__super__.prototype`.
+                    //   - In a static method, `this` is the class itself; super is `this.__super__` (the parent class).
+                    //   - For a class without `extends`, fall back to Object.prototype.
                     let this_val = self.frames.last().unwrap().this_value;
                     let class_key = self.interner.intern("__class__");
                     let super_key = self.interner.intern("__super__");
                     let proto_key = self.interner.intern("prototype");
-                    let super_class = this_val.as_object_id()
-                        .and_then(|oid| self.heap.get(oid))
-                        .and_then(|obj| obj.get_property(class_key))
-                        .and_then(|cv| cv.as_object_id())
-                        .and_then(|cid| self.heap.get(cid))
-                        .and_then(|cls| cls.get_property(super_key));
-                    // Try super_class.prototype first, fall back to super_class itself
-                    let result = if let Some(sv) = super_class {
-                        if let Some(sid) = sv.as_object_id() {
-                            self.heap.get(sid)
+
+                    let result = this_val.as_object_id().and_then(|oid| {
+                        let has_super_directly = self.heap.get(oid)
+                            .map(|o| o.get_property(super_key).is_some())
+                            .unwrap_or(false);
+                        if has_super_directly {
+                            // Static method context: `this` is the class itself
+                            self.heap.get(oid).and_then(|o| o.get_property(super_key))
+                        } else {
+                            // Instance method context: walk this.__class__.__super__.prototype
+                            self.heap.get(oid)
+                                .and_then(|obj| obj.get_property(class_key))
+                                .and_then(|cv| cv.as_object_id())
+                                .and_then(|cid| self.heap.get(cid))
+                                .and_then(|cls| cls.get_property(super_key))
+                                .and_then(|sv| sv.as_object_id())
+                                .and_then(|sid| self.heap.get(sid))
                                 .and_then(|s| s.get_property(proto_key))
-                                .or(Some(sv))
-                        } else { Some(sv) }
-                    } else { None };
-                    self.push(result.unwrap_or(Value::undefined()));
+                        }
+                    });
+                    let result = result.unwrap_or_else(|| Value::object_id(self.object_prototype));
+                    self.push(result);
                     self.frames.last_mut().unwrap().pending_super_call = true;
                 }
 
@@ -6224,10 +6346,16 @@ impl Vm {
                             Err(e) => return Err(VmError::RuntimeError(format!("Module compile error: {e}"))),
                         };
 
-                        // Flatten child chunks and add to VM
+                        // Flatten child chunks and add to VM. Adjust children indices to be absolute
+                        // (flatten_chunk uses indices relative to its output vec).
                         let base_idx = self.chunks.len();
                         let mut flat_chunks = Vec::new();
                         Vm::flatten_chunk(chunk, &mut flat_chunks);
+                        for c in &mut flat_chunks {
+                            for child in &mut c.children {
+                                *child += base_idx;
+                            }
+                        }
                         self.chunks.extend(flat_chunks);
 
                         // Save current globals
@@ -6415,6 +6543,12 @@ impl Vm {
         let base_idx = self.chunks.len();
         let mut flat_chunks = Vec::new();
         Vm::flatten_chunk(chunk, &mut flat_chunks);
+        // Adjust children indices to be absolute (flatten_chunk uses indices relative to its output vec).
+        for c in &mut flat_chunks {
+            for child in &mut c.children {
+                *child += base_idx;
+            }
+        }
         self.chunks.extend(flat_chunks);
         // Run the outer wrapper to evaluate the function expression
         let wrapper_fn = Value::function(base_idx as i32);

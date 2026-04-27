@@ -4,7 +4,7 @@ A JavaScript engine written from scratch in Rust with an **experimental ARM64 JI
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**92.3% [Test262](docs/TEST262.md) conformance (9,052 / 9,805 tests)** | **90 tests** | **~22,500 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
+**95.6% [Test262](docs/TEST262.md) conformance (9,369 / 9,805 tests)** | **90 tests** | **~22,500 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
 
 ![Zinc Playground](web/screenshot.png)
 
@@ -20,6 +20,32 @@ Zinc implements a complete pipeline from source code to execution: **lexer** →
 - **Regex/division disambiguation** — `/` after `undefined`, `null`, `true`, `false` is now correctly treated as division, not the start of a regex literal
 - **Error.prototype.toString()** — error objects now stringify as `"TypeError: message"` instead of `"[object Object]"`
 - **AST nodes derive Clone** — all AST types now implement `Clone`, enabling finally-block inlining
+
+## What's New in v0.4.0
+
+- **95.6% test262 conformance** — up from 92.3% (9,369 / 9,805 active tests, +317 tests passing)
+- **`yield *` (yield delegation)** — `yield * iter` properly iterates and yields each value, enabling many class generator-method tests
+- **Default constructor for derived classes** — derived classes without an explicit `constructor` now correctly walk the `__super__` chain and forward arguments to the nearest parent constructor
+- **Constructor return semantics** — when a constructor explicitly returns a non-object value, `this` is returned instead (per spec)
+- **`super` in static methods** — `super.method()` in a static method now resolves to the parent class (not its prototype); falls back to `Object.prototype` for non-derived classes
+- **Class getter dispatch in `CallMethod`** — `C.foo()` where `foo` is a getter (e.g. `static get $() { return this.#$; }`) now correctly invokes the getter and calls its return value with `this = C`
+- **Non-strict `this` global coercion** — non-strict functions called without an explicit `this` now receive the global object (per spec); strict and arrow functions are unaffected
+- **Computed-key class methods** — `['constructor']() {}`, `[1]() {}` resolve to the static string/numeric key at compile time so methods/getters get correct names
+- **`static constructor()` is a method** — treated as a regular static method, not the class constructor
+- **Optional chain short-circuiting** — `a?.b.c.d` now skips the entire remaining chain when `a` is nullish
+- **Optional method calls preserve `this`** — `a?.b().c` compiles to a method call so `this` is bound to `a` (not undefined)
+- **`?.` lookahead** — `true ?.30 : false` now parses as the conditional `true ? .30 : false`
+- **Proper `Array(...)` constructor** — `new Array(2,4,8,16,32)` produces a real array; single integer arg sets length
+- **`new Number()` / `new String()` / `new Boolean()`** — no-arg form returns wrapped `0` / `""` / `false`
+- **Math constants are read-only** — `Math.E`, `Math.PI`, `Math.LN2`, `Math.LN10`, `Math.SQRT2` are now non-writable per spec
+- **Hex / octal / binary string-to-number** — `+"0xff"`, `255 == "0xff"` work; rejects lowercase `"infinity"`/`"INFINITY"`
+- **Form-feed and vertical-tab whitespace** — `\f` and `\v` recognized by the lexer
+- **`in` for sentinel constructors** — `"MAX_VALUE" in Number` works; primitives on RHS throw `TypeError`
+- **Numeric class member names** — `class C { 1() {} get 2() {} }` stores methods under canonical string keys `"1"` and `"2"`
+- **Array methods are reference-equal to `Array.prototype.*`** — `arr.toString === Array.prototype.toString`, etc.
+- **eval frame cleanup** — `eval()` correctly returns the last expression and unwinds its call frame
+- **`new Function(...)` inner-function indices** — `flatten_chunk` now adjusts children indices to be absolute, fixing inner functions inside eval/Function
+- **`for (var x in obj)` scoping** — `var` declarations inside for-in/for-of loops stay function-local instead of polluting global scope
 
 ## Try It
 
@@ -140,9 +166,9 @@ bash bench/sunspider/run.sh    # SunSpider benchmarks
 
 ## Test262 Conformance
 
-**92.3%** of tested ECMAScript spec tests pass (9,052 / 9,805 active tests). See [TEST262.md](docs/TEST262.md).
+**95.6%** of tested ECMAScript spec tests pass (9,369 / 9,805 active tests). See [TEST262.md](docs/TEST262.md).
 
-15 categories with **100% pass rate** including: numeric literals, string literals, boolean literals, compound-assignment, if, return, throw, coalesce, keywords, block, and more.
+29 categories with **100% pass rate** including: numeric literals, string literals, boolean literals, white-space, statementList, expressions/template-literal, expressions/this, expressions/strict-equals, expressions/conditional, expressions/coalesce, statements/return, statements/throw, statements/block, future-reserved-words, reserved-words, keywords, and more.
 
 ```bash
 git clone --depth 1 https://github.com/nicolo-ribaudo/test262.git
@@ -192,7 +218,7 @@ web/                   WASM playground (HTML + compiled WASM)
 
 - **~22,500 lines** of Rust
 - **90 tests** passing
-- **92.3%** Test262 conformance (9,052 / 9,805 active tests)
+- **95.6%** Test262 conformance (9,369 / 9,805 active tests)
 - **1.5 MB** WASM binary (includes regex engine)
 - **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation

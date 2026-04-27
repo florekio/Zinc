@@ -175,15 +175,13 @@ impl<'a> Lexer<'a> {
                     } else {
                         TokenKind::QuestionQuestion
                     }
-                } else if self.cursor.eat(b'.') {
-                    // ?. but not ?.digit (that would be ? followed by .5)
-                    if matches!(self.cursor.peek(), Some(b'0'..=b'9')) {
-                        // Oops, this is ? . 5, back up
-                        // Actually ?. is always optional chaining, digits after don't matter
-                        TokenKind::QuestionDot
-                    } else {
-                        TokenKind::QuestionDot
-                    }
+                } else if self.cursor.peek() == Some(b'.')
+                    && !matches!(self.cursor.peek_at(1), Some(b'0'..=b'9'))
+                {
+                    // `?.` is the optional-chaining punctuator only when not followed by a digit.
+                    // Per spec, `a ?.5 : b` is the conditional `a ? .5 : b`, not `a?.5 : b`.
+                    self.cursor.advance();
+                    TokenKind::QuestionDot
                 } else {
                     TokenKind::Question
                 }
@@ -375,7 +373,8 @@ impl<'a> Lexer<'a> {
     fn skip_whitespace_and_comments(&mut self) {
         loop {
             match self.cursor.peek() {
-                Some(b' ' | b'\t') => { self.cursor.advance(); }
+                // Space, horizontal tab, vertical tab, form feed
+                Some(b' ' | b'\t' | 0x0B | 0x0C) => { self.cursor.advance(); }
                 Some(b'\n') => {
                     self.saw_newline = true;
                     self.cursor.advance();

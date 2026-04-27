@@ -968,7 +968,7 @@ fn parse_class_body(p: &mut Parser) -> ParseResult<ClassBody> {
 
         // Constructor or method
         if p.at(TokenKind::LParen) {
-            let is_constructor = !computed && !is_async && !is_generator
+            let is_constructor = !is_static && !computed && !is_async && !is_generator
                 && matches!(&key, PropertyKey::Identifier(id) if p.interner.resolve(*id) == "constructor");
             let method_kind = if is_constructor {
                 MethodKind::Constructor

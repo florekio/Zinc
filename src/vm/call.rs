@@ -64,6 +64,12 @@ impl Vm {
         // Arrow functions inherit `this` from the enclosing scope.
         let effective_this = if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
             self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined())
+        } else if !self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT)
+            && this_value.is_undefined()
+        {
+            // Non-strict function called with undefined `this`:
+            // `this` is coerced to the global object.
+            Value::object_id(self.global_this_oid)
         } else {
             this_value
         };

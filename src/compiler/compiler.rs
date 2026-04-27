@@ -667,7 +667,7 @@ impl<'a> Compiler<'a> {
         };
         if let Some(name) = var_name {
             self.chunk.emit_op(OpCode::Undefined, line);
-            if is_var || self.scope_depth == 0 {
+            if self.scope_depth <= 1 {
                 let idx = self.make_string_constant(name);
                 self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
             } else {
@@ -753,10 +753,9 @@ impl<'a> Compiler<'a> {
             _ => LoopVar::None,
         };
         // Pre-declare loop variable(s)
-        // var always goes to globals (hoisted); let/const at depth>0 become locals.
         let declare_var = |this: &mut Self, name: StringId| {
             this.chunk.emit_op(OpCode::Undefined, line);
-            if is_var || this.scope_depth == 0 {
+            if this.scope_depth <= 1 {
                 let idx = this.make_string_constant(name);
                 this.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
             } else {
@@ -1979,7 +1978,10 @@ impl<'a> Compiler<'a> {
                     let key_id = self.property_key_name(&m.key);
                     self.pending_function_name = Some(key_id);
                     self.compile_expr(&m.value)?;
-                    // For getters/setters, use __get_name__ / __set_name__ convention
+                    // For getters/setters, use __get_name__ / __set_name__ convention.
+                    // For the actual constructor, use a unique sentinel name (\0_ctor)
+                    // so that a user-defined method named "constructor" via a computed key
+                    // (e.g. `['constructor']() {}`) is not mistaken for the class constructor.
                     let actual_key = match m.kind {
                         MethodKind::Get => {
                             let name = self.interner.resolve(key_id).to_owned();
@@ -1989,6 +1991,7 @@ impl<'a> Compiler<'a> {
                             let name = self.interner.resolve(key_id).to_owned();
                             self.interner.intern(&format!("__set_{name}__"))
                         }
+                        MethodKind::Constructor => self.interner.intern("\u{0}ctor"),
                         _ => key_id,
                     };
                     let idx = self.make_string_constant(actual_key);
@@ -3687,7 +3690,15 @@ impl<'a> Compiler<'a> {
             PropertyKey::Identifier(id)
             | PropertyKey::StringLiteral(id)
             | PropertyKey::Private(id) => *id,
-            PropertyKey::NumberLiteral(_) => StringId(0),
+            PropertyKey::NumberLiteral(n) => {
+                // Convert numeric key to its canonical string form
+                let s = if n.fract() == 0.0 && n.is_finite() && n.abs() < 1e21 {
+                    format!("{}", *n as i64)
+                } else {
+                    format!("{n}")
+                };
+                self.interner.intern(&s)
+            }
             PropertyKey::Computed(expr) => {
                 // Detect well-known symbol access: Symbol.xxx
                 if let Expression::Member(mem) = expr.as_ref()
@@ -3706,6 +3717,20 @@ impl<'a> Compiler<'a> {
                         _ => return StringId(0),
                     };
                     return self.interner.intern(&format!("__sym_{sym_idx}__"));
+                }
+                // Constant string literal in brackets: ['name'] is equivalent to .name
+                if let Expression::StringLiteral(lit) = expr.as_ref() {
+                    return lit.value;
+                }
+                // Constant number literal in brackets: [1] becomes the canonical "1" key
+                if let Expression::NumberLiteral(lit) = expr.as_ref() {
+                    let n = lit.value;
+                    let s = if n.fract() == 0.0 && n.is_finite() && n.abs() < 1e21 {
+                        format!("{}", n as i64)
+                    } else {
+                        format!("{n}")
+                    };
+                    return self.interner.intern(&s);
                 }
                 StringId(0)
             }
@@ -3841,16 +3866,43 @@ impl<'a> Compiler<'a> {
         let line = o.span.start;
         self.compile_expr(&o.base)?;
 
-        for element in &o.chain {
+        // Collect skip jumps from any `?.` along the chain; they all must jump past the
+        // entire remaining chain so a short-circuit on `a?.b.c.d` skips `.c.d` too.
+        let mut skips: Vec<usize> = Vec::new();
+
+        let mut i = 0;
+        while i < o.chain.len() {
+            let element = &o.chain[i];
             match element {
                 OptionalChainElement::Member {
                     property, optional, ..
                 } => {
-                    let skip = if *optional {
-                        Some(self.chunk.emit_jump(OpCode::OptionalChain, line))
-                    } else {
-                        None
-                    };
+                    if *optional {
+                        skips.push(self.chunk.emit_jump(OpCode::OptionalChain, line));
+                    }
+                    // Look ahead: if the next element is a non-optional Call, combine into
+                    // CallMethod so that `this` is bound to the receiver (e.g. a?.b().c).
+                    let next_is_call = matches!(
+                        o.chain.get(i + 1),
+                        Some(OptionalChainElement::Call { optional: false, .. })
+                    );
+                    if next_is_call
+                        && let MemberProperty::Identifier(id) = property
+                    {
+                        if let Some(OptionalChainElement::Call { arguments, .. }) = o.chain.get(i + 1) {
+                            // Stack already has the receiver; emit args then CallMethod.
+                            for arg in arguments {
+                                self.compile_expr(arg)?;
+                            }
+                            let idx = self.make_string_constant(*id);
+                            self.chunk.emit_byte(OpCode::CallMethod as u8, line);
+                            self.chunk.emit_byte(arguments.len() as u8, line);
+                            self.chunk.code.push((idx >> 8) as u8);
+                            self.chunk.code.push((idx & 0xFF) as u8);
+                            i += 2;
+                            continue;
+                        }
+                    }
                     match property {
                         MemberProperty::Identifier(id) => {
                             let idx = self.make_string_constant(*id);
@@ -3865,28 +3917,24 @@ impl<'a> Compiler<'a> {
                             self.chunk.emit_op_u16(OpCode::GetPrivate, idx, line);
                         }
                     }
-                    if let Some(s) = skip {
-                        self.chunk.patch_jump(s);
-                    }
                 }
                 OptionalChainElement::Call {
                     arguments, optional,
                 } => {
-                    let skip = if *optional {
-                        Some(self.chunk.emit_jump(OpCode::OptionalChain, line))
-                    } else {
-                        None
-                    };
+                    if *optional {
+                        skips.push(self.chunk.emit_jump(OpCode::OptionalChain, line));
+                    }
                     for arg in arguments {
                         self.compile_expr(arg)?;
                     }
                     self.chunk
                         .emit_op_u8(OpCode::Call, arguments.len() as u8, line);
-                    if let Some(s) = skip {
-                        self.chunk.patch_jump(s);
-                    }
                 }
             }
+            i += 1;
+        }
+        for s in skips {
+            self.chunk.patch_jump(s);
         }
         Ok(())
     }
@@ -3895,16 +3943,48 @@ impl<'a> Compiler<'a> {
 
     fn compile_yield(&mut self, y: &YieldExpression) -> Result<(), String> {
         let line = y.span.start;
+        if y.delegate {
+            // yield * <expr>:
+            //   let it = GetIterator(<expr>);
+            //   loop:
+            //     let r = it.next();
+            //     if r.done: break with r.value as the result of the yield* expression
+            //     else: yield r.value; continue
+            let arg = y.argument.as_ref().ok_or_else(|| "yield* requires an argument".to_string())?;
+            self.compile_expr(arg)?;
+            self.chunk.emit_op(OpCode::GetIterator, line);
+            // Stack: [iter]
+            let loop_start = self.chunk.len();
+            // Dup iter, IteratorNext leaves [iter, result]
+            self.chunk.emit_op(OpCode::Dup, line);
+            self.chunk.emit_op(OpCode::IteratorNext, line);
+            // Dup result, IteratorDone leaves [iter, result, done]
+            self.chunk.emit_op(OpCode::Dup, line);
+            self.chunk.emit_op(OpCode::IteratorDone, line);
+            let exit_jump = self.chunk.emit_jump(OpCode::JumpIfTrue, line);
+            // Not done: result is on top; extract value, yield it, then pop yielded value
+            self.chunk.emit_op(OpCode::IteratorValue, line);
+            // Stack: [iter, value]
+            self.chunk.emit_op(OpCode::Yield, line);
+            // After yield, the yielded value's "sent" replacement is on top; we discard it
+            // (we don't pass values back into delegated iterators in this minimal impl).
+            self.chunk.emit_op(OpCode::Pop, line);
+            self.chunk.emit_loop(loop_start, line);
+            // Done branch: stack is [iter, result, true]; we need [value-from-result] only
+            self.chunk.patch_jump(exit_jump);
+            self.chunk.emit_op(OpCode::Pop, line);            // pop done flag
+            self.chunk.emit_op(OpCode::IteratorValue, line);   // result -> value
+            // Stack: [iter, value]; remove iter from below
+            self.chunk.emit_op(OpCode::Swap, line);
+            self.chunk.emit_op(OpCode::Pop, line);
+            return Ok(());
+        }
         if let Some(arg) = &y.argument {
             self.compile_expr(arg)?;
         } else {
             self.chunk.emit_op(OpCode::Undefined, line);
         }
-        if y.delegate {
-            self.chunk.emit_op(OpCode::YieldStar, line);
-        } else {
-            self.chunk.emit_op(OpCode::Yield, line);
-        }
+        self.chunk.emit_op(OpCode::Yield, line);
         Ok(())
     }
 
