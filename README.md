@@ -8,52 +8,10 @@ Zinc implements a complete pipeline from source code to execution: **lexer** →
 
 ![Zinc Playground](web/screenshot.png)
 
-## What's New in v0.3.0
+## Releases
 
-- **92.3% test262 conformance** — up from 84.3% (9,052 / 9,805 active tests, +3,591 tests passing)
-- **Private class fields and methods** (`#field`, `#method()`) — full `#`-prefixed syntax with private instance fields, static fields, private methods, private getters/setters, and Unicode-escaped private names (`#\u{6F}_`)
-- **try/finally + break/continue** — `finally` blocks now always execute even when `break` or `continue` exits the `try` body; nested finally blocks inline correctly
-- **Generator/async scope isolation** — `yield` and `await` are valid identifiers inside nested non-generator/non-async functions, even when those are inside a generator or async body
-- **Future reserved words as identifiers** — `implements`, `interface`, `package`, `private`, `protected`, `public`, `static`, `let` are valid variable names in non-strict mode
-- **`undefined` as binding identifier** — `var undefined` and `for (var undefined of ...)` now parse correctly
-- **Unicode identifiers** — proper Unicode ID_Start/ID_Continue via the `unicode-id-start` crate (fixes identifiers like `℘`, `ZW_\u200C_NJ`)
-- **Regex/division disambiguation** — `/` after `undefined`, `null`, `true`, `false` is now correctly treated as division, not the start of a regex literal
-- **Error.prototype.toString()** — error objects now stringify as `"TypeError: message"` instead of `"[object Object]"`
-- **AST nodes derive Clone** — all AST types now implement `Clone`, enabling finally-block inlining
-
-## What's New in v0.4.0
-
-- **95.7% test262 conformance** — up from 92.3% (9,385 / 9,805 active tests, +333 tests passing)
-- **`continue` in `do-while`** — fixed an infinite loop bug where `continue` jumped to the body start instead of the test
-- **`async function` expression** — `(async function() {})` now parses correctly in expression contexts
-- **`?.` lookahead** — `true ?.30 : false` now parses as the conditional `true ? .30 : false` (was incorrectly parsed as optional chaining)
-- **Trailing comma in arrow params** — `(a, b = 39,) => …` now parses
-- **`Object.prototype.constructor` and friends** — array, number, boolean, string primitives all have the right `.constructor` reference (so `arr.constructor === Array`, `(1).constructor === Number`, etc.)
-- **`array literal` prototype** — `[]` now has `Array.prototype` as its prototype, so `Array.prototype.toString === [].toString`
-- **`instanceof` for built-in constructors** — `obj instanceof Promise/Map/Set/WeakMap/WeakSet/Date` work; `fn instanceof Object` is true (functions are objects)
-- **Bitwise NOT / increment / decrement coercion** — `~obj`, `++obj`, `--obj` call `valueOf()` on the operand
-- **`yield *` (yield delegation)** — `yield * iter` properly iterates and yields each value, enabling many class generator-method tests
-- **Default constructor for derived classes** — derived classes without an explicit `constructor` now correctly walk the `__super__` chain and forward arguments to the nearest parent constructor
-- **Constructor return semantics** — when a constructor explicitly returns a non-object value, `this` is returned instead (per spec)
-- **`super` in static methods** — `super.method()` in a static method now resolves to the parent class (not its prototype); falls back to `Object.prototype` for non-derived classes
-- **Class getter dispatch in `CallMethod`** — `C.foo()` where `foo` is a getter (e.g. `static get $() { return this.#$; }`) now correctly invokes the getter and calls its return value with `this = C`
-- **Non-strict `this` global coercion** — non-strict functions called without an explicit `this` now receive the global object (per spec); strict and arrow functions are unaffected
-- **Computed-key class methods** — `['constructor']() {}`, `[1]() {}` resolve to the static string/numeric key at compile time so methods/getters get correct names
-- **`static constructor()` is a method** — treated as a regular static method, not the class constructor
-- **Optional chain short-circuiting** — `a?.b.c.d` now skips the entire remaining chain when `a` is nullish
-- **Optional method calls preserve `this`** — `a?.b().c` compiles to a method call so `this` is bound to `a` (not undefined)
-- **`?.` lookahead** — `true ?.30 : false` now parses as the conditional `true ? .30 : false`
-- **Proper `Array(...)` constructor** — `new Array(2,4,8,16,32)` produces a real array; single integer arg sets length
-- **`new Number()` / `new String()` / `new Boolean()`** — no-arg form returns wrapped `0` / `""` / `false`
-- **Math constants are read-only** — `Math.E`, `Math.PI`, `Math.LN2`, `Math.LN10`, `Math.SQRT2` are now non-writable per spec
-- **Hex / octal / binary string-to-number** — `+"0xff"`, `255 == "0xff"` work; rejects lowercase `"infinity"`/`"INFINITY"`
-- **Form-feed and vertical-tab whitespace** — `\f` and `\v` recognized by the lexer
-- **`in` for sentinel constructors** — `"MAX_VALUE" in Number` works; primitives on RHS throw `TypeError`
-- **Numeric class member names** — `class C { 1() {} get 2() {} }` stores methods under canonical string keys `"1"` and `"2"`
-- **Array methods are reference-equal to `Array.prototype.*`** — `arr.toString === Array.prototype.toString`, etc.
-- **eval frame cleanup** — `eval()` correctly returns the last expression and unwinds its call frame
-- **`new Function(...)` inner-function indices** — `flatten_chunk` now adjusts children indices to be absolute, fixing inner functions inside eval/Function
-- **`for (var x in obj)` scoping** — `var` declarations inside for-in/for-of loops stay function-local instead of polluting global scope
+Per-version release notes live in [`docs/releases/`](docs/releases/).
+Latest: [**v0.4.0**](docs/releases/v0.4.0.md) · [v0.3.0](docs/releases/v0.3.0.md)
 
 ## Try It
 
