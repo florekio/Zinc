@@ -210,6 +210,9 @@ impl Vm {
         obj_proto.define_property(valueof_key, Property::with_flags(Value::function(-593), Property::WRITABLE | Property::CONFIGURABLE));
         let ipof_key = interner.intern("isPrototypeOf");
         obj_proto.define_property(ipof_key, Property::with_flags(Value::function(-594), Property::WRITABLE | Property::CONFIGURABLE));
+        // Object.prototype.constructor = Object (sentinel -508), non-enumerable.
+        let ctor_key = interner.intern("constructor");
+        obj_proto.define_property(ctor_key, Property::with_flags(Value::function(-508), Property::WRITABLE | Property::CONFIGURABLE));
         let object_prototype = heap.allocate(obj_proto);
 
         // Create Function.prototype singleton (prototype = Object.prototype)
@@ -245,23 +248,28 @@ impl Vm {
             let k = interner.intern(name);
             arr_proto.define_property(k, Property::with_flags(Value::function(sentinel), Property::WRITABLE | Property::CONFIGURABLE));
         }
+        // Array.prototype.constructor = Array (-507)
+        arr_proto.define_property(ctor_key, Property::with_flags(Value::function(-507), Property::WRITABLE | Property::CONFIGURABLE));
         let array_prototype = heap.allocate(arr_proto);
 
         // Create Boolean.prototype (prototype = Object.prototype)
         let mut bool_proto = JsObject::ordinary();
         bool_proto.prototype = Some(object_prototype);
+        bool_proto.define_property(ctor_key, Property::with_flags(Value::function(-506), Property::WRITABLE | Property::CONFIGURABLE));
         let boolean_prototype = heap.allocate(bool_proto);
         func_prototypes.insert(-506i32, boolean_prototype);
 
         // Create Number.prototype (prototype = Object.prototype)
         let mut num_proto = JsObject::ordinary();
         num_proto.prototype = Some(object_prototype);
+        num_proto.define_property(ctor_key, Property::with_flags(Value::function(-505), Property::WRITABLE | Property::CONFIGURABLE));
         let number_prototype = heap.allocate(num_proto);
         func_prototypes.insert(-505i32, number_prototype);
 
         // Create String.prototype (prototype = Object.prototype)
         let mut str_proto = JsObject::ordinary();
         str_proto.prototype = Some(object_prototype);
+        str_proto.define_property(ctor_key, Property::with_flags(Value::function(-504), Property::WRITABLE | Property::CONFIGURABLE));
         let string_prototype = heap.allocate(str_proto);
         func_prototypes.insert(-504i32, string_prototype);
 
@@ -1626,12 +1634,14 @@ impl Vm {
 
                 OpCode::Inc => {
                     let val = self.pop()?;
-                    self.push_number(self.to_f64(val) + 1.0);
+                    let prim = if val.is_object() { self.coerce_to_number_primitive(val) } else { val };
+                    self.push_number(self.to_f64(prim) + 1.0);
                 }
 
                 OpCode::Dec => {
                     let val = self.pop()?;
-                    self.push_number(self.to_f64(val) - 1.0);
+                    let prim = if val.is_object() { self.coerce_to_number_primitive(val) } else { val };
+                    self.push_number(self.to_f64(prim) - 1.0);
                 }
 
                 // ---- Bitwise ---------------------------------------------
@@ -1652,7 +1662,8 @@ impl Vm {
 
                 OpCode::BitNot => {
                     let val = self.pop()?;
-                    let n = self.to_i32(val)?;
+                    let prim = if val.is_object() { self.coerce_to_number_primitive(val) } else { val };
+                    let n = self.to_i32(prim)?;
                     self.push(Value::int(!n));
                 }
 
@@ -2517,7 +2528,8 @@ impl Vm {
                 OpCode::CreateArray => {
                     let hint = self.read_u16() as usize;
                     let elements = Vec::with_capacity(hint);
-                    let obj = JsObject::array(elements);
+                    let mut obj = JsObject::array(elements);
+                    obj.prototype = Some(self.array_prototype);
                     let id = self.heap.allocate(obj);
                     self.push(Value::object_id(id));
                 }
@@ -2698,8 +2710,8 @@ impl Vm {
                     if constructor.is_function() {
                         let s = constructor.as_function().unwrap();
                         if s == -508 {
-                            // Object constructor: true for any object
-                            self.push(Value::boolean(obj.is_object()));
+                            // Object constructor: true for any object-like value (objects + functions)
+                            self.push(Value::boolean(obj.is_object() || obj.is_function()));
                             continue;
                         }
                         if s == -507 {
@@ -2719,6 +2731,40 @@ impl Vm {
                                     .map(|o| matches!(&o.kind, ObjectKind::Function(_)))
                                     .unwrap_or(false);
                             self.push(Value::boolean(is_fn));
+                            continue;
+                        }
+                        if s == -520 {
+                            // Promise constructor: true if obj is a Promise object
+                            let is_prom = obj.as_object_id()
+                                .and_then(|oid| self.heap.get(oid))
+                                .map(|o| matches!(&o.kind, ObjectKind::Promise { .. }))
+                                .unwrap_or(false);
+                            self.push(Value::boolean(is_prom));
+                            continue;
+                        }
+                        if (-543..=-540).contains(&s) {
+                            // Map (-540), Set (-541), WeakMap (-542), WeakSet (-543)
+                            let want = s;
+                            let is_match = obj.as_object_id()
+                                .and_then(|oid| self.heap.get(oid))
+                                .map(|o| match (&o.kind, want) {
+                                    (ObjectKind::Map { .. }, -540) => true,
+                                    (ObjectKind::Set { .. }, -541) => true,
+                                    (ObjectKind::WeakMap { .. }, -542) => true,
+                                    (ObjectKind::WeakSet { .. }, -543) => true,
+                                    _ => false,
+                                })
+                                .unwrap_or(false);
+                            self.push(Value::boolean(is_match));
+                            continue;
+                        }
+                        if s == -550 {
+                            // Date
+                            let is_date = obj.as_object_id()
+                                .and_then(|oid| self.heap.get(oid))
+                                .map(|o| matches!(&o.kind, ObjectKind::Date(_)))
+                                .unwrap_or(false);
+                            self.push(Value::boolean(is_date));
                             continue;
                         }
                     }
@@ -3008,6 +3054,7 @@ impl Vm {
                                 };
                                 self.push(Value::function(-200 - method_idx));
                             }
+                            "constructor" => self.push(Value::function(-504)),
                             _ => self.push(Value::undefined()),
                         }
                     } else if obj_val.is_function() {
@@ -3100,6 +3147,12 @@ impl Vm {
                             }
                         };
                         self.push(result);
+                    } else if (obj_val.is_number() || obj_val.is_int())
+                        && name_str == "constructor"
+                    {
+                        self.push(Value::function(-505));
+                    } else if obj_val.is_boolean() && name_str == "constructor" {
+                        self.push(Value::function(-506));
                     } else {
                         self.push(Value::undefined());
                     }

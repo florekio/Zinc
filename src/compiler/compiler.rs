@@ -555,17 +555,25 @@ impl<'a> Compiler<'a> {
         let line = d.span.start;
         let loop_start = self.chunk.len();
 
+        // Use deferred continue patching so `continue` jumps to the test, not
+        // back to the body start (which would skip the test and infinite-loop).
         self.loops.push(LoopCtx {
             continue_target: loop_start,
             break_patches: Vec::new(),
             continue_patches: Vec::new(),
             scope_depth: self.scope_depth,
             label: None,
-            has_deferred_continue: false,
+            has_deferred_continue: true,
             try_depth: self.finally_stack.len(),
         });
 
         self.compile_statement(&d.body)?;
+        // Patch any `continue` jumps to land here, at the test evaluation.
+        if let Some(ctx) = self.loops.last_mut() {
+            for patch in std::mem::take(&mut ctx.continue_patches) {
+                self.chunk.patch_jump(patch);
+            }
+        }
         self.compile_expr(&d.test)?;
         let exit_jump = self.chunk.emit_jump(OpCode::JumpIfFalse, line);
         self.chunk.emit_loop(loop_start, line);

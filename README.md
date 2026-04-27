@@ -4,7 +4,7 @@ A JavaScript engine written from scratch in Rust with an **experimental ARM64 JI
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**95.6% [Test262](docs/TEST262.md) conformance (9,369 / 9,805 tests)** | **90 tests** | **~22,500 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
+**95.7% [Test262](docs/TEST262.md) conformance (9,385 / 9,805 tests)** | **90 tests** | **~22,500 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
 
 ![Zinc Playground](web/screenshot.png)
 
@@ -23,7 +23,15 @@ Zinc implements a complete pipeline from source code to execution: **lexer** →
 
 ## What's New in v0.4.0
 
-- **95.6% test262 conformance** — up from 92.3% (9,369 / 9,805 active tests, +317 tests passing)
+- **95.7% test262 conformance** — up from 92.3% (9,385 / 9,805 active tests, +333 tests passing)
+- **`continue` in `do-while`** — fixed an infinite loop bug where `continue` jumped to the body start instead of the test
+- **`async function` expression** — `(async function() {})` now parses correctly in expression contexts
+- **`?.` lookahead** — `true ?.30 : false` now parses as the conditional `true ? .30 : false` (was incorrectly parsed as optional chaining)
+- **Trailing comma in arrow params** — `(a, b = 39,) => …` now parses
+- **`Object.prototype.constructor` and friends** — array, number, boolean, string primitives all have the right `.constructor` reference (so `arr.constructor === Array`, `(1).constructor === Number`, etc.)
+- **`array literal` prototype** — `[]` now has `Array.prototype` as its prototype, so `Array.prototype.toString === [].toString`
+- **`instanceof` for built-in constructors** — `obj instanceof Promise/Map/Set/WeakMap/WeakSet/Date` work; `fn instanceof Object` is true (functions are objects)
+- **Bitwise NOT / increment / decrement coercion** — `~obj`, `++obj`, `--obj` call `valueOf()` on the operand
 - **`yield *` (yield delegation)** — `yield * iter` properly iterates and yields each value, enabling many class generator-method tests
 - **Default constructor for derived classes** — derived classes without an explicit `constructor` now correctly walk the `__super__` chain and forward arguments to the nearest parent constructor
 - **Constructor return semantics** — when a constructor explicitly returns a non-object value, `this` is returned instead (per spec)
@@ -166,9 +174,9 @@ bash bench/sunspider/run.sh    # SunSpider benchmarks
 
 ## Test262 Conformance
 
-**95.6%** of tested ECMAScript spec tests pass (9,369 / 9,805 active tests). See [TEST262.md](docs/TEST262.md).
+**95.7%** of tested ECMAScript spec tests pass (9,385 / 9,805 active tests). See [TEST262.md](docs/TEST262.md).
 
-29 categories with **100% pass rate** including: numeric literals, string literals, boolean literals, white-space, statementList, expressions/template-literal, expressions/this, expressions/strict-equals, expressions/conditional, expressions/coalesce, statements/return, statements/throw, statements/block, future-reserved-words, reserved-words, keywords, and more.
+32 categories with **100% pass rate** including: numeric literals, string literals, boolean literals, white-space, statementList, statements/if, expressions/template-literal, expressions/this, expressions/async-function, expressions/strict-equals, expressions/conditional, expressions/coalesce, statements/return, statements/throw, statements/block, block-scope, future-reserved-words, reserved-words, keywords, and more.
 
 ```bash
 git clone --depth 1 https://github.com/nicolo-ribaudo/test262.git
@@ -218,7 +226,7 @@ web/                   WASM playground (HTML + compiled WASM)
 
 - **~22,500 lines** of Rust
 - **90 tests** passing
-- **95.6%** Test262 conformance (9,369 / 9,805 active tests)
+- **95.7%** Test262 conformance (9,385 / 9,805 active tests)
 - **1.5 MB** WASM binary (includes regex engine)
 - **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation

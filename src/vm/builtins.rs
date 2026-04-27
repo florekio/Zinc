@@ -1289,18 +1289,20 @@ impl Vm {
     pub(crate) fn coerce_to_primitive(&mut self, val: Value) -> Value {
         // ConsString is already a string primitive — no coercion needed
         if self.is_cons_string(val) { return val; }
-        self.coerce_to_primitive_hint(val, "default")
+        self.try_coerce_to_primitive_hint(val, "default").unwrap_or(val)
     }
 
     pub(crate) fn coerce_to_number_primitive(&mut self, val: Value) -> Value {
-        self.coerce_to_primitive_hint(val, "number")
+        self.try_coerce_to_primitive_hint(val, "number").unwrap_or(val)
     }
 
-    fn coerce_to_primitive_hint(&mut self, val: Value, hint_str: &str) -> Value {
+    /// Coerce a value to a primitive, propagating any exception thrown from
+    /// the `valueOf`/`toString`/`@@toPrimitive` method.
+    pub(crate) fn try_coerce_to_primitive_hint(&mut self, val: Value, hint_str: &str) -> Result<Value, super::vm::VmError> {
         if let Some(oid) = val.as_object_id() {
             if let Some(obj) = self.heap.get(oid)
                 && let ObjectKind::Wrapper(inner) = &obj.kind {
-                    return *inner;
+                    return Ok(*inner);
                 }
             // Check for Symbol.toPrimitive method
             let sym_key = self.interner.intern(&format!("__sym_{}__", self.sym_to_primitive));
@@ -1308,28 +1310,30 @@ impl Vm {
                 && tp_fn.is_function()
             {
                 let hint = self.interner.intern(hint_str);
-                if let Ok(result) = self.call_function_this(tp_fn, val, &[Value::string(hint)])
-                    && !result.is_object() {
-                        return result;
-                    }
+                let result = self.call_function_this(tp_fn, val, &[Value::string(hint)])?;
+                if !result.is_object() { return Ok(result); }
             }
-            // Try valueOf()
-            let valueof_key = self.interner.intern("valueOf");
-            if let Some(vfn) = self.heap.get_property_chain(oid, valueof_key)
-                && vfn.is_function()
-                    && let Ok(result) = self.call_function_this(vfn, val, &[])
-                        && !result.is_object() {
-                            return result;
-                        }
-            // Try toString()
-            let tostring_key = self.interner.intern("toString");
-            if let Some(tfn) = self.heap.get_property_chain(oid, tostring_key)
-                && tfn.is_function()
-                    && let Ok(result) = self.call_function_this(tfn, val, &[])
-                        && !result.is_object() {
-                            return result;
-                        }
+            // Per spec, "string" hint tries toString first, otherwise valueOf first.
+            let (try_first, try_second) = if hint_str == "string" {
+                ("toString", "valueOf")
+            } else {
+                ("valueOf", "toString")
+            };
+            let first_key = self.interner.intern(try_first);
+            if let Some(fn1) = self.heap.get_property_chain(oid, first_key)
+                && fn1.is_function()
+            {
+                let result = self.call_function_this(fn1, val, &[])?;
+                if !result.is_object() { return Ok(result); }
+            }
+            let second_key = self.interner.intern(try_second);
+            if let Some(fn2) = self.heap.get_property_chain(oid, second_key)
+                && fn2.is_function()
+            {
+                let result = self.call_function_this(fn2, val, &[])?;
+                if !result.is_object() { return Ok(result); }
+            }
         }
-        val
+        Ok(val)
     }
 }

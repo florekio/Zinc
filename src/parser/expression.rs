@@ -316,6 +316,11 @@ pub fn parse_expression(p: &mut Parser, min_bp: u8) -> ParseResult<Expression> {
                     // Comma expression: collect into a sequence
                     let mut exprs = vec![left, right];
                     while p.eat(TokenKind::Comma) {
+                        // Allow a trailing comma when the next token closes a paren list
+                        // (e.g. `(a, b,) =>` arrow params).
+                        if p.at(TokenKind::RParen) {
+                            break;
+                        }
                         exprs.push(parse_expression(p, r_bp)?);
                     }
                     let end = expr_span(exprs.last().unwrap()).end;
@@ -413,6 +418,38 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
         TokenKind::Identifier => {
             let name = p.intern_current();
             let span = p.current().span;
+            // `async function ...` expression form
+            if p.current_text() == "async"
+                && p.peek().kind == TokenKind::Function
+                && !p.peek().preceded_by_newline
+            {
+                p.advance(); // async
+                p.advance(); // function
+                let is_generator = p.eat(TokenKind::Star);
+                let fn_id = if p.at(TokenKind::Identifier) {
+                    let n = p.intern_current();
+                    p.advance();
+                    Some(n)
+                } else {
+                    None
+                };
+                let params = parse_params(p)?;
+                let saved_gen = p.generator_depth;
+                let saved_async = p.async_depth;
+                p.generator_depth = if is_generator { 1 } else { 0 };
+                p.async_depth = 1;
+                let body = parse_block_statement(p)?;
+                p.generator_depth = saved_gen;
+                p.async_depth = saved_async;
+                return Ok(Expression::Function(Box::new(FunctionExpression {
+                    id: fn_id,
+                    params,
+                    body,
+                    is_async: true,
+                    is_generator,
+                    span: Span::new(start, p.pos()),
+                })));
+            }
             p.advance();
 
             // Check for arrow function: `ident =>`
