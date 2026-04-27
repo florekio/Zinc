@@ -3896,20 +3896,19 @@ impl<'a> Compiler<'a> {
                     );
                     if next_is_call
                         && let MemberProperty::Identifier(id) = property
+                        && let Some(OptionalChainElement::Call { arguments, .. }) = o.chain.get(i + 1)
                     {
-                        if let Some(OptionalChainElement::Call { arguments, .. }) = o.chain.get(i + 1) {
-                            // Stack already has the receiver; emit args then CallMethod.
-                            for arg in arguments {
-                                self.compile_expr(arg)?;
-                            }
-                            let idx = self.make_string_constant(*id);
-                            self.chunk.emit_byte(OpCode::CallMethod as u8, line);
-                            self.chunk.emit_byte(arguments.len() as u8, line);
-                            self.chunk.code.push((idx >> 8) as u8);
-                            self.chunk.code.push((idx & 0xFF) as u8);
-                            i += 2;
-                            continue;
+                        // Stack already has the receiver; emit args then CallMethod.
+                        for arg in arguments {
+                            self.compile_expr(arg)?;
                         }
+                        let idx = self.make_string_constant(*id);
+                        self.chunk.emit_byte(OpCode::CallMethod as u8, line);
+                        self.chunk.emit_byte(arguments.len() as u8, line);
+                        self.chunk.code.push((idx >> 8) as u8);
+                        self.chunk.code.push((idx & 0xFF) as u8);
+                        i += 2;
+                        continue;
                     }
                     match property {
                         MemberProperty::Identifier(id) => {

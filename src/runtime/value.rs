@@ -425,12 +425,12 @@ mod tests {
 
     #[test]
     fn test_floats() {
-        let v = Value::number(3.14);
+        let v = Value::number(2.5);
         assert!(v.is_float());
         assert!(v.is_number());
         assert!(!v.is_int());
-        assert_eq!(v.as_float(), Some(3.14));
-        assert_eq!(v.as_number(), Some(3.14));
+        assert_eq!(v.as_float(), Some(2.5));
+        assert_eq!(v.as_number(), Some(2.5));
         assert!(v.to_boolean());
 
         // Zero

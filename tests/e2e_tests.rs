@@ -639,7 +639,7 @@ fn test_throw_catch_error() {
 #[test]
 fn test_promise_resolve_then() {
     let mut engine = Engine::new();
-    let (result, output) = engine.eval_with_output(
+    let (_result, output) = engine.eval_with_output(
         r#"new Promise(function(resolve) { resolve(42); }).then(function(v) { console.log(v); });"#
     );
     assert_eq!(output, vec!["42"]);

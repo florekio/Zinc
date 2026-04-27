@@ -2747,13 +2747,13 @@ impl Vm {
                             let want = s;
                             let is_match = obj.as_object_id()
                                 .and_then(|oid| self.heap.get(oid))
-                                .map(|o| match (&o.kind, want) {
-                                    (ObjectKind::Map { .. }, -540) => true,
-                                    (ObjectKind::Set { .. }, -541) => true,
-                                    (ObjectKind::WeakMap { .. }, -542) => true,
-                                    (ObjectKind::WeakSet { .. }, -543) => true,
-                                    _ => false,
-                                })
+                                .map(|o| matches!(
+                                    (&o.kind, want),
+                                    (ObjectKind::Map { .. }, -540)
+                                    | (ObjectKind::Set { .. }, -541)
+                                    | (ObjectKind::WeakMap { .. }, -542)
+                                    | (ObjectKind::WeakSet { .. }, -543)
+                                ))
                                 .unwrap_or(false);
                             self.push(Value::boolean(is_match));
                             continue;
@@ -2854,15 +2854,15 @@ impl Vm {
                         // Sentinel constructors: check well-known static properties
                         let sentinel = obj.as_function().unwrap();
                         let key_str = self.value_to_string(key);
-                        match (sentinel, key_str.as_str()) {
+                        matches!(
+                            (sentinel, key_str.as_str()),
                             (-505, "MAX_VALUE") | (-505, "MIN_VALUE") | (-505, "NaN")
                             | (-505, "POSITIVE_INFINITY") | (-505, "NEGATIVE_INFINITY")
                             | (-505, "EPSILON") | (-505, "MAX_SAFE_INTEGER") | (-505, "MIN_SAFE_INTEGER")
                             | (-505, "isFinite") | (-505, "isInteger") | (-505, "isNaN") | (-505, "isSafeInteger")
-                            | (-505, "parseFloat") | (-505, "parseInt") => true,
-                            (-504, "fromCharCode") | (-504, "fromCodePoint") | (-504, "raw") => true,
-                            _ => false,
-                        }
+                            | (-505, "parseFloat") | (-505, "parseInt")
+                            | (-504, "fromCharCode") | (-504, "fromCodePoint") | (-504, "raw")
+                        )
                     } else { false };
                     self.push(Value::boolean(result));
                 }
@@ -4024,10 +4024,9 @@ impl Vm {
                             let getter_key = self.interner.intern(&format!("__get_{method_name_s}__"));
                             if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
                                 && gfn.is_function()
+                                && let Ok(rv) = self.call_function_this(gfn, obj_val, &[])
                             {
-                                if let Ok(rv) = self.call_function_this(gfn, obj_val, &[]) {
-                                    method_val = Some(rv);
-                                }
+                                method_val = Some(rv);
                             }
                         }
                         if let Some(mv) = method_val
@@ -7080,7 +7079,7 @@ mod tests {
     #[test]
     fn test_typeof() {
         let (mut chunk, interner) = make_env();
-        emit_const_number(&mut chunk, 3.14);
+        emit_const_number(&mut chunk, 2.5);
         emit_op(&mut chunk, OpCode::TypeOf);
         emit_op(&mut chunk, OpCode::Halt);
         let result = run(chunk, interner).unwrap();
