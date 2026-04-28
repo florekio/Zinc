@@ -1,6 +1,10 @@
 # JIT Compiler
 
-Zinc includes an experimental ARM64 JIT compiler that emits raw machine code — no Cranelift, no LLVM, just hand-written instruction bytes into `mmap`'d executable memory.
+Zinc includes an experimental JIT compiler that emits raw machine code — no Cranelift, no LLVM, just hand-written instruction bytes into `mmap`'d executable memory.
+
+**Supported targets:**
+- **ARM64** — macOS/Apple Silicon (`aarch64-apple-darwin`)
+- **x86-64** — Linux (`x86_64-unknown-linux-gnu`)
 
 ## How It Works
 
@@ -11,7 +15,7 @@ JS source → Lexer → Parser → Bytecode → VM executes bytecode
                                            ↓ (after 100 calls)
                                         Attempt JIT compilation
                                            ↓
-                                        Emit ARM64 machine code
+                                        Emit native machine code (ARM64 or x86-64)
                                            ↓
                                         Execute native code directly
 ```
@@ -19,9 +23,9 @@ JS source → Lexer → Parser → Bytecode → VM executes bytecode
 1. **Hotspot detection**: The VM counts how many times each function is called. At 100 calls, it attempts JIT compilation.
 2. **Compilation**: The JIT uses two strategies depending on the function shape:
    - **Pattern matching** for recursive functions (fibonacci, Ackermann, tak)
-   - **Bytecode walking** for loop-based functions (translates opcodes linearly to ARM64)
-3. **Code emission**: A hand-written ARM64 assembler emits raw 32-bit instruction words into a `Vec<u8>`.
-4. **Executable memory**: The machine code is copied into `mmap`'d memory with `PROT_READ | PROT_WRITE | PROT_EXEC` and `MAP_JIT` (required on Apple Silicon).
+   - **Bytecode walking** for loop-based functions (translates opcodes linearly to native code)
+3. **Code emission**: A hand-written assembler emits raw machine code into a `Vec<u8>`. The backend is selected at compile time via `#[cfg(target_arch)]`.
+4. **Executable memory**: The machine code is copied into `mmap`'d memory with `PROT_READ | PROT_WRITE | PROT_EXEC`. On macOS, `MAP_JIT` and the W^X protocol are required; on Linux, a plain `mmap` suffices.
 5. **Execution**: On subsequent calls, the VM bypasses the interpreter entirely and calls the native function pointer.
 
 ## Supported Patterns
@@ -59,6 +63,27 @@ fib:
     ; epilogue + ret
 ```
 
+**Generated x86-64** (simplified):
+```asm
+fib:
+    push rbp
+    push r13
+    push r12                       ; 3 pushes → RSP 16-byte aligned
+    mov  r12, rdi                  ; r12 = n
+    cmp  r12, 1                    ; if n <= 1
+    jle  .base                     ;   goto base case
+    lea  rdi, [r12-1]              ; fib(n-1)
+    call fib
+    mov  r13, rax                  ; save result
+    lea  rdi, [r12-2]              ; fib(n-2)
+    call fib
+    add  rax, r13                  ; return fib(n-1) + fib(n-2)
+    pop r12; pop r13; pop rbp; ret
+.base:
+    mov  rax, r12
+    pop r12; pop r13; pop rbp; ret
+```
+
 ### 2. Ackermann (2-param recursive)
 
 **Signature**: `function ack(m, n)` — 2 parameters
@@ -92,7 +117,7 @@ function tak(x, y, z) {
 
 **Detected when**: no `Call` opcodes, has `Loop` opcode, `local_count <= 5`, no global variable access
 
-Instead of pattern matching, the JIT walks the bytecode opcode-by-opcode and translates each to ARM64. The VM's stack positions are mapped directly to registers.
+Instead of pattern matching, the JIT walks the bytecode opcode-by-opcode and translates each to native instructions. The VM's stack positions are mapped directly to registers.
 
 **Example**:
 ```js
@@ -105,7 +130,7 @@ function loop_sum(n) {
 }
 ```
 
-**Translation approach**: Each VM stack position maps to a register. Arithmetic opcodes pop/push the register stack. Comparisons fuse with the following `JumpIfFalse` to emit a single compare-and-branch. The `Loop` opcode becomes a backward `b` (branch).
+**Translation approach**: Each VM stack position maps to a register. Arithmetic opcodes pop/push the register stack. Comparisons fuse with the following `JumpIfFalse` to emit a single compare-and-branch. The `Loop` opcode becomes a backward branch.
 
 **Supported opcodes**: `GetLocal`, `SetLocal`, `Const`, `Zero`, `One`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `BitAnd`, `BitOr`, `BitXor`, `BitNot`, `Shl`, `Shr`, `UShr`, all comparisons, `JumpIfFalse`, `Jump`, `Loop`, `Pop`, `Return`.
 
@@ -115,14 +140,15 @@ function loop_sum(n) {
 
 | File | Purpose |
 |------|---------|
-| `src/jit/arm64.rs` | ARM64 assembler — emits raw 32-bit instructions |
-| `src/jit/compiler.rs` | Pattern matcher + bytecode walker + code emitter |
-| `src/jit/executable_memory.rs` | `mmap` allocation with Apple Silicon W^X support |
+| `src/jit/arm64.rs` | ARM64 assembler — emits raw 32-bit instruction words |
+| `src/jit/x86_64.rs` | x86-64 assembler — emits raw variable-length instruction bytes |
+| `src/jit/compiler.rs` | Pattern matcher + bytecode walker + code emitter (both backends) |
+| `src/jit/executable_memory.rs` | `mmap` allocation, cross-platform (Linux + macOS W^X) |
 | `src/jit/mod.rs` | Module declaration |
 
-### ARM64 Assembler
+### ARM64 Assembler (`src/jit/arm64.rs`)
 
-The assembler supports ~45 instructions:
+Supports ~45 instructions:
 
 | Category | Instructions |
 |----------|-------------|
@@ -134,26 +160,51 @@ The assembler supports ~45 instructions:
 | Load/Store | `STP` (pre-index), `LDP` (post-index), `STR`, `LDR`, `STR.fp`, `LDR.fp` |
 | Floating-point | `FADD`, `FSUB`, `FMUL`, `FDIV`, `SCVTF`, `FCVTZS` |
 
-### Register Allocation
-
-**Recursive patterns**: fixed assignment per pattern (X19-X23 for callee-saved params/temps).
-
-**Loop functions**: unified register stack mapping VM positions to ARM64 registers:
+**Register allocation (ARM64):**
 
 | Position | Register | Role |
 |----------|----------|------|
 | 0-4 | X19-X23 | Local variables (callee-saved) |
 | 5-11 | X3-X9 | Operand stack (caller-saved, safe since no calls) |
 
-### Executable Memory (Apple Silicon)
+### x86-64 Assembler (`src/jit/x86_64.rs`)
 
-Apple Silicon enforces W^X (write XOR execute). The JIT handles this with:
+Targets the System V AMD64 ABI. Supports ~50 instructions:
+
+| Category | Instructions |
+|----------|-------------|
+| Arithmetic | `ADD` (reg/imm), `SUB` (reg/imm), `IMUL`, `IDIV` (via CQO+IDIV), `NEG` |
+| Bitwise | `AND`, `OR`, `XOR`, `NOT`, `SHL`, `SHR`, `SAR` (variable shifts via RCX) |
+| Compare | `CMP` (reg/imm), `TEST` |
+| Branch | `JMP`, `Jcc` (E/NE/L/GE/LE/G/AE/A/BE/B), `CALL`, `RET` |
+| Move | `MOV` (reg/imm32/imm64), `LEA` |
+| Load/Store | `MOV r64, [base+disp]`, `MOV [base+disp], r64` |
+| Floating-point | `ADDSD`, `SUBSD`, `MULSD`, `DIVSD`, `UCOMISD`, `CVTSI2SD`, `CVTTSD2SI`, `MOVSD`, `MOVQ` |
+
+**Register allocation (x86-64):**
+
+| Position | Register | Role |
+|----------|----------|------|
+| 0 | R12 | Local #0 (callee-saved) |
+| 1 | R13 | Local #1 (callee-saved) |
+| 2 | R14 | Local #2 (callee-saved) |
+| 3 | R15 | Local #3 (callee-saved, or globals pointer) |
+| 4 | RBX | Local #4 (callee-saved) |
+| 5-11 | RDI/RSI/RDX/R8-R11 | Operand stack (caller-saved, safe since no calls in loop fns) |
+| — | RCX | Reserved for shift counts |
+| — | RAX | Return value / IDIV quotient / scratch |
+
+### Executable Memory
+
+**macOS (Apple Silicon):** W^X (write XOR execute) is enforced by the kernel.
 
 1. `mmap` with `MAP_JIT` flag
 2. `pthread_jit_write_protect_np(0)` — disable write protection
 3. `ptr::copy_nonoverlapping` — copy machine code
 4. `pthread_jit_write_protect_np(1)` — re-enable write protection
 5. `sys_icache_invalidate` — flush instruction cache
+
+**Linux (x86-64):** plain `mmap` with `PROT_READ | PROT_WRITE | PROT_EXEC`. No W^X toggling required; x86-64 handles self-modifying code via TSO memory ordering.
 
 ### VM Integration
 
@@ -191,7 +242,6 @@ The JIT beats V8 because:
 
 ## Limitations
 
-- **Apple Silicon only** — ARM64 macOS (`aarch64-apple-darwin`)
 - **Integer arithmetic only** — no floats, strings, objects, or closures
 - **Loop JIT limited to 5 locals** — functions with more than 5 local variables fall back to interpreter
 - **No global variable access in loops** — loop functions must be self-contained
@@ -201,7 +251,6 @@ The JIT beats V8 because:
 ## What Could Be Added
 
 ### Near Term
-- **Floating-point support** — use ARM64 `D0`-`D31` SIMD/FP registers for `f64` arithmetic
 - **Nested loop support** — extend bytecode walker to handle conditionals inside loops (sieve benchmark)
 - **More locals** — spill excess locals to stack memory instead of bailing out
 
@@ -211,6 +260,5 @@ The JIT beats V8 because:
 - **Type specialization** — emit type-guarded fast paths with deoptimization fallback
 
 ### Long Term
-- **x86-64 backend** — second assembler for Intel/AMD
-- **Linux support** — `mprotect`-based W^X instead of macOS-specific APIs
 - **Trace compilation** — record hot execution traces and compile entire traces to native code
+- **Windows support** — adapt calling convention to Microsoft x64 ABI

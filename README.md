@@ -1,6 +1,6 @@
 # Zinc
 
-A JavaScript engine written from scratch in Rust with an **experimental ARM64 JIT compiler**.
+A JavaScript engine written from scratch in Rust with an **experimental JIT compiler** (ARM64 + x86-64).
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
@@ -33,11 +33,11 @@ cargo test                         # run tests
 
 ## JIT Compiler
 
-Zinc includes an **experimental ARM64 JIT** that emits raw machine code — no Cranelift, no LLVM, just hand-written instruction bytes into `mmap`'d executable memory.
+Zinc includes an **experimental JIT** that emits raw machine code — no Cranelift, no LLVM, just hand-written instruction bytes into `mmap`'d executable memory. Supports **ARM64** (macOS/Apple Silicon) and **x86-64** (Linux).
 
 The JIT has two modes:
 
-1. **Pattern matching** — detects recursive functions (fibonacci, Ackermann, tak) and emits hand-tuned ARM64
+1. **Pattern matching** — detects recursive functions (fibonacci, Ackermann, tak) and emits hand-tuned native code
 2. **Bytecode walking** — translates loop-based functions opcode-by-opcode, mapping the VM stack to registers
 
 When a function is called 100+ times, the VM compiles it to native code on the fly:
@@ -91,7 +91,7 @@ See [JIT.md](docs/JIT.md) for technical details.
 - **NaN-boxed values** — every JS value in 8 bytes via IEEE 754 quiet NaN space with sign-bit tagging
 - **~130 bytecode opcodes** with variable-length encoding
 - **Stack-based VM** with call frames, operand stack, and upvalue-based closures
-- **ARM64 JIT** — hand-written machine code emitter with two compilation modes
+- **JIT compiler** — hand-written machine code emitter for ARM64 (macOS) and x86-64 (Linux), two compilation modes
 - **Prototype chain** — real `__proto__` traversal for property lookup and class inheritance
 - **Property descriptors** — writable/enumerable/configurable flags on all properties
 - **Pratt parser** with precedence climbing across ~25 levels
@@ -169,7 +169,7 @@ src/
   ast/                 ~80 AST node types
   compiler/            AST → bytecode compiler + disassembler
   vm/                  Stack-based VM (core, builtins, promises, JSON, call, map, regexp)
-  jit/                 ARM64 JIT compiler (assembler, executable memory, compiler)
+  jit/                 JIT compiler — ARM64 + x86-64 assemblers, executable memory, pattern matcher
   runtime/             NaN-boxed values, object heap, property descriptors, builtins
   gc/                  Mark-and-sweep GC foundation
   util/                String interner
