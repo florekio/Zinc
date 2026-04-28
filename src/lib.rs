@@ -2,7 +2,7 @@ pub mod ast;
 pub mod compiler;
 pub mod engine;
 pub mod gc;
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
 pub mod jit;
 pub mod lexer;
 pub mod parser;

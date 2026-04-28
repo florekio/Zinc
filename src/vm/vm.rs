@@ -124,10 +124,10 @@ pub struct Vm {
     /// Upvalues for each closure, indexed by closure_id.
     pub(crate) closure_upvalues: Vec<Vec<Upvalue>>,
     /// Call counter per chunk index (for JIT hotspot detection).
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
     pub(crate) call_counts: HashMap<usize, u32>,
     /// JIT-compiled native functions, keyed by chunk index.
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
     pub(crate) jit_functions: HashMap<usize, crate::jit::compiler::JitFunction>,
     /// console.log output buffer (for testing)
     pub output: Vec<String>,
@@ -464,9 +464,9 @@ impl Vm {
             exc_handlers: Vec::new(),
             microtask_queue: Vec::new(),
             closure_upvalues: Vec::new(),
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
             call_counts: HashMap::new(),
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
             jit_functions: HashMap::new(),
             output: Vec::new(),
             module_cache: HashMap::new(),
@@ -1356,7 +1356,7 @@ impl Vm {
     // ---- Main execution loop ----------------------------------------------
 
     pub fn run(&mut self) -> Result<Value, VmError> {
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
         self.try_partial_jit();
 
         let result = self.run_until(0)?;
@@ -1372,7 +1372,7 @@ impl Vm {
     /// Attempt to JIT-compile and run the loop portion of chunk 0.
     /// If successful, updates globals and advances the initial frame's IP
     /// so the interpreter resumes after the JIT-ed bytecode.
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
     fn try_partial_jit(&mut self) {
         use crate::compiler::opcode::OpCode;
         let chunk0 = &self.chunks[0];
@@ -2004,7 +2004,7 @@ impl Vm {
                             }
 
                             // ---- JIT: check if we have compiled native code ----
-                            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                            #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
                             {
                                 // Check if JIT code already exists
                                 if let Some(jit_fn) = self.jit_functions.get(&chunk_idx) {
@@ -6642,7 +6642,7 @@ fn format_iso(ms: f64) -> String {
 // ---- Standalone JSON parser (avoids &mut self borrow issues) ----
 
 /// Unbox a NaN-tagged Value to a raw i64 for the globals JIT buffer.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
 fn jit_unbox(val: Value) -> i64 {
     if val.is_int() {
         val.as_int().unwrap_or(0) as i64
@@ -6656,7 +6656,7 @@ fn jit_unbox(val: Value) -> i64 {
 }
 
 /// Rebox a raw i64 from the globals JIT buffer back to a NaN-tagged Value.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
 fn jit_rebox(v: i64) -> Value {
     if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
         Value::int(v as i32)
