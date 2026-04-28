@@ -76,18 +76,26 @@ impl ExecutableBuffer {
         self.code_len = code.len();
     }
 
+    /// # Safety
+    /// The buffer must contain valid executable machine code with the correct signature.
     pub unsafe fn as_fn1(&self) -> fn(i64) -> i64 { unsafe {
         std::mem::transmute::<*mut u8, fn(i64) -> i64>(self.ptr)
     }}
 
+    /// # Safety
+    /// The buffer must contain valid executable machine code with the correct signature.
     pub unsafe fn as_fn2(&self) -> fn(i64, i64) -> i64 { unsafe {
         std::mem::transmute::<*mut u8, fn(i64, i64) -> i64>(self.ptr)
     }}
 
+    /// # Safety
+    /// The buffer must contain valid executable machine code with the correct signature.
     pub unsafe fn as_fn3(&self) -> fn(i64, i64, i64) -> i64 { unsafe {
         std::mem::transmute::<*mut u8, fn(i64, i64, i64) -> i64>(self.ptr)
     }}
 
+    /// # Safety
+    /// The buffer must contain valid executable machine code with the correct signature.
     pub unsafe fn as_fn_globals(&self) -> fn(*mut i64) { unsafe {
         std::mem::transmute::<*mut u8, fn(*mut i64)>(self.ptr)
     }}

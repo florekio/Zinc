@@ -6,7 +6,6 @@
 /// Register constants match the AMD64 encoding (0=RAX … 15=R15).
 /// All assembler methods accept u32 register numbers (like arm64.rs) for
 /// a uniform interface with the compiler layer, but treat values as u8 internally.
-
 // Integer register constants (AMD64 encoding)
 pub const RAX: u32 = 0;  // return value / scratch
 pub const RCX: u32 = 1;  // shift-count register (reserved, not allocated to locals)
@@ -464,7 +463,7 @@ impl Assembler {
     fn emit_alu_imm(&mut self, opext: u8, dst: u8, imm: i64) {
         let rex = 0x48 | (dst >> 3);
         let modrm = 0xC0 | (opext << 3) | (dst & 7);
-        if imm >= -128 && imm <= 127 {
+        if (-128..=127).contains(&imm) {
             self.code.extend_from_slice(&[rex, 0x83, modrm, imm as u8]);
         } else {
             self.code.extend_from_slice(&[rex, 0x81, modrm]);
