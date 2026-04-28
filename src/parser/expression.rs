@@ -418,6 +418,60 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
         TokenKind::Identifier => {
             let name = p.intern_current();
             let span = p.current().span;
+            // `async (params) => ...` arrow expression form
+            if p.current_text() == "async"
+                && !p.peek().preceded_by_newline
+                && p.peek().kind == TokenKind::LParen
+            {
+                // Save position; if it doesn't turn out to be an arrow, fall back.
+                let save = p.save_pos();
+                p.advance(); // async
+                let params_result = parse_params(p);
+                if let Ok(params) = params_result
+                    && p.at(TokenKind::Arrow)
+                    && !p.preceded_by_newline()
+                {
+                    p.advance(); // =>
+                    let saved_async = p.async_depth;
+                    p.async_depth = 1;
+                    let body = parse_arrow_body(p)?;
+                    p.async_depth = saved_async;
+                    let end = arrow_body_end(&body);
+                    return Ok(Expression::ArrowFunction(Box::new(ArrowFunctionExpression {
+                        params,
+                        body,
+                        is_async: true,
+                        span: Span::new(start, end),
+                    })));
+                }
+                p.restore_pos(save);
+            }
+            // `async ident => ...` arrow expression form (single parameter, no parens)
+            if p.current_text() == "async"
+                && !p.peek().preceded_by_newline
+                && p.peek().kind == TokenKind::Identifier
+            {
+                let save = p.save_pos();
+                p.advance(); // async
+                let param_name = p.intern_current();
+                let param_span = p.current().span;
+                p.advance(); // identifier
+                if p.at(TokenKind::Arrow) && !p.preceded_by_newline() {
+                    p.advance(); // =>
+                    let saved_async = p.async_depth;
+                    p.async_depth = 1;
+                    let body = parse_arrow_body(p)?;
+                    p.async_depth = saved_async;
+                    let end = arrow_body_end(&body);
+                    return Ok(Expression::ArrowFunction(Box::new(ArrowFunctionExpression {
+                        params: vec![Pattern::Identifier(Identifier { name: param_name, span: param_span })],
+                        body,
+                        is_async: true,
+                        span: Span::new(start, end),
+                    })));
+                }
+                p.restore_pos(save);
+            }
             // `async function ...` expression form
             if p.current_text() == "async"
                 && p.peek().kind == TokenKind::Function

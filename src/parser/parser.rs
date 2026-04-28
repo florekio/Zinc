@@ -103,6 +103,16 @@ impl<'a> Parser<'a> {
         self.generator_depth > 0
     }
 
+    /// Snapshot the current token cursor (for limited backtracking).
+    pub(crate) fn save_pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Restore a previously saved cursor position.
+    pub(crate) fn restore_pos(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
     /// True when `await` must be treated as a keyword (inside an async body).
     pub(crate) fn in_async(&self) -> bool {
         self.async_depth > 0

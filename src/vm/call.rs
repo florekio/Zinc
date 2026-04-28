@@ -1,4 +1,5 @@
 use crate::compiler::chunk::ChunkFlags;
+use crate::runtime::object::{GeneratorState, JsObject, ObjectKind};
 use crate::runtime::value::Value;
 
 use super::vm::{Vm, VmError, CallFrame};
@@ -41,6 +42,39 @@ impl Vm {
         let chunk_idx = (packed & 0xFFFF) as usize;
         if chunk_idx < 1 || chunk_idx >= self.chunks.len() {
             return Ok(Value::undefined());
+        }
+
+        // Generator function: invoking it does NOT execute the body — it
+        // returns a fresh generator object whose .next() will resume the body.
+        if self.chunks[chunk_idx].flags.contains(ChunkFlags::GENERATOR) {
+            let saved_upvalues: Vec<Value> = if closure_id < self.closure_upvalues.len() {
+                self.closure_upvalues[closure_id]
+                    .iter()
+                    .map(|uv| match &uv.location {
+                        super::vm::UpvalueLocation::Open(idx) => {
+                            self.stack.get(*idx).copied().unwrap_or(Value::undefined())
+                        }
+                        super::vm::UpvalueLocation::Closed(v) => *v,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let expected = self.chunks[chunk_idx].param_count as usize;
+            let saved_stack: Vec<Value> = (0..expected.max(args.len()))
+                .map(|i| args.get(i).copied().unwrap_or(Value::undefined()))
+                .collect();
+            let mut gen_obj = JsObject::ordinary();
+            gen_obj.kind = ObjectKind::Generator {
+                state: GeneratorState::SuspendedStart,
+                chunk_idx,
+                ip: 0,
+                saved_stack,
+                saved_upvalues,
+                this_value,
+            };
+            let gen_oid = self.heap.allocate(gen_obj);
+            return Ok(Value::object_id(gen_oid));
         }
 
         let func_pos = self.stack.len();

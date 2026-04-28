@@ -2043,7 +2043,52 @@ impl<'a> Compiler<'a> {
                         self.chunk.emit_op_u16(op, idx, line);
                     }
                 }
-                ClassMember::StaticBlock(_) => { /* skip */ }
+                ClassMember::StaticBlock(block) => {
+                    // `static { ... }` runs once at class definition time with `this`
+                    // bound to the class. Compile the block as a 0-param function and
+                    // immediately invoke it with the class as the receiver.
+                    let name = self.interner.intern("<static_block>");
+                    let child_chunk = self.compile_function_body(
+                        name,
+                        &[],
+                        block,
+                        false, // is_async
+                        false, // is_generator
+                    )?;
+                    let chunk_idx = self.chunk.child_chunks.len() as u16;
+                    let uv_descs = child_chunk.upvalue_descriptors.clone();
+                    self.chunk.child_chunks.push(child_chunk);
+                    // Stack: [class]
+                    // Dup the class so we can keep it on the stack while calling.
+                    self.chunk.emit_op(OpCode::Dup, line);
+                    // Build the closure for the block body.
+                    self.chunk.emit_op_u16(OpCode::Closure, chunk_idx, line);
+                    for desc in &uv_descs {
+                        self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
+                        self.chunk.emit_byte(desc.index, line);
+                    }
+                    // Stack: [class, class, fn]
+                    // Use Function.prototype.call to invoke with this=class:
+                    //   fn.call(class)  →  emit CallMethod "call" with 1 arg (the class).
+                    // Simpler path: swap so stack becomes [class, fn, class], then Call argc=0 won't bind `this`.
+                    // Instead, model as: push fn, push receiver as arg, use a runtime helper.
+                    // Easiest correct path: invoke via Function.prototype.call.
+                    let call_name = self.interner.intern("call");
+                    let call_id = self.make_string_constant(call_name);
+                    // Swap: [class, fn, class]  (we already have [class, class, fn]; swap top two? no — Swap swaps top two)
+                    self.chunk.emit_op(OpCode::Swap, line);
+                    // Now stack: [class, fn, class] — but we wanted receiver-first for CallMethod.
+                    // CallMethod expects [obj, arg0, arg1, ...] then pops obj+args, calls obj.method(args).
+                    // We want to call fn.call(class) which means obj=fn, arg0=class.
+                    // Stack: [class, fn, class] — top is class (arg0), below fn (obj). Perfect for CallMethod.
+                    self.chunk.emit_byte(OpCode::CallMethod as u8, line);
+                    self.chunk.emit_byte(1u8, line); // argc
+                    self.chunk.code.push((call_id >> 8) as u8);
+                    self.chunk.code.push((call_id & 0xFF) as u8);
+                    // Stack: [class, return_value]
+                    self.chunk.emit_op(OpCode::Pop, line);
+                    // Stack: [class]
+                }
             }
         }
         Ok(())
@@ -3722,6 +3767,8 @@ impl<'a> Compiler<'a> {
                         "toStringTag" => 3,
                         "species" => 4,
                         "unscopables" => 5,
+                        "asyncIterator" => 6,
+                        "matchAll" => 7,
                         _ => return StringId(0),
                     };
                     return self.interner.intern(&format!("__sym_{sym_idx}__"));

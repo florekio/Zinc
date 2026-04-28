@@ -109,6 +109,13 @@ impl Vm {
                                 elements.push(Value::undefined());
                             }
                         }
+                        // Collect named groups into a `groups` object (or null if none).
+                        let named: Vec<(String, Option<String>)> = re.capture_names()
+                            .filter_map(|n| n.map(|name| (
+                                name.to_string(),
+                                caps.name(name).map(|m| m.as_str().to_string()),
+                            )))
+                            .collect();
                         let mut arr = JsObject::array(elements);
                         // Set .index property
                         let index_key = self.interner.intern("index");
@@ -119,6 +126,24 @@ impl Vm {
                         let input_key = self.interner.intern("input");
                         let input_id = self.interner.intern(&input);
                         arr.set_property(input_key, Value::string(input_id));
+                        // Set .groups property: object with named-group captures, or undefined.
+                        let groups_key = self.interner.intern("groups");
+                        let groups_val = if named.is_empty() {
+                            Value::undefined()
+                        } else {
+                            let mut g = JsObject::ordinary();
+                            g.prototype = Some(self.object_prototype);
+                            for (name, capture) in &named {
+                                let key = self.interner.intern(name);
+                                let v = match capture {
+                                    Some(s) => Value::string(self.interner.intern(s)),
+                                    None => Value::undefined(),
+                                };
+                                g.set_property(key, v);
+                            }
+                            Value::object_id(self.heap.allocate(g))
+                        };
+                        arr.set_property(groups_key, groups_val);
                         let arr_oid = self.heap.allocate(arr);
                         Ok(Value::object_id(arr_oid))
                     }

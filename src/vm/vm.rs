@@ -121,6 +121,8 @@ pub struct Vm {
     pub(crate) global_ic_version: HashMap<(usize, usize), u64>,
     pub(crate) exc_handlers: Vec<ExcHandler>,
     pub(crate) microtask_queue: Vec<Microtask>,
+    /// Active `with`-scope objects (innermost last). Names resolve here before globals.
+    pub(crate) with_stack: Vec<ObjectId>,
     /// Upvalues for each closure, indexed by closure_id.
     pub(crate) closure_upvalues: Vec<Vec<Upvalue>>,
     /// Call counter per chunk index (for JIT hotspot detection).
@@ -131,6 +133,10 @@ pub struct Vm {
     pub(crate) jit_functions: HashMap<usize, crate::jit::compiler::JitFunction>,
     /// console.log output buffer (for testing)
     pub output: Vec<String>,
+    /// When true, console.log/warn/error capture into `output` but do not print
+    /// to stdout/stderr. Used by the test262 runner to keep $DONE markers off
+    /// the orchestrator's pipes.
+    pub silent_console: bool,
     /// Module cache: maps module path → exports ObjectId
     pub(crate) module_cache: HashMap<String, ObjectId>,
     /// Base directory for resolving relative module imports
@@ -168,6 +174,8 @@ pub struct Vm {
     pub(crate) sym_to_string_tag: u32,
     pub(crate) sym_species: u32,
     pub(crate) sym_unscopables: u32,
+    pub(crate) sym_async_iterator: u32,
+    pub(crate) sym_match_all: u32,
     /// Per-function property overrides/deletions: key = (sentinel, StringId), None = deleted, Some(v) = overridden.
     pub(crate) fn_property_overrides: HashMap<(i32, StringId), Option<Value>>,
     /// Dynamic exclusion buffer for object rest destructuring with computed keys.
@@ -437,6 +445,8 @@ impl Vm {
             Some(interner.intern("Symbol.toStringTag")),
             Some(interner.intern("Symbol.species")),
             Some(interner.intern("Symbol.unscopables")),
+            Some(interner.intern("Symbol.asyncIterator")),
+            Some(interner.intern("Symbol.matchAll")),
         ];
 
         // Pre-populate fast lookup Vec from all initial globals
@@ -463,12 +473,14 @@ impl Vm {
             global_ic_version: HashMap::new(),
             exc_handlers: Vec::new(),
             microtask_queue: Vec::new(),
+            with_stack: Vec::new(),
             closure_upvalues: Vec::new(),
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             call_counts: HashMap::new(),
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             jit_functions: HashMap::new(),
             output: Vec::new(),
+            silent_console: false,
             module_cache: HashMap::new(),
             module_dir: None,
             regex_cache: crate::vm::regexp::RegexCache::new(),
@@ -483,13 +495,15 @@ impl Vm {
             math_oid: Some(math_oid),
             json_oid: Some(json_oid),
             symbol_descriptions: sym_descs,
-            next_symbol_id: 6, // 0-5 are well-known
+            next_symbol_id: 8, // 0-7 are well-known
             sym_iterator: 0,
             sym_has_instance: 1,
             sym_to_primitive: 2,
             sym_to_string_tag: 3,
             sym_species: 4,
             sym_unscopables: 5,
+            sym_async_iterator: 6,
+            sym_match_all: 7,
             fn_property_overrides: HashMap::new(),
             computed_exclusions: Vec::new(),
             steps: 0,
@@ -1866,6 +1880,23 @@ impl Vm {
                     let name_id = name_val.as_string_id().ok_or_else(|| {
                         VmError::RuntimeError("expected string constant".into())
                     })?;
+                    // `with` scope: innermost-first, look up the name as a property of
+                    // any active with-scope object before falling back to globals.
+                    if !self.with_stack.is_empty() {
+                        let mut found: Option<Value> = None;
+                        for &oid in self.with_stack.iter().rev() {
+                            if let Some(obj) = self.heap.get(oid)
+                                && let Some(v) = obj.get_property(name_id)
+                            {
+                                found = Some(v);
+                                break;
+                            }
+                        }
+                        if let Some(v) = found {
+                            self.push(v);
+                            continue;
+                        }
+                    }
                     // Fast path: Vec-based lookup (O(1) instead of HashMap)
                     // null in the vec means "not present" (we never store null as a global)
                     let idx = name_id.0 as usize;
@@ -1896,6 +1927,15 @@ impl Vm {
                         match self.globals.get(&name_id).copied() {
                             Some(val) => self.push(val),
                             None => {
+                                // Fall back to the globalThis object — properties set via
+                                // `this.x = …` or `globalThis.x = …` at script level live
+                                // there, and bare identifiers should see them.
+                                if let Some(obj) = self.heap.get(self.global_this_oid)
+                                    && let Some(v) = obj.get_property(name_id)
+                                {
+                                    self.push(v);
+                                    continue;
+                                }
                                 let name = self.interner.resolve(name_id).to_owned();
                                 let msg = format!("{name} is not defined");
                                 let err = self.make_native_error("ReferenceError", &msg);
@@ -1913,6 +1953,24 @@ impl Vm {
                         VmError::RuntimeError("expected string constant for variable name".into())
                     })?;
                     let val = self.peek()?;
+                    // `with` scope: if any active with-object owns this name, set it there.
+                    if !self.with_stack.is_empty() {
+                        let mut target_oid: Option<ObjectId> = None;
+                        for &oid in self.with_stack.iter().rev() {
+                            if let Some(obj) = self.heap.get(oid)
+                                && obj.get_property(name_id).is_some()
+                            {
+                                target_oid = Some(oid);
+                                break;
+                            }
+                        }
+                        if let Some(oid) = target_oid {
+                            if let Some(obj) = self.heap.get_mut(oid) {
+                                obj.set_property(name_id, val);
+                            }
+                            continue;
+                        }
+                    }
                     self.globals.insert(name_id, val);
                     // Sync to fast Vec
                     let idx = name_id.0 as usize;
@@ -2684,8 +2742,37 @@ impl Vm {
                     let name_idx = self.read_u16() as usize;
                     let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
                     let name_id = name_val.as_string_id().unwrap();
-                    let deleted = self.globals.remove(&name_id).is_some();
-                    self.push(Value::boolean(deleted));
+                    // `with` scope: if any active with-object owns this name, delete it there.
+                    if !self.with_stack.is_empty() {
+                        let mut target_oid: Option<ObjectId> = None;
+                        for &oid in self.with_stack.iter().rev() {
+                            if let Some(obj) = self.heap.get(oid)
+                                && obj.get_property(name_id).is_some()
+                            {
+                                target_oid = Some(oid);
+                                break;
+                            }
+                        }
+                        if let Some(oid) = target_oid {
+                            let removed = if let Some(obj) = self.heap.get_mut(oid) {
+                                obj.properties.iter().position(|(k, _)| *k == name_id)
+                                    .map(|pos| { obj.properties.remove(pos); true })
+                                    .unwrap_or(false)
+                            } else { false };
+                            self.push(Value::boolean(removed));
+                            continue;
+                        }
+                    }
+                    // Also remove from globalThis if present.
+                    let removed_global = self.globals.remove(&name_id).is_some();
+                    let mut removed_globalthis = false;
+                    if let Some(obj) = self.heap.get_mut(self.global_this_oid)
+                        && let Some(pos) = obj.properties.iter().position(|(k, _)| *k == name_id)
+                    {
+                        obj.properties.remove(pos);
+                        removed_globalthis = true;
+                    }
+                    self.push(Value::boolean(removed_global || removed_globalthis));
                 }
 
                 OpCode::InstanceOf => {
@@ -3090,6 +3177,8 @@ impl Vm {
                                 "toStringTag" => Value::symbol(self.sym_to_string_tag),
                                 "species" => Value::symbol(self.sym_species),
                                 "unscopables" => Value::symbol(self.sym_unscopables),
+                                "asyncIterator" => Value::symbol(self.sym_async_iterator),
+                                "matchAll" => Value::symbol(self.sym_match_all),
                                 _ => Value::undefined(),
                             },
                             -504 => match name_str {
@@ -3529,10 +3618,12 @@ impl Vm {
                                     parts.push(self.value_to_string(val));
                                 }
                                 let line = parts.join(" ");
-                                if sentinel == -102 {
-                                    eprintln!("{line}"); // console.error -> stderr
-                                } else {
-                                    println!("{line}");
+                                if !self.silent_console {
+                                    if sentinel == -102 {
+                                        eprintln!("{line}"); // console.error -> stderr
+                                    } else {
+                                        println!("{line}");
+                                    }
                                 }
                                 self.output.push(line);
                                 self.stack.truncate(obj_pos);
@@ -6555,10 +6646,23 @@ impl Vm {
                     ));
                 }
 
-                OpCode::WithEnter | OpCode::WithExit => {
-                    return Err(VmError::RuntimeError(format!(
-                        "{opcode:?} not yet implemented"
-                    )));
+                OpCode::WithEnter => {
+                    // Pop the value, coerce to object, push onto the with-scope stack.
+                    let val = self.pop()?;
+                    if let Some(oid) = val.as_object_id() {
+                        self.with_stack.push(oid);
+                    } else {
+                        // Per spec, ToObject(null/undefined) throws TypeError.
+                        let err = self.make_native_error(
+                            "TypeError",
+                            "Cannot convert undefined or null to object",
+                        );
+                        self.handle_throw(err)?;
+                    }
+                }
+
+                OpCode::WithExit => {
+                    self.with_stack.pop();
                 }
             }
         }
