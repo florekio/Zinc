@@ -1270,6 +1270,7 @@ impl Vm {
                         Value::object_id(proto_oid)
                     }
                 }
+                "constructor" => Value::function(-551),
                 "name" | "length" => self.fn_get_own_prop(sentinel, name_id).unwrap_or(Value::undefined()),
                 "call" | "apply" | "bind" => obj_val,
                 _ => Value::undefined(),
@@ -2522,15 +2523,26 @@ impl Vm {
                                 -513 => "ReferenceError", -514 => "SyntaxError",
                                 -515 => "EvalError", -516 => "URIError", _ => "Error",
                             };
-                            let msg = if argc > 0 { self.value_to_string(self.stack[func_pos + 1]) } else { String::new() };
-                            if let Some(this_oid) = this_val.as_object_id() {
+                            // Per spec, only set "message" if a non-undefined argument was passed.
+                            let msg_arg = if argc > 0 { Some(self.stack[func_pos + 1]) } else { None };
+                            if let Some(this_oid) = this_val.as_object_id()
+                                && let Some(arg) = msg_arg
+                                && !arg.is_undefined()
+                            {
+                                let msg = self.value_to_string(arg);
                                 let msg_key = self.interner.intern("message");
                                 let msg_id = self.interner.intern(&msg);
                                 let stack_key = self.interner.intern("stack");
                                 let stack_str = format!("{error_type}: {msg}");
                                 let stack_id = self.interner.intern(&stack_str);
                                 if let Some(obj) = self.heap.get_mut(this_oid) {
-                                    obj.set_property(msg_key, Value::string(msg_id));
+                                    obj.define_property(
+                                        msg_key,
+                                        Property::with_flags(
+                                            Value::string(msg_id),
+                                            Property::WRITABLE | Property::CONFIGURABLE,
+                                        ),
+                                    );
                                     obj.set_property(stack_key, Value::string(stack_id));
                                 }
                             }
@@ -2680,6 +2692,13 @@ impl Vm {
                         self.stack.truncate(frame.base.saturating_sub(1));
                         self.push(result);
                     }
+                }
+
+                OpCode::LoadCallee => {
+                    // The running closure value is at stack[base - 1] (set up by Call).
+                    let base = self.frames.last().unwrap().base;
+                    let callee = if base > 0 { self.stack[base - 1] } else { Value::undefined() };
+                    self.push(callee);
                 }
 
                 OpCode::ReturnUndefined => {
@@ -3355,6 +3374,7 @@ impl Vm {
                                             Value::object_id(proto_oid)
                                         }
                                     }
+                                    "constructor" => Value::function(-551),
                                     "name" | "length" => {
                                         self.fn_get_own_prop(sentinel, name_id)
                                             .unwrap_or(Value::undefined())
@@ -5242,17 +5262,28 @@ impl Vm {
                                 -516 => "URIError",
                                 _ => "Error",
                             };
-                            let msg = if argc > 0 {
-                                self.value_to_string(self.stack[func_pos + 1])
-                            } else {
-                                String::new()
-                            };
                             let mut err_obj = JsObject::ordinary();
                             err_obj.prototype = self.func_prototypes.get(&sentinel).copied()
                                 .or(Some(self.object_prototype));
-                            let msg_key = self.interner.intern("message");
-                            let msg_id = self.interner.intern(&msg);
-                            err_obj.set_property(msg_key, Value::string(msg_id));
+                            // Only attach an own "message" if a non-undefined arg was passed.
+                            let msg_arg = if argc > 0 { Some(self.stack[func_pos + 1]) } else { None };
+                            let msg = if let Some(arg) = msg_arg
+                                && !arg.is_undefined()
+                            {
+                                let s = self.value_to_string(arg);
+                                let msg_key = self.interner.intern("message");
+                                let msg_id = self.interner.intern(&s);
+                                err_obj.define_property(
+                                    msg_key,
+                                    Property::with_flags(
+                                        Value::string(msg_id),
+                                        Property::WRITABLE | Property::CONFIGURABLE,
+                                    ),
+                                );
+                                s
+                            } else {
+                                String::new()
+                            };
                             let stack_key = self.interner.intern("stack");
                             let stack_str = format!("{error_type}: {msg}");
                             let stack_id = self.interner.intern(&stack_str);
@@ -5308,21 +5339,30 @@ impl Vm {
                         let mut ctor_val = self.heap.get(class_oid)
                             .and_then(|o| o.get_property(ctor_key))
                             .filter(|v| v.is_function());
+                        // Native-error super: when extending Error/TypeError/etc., ctor_val
+                        // is the sentinel itself; we'll handle it specially below.
+                        let mut native_super_sentinel: Option<i32> = None;
                         if ctor_val.is_none() {
                             // Default constructor for derived classes: walk __super__ chain.
-                            let mut cur = self.heap.get(class_oid)
-                                .and_then(|o| o.get_property(super_key))
-                                .and_then(|v| v.as_object_id());
-                            while let Some(sid) = cur {
-                                if let Some(obj) = self.heap.get(sid) {
-                                    if let Some(cv) = obj.get_property(ctor_key)
-                                        && cv.is_function()
-                                    {
-                                        ctor_val = Some(cv);
-                                        break;
+                            let mut cur_val: Option<Value> = self.heap.get(class_oid)
+                                .and_then(|o| o.get_property(super_key));
+                            while let Some(v) = cur_val {
+                                if v.is_function() {
+                                    let sentinel = v.as_function().unwrap();
+                                    if (-516..=-510).contains(&sentinel) {
+                                        native_super_sentinel = Some(sentinel);
                                     }
-                                    cur = obj.get_property(super_key).and_then(|v| v.as_object_id());
-                                } else { break; }
+                                    break;
+                                }
+                                let Some(sid) = v.as_object_id() else { break };
+                                let Some(obj) = self.heap.get(sid) else { break };
+                                if let Some(cv) = obj.get_property(ctor_key)
+                                    && cv.is_function()
+                                {
+                                    ctor_val = Some(cv);
+                                    break;
+                                }
+                                cur_val = obj.get_property(super_key);
                             }
                         }
                         let proto_val = self.heap.get(class_oid)
@@ -5398,6 +5438,38 @@ impl Vm {
                                     continue;
                                 }
                             }
+                        // Default ctor extending a native Error: set message+stack on `this`
+                        // (mirrors what super() to a native Error sentinel does).
+                        // Per spec, "message" descriptor is { writable: true, enumerable: false,
+                        // configurable: true } — only created when an argument is provided.
+                        if let Some(sentinel) = native_super_sentinel
+                            && argc > 0
+                            && !self.stack[func_pos + 1].is_undefined()
+                        {
+                            let msg = self.value_to_string(self.stack[func_pos + 1]);
+                            let error_type = match sentinel {
+                                -510 => "Error", -511 => "TypeError", -512 => "RangeError",
+                                -513 => "ReferenceError", -514 => "SyntaxError",
+                                -515 => "EvalError", -516 => "URIError", _ => "Error",
+                            };
+                            if let Some(this_oid) = this_val.as_object_id() {
+                                let msg_key = self.interner.intern("message");
+                                let msg_id = self.interner.intern(&msg);
+                                let stack_key = self.interner.intern("stack");
+                                let stack_str = format!("{error_type}: {msg}");
+                                let stack_id = self.interner.intern(&stack_str);
+                                if let Some(obj) = self.heap.get_mut(this_oid) {
+                                    obj.define_property(
+                                        msg_key,
+                                        Property::with_flags(
+                                            Value::string(msg_id),
+                                            Property::WRITABLE | Property::CONFIGURABLE,
+                                        ),
+                                    );
+                                    obj.set_property(stack_key, Value::string(stack_id));
+                                }
+                            }
+                        }
                         // No constructor -- just return the object with prototype methods
                         self.stack.truncate(func_pos);
                         self.push(this_val);

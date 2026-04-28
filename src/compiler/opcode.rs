@@ -195,6 +195,9 @@ pub enum OpCode {
     Return = 0x95,
     /// Return undefined (implicit return)
     ReturnUndefined = 0x96,
+    /// Push the running function value (the closure that was Call'd to enter this frame).
+    /// Used to give a named function expression access to itself by its name.
+    LoadCallee = 0x97,
 
     // ---- Object / Array Creation ----
     /// Push new empty object {}
@@ -372,7 +375,7 @@ impl OpCode {
             | 0x60..=0x67
             | 0x70..=0x7C
             | 0x80..=0x88
-            | 0x90..=0x96
+            | 0x90..=0x97
             | 0xA0..=0xA9
             | 0xB0..=0xB1
             | 0xB8..=0xBF
@@ -436,6 +439,7 @@ impl OpCode {
             | OpCode::CloseUpvalue
             | OpCode::Return
             | OpCode::ReturnUndefined
+            | OpCode::LoadCallee
             | OpCode::CreateObject
             | OpCode::ArraySpread
             | OpCode::DefineDataProp

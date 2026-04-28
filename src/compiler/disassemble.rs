@@ -52,7 +52,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         | OpCode::InstanceOf | OpCode::In
         | OpCode::Not | OpCode::TypeOf | OpCode::Void | OpCode::DeleteProp
         | OpCode::CloseUpvalue
-        | OpCode::Return | OpCode::ReturnUndefined
+        | OpCode::Return | OpCode::ReturnUndefined | OpCode::LoadCallee
         | OpCode::CreateObject | OpCode::ArraySpread | OpCode::DefineDataProp
         | OpCode::DefineGetter | OpCode::DefineSetter | OpCode::ObjectSpread
         | OpCode::Inherit | OpCode::GetSuperConstructor

@@ -2537,6 +2537,18 @@ impl<'a> Compiler<'a> {
         is_async: bool,
         is_generator: bool,
     ) -> Result<Chunk, String> {
+        self.compile_function_body_with_self(name, params, body, is_async, is_generator, None)
+    }
+
+    fn compile_function_body_with_self(
+        &mut self,
+        name: StringId,
+        params: &[Pattern],
+        body: &BlockStatement,
+        is_async: bool,
+        is_generator: bool,
+        self_binding: Option<StringId>,
+    ) -> Result<Chunk, String> {
         let source_name = self.chunk.source_name;
 
         let mut child_chunk = Chunk::new(name, source_name);
@@ -2684,8 +2696,72 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        // Compile body.
+        // Named function expression self-binding: `function f() { ...f()... }` exposes
+        // `f` inside the body as an immutable reference to the function itself.
+        // Skip if the name collides with a parameter (the parameter wins).
+        if let Some(self_name) = self_binding {
+            let already_a_param = self.locals.iter().any(|l| l.name == self_name);
+            if !already_a_param {
+                self.chunk.emit_op(OpCode::LoadCallee, 0);
+                self.add_local(self_name);
+                self.mark_initialized();
+            }
+        }
+
+        // Hoist function declarations: each top-level `function f() {...}` in the body
+        // is initialized at the top with its closure, shadowing any same-named parameter
+        // or var binding (per spec, function declarations have higher precedence than
+        // params/vars in function code).
+        //
+        // Skip the hoist if the body has any top-level `let` / `const` — pre-compiling
+        // inner functions would resolve those bindings as missing upvalues since their
+        // slots are not yet allocated. The functions still work in execution order; only
+        // the rare param-shadowing pattern (`function f(x){ return x; function x(){} }`)
+        // depends on hoisting and that pattern doesn't typically include lexical decls.
+        let has_top_level_lex = body.body.iter().any(|s| matches!(
+            s,
+            Statement::Variable(d) if matches!(d.kind, VarKind::Let | VarKind::Const)
+        ));
+        let mut hoisted_fns: Vec<StringId> = Vec::new();
+        if !has_top_level_lex {
+            for stmt in &body.body {
+                if let Statement::Function(f) = stmt
+                    && let Some(name) = f.id
+                {
+                    let line = f.span.start;
+                    let child_chunk = self.compile_function_body(name, &f.params, &f.body, f.is_async, f.is_generator)?;
+                    let chunk_idx = self.chunk.child_chunks.len() as u16;
+                    let upvalue_descs = child_chunk.upvalue_descriptors.clone();
+                    self.chunk.child_chunks.push(child_chunk);
+                    self.chunk.emit_op_u16(OpCode::Closure, chunk_idx, line);
+                    for desc in &upvalue_descs {
+                        self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
+                        self.chunk.emit_byte(desc.index, line);
+                    }
+                    if let Some(slot) = self.resolve_local(name) {
+                        if slot <= u8::MAX as usize {
+                            self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
+                        } else {
+                            self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
+                        }
+                        self.chunk.emit_op(OpCode::Pop, line);
+                    } else {
+                        self.add_local(name);
+                        self.mark_initialized();
+                    }
+                    hoisted_fns.push(name);
+                }
+            }
+        }
+
+        // Compile body. Skip top-level function declarations that were hoisted above.
         for stmt in &body.body {
+            if let Statement::Function(f) = stmt
+                && let Some(name) = f.id
+                && hoisted_fns.contains(&name)
+            {
+                continue;
+            }
             self.compile_statement(stmt)?;
         }
 
@@ -3961,8 +4037,11 @@ impl<'a> Compiler<'a> {
         let name = f.id
             .or_else(|| self.pending_function_name.take())
             .unwrap_or_else(|| self.interner.intern("<anonymous>"));
+        // For *named* function expressions, the name binds to the function itself
+        // inside the body (so `function f() { ... f() ... }` self-recurses).
+        let self_binding = f.id;
         let child_chunk =
-            self.compile_function_body(name, &f.params, &f.body, f.is_async, f.is_generator)?;
+            self.compile_function_body_with_self(name, &f.params, &f.body, f.is_async, f.is_generator, self_binding)?;
         let chunk_idx = self.chunk.child_chunks.len() as u16;
         let uv_descs = child_chunk.upvalue_descriptors.clone();
         self.chunk.child_chunks.push(child_chunk);
@@ -3973,8 +4052,6 @@ impl<'a> Compiler<'a> {
             self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
             self.chunk.emit_byte(desc.index, line);
         }
-        // Named function expressions: the name is NOT visible in the outer scope.
-        // Self-recursion works through upvalue capture inside the function body.
         Ok(())
     }
 
