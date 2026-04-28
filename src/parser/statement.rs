@@ -29,6 +29,7 @@ pub fn parse_statement(p: &mut Parser) -> ParseResult<Statement> {
         TokenKind::Continue => parse_continue(p),
         TokenKind::Throw => parse_throw(p),
         TokenKind::Try => parse_try(p),
+        TokenKind::With => parse_with(p),
         TokenKind::Function => parse_function_declaration(p, false),
         TokenKind::Identifier if p.current_text() == "async" && p.peek().kind == TokenKind::Function => {
             p.advance(); // consume 'async'
@@ -789,6 +790,20 @@ fn parse_throw(p: &mut Parser) -> ParseResult<Statement> {
     }))
 }
 
+fn parse_with(p: &mut Parser) -> ParseResult<Statement> {
+    let start = p.pos();
+    p.expect(TokenKind::With)?;
+    p.expect(TokenKind::LParen)?;
+    let object = parse_expression(p, 0)?;
+    p.expect(TokenKind::RParen)?;
+    let body = parse_statement(p)?;
+    Ok(Statement::With(Box::new(WithStatement {
+        object,
+        body,
+        span: Span::new(start, p.pos()),
+    })))
+}
+
 fn parse_try(p: &mut Parser) -> ParseResult<Statement> {
     let start = p.pos();
     p.expect(TokenKind::Try)?;
@@ -923,6 +938,13 @@ fn parse_class_body(p: &mut Parser) -> ParseResult<ClassBody> {
             && !matches!(p.peek().kind, TokenKind::LParen | TokenKind::Assign);
         if is_static {
             p.advance();
+        }
+
+        // Static initialization block: `static { ... }`
+        if is_static && p.at(TokenKind::LBrace) {
+            let block = expression::parse_block_statement(p)?;
+            body.push(ClassMember::StaticBlock(block));
+            continue;
         }
 
         // Check for async methods

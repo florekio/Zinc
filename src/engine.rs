@@ -9,6 +9,7 @@ use crate::vm::vm::{Vm, VmError};
 pub struct Engine {
     interner: Interner,
     max_steps: u64,
+    silent_console: bool,
 }
 
 impl Engine {
@@ -16,12 +17,20 @@ impl Engine {
         Self {
             interner: Interner::new(),
             max_steps: 0,
+            silent_console: false,
         }
     }
 
     /// Set a fuel limit (max VM instructions). 0 = unlimited (the default).
     pub fn set_max_steps(&mut self, n: u64) {
         self.max_steps = n;
+    }
+
+    /// Suppress stdout/stderr writes from `console.log/warn/error`.
+    /// The output is still captured into the buffer returned by
+    /// `eval_with_output`.
+    pub fn set_silent_console(&mut self, silent: bool) {
+        self.silent_console = silent;
     }
 
     /// Evaluate a JavaScript source string and return the result.
@@ -60,6 +69,7 @@ impl Engine {
         let interner = std::mem::take(&mut self.interner);
         let mut vm = Vm::new(chunk, interner);
         vm.max_steps = self.max_steps;
+        vm.silent_console = self.silent_console;
         let result = vm.run().map_err(EngineError::RuntimeError);
         // Drain microtask queue (Promise .then callbacks)
         let _ = vm.drain_microtasks();
@@ -95,6 +105,8 @@ impl Engine {
         };
         let interner = std::mem::take(&mut self.interner);
         let mut vm = Vm::new(chunk, interner);
+        vm.max_steps = self.max_steps;
+        vm.silent_console = self.silent_console;
         let result = vm.run();
         let _ = vm.drain_microtasks();
         let output = vm.output.clone();

@@ -113,7 +113,6 @@ fn extract_bracket_list(line: &str) -> Option<Vec<String>> {
 
 const UNSUPPORTED_FEATURES: &[&str] = &[
     "Proxy", "Reflect",
-    "Symbol.asyncIterator", "Symbol.matchAll",
     "WeakRef", "FinalizationRegistry",
     "SharedArrayBuffer", "Atomics",
     "async-iteration", "for-await-of",
@@ -129,22 +128,17 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "set-methods",
     "promise-with-resolvers",
     "regexp-v-flag", "regexp-unicode-property-escapes",
-    "regexp-named-groups", "regexp-lookbehind", "regexp-dotall",
+    "regexp-lookbehind", "regexp-dotall",
     "regexp-match-indices",
     "class-static-fields-public",
-    "class-static-block",
-    "logical-assignment-operators",
     "json-modules",
     "String.prototype.matchAll",
     "Array.fromAsync",
-    "change-array-by-copy",
 ];
 
 fn should_skip(source: &str, meta: &TestMeta) -> bool {
-    if source.contains('\u{2028}') || source.contains('\u{2029}')
-        || source.contains("\\u2028") || source.contains("\\u2029") {
-        return true;
-    }
+    // Note: U+2028 / U+2029 line terminators are handled by the lexer
+    // (src/lexer/cursor.rs is_unicode_line_terminator), so no need to skip.
 
     for feat in &meta.features {
         for unsupported in UNSUPPORTED_FEATURES {
@@ -158,24 +152,21 @@ fn should_skip(source: &str, meta: &TestMeta) -> bool {
         || source.contains("SharedArrayBuffer")
         || source.contains("Atomics.")
         || source.contains("import(") || source.contains("import.meta")
-        || source.contains("Symbol.toPrimitive")
-        || source.contains("Symbol.species")
-        || source.contains("[Symbol.")
     {
         return true;
     }
 
     if meta.flags.contains(&"module".to_string()) { return true; }
-    if meta.is_async { return true; }
-    if source.contains("fnGlobalObject") { return true; }
-    // Skip tests that use `with` statement (not implemented)
-    if source.contains("with (") || source.contains("with(") { return true; }
+    // Async tests are now handled by run_test via $DONE output markers.
 
     for inc in &meta.includes {
         match inc.as_str() {
             "compareArray.js" | "deepEqual.js" | "nans.js"
             | "decimalToHexString.js" | "isConstructor.js"
-            | "propertyHelper.js" => {}
+            | "propertyHelper.js"
+            | "fnGlobalObject.js"   // we inline an equivalent in BASE_HARNESS
+            | "asyncHelpers.js"     // $DONE is provided in BASE_HARNESS
+            => {}
             _ => return true,
         }
     }
@@ -214,6 +205,14 @@ const CATEGORIES: &[&str] = &[
     "statements/function", "statements/for-in", "expressions/array", "expressions/in",
     "expressions/instanceof", "expressions/new", "expressions/call", "directive-prologue",
     "future-reserved-words", "reserved-words",
+    // Phase-3 additions (more language-test directories)
+    "arguments-object", "destructuring", "eval-code", "identifiers", "source-text",
+    "expressions/async-arrow-function", "expressions/await", "expressions/class",
+    "expressions/delete", "expressions/generators", "expressions/member-expression",
+    "expressions/property-accessors", "expressions/super", "expressions/tagged-template",
+    "expressions/yield", "expressions/assignmenttargettype",
+    "statements/generators", "statements/with",
+    "statements/async-function",
 ];
 
 fn main() {
@@ -554,6 +553,23 @@ assert.throws = function(err, fn, msg) {
     throw new Test262Error(msg || "expected exception");
 };
 function $ERROR(msg) { throw new Test262Error(msg); }
+function fnGlobalObject() { return globalThis; }
+function $DONE(err) {
+    // Tag the captured console output so the runner can detect async outcome
+    // after drain_microtasks. (We can't mutate runner state from JS otherwise.)
+    if (err === undefined || err === null) {
+        console.log("__T262_DONE_OK__");
+    } else {
+        var msg = err && err.message ? err.message : (err.toString ? err.toString() : String(err));
+        console.error("__T262_DONE_ERR__:" + msg);
+    }
+}
+// Mirror harness onto globalThis so `Object.hasOwn(globalThis, "$DONE")`
+// (used by asyncTest in test262/harness/asyncHelpers.js) returns true.
+globalThis.$DONE = $DONE;
+globalThis.fnGlobalObject = fnGlobalObject;
+globalThis.assert = assert;
+globalThis.Test262Error = Test262Error;
 var $262 = {};
 "#;
 
@@ -578,16 +594,47 @@ fn run_test(source: &str, meta: &TestMeta, harness_cache: &HashMap<String, Strin
     parts.push(source.to_string());
     let full_source = parts.join("\n");
 
+    let is_async = meta.is_async;
+
     // 2M instructions is plenty for any real test; cuts off infinite loops quickly
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut engine = Engine::new();
         engine.set_max_steps(2_000_000);
-        engine.eval(&full_source)
+        // Tests should never spam the runner's stdout/stderr; output is still
+        // captured for $DONE-marker scanning via eval_with_output.
+        engine.set_silent_console(true);
+        if is_async {
+            // We need console output to detect $DONE markers after microtasks drain.
+            let (res, output) = engine.eval_with_output(&full_source);
+            if res.starts_with("Error:")
+                || res.starts_with("RuntimeError:")
+                || res.starts_with("SyntaxError:")
+                || res.starts_with("CompileError:")
+            {
+                return Err(res);
+            }
+            // Check the output for $DONE markers (printed by harness $DONE).
+            for line in &output {
+                if let Some(rest) = line.strip_prefix("__T262_DONE_ERR__:") {
+                    return Err(format!("Test262Error: $DONE called with error: {rest}"));
+                }
+            }
+            if output.iter().any(|l| l == "__T262_DONE_OK__") {
+                Ok(())
+            } else {
+                Err("Test262Error: $DONE never called".to_string())
+            }
+        } else {
+            match engine.eval(&full_source) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(format!("{e}")),
+            }
+        }
     }));
 
     match result {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(format!("{e}")),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
         Err(_) => Err("panic".to_string()),
     }
 }

@@ -1173,7 +1173,15 @@ impl Vm {
                 let setter_key = self.interner.intern(&format!("__set_{key}__"));
                 if let Some(oid) = this_val.as_object_id() {
                     let has = self.heap.get(oid).map(|o| {
-                        o.has_own_property(key_id)
+                        // Array/arguments objects also expose numeric indices and "length"
+                        // as own properties even though they aren't in `properties`.
+                        let array_match = if let ObjectKind::Array(ref elems) = o.kind {
+                            if key == "length" { true }
+                            else if let Ok(idx) = key.parse::<usize>() { idx < elems.len() }
+                            else { false }
+                        } else { false };
+                        array_match
+                            || o.has_own_property(key_id)
                             || o.has_own_property(getter_key)
                             || o.has_own_property(setter_key)
                     }).unwrap_or(false);
@@ -1181,6 +1189,16 @@ impl Vm {
                 } else if this_val.is_function() {
                     let sentinel = this_val.as_function().unwrap();
                     let has = self.fn_get_own_prop(sentinel, key_id).is_some();
+                    Value::boolean(has)
+                } else if this_val.is_string() {
+                    // String primitives: numeric indices and "length" are own properties.
+                    let s_id = this_val.as_string_id().unwrap();
+                    let s = self.interner.resolve(s_id);
+                    let has = if key == "length" {
+                        true
+                    } else if let Ok(idx) = key.parse::<usize>() {
+                        idx < s.chars().count()
+                    } else { false };
                     Value::boolean(has)
                 } else { Value::boolean(false) }
             }
