@@ -1302,26 +1302,28 @@ impl Vm {
                 }
         false
     }
-    /// Unwrap a wrapper object to its primitive, or return the value as-is.
-    /// ToPrimitive with valueOf/toString calls.
-    pub(crate) fn coerce_to_primitive(&mut self, val: Value) -> Value {
-        // ConsString is already a string primitive — no coercion needed
-        if self.is_cons_string(val) { return val; }
-        self.try_coerce_to_primitive_hint(val, "default").unwrap_or(val)
-    }
-
-    pub(crate) fn coerce_to_number_primitive(&mut self, val: Value) -> Value {
-        self.try_coerce_to_primitive_hint(val, "number").unwrap_or(val)
-    }
-
     /// Coerce a value to a primitive, propagating any exception thrown from
-    /// the `valueOf`/`toString`/`@@toPrimitive` method.
+    /// the `valueOf`/`toString`/`@@toPrimitive` method as `VmError::Throw(_)`.
+    /// The caller is expected to either propagate the throw or re-route it via
+    /// `handle_throw` once its own stack is balanced.
     pub(crate) fn try_coerce_to_primitive_hint(&mut self, val: Value, hint_str: &str) -> Result<Value, super::vm::VmError> {
+        let prev_protect = self.protect_throw_depth;
+        self.protect_throw_depth = self.frames.len() + 1;
+        let result = self.try_coerce_to_primitive_hint_inner(val, hint_str);
+        self.protect_throw_depth = prev_protect;
+        result
+    }
+
+    fn try_coerce_to_primitive_hint_inner(&mut self, val: Value, hint_str: &str) -> Result<Value, super::vm::VmError> {
         if let Some(oid) = val.as_object_id() {
             if let Some(obj) = self.heap.get(oid)
                 && let ObjectKind::Wrapper(inner) = &obj.kind {
                     return Ok(*inner);
                 }
+            // Track whether any method existed so we can distinguish "had no
+            // primitive coercion" (return object as-is for back-compat with
+            // string contexts) from "all methods returned objects" (throw TypeError).
+            let mut tried_method = false;
             // Check for Symbol.toPrimitive method
             let sym_key = self.interner.intern(&format!("__sym_{}__", self.sym_to_primitive));
             if let Some(tp_fn) = self.heap.get_property_chain(oid, sym_key)
@@ -1330,6 +1332,9 @@ impl Vm {
                 let hint = self.interner.intern(hint_str);
                 let result = self.call_function_this(tp_fn, val, &[Value::string(hint)])?;
                 if !result.is_object() { return Ok(result); }
+                // @@toPrimitive returning an object always throws.
+                let err = self.make_native_error("TypeError", "Cannot convert object to primitive value");
+                return Err(super::vm::VmError::Throw(err));
             }
             // Per spec, "string" hint tries toString first, otherwise valueOf first.
             let (try_first, try_second) = if hint_str == "string" {
@@ -1341,6 +1346,7 @@ impl Vm {
             if let Some(fn1) = self.heap.get_property_chain(oid, first_key)
                 && fn1.is_function()
             {
+                tried_method = true;
                 let result = self.call_function_this(fn1, val, &[])?;
                 if !result.is_object() { return Ok(result); }
             }
@@ -1348,8 +1354,15 @@ impl Vm {
             if let Some(fn2) = self.heap.get_property_chain(oid, second_key)
                 && fn2.is_function()
             {
+                tried_method = true;
                 let result = self.call_function_this(fn2, val, &[])?;
                 if !result.is_object() { return Ok(result); }
+            }
+            // Both methods returned objects (or weren't callable in a way that produced
+            // a primitive) — per spec, OrdinaryToPrimitive throws TypeError.
+            if tried_method {
+                let err = self.make_native_error("TypeError", "Cannot convert object to primitive value");
+                return Err(super::vm::VmError::Throw(err));
             }
         }
         Ok(val)

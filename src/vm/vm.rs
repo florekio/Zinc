@@ -28,6 +28,10 @@ pub enum VmError {
     TypeError(String),
     ReferenceError(String),
     RuntimeError(String),
+    /// A throw that escaped a protected nested call (e.g. valueOf during a
+    /// comparison opcode). The opcode handler is expected to catch this and
+    /// re-route via `handle_throw` so the stack stays balanced.
+    Throw(Value),
 }
 
 impl fmt::Display for VmError {
@@ -36,6 +40,7 @@ impl fmt::Display for VmError {
             VmError::TypeError(msg) => write!(f, "TypeError: {msg}"),
             VmError::ReferenceError(msg) => write!(f, "ReferenceError: {msg}"),
             VmError::RuntimeError(msg) => write!(f, "RuntimeError: {msg}"),
+            VmError::Throw(_) => write!(f, "Throw"),
         }
     }
 }
@@ -127,6 +132,12 @@ pub struct Vm {
     #[allow(dead_code)]
     pub(crate) global_ic_version: HashMap<(usize, usize), u64>,
     pub(crate) exc_handlers: Vec<ExcHandler>,
+    /// Lower bound for handle_throw unwinding. Set by `try_coerce_to_primitive_hint`
+    /// (and similar) before calling into user code so a throw that would unwind
+    /// past the current opcode is converted to `Err(VmError::Throw(_))`. The opcode
+    /// handler can then catch it and re-throw via `handle_throw` once its own stack
+    /// expectations are met.
+    pub(crate) protect_throw_depth: usize,
     pub(crate) microtask_queue: Vec<Microtask>,
     /// Active `with`-scope objects (innermost last). Names resolve here before globals.
     pub(crate) with_stack: Vec<ObjectId>,
@@ -485,6 +496,7 @@ impl Vm {
             global_version: 0,
             global_ic_version: HashMap::new(),
             exc_handlers: Vec::new(),
+            protect_throw_depth: 0,
             microtask_queue: Vec::new(),
             with_stack: Vec::new(),
             closure_upvalues: Vec::new(),
@@ -862,48 +874,13 @@ impl Vm {
         f64::NAN
     }
 
-    /// ECMAScript ToPrimitive: call valueOf() then toString() on an object.
-    /// Returns Ok(Some(primitive)) on success, Ok(None) if no methods exist,
-    /// or Err if a method throws.
-    pub(crate) fn call_value_of_to_string(&mut self, val: Value) -> Option<Value> {
-        let oid = val.as_object_id()?;
-        let obj = self.heap.get(oid)?;
-
-        // Try valueOf first
-        let value_of_name = self.interner.intern("valueOf");
-        if let Some(method_val) = obj.get_property(value_of_name)
-            && method_val.is_function()
-        {
-            match self.call_function(method_val, &[]) {
-                Ok(result) if !result.is_object() => return Some(result),
-                Ok(_) => {} // returned object, try toString
-                Err(_) => return None, // method threw
-            }
-        }
-
-        // Then try toString
-        let to_string_name = self.interner.intern("toString");
-        let obj = self.heap.get(oid)?;
-        if let Some(method_val) = obj.get_property(to_string_name)
-            && method_val.is_function()
-        {
-            match self.call_function(method_val, &[]) {
-                Ok(result) if !result.is_object() => return Some(result),
-                Ok(_) => {} // returned object
-                Err(_) => return None,
-            }
-        }
-
-        None
-    }
-
     #[inline(always)]
     pub(crate) fn pop_numbers(&mut self) -> Result<(f64, f64), VmError> {
         let b = self.pop()?;
         let a = self.pop()?;
-        // ToPrimitive for objects
-        let a = if a.is_object() { self.call_value_of_to_string(a).unwrap_or(a) } else { a };
-        let b = if b.is_object() { self.call_value_of_to_string(b).unwrap_or(b) } else { b };
+        // ToPrimitive for objects — throws propagate as VmError::Throw, opcode catches.
+        let a = if a.is_object() { self.try_coerce_to_primitive_hint(a, "number")? } else { a };
+        let b = if b.is_object() { self.try_coerce_to_primitive_hint(b, "number")? } else { b };
         Ok((self.to_f64(a), self.to_f64(b)))
     }
 
@@ -911,9 +888,9 @@ impl Vm {
     pub(crate) fn pop_ints(&mut self) -> Result<(i32, i32), VmError> {
         let bv = self.pop()?;
         let av = self.pop()?;
-        // ToPrimitive for objects
-        let av = if av.is_object() { self.call_value_of_to_string(av).unwrap_or(av) } else { av };
-        let bv = if bv.is_object() { self.call_value_of_to_string(bv).unwrap_or(bv) } else { bv };
+        // ToPrimitive for objects — throws propagate as VmError::Throw, opcode catches.
+        let av = if av.is_object() { self.try_coerce_to_primitive_hint(av, "number")? } else { av };
+        let bv = if bv.is_object() { self.try_coerce_to_primitive_hint(bv, "number")? } else { bv };
         let b = self.to_i32(bv)?;
         let a = self.to_i32(av)?;
         Ok((a, b))
@@ -1115,12 +1092,43 @@ impl Vm {
         Value::object_id(oid)
     }
 
+    /// Shared core of `<`, `<=`, `>`, `>=`. Coerces both sides to primitives
+    /// (with throw-protection) and applies `str_cmp` for two strings or `num_cmp`
+    /// otherwise.
+    pub(crate) fn relational_compare(
+        &mut self,
+        av: Value,
+        bv: Value,
+        num_cmp: fn(f64, f64) -> bool,
+        str_cmp: fn(&str, &str) -> bool,
+    ) -> Result<bool, VmError> {
+        let a = self.try_coerce_to_primitive_hint(av, "number")?;
+        let b = self.try_coerce_to_primitive_hint(bv, "number")?;
+        if self.is_string_like(a) && self.is_string_like(b) {
+            let sa = self.flatten_cons_to_string(a);
+            let sb = self.flatten_cons_to_string(b);
+            Ok(str_cmp(&sa, &sb))
+        } else {
+            Ok(num_cmp(self.to_f64(a), self.to_f64(b)))
+        }
+    }
+
     /// Throw a JS value through the exception-handler machinery.
     /// If a handler is found the stack/frames are unwound and `Ok(())` is
     /// returned (caller must `continue` the main dispatch loop).
     /// If no handler exists the value is stringified and returned as
     /// `Err(VmError::RuntimeError)`.
     pub(crate) fn handle_throw(&mut self, val: Value) -> Result<(), VmError> {
+        // Protected nested call (e.g. valueOf during a comparison opcode):
+        // if the handler that would catch this throw lives in a frame strictly
+        // below the protect depth, the throw escapes the nested call. Bubble
+        // it up as a VmError so the calling opcode can re-throw at its own level.
+        if self.protect_throw_depth > 0
+            && let Some(handler) = self.exc_handlers.last()
+            && handler.frame_idx + 1 < self.protect_throw_depth
+        {
+            return Err(VmError::Throw(val));
+        }
         if let Some(handler) = self.exc_handlers.pop() {
             for frame in self.frames.iter().skip(handler.frame_idx + 1) {
                 if let Some(gid) = frame.generator_id
@@ -1346,80 +1354,83 @@ impl Vm {
     // ---- Abstract equality (simplified) -----------------------------------
 
     /// Simplified abstract equality (==). Handles the most common cases:
+    /// Abstract equality (==) that propagates throws from valueOf/toString
+    /// during ToPrimitive as `Err(VmError::Throw(_))`.
+    ///
     ///   - same type: strict equality
     ///   - null == undefined (and vice versa)
     ///   - number == string: coerce string to number
-    pub(crate) fn abstract_eq(&mut self, a: Value, b: Value) -> bool {
+    pub(crate) fn try_abstract_eq(&mut self, a: Value, b: Value) -> Result<bool, VmError> {
         // Fast path: identical bits
         if a.raw() == b.raw() {
             // NaN !== NaN
             if a.is_float() {
                 let f = a.as_number().unwrap();
-                return !f.is_nan();
+                return Ok(!f.is_nan());
             }
-            return true;
+            return Ok(true);
         }
 
         // null == undefined
         if a.is_nullish() && b.is_nullish() {
-            return true;
+            return Ok(true);
         }
 
         // Both numbers (int/float mix)
         if a.is_number() && b.is_number() {
-            return a.as_number() == b.as_number();
+            return Ok(a.as_number() == b.as_number());
         }
 
         // Both strings (including ConsString)
         if self.is_string_like(a) && self.is_string_like(b) {
-            return self.flatten_cons_to_string(a) == self.flatten_cons_to_string(b);
+            return Ok(self.flatten_cons_to_string(a) == self.flatten_cons_to_string(b));
         }
 
         // Both booleans
         if a.is_boolean() && b.is_boolean() {
-            return false; // already handled by raw() check
+            return Ok(false); // already handled by raw() check
         }
 
         // number == string: coerce string to number
         if a.is_number() && b.is_string() {
             if let Some(n) = self.string_to_number(b) {
-                return a.as_number() == Some(n);
+                return Ok(a.as_number() == Some(n));
             }
-            return false;
+            return Ok(false);
         }
         if a.is_string() && b.is_number() {
             if let Some(n) = self.string_to_number(a) {
-                return b.as_number() == Some(n);
+                return Ok(b.as_number() == Some(n));
             }
-            return false;
+            return Ok(false);
         }
 
         // boolean vs other: coerce boolean to number, retry
         if a.is_boolean() {
             let num_a = if a.as_bool().unwrap() { 1.0 } else { 0.0 };
-            return self.abstract_eq(Value::number(num_a), b);
+            return self.try_abstract_eq(Value::number(num_a), b);
         }
         if b.is_boolean() {
             let num_b = if b.as_bool().unwrap() { 1.0 } else { 0.0 };
-            return self.abstract_eq(a, Value::number(num_b));
+            return self.try_abstract_eq(a, Value::number(num_b));
         }
 
         // object vs primitive: unwrap wrapper only when the OTHER side is primitive
         // (object == object compares references, not values)
         if a.is_object() && !b.is_object() {
-            let pa = self.coerce_to_primitive(a);
+            let pa = self.try_coerce_to_primitive_hint(a, "default")?;
             if pa.raw() != a.raw() {
-                return self.abstract_eq(pa, b);
+                return self.try_abstract_eq(pa, b);
             }
         }
         if b.is_object() && !a.is_object() {
-            let pb = self.coerce_to_primitive(b);
+            let pb = self.try_coerce_to_primitive_hint(b, "default")?;
             if pb.raw() != b.raw() {
-                return self.abstract_eq(a, pb);
+                return self.try_abstract_eq(a, pb);
             }
         }
 
-        false
+        Ok(false)
     }
 
     /// Strict equality (===).
@@ -1665,12 +1676,20 @@ impl Vm {
                     let b = self.pop()?;
                     let a = self.pop()?;
 
-                    // ToPrimitive for objects before type check
+                    // ToPrimitive for objects before type check (throws propagate via VmError::Throw)
                     let a_prim = if a.is_object() {
-                        self.coerce_to_primitive(a)
+                        match self.try_coerce_to_primitive_hint(a, "default") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
                     } else { a };
                     let b_prim = if b.is_object() {
-                        self.coerce_to_primitive(b)
+                        match self.try_coerce_to_primitive_hint(b, "default") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
                     } else { b };
 
                     let a_is_str = a_prim.is_string() || self.is_cons_string(a_prim) || self.is_string_wrapper(a_prim);
@@ -1723,87 +1742,151 @@ impl Vm {
                 }
 
                 OpCode::Sub => {
-                    let (a, b) = self.pop_numbers()?;
-                    self.push_number(a - b);
+                    match self.pop_numbers() {
+                        Ok((a, b)) => self.push_number(a - b),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::Mul => {
-                    let (a, b) = self.pop_numbers()?;
-                    self.push_number(a * b);
+                    match self.pop_numbers() {
+                        Ok((a, b)) => self.push_number(a * b),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::Div => {
-                    let (a, b) = self.pop_numbers()?;
-                    self.push_number(a / b);
+                    match self.pop_numbers() {
+                        Ok((a, b)) => self.push_number(a / b),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::Rem => {
-                    let (a, b) = self.pop_numbers()?;
-                    self.push_number(a % b);
+                    match self.pop_numbers() {
+                        Ok((a, b)) => self.push_number(a % b),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::Exp => {
-                    let (a, b) = self.pop_numbers()?;
-                    self.push_number(a.powf(b));
+                    match self.pop_numbers() {
+                        Ok((a, b)) => self.push_number(a.powf(b)),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::Neg => {
                     let val = self.pop()?;
-                    let prim = if val.is_object() { self.coerce_to_number_primitive(val) } else { val };
+                    let prim = if val.is_object() {
+                        match self.try_coerce_to_primitive_hint(val, "number") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
+                    } else { val };
                     self.push_number(-self.to_f64(prim));
                 }
 
                 OpCode::Pos => {
                     let val = self.pop()?;
-                    let prim = if val.is_object() { self.coerce_to_number_primitive(val) } else { val };
+                    let prim = if val.is_object() {
+                        match self.try_coerce_to_primitive_hint(val, "number") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
+                    } else { val };
                     self.push_number(self.to_f64(prim));
                 }
 
                 OpCode::Inc => {
                     let val = self.pop()?;
-                    let prim = if val.is_object() { self.coerce_to_number_primitive(val) } else { val };
+                    let prim = if val.is_object() {
+                        match self.try_coerce_to_primitive_hint(val, "number") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
+                    } else { val };
                     self.push_number(self.to_f64(prim) + 1.0);
                 }
 
                 OpCode::Dec => {
                     let val = self.pop()?;
-                    let prim = if val.is_object() { self.coerce_to_number_primitive(val) } else { val };
+                    let prim = if val.is_object() {
+                        match self.try_coerce_to_primitive_hint(val, "number") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
+                    } else { val };
                     self.push_number(self.to_f64(prim) - 1.0);
                 }
 
                 // ---- Bitwise ---------------------------------------------
                 OpCode::BitAnd => {
-                    let (a, b) = self.pop_ints()?;
-                    self.push(Value::int(a & b));
+                    match self.pop_ints() {
+                        Ok((a, b)) => self.push(Value::int(a & b)),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::BitOr => {
-                    let (a, b) = self.pop_ints()?;
-                    self.push(Value::int(a | b));
+                    match self.pop_ints() {
+                        Ok((a, b)) => self.push(Value::int(a | b)),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::BitXor => {
-                    let (a, b) = self.pop_ints()?;
-                    self.push(Value::int(a ^ b));
+                    match self.pop_ints() {
+                        Ok((a, b)) => self.push(Value::int(a ^ b)),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::BitNot => {
                     let val = self.pop()?;
-                    let prim = if val.is_object() { self.coerce_to_number_primitive(val) } else { val };
+                    let prim = if val.is_object() {
+                        match self.try_coerce_to_primitive_hint(val, "number") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
+                    } else { val };
                     let n = self.to_i32(prim)?;
                     self.push(Value::int(!n));
                 }
 
                 OpCode::Shl => {
-                    let (a, b) = self.pop_ints()?;
-                    let shift = (b as u32) & 0x1F;
-                    self.push(Value::int(a.wrapping_shl(shift)));
+                    match self.pop_ints() {
+                        Ok((a, b)) => {
+                            let shift = (b as u32) & 0x1F;
+                            self.push(Value::int(a.wrapping_shl(shift)));
+                        }
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::Shr => {
-                    let (a, b) = self.pop_ints()?;
-                    let shift = (b as u32) & 0x1F;
-                    self.push(Value::int(a.wrapping_shr(shift)));
+                    match self.pop_ints() {
+                        Ok((a, b)) => {
+                            let shift = (b as u32) & 0x1F;
+                            self.push(Value::int(a.wrapping_shr(shift)));
+                        }
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::UShr => {
@@ -1824,15 +1907,21 @@ impl Vm {
                 OpCode::Eq => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = self.abstract_eq(a, b);
-                    self.push(Value::boolean(result));
+                    match self.try_abstract_eq(a, b) {
+                        Ok(r) => self.push(Value::boolean(r)),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::Ne => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = self.abstract_eq(a, b);
-                    self.push(Value::boolean(!result));
+                    match self.try_abstract_eq(a, b) {
+                        Ok(r) => self.push(Value::boolean(!r)),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 OpCode::StrictEq => {
@@ -1848,50 +1937,42 @@ impl Vm {
                 }
 
                 OpCode::Lt => {
-                    let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
-                    let av = self.pop()?; let a = self.coerce_to_primitive(av);
-                    if self.is_string_like(a) && self.is_string_like(b) {
-                        let sa = self.flatten_cons_to_string(a);
-                        let sb = self.flatten_cons_to_string(b);
-                        self.push(Value::boolean(sa < sb));
-                    } else {
-                        self.push(Value::boolean(self.to_f64(a) < self.to_f64(b)));
+                    let bv = self.pop()?;
+                    let av = self.pop()?;
+                    match self.relational_compare(av, bv, |a, b| a < b, |a, b| a < b) {
+                        Ok(r) => self.push(Value::boolean(r)),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
                     }
                 }
 
                 OpCode::Le => {
-                    let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
-                    let av = self.pop()?; let a = self.coerce_to_primitive(av);
-                    if self.is_string_like(a) && self.is_string_like(b) {
-                        let sa = self.flatten_cons_to_string(a);
-                        let sb = self.flatten_cons_to_string(b);
-                        self.push(Value::boolean(sa <= sb));
-                    } else {
-                        self.push(Value::boolean(self.to_f64(a) <= self.to_f64(b)));
+                    let bv = self.pop()?;
+                    let av = self.pop()?;
+                    match self.relational_compare(av, bv, |a, b| a <= b, |a, b| a <= b) {
+                        Ok(r) => self.push(Value::boolean(r)),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
                     }
                 }
 
                 OpCode::Gt => {
-                    let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
-                    let av = self.pop()?; let a = self.coerce_to_primitive(av);
-                    if self.is_string_like(a) && self.is_string_like(b) {
-                        let sa = self.flatten_cons_to_string(a);
-                        let sb = self.flatten_cons_to_string(b);
-                        self.push(Value::boolean(sa > sb));
-                    } else {
-                        self.push(Value::boolean(self.to_f64(a) > self.to_f64(b)));
+                    let bv = self.pop()?;
+                    let av = self.pop()?;
+                    match self.relational_compare(av, bv, |a, b| a > b, |a, b| a > b) {
+                        Ok(r) => self.push(Value::boolean(r)),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
                     }
                 }
 
                 OpCode::Ge => {
-                    let bv = self.pop()?; let b = self.coerce_to_primitive(bv);
-                    let av = self.pop()?; let a = self.coerce_to_primitive(av);
-                    if self.is_string_like(a) && self.is_string_like(b) {
-                        let sa = self.flatten_cons_to_string(a);
-                        let sb = self.flatten_cons_to_string(b);
-                        self.push(Value::boolean(sa >= sb));
-                    } else {
-                        self.push(Value::boolean(self.to_f64(a) >= self.to_f64(b)));
+                    let bv = self.pop()?;
+                    let av = self.pop()?;
+                    match self.relational_compare(av, bv, |a, b| a >= b, |a, b| a >= b) {
+                        Ok(r) => self.push(Value::boolean(r)),
+                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                        Err(e) => return Err(e),
                     }
                 }
 
