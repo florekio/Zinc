@@ -6,7 +6,14 @@ Run with: `cargo run --release --bin test262_runner`
 
 ## Results
 
-**95.7% pass rate** — 9,385 of 9,805 active tests pass (2,760 tests skipped).
+**92.6% pass rate** — 14,821 of 16,010 active tests pass (2,988 tests skipped).
+
+The active count nearly doubled from v0.4.0 after the runner stopped pre-skipping
+features that already work (`Symbol.asyncIterator`, `Symbol.matchAll`, change-array-by-copy,
+logical-assignment), wired up the `$DONE` async harness, implemented `with`, and turned
+on `class { static { … } }`. The pass rate dipped a few points but the underlying
+implementation is the same — we now report against thousands of tests we previously
+hid behind `should_skip()`.
 
 ### Perfect Scores (100%)
 
@@ -49,26 +56,35 @@ Run with: `cargo run --release --bin test262_runner`
 
 | Category | Total | Pass | Rate |
 |----------|-------|------|------|
-| statements/class | 2782 | 2685 | 96.5% |
-| statements/for-of | 630 | 600 | 95.2% |
-| statements/function | 416 | 380 | 91.3% |
+| statements/class | 3112 | 2856 | 91.8% |
+| expressions/class | 2831 | 2606 | 92.1% |
+| expressions/object | 864 | 833 | 96.4% |
+| statements/for-of | 733 | 688 | 93.9% |
+| expressions/assignment | 480 | 451 | 94.0% |
+| expressions/compound-assignment | 454 | 410 | 90.3% |
+| statements/function | 451 | 405 | 89.8% |
+| statements/for | 380 | 372 | 97.9% |
+| expressions/arrow-function | 343 | 333 | 97.1% |
+| eval-code | 343 | 245 | 71.4% |
+| expressions/generators | 290 | 280 | 96.6% |
+| statements/generators | 266 | 257 | 96.6% |
+| expressions/function | 264 | 258 | 97.7% |
+| function-code | 217 | 202 | 93.1% |
+| arguments-object | 203 | 166 | 81.8% |
+| statements/variable | 178 | 172 | 96.6% |
+| statements/with | 173 | 126 | 72.8% |
+| statements/const | 136 | 134 | 98.5% |
+| statements/let | 145 | 143 | 98.6% |
 | statements/for-in | 113 | 98 | 86.7% |
-| statements/const | 125 | 123 | 98.4% |
-| statements/let | 134 | 131 | 97.8% |
-| statements/do-while | 34 | 30 | 88.2% |
-| expressions/object | 792 | 773 | 97.6% |
-| expressions/arrow-function | 320 | 310 | 96.9% |
-| expressions/optional-chaining | 31 | 29 | 93.5% |
-| expressions/array | 40 | 39 | 97.5% |
-| expressions/in | 34 | 24 | 70.6% |
-| expressions/instanceof | 38 | 30 | 78.9% |
-| directive-prologue | 57 | 55 | 96.5% |
-| function-code | 217 | 198 | 91.2% |
-| computed-property-names | 48 | 46 | 95.8% |
+| expressions/async-function | 93 | 83 | 89.2% |
+| statements/switch | 93 | 77 | 82.8% |
+| expressions/super | 92 | 77 | 83.7% |
+| expressions/logical-assignment | 78 | 78 | 100.0% |
+| statements/async-function | 74 | 66 | 89.2% |
 
 ### Skipped Features
 
-Tests requiring these features are currently skipped (2,760 tests):
+Tests requiring these features are currently skipped (2,988 tests):
 
 - `Proxy`, `Reflect`
 - `SharedArrayBuffer`, `Atomics`
@@ -77,9 +93,7 @@ Tests requiring these features are currently skipped (2,760 tests):
 - `Intl`, `Temporal`
 - `WeakRef`, `FinalizationRegistry`
 - Private class field brand checks (`#x in obj`)
-- Regex advanced features (named groups, lookbehind, dotall, unicode properties)
-- Logical assignment operators (`&&=`, `||=`, `??=`)
-- Class static blocks
+- Regex advanced features (lookbehind, dotall, unicode properties, v-flag, match-indices)
 - Various stage 3/4 proposals (decorators, explicit resource management, iterator helpers, set methods)
 - ES Modules
 
@@ -91,6 +105,11 @@ Tests requiring these features are currently skipped (2,760 tests):
 | v0.2.0  | 6,476       | 5,461   | 84.3% |
 | v0.3.0  | 9,805       | 9,052   | 92.3% |
 | v0.4.0  | 9,805       | 9,385   | 95.7% |
+| post-v0.4.0 | 16,010  | 14,821  | 92.6% |
+
+The post-v0.4.0 jump in active tests (9,805 → 16,010) reflects unskipping
+features the engine already implemented and adding `$DONE`/`with`/`static {}`/
+named regex groups support.
 
 ### Running
 

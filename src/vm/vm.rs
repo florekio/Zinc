@@ -79,6 +79,10 @@ pub(crate) struct CallFrame {
     /// Snapshot of the actual argument values, captured at call time before
     /// locals can overwrite the same stack slots (needed for `arguments` object).
     pub(crate) saved_args: Vec<Value>,
+    /// Cached `arguments` object id — allocated lazily on first reference and
+    /// reused so identity holds (`arguments === arguments`) and writes
+    /// (e.g. via `with`) are visible on subsequent reads.
+    pub(crate) arguments_oid: Option<crate::runtime::object::ObjectId>,
 }
 
 /// An active exception handler (pushed by PushExcHandler).
@@ -88,6 +92,9 @@ pub(crate) struct ExcHandler {
     pub(crate) finally_target: u16,
     pub(crate) stack_depth: usize,
     pub(crate) frame_idx: usize,
+    /// with_stack length at handler-push time; on unwind, with_stack is truncated
+    /// to this length so exiting via throw still pops `with` scopes correctly.
+    pub(crate) with_depth: usize,
 }
 
 #[derive(Clone)]
@@ -336,6 +343,12 @@ impl Vm {
         math_obj.define_property(ln10_name, Property::with_flags(Value::number(std::f64::consts::LN_10), 0));
         let sqrt2_name = interner.intern("SQRT2");
         math_obj.define_property(sqrt2_name, Property::with_flags(Value::number(std::f64::consts::SQRT_2), 0));
+        let log2e_name = interner.intern("LOG2E");
+        math_obj.define_property(log2e_name, Property::with_flags(Value::number(std::f64::consts::LOG2_E), 0));
+        let log10e_name = interner.intern("LOG10E");
+        math_obj.define_property(log10e_name, Property::with_flags(Value::number(std::f64::consts::LOG10_E), 0));
+        let sqrt1_2_name = interner.intern("SQRT1_2");
+        math_obj.define_property(sqrt1_2_name, Property::with_flags(Value::number(std::f64::consts::FRAC_1_SQRT_2), 0));
         // Math methods as sentinel functions (-700 range)
         for (name, sentinel) in [
             ("sin", -700i32), ("cos", -701), ("abs", -702), ("floor", -703),
@@ -462,7 +475,7 @@ impl Vm {
         
         Self {
             chunks,
-            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::object_id(global_this_oid), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0, saved_args: Vec::new() }],
+            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::object_id(global_this_oid), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0, saved_args: Vec::new(), arguments_oid: None }],
             stack: Vec::with_capacity(256),
             globals,
             interner,
@@ -710,6 +723,7 @@ impl Vm {
                 self.frames.pop();
             }
             self.stack.truncate(handler.stack_depth);
+            self.with_stack.truncate(handler.with_depth);
             self.push(Value::object_id(oid));
             self.frames.last_mut().unwrap().ip = handler.catch_target as usize;
             Ok(())
@@ -1120,6 +1134,8 @@ impl Vm {
                 self.frames.pop();
             }
             self.stack.truncate(handler.stack_depth);
+            // Pop any with-scopes entered since the handler was pushed.
+            self.with_stack.truncate(handler.with_depth);
             self.push(val);
             self.frames.last_mut().unwrap().ip = handler.catch_target as usize;
             Ok(())
@@ -1162,6 +1178,102 @@ impl Vm {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Comprehensive property lookup on a function-sentinel value (e.g. Number.POSITIVE_INFINITY,
+    /// Symbol.iterator, fn.prototype). Returns the resolved value (Value::undefined() if missing).
+    /// Used by both dot- and bracket-access paths.
+    pub(crate) fn fn_property_get(&mut self, sentinel: i32, name_id: StringId, obj_val: Value) -> Value {
+        if let Some(ov) = self.fn_property_overrides.get(&(sentinel, name_id)).copied() {
+            return ov.unwrap_or(Value::undefined());
+        }
+        let name_str = self.interner.resolve(name_id).to_owned();
+        match sentinel {
+            -505 => match name_str.as_str() {
+                "NaN" => Value::number(f64::NAN),
+                "POSITIVE_INFINITY" => Value::number(f64::INFINITY),
+                "NEGATIVE_INFINITY" => Value::number(f64::NEG_INFINITY),
+                "MAX_VALUE" => Value::number(f64::MAX),
+                "MIN_VALUE" => Value::number(f64::MIN_POSITIVE),
+                "MAX_SAFE_INTEGER" => Value::number(9007199254740991.0),
+                "MIN_SAFE_INTEGER" => Value::number(-9007199254740991.0),
+                "EPSILON" => Value::number(f64::EPSILON),
+                "isNaN" => Value::function(-530),
+                "isFinite" => Value::function(-531),
+                "isInteger" => Value::function(-532),
+                "isSafeInteger" => Value::function(-533),
+                "parseInt" => Value::function(-500),
+                "parseFloat" => Value::function(-501),
+                "name" => { let id = self.interner.intern("Number"); Value::string(id) }
+                "length" => Value::int(1),
+                "call" | "apply" | "bind" => obj_val,
+                _ => Value::undefined(),
+            },
+            -570 => match name_str.as_str() {
+                "iterator" => Value::symbol(self.sym_iterator),
+                "hasInstance" => Value::symbol(self.sym_has_instance),
+                "toPrimitive" => Value::symbol(self.sym_to_primitive),
+                "toStringTag" => Value::symbol(self.sym_to_string_tag),
+                "species" => Value::symbol(self.sym_species),
+                "unscopables" => Value::symbol(self.sym_unscopables),
+                "asyncIterator" => Value::symbol(self.sym_async_iterator),
+                "matchAll" => Value::symbol(self.sym_match_all),
+                "name" => { let id = self.interner.intern("Symbol"); Value::string(id) }
+                "length" => Value::int(0),
+                "call" | "apply" | "bind" => obj_val,
+                _ => Value::undefined(),
+            },
+            -504 => match name_str.as_str() {
+                "fromCharCode" => Value::function(-534),
+                "fromCodePoint" => Value::function(-535),
+                "raw" => Value::function(-536),
+                "name" => { let id = self.interner.intern("String"); Value::string(id) }
+                "length" => Value::int(1),
+                "call" | "apply" | "bind" => obj_val,
+                _ => Value::undefined(),
+            },
+            -507 => match name_str.as_str() {
+                "prototype" => Value::object_id(self.array_prototype),
+                "name" => { let id = self.interner.intern("Array"); Value::string(id) }
+                "length" => Value::int(1),
+                "call" | "apply" | "bind" => obj_val,
+                _ => Value::undefined(),
+            },
+            -508 => match name_str.as_str() {
+                "prototype" => Value::object_id(self.object_prototype),
+                "name" => { let id = self.interner.intern("Object"); Value::string(id) }
+                "length" => Value::int(1),
+                "call" | "apply" | "bind" => obj_val,
+                _ => Value::undefined(),
+            },
+            -551 => match name_str.as_str() {
+                "prototype" => Value::object_id(self.function_prototype),
+                "name" => { let id = self.interner.intern("Function"); Value::string(id) }
+                "length" => Value::int(1),
+                "call" | "apply" | "bind" => obj_val,
+                _ => Value::undefined(),
+            },
+            _ => match name_str.as_str() {
+                "prototype" => {
+                    if let Some(&proto_oid) = self.func_prototypes.get(&sentinel) {
+                        Value::object_id(proto_oid)
+                    } else {
+                        let mut proto = JsObject::ordinary();
+                        proto.prototype = Some(self.object_prototype);
+                        let ctor_key = self.interner.intern("constructor");
+                        proto.define_property(ctor_key, Property::with_flags(
+                            obj_val, Property::WRITABLE | Property::CONFIGURABLE
+                        ));
+                        let proto_oid = self.heap.allocate(proto);
+                        self.func_prototypes.insert(sentinel, proto_oid);
+                        Value::object_id(proto_oid)
+                    }
+                }
+                "name" | "length" => self.fn_get_own_prop(sentinel, name_id).unwrap_or(Value::undefined()),
+                "call" | "apply" | "bind" => obj_val,
+                _ => Value::undefined(),
+            },
         }
     }
 
@@ -1917,11 +2029,31 @@ impl Vm {
                         {
                             frame_idx -= 1;
                         }
-                        // Use saved_args (captured at call time) so locals that share
-                        // stack slots with args don't corrupt the arguments object.
-                        let args = self.frames[frame_idx].saved_args.clone();
-                        let arr = JsObject::array(args);
-                        let oid = self.heap.allocate(arr);
+                        // Reuse the cached arguments object so identity holds and
+                        // mutations (e.g. via `with`) persist across reads.
+                        let cached = self.frames[frame_idx].arguments_oid;
+                        let oid = if let Some(oid) = cached {
+                            oid
+                        } else {
+                            let args = self.frames[frame_idx].saved_args.clone();
+                            let chunk_idx = self.frames[frame_idx].chunk_idx;
+                            let is_strict = self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT);
+                            let mut arr = JsObject::array(args);
+                            if !is_strict {
+                                let callee_key = self.interner.intern("callee");
+                                arr.define_property(
+                                    callee_key,
+                                    crate::runtime::object::Property::with_flags(
+                                        Value::function(chunk_idx as i32),
+                                        crate::runtime::object::Property::WRITABLE
+                                            | crate::runtime::object::Property::CONFIGURABLE,
+                                    ),
+                                );
+                            }
+                            let oid = self.heap.allocate(arr);
+                            self.frames[frame_idx].arguments_oid = Some(oid);
+                            oid
+                        };
                         self.push(Value::object_id(oid));
                     } else {
                         match self.globals.get(&name_id).copied() {
@@ -2190,7 +2322,7 @@ impl Vm {
                                 pending_super_call: false,
                                 generator_id: None,
                                 argc,
-                                saved_args,
+                                saved_args, arguments_oid: None,
                             });
                             continue;
                         }
@@ -3408,37 +3540,13 @@ impl Vm {
                             }
                         }
                     }
-                    // Function bracket access: fn['name'], fn['length'], fn['prototype']
+                    // Function bracket access: delegate to dot-access helper for consistency.
                     if obj_val.is_function()
                         && let Some(key_id) = key.as_string_id() {
-                        {
-                            let sentinel = obj_val.as_function().unwrap();
-                            let name_str = self.interner.resolve(key_id).to_owned();
-                            let result = match name_str.as_str() {
-                                "name" | "length" => {
-                                    self.fn_get_own_prop(sentinel, key_id).unwrap_or(Value::undefined())
-                                }
-                                "prototype" => {
-                                    if let Some(&proto_oid) = self.func_prototypes.get(&sentinel) {
-                                        Value::object_id(proto_oid)
-                                    } else {
-                                        let mut proto = JsObject::ordinary();
-                                        proto.prototype = Some(self.object_prototype);
-                                        let ctor_key = self.interner.intern("constructor");
-                                        proto.define_property(ctor_key, Property::with_flags(
-                                            obj_val, Property::WRITABLE | Property::CONFIGURABLE
-                                        ));
-                                        let proto_oid = self.heap.allocate(proto);
-                                        self.func_prototypes.insert(sentinel, proto_oid);
-                                        Value::object_id(proto_oid)
-                                    }
-                                }
-                                "call" | "apply" | "bind" => obj_val,
-                                _ => Value::undefined(),
-                            };
-                            self.push(result);
-                            continue;
-                        }
+                        let sentinel = obj_val.as_function().unwrap();
+                        let result = self.fn_property_get(sentinel, key_id, obj_val);
+                        self.push(result);
+                        continue;
                     }
                     self.push(Value::undefined());
                 }
@@ -4175,7 +4283,7 @@ impl Vm {
                                         chunk_idx, ip: 0, base: obj_pos + 1,
                                         upvalues, this_value: obj_val, is_constructor: false,
                                         pending_super_call: false, generator_id: None, argc,
-                                        saved_args,
+                                        saved_args, arguments_oid: None,
                                     });
                                     continue;
                                 }
@@ -4420,6 +4528,34 @@ impl Vm {
                                             desc.set_property(en_key, Value::boolean(prop.is_enumerable()));
                                             desc.set_property(cf_key, Value::boolean(prop.is_configurable()));
                                             Value::object_id(self.heap.allocate(desc))
+                                        } else if let Some(arr_info) = self.heap.get(oid).and_then(|o| {
+                                            // Array index "0", "1", … and "length" descriptors.
+                                            if let ObjectKind::Array(ref e) = o.kind {
+                                                Some((e.clone(), e.len()))
+                                            } else { None }
+                                        }) {
+                                            let (elements, len) = arr_info;
+                                            let val_key = self.interner.intern("value");
+                                            let wr_key = self.interner.intern("writable");
+                                            let en_key = self.interner.intern("enumerable");
+                                            let cf_key = self.interner.intern("configurable");
+                                            if key_str == "length" {
+                                                let mut desc = JsObject::ordinary();
+                                                desc.set_property(val_key, Value::int(len as i32));
+                                                desc.set_property(wr_key, Value::boolean(true));
+                                                desc.set_property(en_key, Value::boolean(false));
+                                                desc.set_property(cf_key, Value::boolean(false));
+                                                Value::object_id(self.heap.allocate(desc))
+                                            } else if let Ok(idx) = key_str.parse::<usize>() {
+                                                if idx < len {
+                                                    let mut desc = JsObject::ordinary();
+                                                    desc.set_property(val_key, elements[idx]);
+                                                    desc.set_property(wr_key, Value::boolean(true));
+                                                    desc.set_property(en_key, Value::boolean(true));
+                                                    desc.set_property(cf_key, Value::boolean(true));
+                                                    Value::object_id(self.heap.allocate(desc))
+                                                } else { Value::undefined() }
+                                            } else { Value::undefined() }
                                         } else { Value::undefined() }
                                 } else if first_arg.is_function() {
                                     let sentinel = first_arg.as_function().unwrap();
@@ -4459,11 +4595,33 @@ impl Vm {
                             }
                             "getOwnPropertyNames" => {
                                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
+                                    let mut seen = std::collections::HashSet::new();
+                                    let mut names: Vec<Value> = Vec::new();
+                                    // For arrays, integer indices come first in numeric order,
+                                    // then the `length` property, then named own properties.
+                                    let array_len = self.heap.get(oid).and_then(|o| {
+                                        if let ObjectKind::Array(ref e) = o.kind {
+                                            Some(e.len())
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    if let Some(len) = array_len {
+                                        for i in 0..len {
+                                            let s = i.to_string();
+                                            let id = self.interner.intern(&s);
+                                            names.push(Value::string(id));
+                                            seen.insert(s);
+                                        }
+                                        let length_str = "length".to_string();
+                                        if seen.insert(length_str.clone()) {
+                                            let id = self.interner.intern("length");
+                                            names.push(Value::string(id));
+                                        }
+                                    }
                                     let raw_props: Vec<StringId> = self.heap.get(oid)
                                         .map(|o| o.properties.iter().map(|(k, _)| *k).collect())
                                         .unwrap_or_default();
-                                    let mut seen = std::collections::HashSet::new();
-                                    let mut names: Vec<Value> = Vec::new();
                                     for k in raw_props {
                                         let s = self.interner.resolve(k).to_owned();
                                         // Convert __get_X__ / __set_X__ → X
@@ -5235,7 +5393,7 @@ impl Vm {
                                         chunk_idx, ip: 0, base: func_pos + 1,
                                         upvalues, this_value: this_val, is_constructor: true,
                                         pending_super_call: false, generator_id: None, argc,
-                                        saved_args,
+                                        saved_args, arguments_oid: None,
                                     });
                                     continue;
                                 }
@@ -5274,7 +5432,7 @@ impl Vm {
                                 pending_super_call: false,
                                 generator_id: None,
                                 argc,
-                                saved_args,
+                                saved_args, arguments_oid: None,
                             });
                             continue;
                         }
@@ -5930,6 +6088,7 @@ impl Vm {
                         finally_target,
                         stack_depth: self.stack.len(),
                         frame_idx: self.frames.len() - 1,
+                        with_depth: self.with_stack.len(),
                     });
                 }
 

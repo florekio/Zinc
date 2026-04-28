@@ -412,7 +412,16 @@ impl<'a> Compiler<'a> {
                                 self.const_globals.insert(name);
                             }
                             let idx = self.make_string_constant(name);
-                            self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
+                            // For `var x = expr`, the binding is hoisted (already defined as
+                            // undefined). The `x = expr` is a normal assignment that must go
+                            // through the scope chain — including any active `with` scope.
+                            // For let/const, use DefineGlobal which creates the binding fresh.
+                            if decl.kind == VarKind::Var {
+                                self.chunk.emit_op_u16(OpCode::SetGlobal, idx, line);
+                                self.chunk.emit_op(OpCode::Pop, line);
+                            } else {
+                                self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
+                            }
                         } else if decl.kind == VarKind::Var {
                             if let Some(slot) = self.resolve_local(name) {
                                 if slot <= u8::MAX as usize {
@@ -3397,45 +3406,186 @@ impl<'a> Compiler<'a> {
         rhs: &Expression,
         line: u32,
     ) -> Result<(), String> {
+        // Logical compound semantics:
+        //   &&= : assign rhs if oldval is truthy   (skip when falsy)
+        //   ||= : assign rhs if oldval is falsy    (skip when truthy)
+        //   ??= : assign rhs if oldval is nullish  (skip when NOT nullish)
+        // Returns Some((skip_op, sense)) where sense=true means the jump skips
+        // assignment, sense=false means the jump targets the assignment branch.
+        let logical = match op {
+            AssignmentOperator::AndAssign => Some((OpCode::JumpIfFalsePeek, true)),
+            AssignmentOperator::OrAssign => Some((OpCode::JumpIfTruePeek, true)),
+            AssignmentOperator::NullishAssign => Some((OpCode::JumpIfNullishPeek, false)),
+            _ => None,
+        };
+
         self.compile_expr(&m.object)?;
 
         match &m.property {
             MemberProperty::Identifier(name) => {
                 let idx = self.make_string_constant(*name);
-                if op != AssignmentOperator::Assign {
+                if let Some((jump_op, jump_skips)) = logical {
+                    self.chunk.emit_op(OpCode::Dup, line);            // [obj, obj]
+                    self.emit_get_property(idx, line);                // [obj, oldval]
+                    self.emit_logical_member_assign_inline(jump_op, jump_skips, idx, rhs, line)?;
+                } else if op != AssignmentOperator::Assign {
                     self.chunk.emit_op(OpCode::Dup, line);
                     self.emit_get_property(idx, line);
                     self.compile_expr(rhs)?;
                     self.emit_compound_arith(op, line)?;
+                    self.emit_set_property(idx, line);
                 } else {
                     self.compile_expr(rhs)?;
+                    self.emit_set_property(idx, line);
                 }
-                self.emit_set_property(idx, line);
             }
             MemberProperty::Expression(key) => {
                 self.compile_expr(key)?;
-                if op != AssignmentOperator::Assign {
+                if let Some((jump_op, jump_skips)) = logical {
+                    // Stack: [obj, key]
+                    self.chunk.emit_op(OpCode::Dup2, line);           // [obj, key, obj, key]
+                    self.chunk.emit_op(OpCode::GetElement, line);     // [obj, key, oldval]
+                    self.emit_logical_elem_assign(jump_op, jump_skips, rhs, line)?;
+                } else if op != AssignmentOperator::Assign {
                     self.chunk.emit_op(OpCode::Dup2, line);
                     self.chunk.emit_op(OpCode::GetElement, line);
                     self.compile_expr(rhs)?;
                     self.emit_compound_arith(op, line)?;
+                    self.chunk.emit_op(OpCode::SetElement, line);
                 } else {
                     self.compile_expr(rhs)?;
+                    self.chunk.emit_op(OpCode::SetElement, line);
                 }
-                self.chunk.emit_op(OpCode::SetElement, line);
             }
             MemberProperty::PrivateIdentifier(name) => {
                 let idx = self.make_string_constant(*name);
-                if op != AssignmentOperator::Assign {
+                if let Some((jump_op, jump_skips)) = logical {
+                    self.chunk.emit_op(OpCode::Dup, line);                   // [obj, obj]
+                    self.chunk.emit_op_u16(OpCode::GetPrivate, idx, line);   // [obj, oldval]
+                    self.emit_logical_priv_assign(jump_op, jump_skips, idx, rhs, line)?;
+                } else if op != AssignmentOperator::Assign {
                     self.chunk.emit_op(OpCode::Dup, line);
                     self.chunk.emit_op_u16(OpCode::GetPrivate, idx, line);
                     self.compile_expr(rhs)?;
                     self.emit_compound_arith(op, line)?;
+                    self.chunk.emit_op_u16(OpCode::SetPrivate, idx, line);
                 } else {
                     self.compile_expr(rhs)?;
+                    self.chunk.emit_op_u16(OpCode::SetPrivate, idx, line);
                 }
-                self.chunk.emit_op_u16(OpCode::SetPrivate, idx, line);
             }
+        }
+        Ok(())
+    }
+
+    /// Logical-compound assignment for `obj.name` (entry point shared by all 3 ops).
+    /// On entry stack: [obj, oldval]. On exit: [result].
+    /// `jump_skips` chooses the conditional-jump direction:
+    ///   true  → jump to the SKIP branch (&&=/||=)
+    ///   false → jump to the ASSIGN branch (??=)
+    fn emit_logical_member_assign_inline(
+        &mut self,
+        jump_op: OpCode,
+        jump_skips: bool,
+        idx: u16,
+        rhs: &Expression,
+        line: u32,
+    ) -> Result<(), String> {
+        if jump_skips {
+            // Jump skips assignment: AND/OR pattern.
+            let skip = self.chunk.emit_jump(jump_op, line);
+            self.chunk.emit_op(OpCode::Pop, line);             // [obj]
+            self.compile_expr(rhs)?;                           // [obj, rhs]
+            self.emit_set_property(idx, line);                 // [rhs]
+            let end = self.chunk.emit_jump(OpCode::Jump, line);
+            self.chunk.patch_jump(skip);
+            // Short-circuit: [obj, oldval] → [oldval]
+            self.chunk.emit_op(OpCode::Swap, line);
+            self.chunk.emit_op(OpCode::Pop, line);
+            self.chunk.patch_jump(end);
+        } else {
+            // Jump goes to ASSIGN branch: ??= pattern (jump when nullish → assign).
+            let to_assign = self.chunk.emit_jump(jump_op, line);
+            // Fall-through (not-nullish): keep oldval, drop obj.
+            self.chunk.emit_op(OpCode::Swap, line);            // [oldval, obj]
+            self.chunk.emit_op(OpCode::Pop, line);             // [oldval]
+            let end = self.chunk.emit_jump(OpCode::Jump, line);
+            self.chunk.patch_jump(to_assign);
+            self.chunk.emit_op(OpCode::Pop, line);             // [obj]
+            self.compile_expr(rhs)?;                           // [obj, rhs]
+            self.emit_set_property(idx, line);                 // [rhs]
+            self.chunk.patch_jump(end);
+        }
+        Ok(())
+    }
+
+    /// Same shape as `emit_logical_member_assign_inline`, for `obj[key]`.
+    /// On entry stack: [obj, key, oldval]. On exit: [result].
+    fn emit_logical_elem_assign(
+        &mut self,
+        jump_op: OpCode,
+        jump_skips: bool,
+        rhs: &Expression,
+        line: u32,
+    ) -> Result<(), String> {
+        if jump_skips {
+            let skip = self.chunk.emit_jump(jump_op, line);
+            self.chunk.emit_op(OpCode::Pop, line);             // [obj, key]
+            self.compile_expr(rhs)?;                           // [obj, key, rhs]
+            self.chunk.emit_op(OpCode::SetElement, line);      // [rhs]
+            let end = self.chunk.emit_jump(OpCode::Jump, line);
+            self.chunk.patch_jump(skip);
+            // Short-circuit: [obj, key, oldval] → [oldval]
+            self.chunk.emit_op(OpCode::Swap, line);            // [obj, oldval, key]
+            self.chunk.emit_op(OpCode::Pop, line);             // [obj, oldval]
+            self.chunk.emit_op(OpCode::Swap, line);            // [oldval, obj]
+            self.chunk.emit_op(OpCode::Pop, line);             // [oldval]
+            self.chunk.patch_jump(end);
+        } else {
+            let to_assign = self.chunk.emit_jump(jump_op, line);
+            // Fall-through (not-nullish): cleanup to oldval.
+            self.chunk.emit_op(OpCode::Swap, line);
+            self.chunk.emit_op(OpCode::Pop, line);
+            self.chunk.emit_op(OpCode::Swap, line);
+            self.chunk.emit_op(OpCode::Pop, line);
+            let end = self.chunk.emit_jump(OpCode::Jump, line);
+            self.chunk.patch_jump(to_assign);
+            self.chunk.emit_op(OpCode::Pop, line);             // [obj, key]
+            self.compile_expr(rhs)?;                           // [obj, key, rhs]
+            self.chunk.emit_op(OpCode::SetElement, line);      // [rhs]
+            self.chunk.patch_jump(end);
+        }
+        Ok(())
+    }
+
+    fn emit_logical_priv_assign(
+        &mut self,
+        jump_op: OpCode,
+        jump_skips: bool,
+        idx: u16,
+        rhs: &Expression,
+        line: u32,
+    ) -> Result<(), String> {
+        if jump_skips {
+            let skip = self.chunk.emit_jump(jump_op, line);
+            self.chunk.emit_op(OpCode::Pop, line);
+            self.compile_expr(rhs)?;
+            self.chunk.emit_op_u16(OpCode::SetPrivate, idx, line);
+            let end = self.chunk.emit_jump(OpCode::Jump, line);
+            self.chunk.patch_jump(skip);
+            self.chunk.emit_op(OpCode::Swap, line);
+            self.chunk.emit_op(OpCode::Pop, line);
+            self.chunk.patch_jump(end);
+        } else {
+            let to_assign = self.chunk.emit_jump(jump_op, line);
+            self.chunk.emit_op(OpCode::Swap, line);
+            self.chunk.emit_op(OpCode::Pop, line);
+            let end = self.chunk.emit_jump(OpCode::Jump, line);
+            self.chunk.patch_jump(to_assign);
+            self.chunk.emit_op(OpCode::Pop, line);
+            self.compile_expr(rhs)?;
+            self.chunk.emit_op_u16(OpCode::SetPrivate, idx, line);
+            self.chunk.patch_jump(end);
         }
         Ok(())
     }
@@ -3536,9 +3686,22 @@ impl<'a> Compiler<'a> {
                     self.chunk.emit_op_u8(OpCode::Call, argc, line);
                     return Ok(());
                 }
-            // Computed member call obj[expr](args): evaluate obj+key, GetElement, then Call.
-            // This must happen before args are evaluated to keep the stack order correct.
+            // Computed member call obj[expr](args). Fast path for string-literal key
+            // (`obj["method"](args)`): emit identical bytecode to `obj.method(args)` so
+            // the receiver is bound and primitive method dispatch works (false["toString"]() etc).
             if let MemberProperty::Expression(key_expr) = &m.property {
+                if let Expression::StringLiteral(s) = key_expr {
+                    self.compile_expr(&m.object)?;
+                    for arg in &c.arguments {
+                        self.compile_expr(arg)?;
+                    }
+                    let idx = self.make_string_constant(s.value);
+                    self.chunk.emit_byte(OpCode::CallMethod as u8, line);
+                    self.chunk.emit_byte(argc, line);
+                    self.chunk.code.push((idx >> 8) as u8);
+                    self.chunk.code.push((idx & 0xFF) as u8);
+                    return Ok(());
+                }
                 self.compile_expr(&m.object)?;
                 self.compile_expr(key_expr)?;
                 self.chunk.emit_op(OpCode::GetElement, line);
@@ -4180,6 +4343,7 @@ fn collect_var_declarations(stmt: &Statement, out: &mut Vec<StringId>) {
             }
         }
         Statement::Labeled(l) => collect_var_declarations(&l.body, out),
+        Statement::With(w) => collect_var_declarations(&w.body, out),
         _ => {}
     }
 }
