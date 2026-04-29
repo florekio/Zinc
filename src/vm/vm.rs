@@ -4870,9 +4870,21 @@ impl Vm {
                         if let Some(mv) = method_val
                             && mv.is_function() {
                                 let packed = mv.as_function().unwrap();
-                                let closure_id = ((packed as u32) >> 16) as usize;
+                                let _closure_id = ((packed as u32) >> 16) as usize;
                                 let chunk_idx = (packed & 0xFFFF) as usize;
                                 if chunk_idx >= 1 && chunk_idx < self.chunks.len() {
+                                    // Async methods: route through call_with_async_wrap
+                                    // so the body runs synchronously and its result is
+                                    // wrapped in a fulfilled / rejected Promise.
+                                    if self.chunks[chunk_idx].flags.contains(ChunkFlags::ASYNC) {
+                                        let args_vec: Vec<Value> = (0..argc)
+                                            .map(|i| self.stack[obj_pos + 1 + i])
+                                            .collect();
+                                        self.stack.truncate(obj_pos);
+                                        let result = self.call_with_async_wrap(mv, obj_val, &args_vec)?;
+                                        self.push(result);
+                                        continue;
+                                    }
                                     // Generator methods: fall through; CreateGenerator opcode
                                     // in the body's prologue will capture state.
                                     // Restructure stack: [obj, args...] -> [args...]
@@ -4884,8 +4896,8 @@ impl Vm {
                                         self.push(Value::undefined());
                                         actual_argc += 1;
                                     }
-                                    let upvalues = if closure_id < self.closure_upvalues.len() {
-                                        self.closure_upvalues[closure_id].clone()
+                                    let upvalues = if _closure_id < self.closure_upvalues.len() {
+                                        self.closure_upvalues[_closure_id].clone()
                                     } else { Vec::new() };
                                     let saved_args: Vec<Value> = (0..argc)
                                         .map(|i| self.stack.get(obj_pos + 1 + i).copied().unwrap_or(Value::undefined()))
