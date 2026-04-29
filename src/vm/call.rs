@@ -1,4 +1,5 @@
 use crate::compiler::chunk::ChunkFlags;
+use crate::runtime::object::JsObject;
 use crate::runtime::value::Value;
 
 use super::vm::{Vm, VmError, CallFrame};
@@ -7,6 +8,48 @@ impl Vm {
     /// Call a closure value with the given arguments and run it to completion.
     pub(crate) fn call_function(&mut self, func_val: Value, args: &[Value]) -> Result<Value, VmError> {
         self.call_function_this(func_val, Value::undefined(), args)
+    }
+
+    /// Like `call_function_this`, but if the target is an async function the
+    /// body is invoked and its result/throw is wrapped into a fulfilled or
+    /// rejected Promise (matching the regular call dispatch path).
+    pub(crate) fn call_with_async_wrap(
+        &mut self,
+        func_val: Value,
+        this_value: Value,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        if let Some(packed) = func_val.as_function() {
+            let chunk_idx = (packed & 0xFFFF) as usize;
+            if packed >= 0
+                && chunk_idx >= 1
+                && chunk_idx < self.chunks.len()
+                && self.chunks[chunk_idx].flags.contains(ChunkFlags::ASYNC)
+            {
+                let promise = JsObject::promise();
+                let promise_id = self.heap.allocate(promise);
+                match self.call_function_this(func_val, this_value, args) {
+                    Ok(val) => { self.resolve_promise(promise_id, val)?; }
+                    Err(VmError::Throw(reason)) => {
+                        self.reject_promise(promise_id, reason)?;
+                    }
+                    Err(VmError::TypeError(msg)) => {
+                        let err = self.make_native_error("TypeError", &msg);
+                        self.reject_promise(promise_id, err)?;
+                    }
+                    Err(VmError::ReferenceError(msg)) => {
+                        let err = self.make_native_error("ReferenceError", &msg);
+                        self.reject_promise(promise_id, err)?;
+                    }
+                    Err(VmError::RuntimeError(msg)) => {
+                        let err = self.make_native_error("Error", &msg);
+                        self.reject_promise(promise_id, err)?;
+                    }
+                }
+                return Ok(Value::object_id(promise_id));
+            }
+        }
+        self.call_function_this(func_val, this_value, args)
     }
 
     /// Call a closure with a specific `this` binding.

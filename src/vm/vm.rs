@@ -931,9 +931,19 @@ impl Vm {
     pub(crate) fn pop_numbers(&mut self) -> Result<(f64, f64), VmError> {
         let b = self.pop()?;
         let a = self.pop()?;
-        // ToPrimitive for objects — throws propagate as VmError::Throw, opcode catches.
+        // Per spec: ToNumber(lhs) (which is ToPrimitive(lhs, Number) → ToNumber(prim))
+        // BEFORE ToNumber(rhs). If ToNumber(lhs) throws (e.g. lhs is Symbol),
+        // rhs's ToPrimitive is never invoked.
         let a = if a.is_object() { self.try_coerce_to_primitive_hint(a, "number")? } else { a };
+        if a.is_symbol() {
+            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+            return Err(VmError::Throw(err));
+        }
         let b = if b.is_object() { self.try_coerce_to_primitive_hint(b, "number")? } else { b };
+        if b.is_symbol() {
+            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+            return Err(VmError::Throw(err));
+        }
         Ok((self.to_f64(a), self.to_f64(b)))
     }
 
@@ -941,9 +951,17 @@ impl Vm {
     pub(crate) fn pop_ints(&mut self) -> Result<(i32, i32), VmError> {
         let bv = self.pop()?;
         let av = self.pop()?;
-        // ToPrimitive for objects — throws propagate as VmError::Throw, opcode catches.
+        // Per spec: ToNumber(lhs) before ToNumber(rhs). Symbol throws TypeError.
         let av = if av.is_object() { self.try_coerce_to_primitive_hint(av, "number")? } else { av };
+        if av.is_symbol() {
+            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+            return Err(VmError::Throw(err));
+        }
         let bv = if bv.is_object() { self.try_coerce_to_primitive_hint(bv, "number")? } else { bv };
+        if bv.is_symbol() {
+            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+            return Err(VmError::Throw(err));
+        }
         let b = self.to_i32(bv)?;
         let a = self.to_i32(av)?;
         Ok((a, b))
@@ -1278,8 +1296,10 @@ impl Vm {
             self.frames.last_mut().unwrap().ip = handler.catch_target as usize;
             Ok(())
         } else {
-            let msg = self.value_to_string(val);
-            Err(VmError::RuntimeError(msg))
+            // Bubble up the actual exception value. Outer code (e.g. the engine
+            // entry point or the async-function wrapper) decides whether to
+            // stringify it or use it as-is for promise rejection.
+            Err(VmError::Throw(val))
         }
     }
 
@@ -1634,7 +1654,18 @@ impl Vm {
         #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
         self.try_partial_jit();
 
-        let result = self.run_until(0)?;
+        let result = match self.run_until(0) {
+            Ok(v) => v,
+            Err(VmError::Throw(val)) => {
+                // Top-level uncaught throw: stringify the exception value into
+                // a RuntimeError. Inner code that needs the original value
+                // (e.g. async function wrapper) handles Throw before reaching
+                // here.
+                let msg = self.value_to_string(val);
+                return Err(VmError::RuntimeError(msg));
+            }
+            Err(e) => return Err(e),
+        };
         // Flatten any ConsString result to a TAG_STRING so callers get a normal string value
         if self.is_cons_string(result) {
             let id = self.flatten_to_string_id(result);
@@ -2029,7 +2060,7 @@ impl Vm {
                 OpCode::UShr => {
                     let b_val = self.pop()?;
                     let a_val = self.pop()?;
-                    // ToPrimitive (number hint) for object operands so valueOf is called.
+                    // Spec: ToNumber(lhs) before ToNumber(rhs); ToNumber on Symbol throws.
                     let a_val = if a_val.is_object() {
                         match self.try_coerce_to_primitive_hint(a_val, "number") {
                             Ok(v) => v,
@@ -2037,6 +2068,11 @@ impl Vm {
                             Err(e) => return Err(e),
                         }
                     } else { a_val };
+                    if a_val.is_symbol() {
+                        let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     let b_val = if b_val.is_object() {
                         match self.try_coerce_to_primitive_hint(b_val, "number") {
                             Ok(v) => v,
@@ -2044,6 +2080,11 @@ impl Vm {
                             Err(e) => return Err(e),
                         }
                     } else { b_val };
+                    if b_val.is_symbol() {
+                        let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     let a = self.to_u32(a_val)?;
                     let b = self.to_u32(b_val)? & 0x1F;
                     let result = a >> b;
@@ -2466,9 +2507,20 @@ impl Vm {
                                 self.stack.truncate(func_pos);
                                 match self.call_function(func_val, &args_vec) {
                                     Ok(val) => { self.resolve_promise(promise_id, val)?; }
-                                    Err(_e) => {
-                                        let msg = self.interner.intern("async function error");
-                                        self.reject_promise(promise_id, Value::string(msg))?;
+                                    Err(VmError::Throw(reason)) => {
+                                        self.reject_promise(promise_id, reason)?;
+                                    }
+                                    Err(VmError::TypeError(msg)) => {
+                                        let err = self.make_native_error("TypeError", &msg);
+                                        self.reject_promise(promise_id, err)?;
+                                    }
+                                    Err(VmError::ReferenceError(msg)) => {
+                                        let err = self.make_native_error("ReferenceError", &msg);
+                                        self.reject_promise(promise_id, err)?;
+                                    }
+                                    Err(VmError::RuntimeError(msg)) => {
+                                        let err = self.make_native_error("Error", &msg);
+                                        self.reject_promise(promise_id, err)?;
                                     }
                                 }
                                 self.push(Value::object_id(promise_id));
@@ -4408,7 +4460,7 @@ impl Vm {
                                 let this_arg = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
                                 let call_args: Vec<Value> = (1..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                                 self.stack.truncate(obj_pos);
-                                let result = self.call_function_this(obj_val, this_arg, &call_args)?;
+                                let result = self.call_with_async_wrap(obj_val, this_arg, &call_args)?;
                                 self.push(result);
                                 continue;
                             }
@@ -4424,7 +4476,7 @@ impl Vm {
                                             }
                                 }
                                 self.stack.truncate(obj_pos);
-                                let result = self.call_function_this(obj_val, this_arg, &call_args)?;
+                                let result = self.call_with_async_wrap(obj_val, this_arg, &call_args)?;
                                 self.push(result);
                                 continue;
                             }

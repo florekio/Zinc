@@ -4482,9 +4482,10 @@ impl<'a> Compiler<'a> {
 
     fn compile_object_property(&mut self, p: &Property, line: u32) -> Result<(), String> {
         // `{__proto__: val}` in an object literal sets the prototype rather than
-        // defining a property — but only when the key is the literal identifier
-        // or string "__proto__" and not a method/computed key.
-        if matches!(p.kind, PropertyKindVal::Init) && !p.method {
+        // defining a property — but only for the explicit form
+        // (PropertyName : AssignmentExpression). Shorthand, computed, and
+        // method forms are treated as ordinary properties per Annex B.3.1.
+        if matches!(p.kind, PropertyKindVal::Init) && !p.method && !p.shorthand && !p.computed {
             let is_proto = match &p.key {
                 PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => {
                     self.interner.resolve(*id) == "__proto__"
