@@ -19,6 +19,36 @@ fn is_internal_key(s: &str) -> bool {
     s.starts_with("__") && s.ends_with("__")
 }
 
+/// Format a finite f64 the way `Number.prototype.toString` does (shortest
+/// round-trip decimal, with exponential notation for |x| < 1e-6 or |x| >= 1e21).
+fn js_format_number(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".into();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    if f == 0.0 {
+        return "0".into();
+    }
+    let abs = f.abs();
+    if !(1e-6..1e21).contains(&abs) {
+        // Exponential notation. Rust's `{:e}` gives e.g. "1e-7" or "1e21";
+        // JS spec requires "1e-7" / "1e+21" — i.e. positive exponents take "+".
+        let raw = format!("{f:e}");
+        // raw looks like "1e-7", "1e21", "1.5e10", "-1.5e-7", etc.
+        if let Some(epos) = raw.find('e') {
+            let exp = &raw[epos + 1..];
+            if !exp.starts_with('-') && !exp.starts_with('+') {
+                return format!("{}e+{}", &raw[..epos], exp);
+            }
+        }
+        raw
+    } else {
+        format!("{f}")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -974,19 +1004,7 @@ impl Vm {
         } else if let Some(i) = val.as_int() {
             i.to_string()
         } else if let Some(f) = val.as_number() {
-            if f.is_nan() {
-                "NaN".into()
-            } else if f.is_infinite() {
-                if f > 0.0 {
-                    "Infinity".into()
-                } else {
-                    "-Infinity".into()
-                }
-            } else {
-                // Use JS-like number formatting
-                let s = format!("{f}");
-                s
-            }
+            js_format_number(f)
         } else if val.is_symbol() {
             let id = val.as_symbol_id().unwrap();
             if let Some(Some(desc)) = self.symbol_descriptions.get(id as usize) {
@@ -1381,10 +1399,17 @@ impl Vm {
                     } else {
                         let mut proto = JsObject::ordinary();
                         proto.prototype = Some(self.object_prototype);
-                        let ctor_key = self.interner.intern("constructor");
-                        proto.define_property(ctor_key, Property::with_flags(
-                            obj_val, Property::WRITABLE | Property::CONFIGURABLE
-                        ));
+                        // Generator functions' prototypes are plain empty objects per
+                        // spec (`function* f(){}.prototype` has no own properties).
+                        let chunk_idx = (sentinel & 0xFFFF) as usize;
+                        let is_gen = chunk_idx < self.chunks.len()
+                            && self.chunks[chunk_idx].flags.contains(ChunkFlags::GENERATOR);
+                        if !is_gen {
+                            let ctor_key = self.interner.intern("constructor");
+                            proto.define_property(ctor_key, Property::with_flags(
+                                obj_val, Property::WRITABLE | Property::CONFIGURABLE
+                            ));
+                        }
                         let proto_oid = self.heap.allocate(proto);
                         self.func_prototypes.insert(sentinel, proto_oid);
                         Value::object_id(proto_oid)
@@ -2004,10 +2029,24 @@ impl Vm {
                 OpCode::UShr => {
                     let b_val = self.pop()?;
                     let a_val = self.pop()?;
+                    // ToPrimitive (number hint) for object operands so valueOf is called.
+                    let a_val = if a_val.is_object() {
+                        match self.try_coerce_to_primitive_hint(a_val, "number") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
+                    } else { a_val };
+                    let b_val = if b_val.is_object() {
+                        match self.try_coerce_to_primitive_hint(b_val, "number") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
+                    } else { b_val };
                     let a = self.to_u32(a_val)?;
                     let b = self.to_u32(b_val)? & 0x1F;
                     let result = a >> b;
-                    // Result is u32; if it fits in i32, use SMI, otherwise float
                     if result <= i32::MAX as u32 {
                         self.push(Value::int(result as i32));
                     } else {
@@ -2233,6 +2272,8 @@ impl Vm {
                             let chunk_idx = self.frames[frame_idx].chunk_idx;
                             let is_strict = self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT);
                             let mut arr = JsObject::array(args);
+                            // Per spec, arguments has Object.prototype (not Array.prototype).
+                            arr.prototype = Some(self.object_prototype);
                             if !is_strict {
                                 let callee_key = self.interner.intern("callee");
                                 arr.define_property(
@@ -2398,6 +2439,10 @@ impl Vm {
                     let mut argc = self.read_byte() as usize;
                     let func_pos = self.stack.len() - 1 - argc;
                     let func_val = self.stack[func_pos];
+                    // Remember the actual user-passed arg count before padding so the
+                    // arguments object reflects the call site, not the formal parameter
+                    // list.
+                    let actual_argc = argc;
 
                     if func_val.is_function() {
                         let packed = func_val.as_function().unwrap();
@@ -2511,7 +2556,7 @@ impl Vm {
                                 Value::object_id(self.global_this_oid)
                             };
 
-                            let saved_args: Vec<Value> = (0..argc)
+                            let saved_args: Vec<Value> = (0..actual_argc)
                                 .map(|i| self.stack.get(func_pos + 1 + i).copied().unwrap_or(Value::undefined()))
                                 .collect();
                             self.frames.push(CallFrame {
@@ -3083,11 +3128,27 @@ impl Vm {
                     let obj_val = self.pop()?;
                     let chunk_idx = self.cur_chunk();
                     let in_strict = self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT);
+                    // Per spec, `delete null.x` / `delete undefined.x` throws TypeError.
+                    if obj_val.is_null() || obj_val.is_undefined() {
+                        let type_name = if obj_val.is_null() { "null" } else { "undefined" };
+                        let msg = format!("Cannot convert {type_name} to object");
+                        let err = self.make_native_error("TypeError", &msg);
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     let result = if let Some(oid) = obj_val.as_object_id() {
+                        // ToPropertyKey: resolve string id, symbol slot, or stringified number.
                         let resolved_key = if key.is_symbol() {
                             Some(self.interner.intern(&format!("__sym_{}__", key.as_symbol_id().unwrap())))
+                        } else if let Some(sid) = key.as_string_id() {
+                            Some(sid)
+                        } else if let Some(n) = key.as_number() {
+                            let s = if n.fract() == 0.0 && n.is_finite() {
+                                (n as i64).to_string()
+                            } else { n.to_string() };
+                            Some(self.interner.intern(&s))
                         } else {
-                            key.as_string_id()
+                            None
                         };
                         if let Some(key_id) = resolved_key {
                             let key_str = self.interner.resolve(key_id).to_owned();
@@ -3231,12 +3292,22 @@ impl Vm {
                             continue;
                         }
                         if s == -507 {
-                            // Array constructor: true if it's an array
+                            // Array constructor: true if it's an array OR has Array.prototype
+                            // anywhere in its prototype chain (subclass detection).
                             let is_arr = obj.as_object_id()
                                 .and_then(|oid| self.heap.get(oid))
                                 .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
                                 .unwrap_or(false);
-                            self.push(Value::boolean(is_arr));
+                            let has_array_proto = if let Some(oid) = obj.as_object_id() {
+                                let mut cur = self.heap.get(oid).and_then(|o| o.prototype);
+                                let mut found = false;
+                                while let Some(pid) = cur {
+                                    if pid == self.array_prototype { found = true; break; }
+                                    cur = self.heap.get(pid).and_then(|o| o.prototype);
+                                }
+                                found
+                            } else { false };
+                            self.push(Value::boolean(is_arr || has_array_proto));
                             continue;
                         }
                         if s == -551 {
@@ -3636,17 +3707,21 @@ impl Vm {
                                 // User-defined function properties
                                 match name_str {
                                     "prototype" => {
-                                        // Get or create the prototype object for this function
                                         if let Some(&proto_oid) = self.func_prototypes.get(&sentinel) {
                                             Value::object_id(proto_oid)
                                         } else {
                                             let mut proto = JsObject::ordinary();
                                             proto.prototype = Some(self.object_prototype);
-                                            let ctor_key = self.interner.intern("constructor");
-                                            // constructor is writable+configurable but NOT enumerable
-                                            proto.define_property(ctor_key, Property::with_flags(
-                                                obj_val, Property::WRITABLE | Property::CONFIGURABLE
-                                            ));
+                                            // Generator functions get a plain empty prototype.
+                                            let chunk_idx = (sentinel & 0xFFFF) as usize;
+                                            let is_gen = chunk_idx < self.chunks.len()
+                                                && self.chunks[chunk_idx].flags.contains(ChunkFlags::GENERATOR);
+                                            if !is_gen {
+                                                let ctor_key = self.interner.intern("constructor");
+                                                proto.define_property(ctor_key, Property::with_flags(
+                                                    obj_val, Property::WRITABLE | Property::CONFIGURABLE
+                                                ));
+                                            }
                                             let proto_oid = self.heap.allocate(proto);
                                             self.func_prototypes.insert(sentinel, proto_oid);
                                             Value::object_id(proto_oid)
@@ -3789,14 +3864,28 @@ impl Vm {
                 OpCode::GetElement => {
                     let key = self.pop()?;
                     let obj_val = self.pop()?;
-                    // ToPropertyKey: coerce undefined/null/boolean to their string forms
-                    // so `obj[undefined]` and `obj["undefined"]` agree.
+                    // ToPropertyKey: coerce non-string/non-symbol/non-numeric keys
+                    // (undefined, null, boolean, function, object) to their string form.
                     let key = if key.is_undefined() {
                         Value::string(self.interner.intern("undefined"))
                     } else if key.is_null() {
                         Value::string(self.interner.intern("null"))
                     } else if let Some(b) = key.as_bool() {
                         Value::string(self.interner.intern(if b { "true" } else { "false" }))
+                    } else if key.is_function() {
+                        let s = self.value_to_string(key);
+                        Value::string(self.interner.intern(&s))
+                    } else if key.is_object() && !key.is_symbol() && !self.is_cons_string(key) {
+                        // Generic objects (non-array, non-symbol) → "[object Object]" or
+                        // their custom toString.
+                        let is_array = key.as_object_id()
+                            .and_then(|oid| self.heap.get(oid))
+                            .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
+                            .unwrap_or(false);
+                        if !is_array {
+                            let s = self.value_to_string(key);
+                            Value::string(self.interner.intern(&s))
+                        } else { key }
                     } else { key };
                     if let Some(oid) = obj_val.as_object_id()
                         && let Some(obj) = self.heap.get(oid)
@@ -3870,6 +3959,15 @@ impl Vm {
                                 n.to_string()
                             };
                             let name_id = self.interner.intern(&s);
+                            // Check for accessor first.
+                            let getter_key = self.interner.intern(&format!("__get_{s}__"));
+                            if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
+                                && gfn.is_function()
+                            {
+                                let result = self.call_function_this(gfn, obj_val, &[])?;
+                                self.push(result);
+                                continue;
+                            }
                             let val = self.heap.get_property_chain(oid, name_id)
                                 .unwrap_or(Value::undefined());
                             self.push(val);
@@ -3921,7 +4019,7 @@ impl Vm {
                 OpCode::SetElement => {
                     let val = self.pop()?;
                     let key = self.pop()?;
-                    // Flatten ConsString keys and coerce undefined/null/boolean.
+                    // ToPropertyKey: flatten ConsString and coerce non-primitive keys.
                     let key = if self.is_cons_string(key) {
                         let flat = self.flatten_cons_to_string(key);
                         Value::string(self.interner.intern(&flat))
@@ -3931,6 +4029,9 @@ impl Vm {
                         Value::string(self.interner.intern("null"))
                     } else if let Some(b) = key.as_bool() {
                         Value::string(self.interner.intern(if b { "true" } else { "false" }))
+                    } else if key.is_function() {
+                        let s = self.value_to_string(key);
+                        Value::string(self.interner.intern(&s))
                     } else { key };
                     let obj_val = self.pop()?;
                     if let Some(oid) = obj_val.as_object_id()
@@ -4063,6 +4164,17 @@ impl Vm {
                             let result = self.call_function_this(gfn, obj_val, &[])?;
                             self.push(result);
                         } else {
+                            // If a private setter exists but no getter, the field is an
+                            // accessor without a getter — PrivateGet must throw TypeError.
+                            let setter_key_str = format!("__set_{}__", name_str);
+                            let setter_key = self.interner.intern(&setter_key_str);
+                            let setter_fn = self.heap.get_property_chain(oid, setter_key);
+                            if let Some(sfn) = setter_fn && sfn.is_function() {
+                                self.throw_type_error(&format!(
+                                    "Cannot read private accessor {name_str} with only a setter"
+                                ))?;
+                                continue;
+                            }
                             // Private fields: stored as __priv_#name__ (fields) or
                             // literal #name (methods on prototype). Try mangled first.
                             let priv_key = self.interner.intern(&format!("__priv_{}__", name_str));
@@ -4091,7 +4203,32 @@ impl Vm {
                         if let Some(sfn) = setter_fn && sfn.is_function() {
                             let _ = self.call_function_this(sfn, obj_val, &[value]);
                         } else {
+                            // If a private getter exists but no setter, the field is an
+                            // accessor without a setter — PrivateSet must throw TypeError.
+                            let getter_key_str = format!("__get_{}__", name_str);
+                            let getter_key = self.interner.intern(&getter_key_str);
+                            let getter_fn = self.heap.get_property_chain(oid, getter_key);
+                            if let Some(gfn) = getter_fn && gfn.is_function() {
+                                self.throw_type_error(&format!(
+                                    "Cannot set private accessor {name_str} with only a getter"
+                                ))?;
+                                continue;
+                            }
+                            // Distinguish private methods (on prototype) from private
+                            // fields (on the instance). PrivateSet on a method throws.
                             let priv_key = self.interner.intern(&format!("__priv_{}__", name_str));
+                            let has_own = self.heap.get(oid)
+                                .map(|o| o.get_property(priv_key).is_some())
+                                .unwrap_or(false);
+                            if !has_own
+                                && let Some(mv) = self.heap.get_property_chain(oid, priv_key)
+                                && mv.is_function()
+                            {
+                                self.throw_type_error(&format!(
+                                    "Cannot assign to private method {name_str}"
+                                ))?;
+                                continue;
+                            }
                             if let Some(obj) = self.heap.get_mut(oid) {
                                 obj.set_property(priv_key, value);
                             }
@@ -4999,10 +5136,16 @@ impl Vm {
                                         } else {
                                             let mut proto = JsObject::ordinary();
                                             proto.prototype = Some(self.object_prototype);
-                                            let ctor_key = self.interner.intern("constructor");
-                                            proto.define_property(ctor_key, Property::with_flags(
-                                                first_arg, Property::WRITABLE | Property::CONFIGURABLE
-                                            ));
+                                            // Generator functions get a plain empty prototype.
+                                            let chunk_idx = (sentinel & 0xFFFF) as usize;
+                                            let is_gen = chunk_idx < self.chunks.len()
+                                                && self.chunks[chunk_idx].flags.contains(ChunkFlags::GENERATOR);
+                                            if !is_gen {
+                                                let ctor_key = self.interner.intern("constructor");
+                                                proto.define_property(ctor_key, Property::with_flags(
+                                                    first_arg, Property::WRITABLE | Property::CONFIGURABLE
+                                                ));
+                                            }
                                             let proto_oid = self.heap.allocate(proto);
                                             self.func_prototypes.insert(sentinel, proto_oid);
                                             Value::object_id(proto_oid)
@@ -5185,8 +5328,12 @@ impl Vm {
                                 target
                             }
                             "isExtensible" => {
-                                if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
+                                let arg = args.first().copied().unwrap_or(Value::undefined());
+                                if let Some(oid) = arg.as_object_id() {
                                     Value::boolean(self.heap.get(oid).map(|o| o.extensible).unwrap_or(false))
+                                } else if arg.is_function() {
+                                    // Function values are extensible by default.
+                                    Value::boolean(true)
                                 } else { Value::boolean(false) }
                             }
                             "hasOwn" => {
@@ -5420,6 +5567,29 @@ impl Vm {
                     let argc = self.read_byte() as usize;
                     let func_pos = self.stack.len() - 1 - argc;
                     let func_val = self.stack[func_pos];
+
+                    // Generator functions and arrow functions can't be constructors.
+                    if func_val.is_function() {
+                        let packed = func_val.as_function().unwrap();
+                        if packed > 0 {
+                            let chunk_idx = (packed & 0xFFFF) as usize;
+                            if chunk_idx < self.chunks.len() {
+                                let flags = self.chunks[chunk_idx].flags;
+                                if flags.contains(ChunkFlags::GENERATOR)
+                                    || flags.contains(ChunkFlags::ARROW)
+                                    || flags.contains(ChunkFlags::ASYNC)
+                                {
+                                    let kind = if flags.contains(ChunkFlags::GENERATOR) { "generator" }
+                                        else if flags.contains(ChunkFlags::ASYNC) { "async function" }
+                                        else { "arrow function" };
+                                    let msg = format!("{kind} is not a constructor");
+                                    let err = self.make_native_error("TypeError", &msg);
+                                    self.handle_throw(err)?;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
 
                     // Handle Promise constructor
                     if func_val.is_function() && func_val.as_function() == Some(-520) {
@@ -6200,7 +6370,7 @@ impl Vm {
                     // Object is still on the stack
                     let obj_val = self.peek()?;
                     if let Some(oid) = obj_val.as_object_id() {
-                        // Resolve the key to a StringId (coercing numbers/symbols/cons-strings).
+                        // ToPropertyKey: coerce any non-symbol key to a string id.
                         let name_id = if let Some(sid) = key.as_string_id() {
                             Some(sid)
                         } else if self.is_cons_string(key) {
@@ -6217,7 +6387,9 @@ impl Vm {
                             let sid = key.as_symbol_id().unwrap();
                             Some(self.interner.intern(&format!("__sym_{sid}__")))
                         } else {
-                            None
+                            // undefined / null / boolean / function / object — stringify.
+                            let s = self.value_to_string(key);
+                            Some(self.interner.intern(&s))
                         };
                         if let Some(name_id) = name_id
                             && let Some(obj) = self.heap.get_mut(oid) {
@@ -6566,12 +6738,19 @@ impl Vm {
                     if let Some(class_oid) = class_val.as_object_id() {
                         let proto_key = self.interner.intern("prototype");
 
-                        // Get superclass's prototype — handles both object classes and native sentinels
+                        // Get superclass's prototype — handles both object classes and
+                        // native sentinels (Array, Object, Function, ...).
                         let super_proto_oid = if let Some(super_oid) = super_val.as_object_id() {
                             self.heap.get(super_oid).and_then(|o| o.get_property(proto_key)).and_then(|v| v.as_object_id())
                         } else if super_val.is_function() {
                             let sentinel = super_val.as_function().unwrap();
-                            self.func_prototypes.get(&sentinel).copied()
+                            // Built-in prototypes have dedicated singleton fields.
+                            match sentinel {
+                                -507 => Some(self.array_prototype),
+                                -508 => Some(self.object_prototype),
+                                -551 => Some(self.function_prototype),
+                                _ => self.func_prototypes.get(&sentinel).copied(),
+                            }
                         } else { None };
 
                         // Get subclass's prototype
@@ -6847,6 +7026,7 @@ impl Vm {
                 OpCode::IteratorNext => {
                     // Stack: [iterator] -> [iterator_result]
                     let iter_val = self.pop()?;
+                    let iter_done_key = self.interner.intern("__iter_done__");
                     if let Some(iter_oid) = iter_val.as_object_id() {
                         // Check if this is a generator
                         let is_gen = self.heap.get(iter_oid)
@@ -6886,6 +7066,18 @@ impl Vm {
                                 let next_fn = self.heap.get_property_chain(iter_oid, next_key)
                                     .unwrap_or(Value::undefined());
                                 let result = self.call_function_this(next_fn, iter_val, &[])?;
+                                // Mark iter as done if result.done is true so a later
+                                // IteratorClose can skip the .return() call per spec.
+                                if let Some(rid) = result.as_object_id() {
+                                    let done_name = self.interner.intern("done");
+                                    let done_val = self.heap.get_property_chain(rid, done_name)
+                                        .unwrap_or(Value::undefined());
+                                    if done_val.to_boolean()
+                                        && let Some(iter) = self.heap.get_mut(iter_oid)
+                                    {
+                                        iter.set_property(iter_done_key, Value::boolean(true));
+                                    }
+                                }
                                 self.push(result);
                                 continue;
                             }
@@ -6953,7 +7145,7 @@ impl Vm {
                                 } else { (Value::undefined(), true) }
                             }
                         };
-                        // Advance the iterator index
+                        // Advance the iterator index and mark done if exhausted.
                         if let Some(iter) = self.heap.get_mut(iter_oid) {
                             let new_idx = iter_info.1 + 1;
                             match &mut iter.kind {
@@ -6962,6 +7154,9 @@ impl Vm {
                                 | ObjectKind::SetIterator(_, i)
                                 | ObjectKind::KeyIterator(_, i) => *i = new_idx,
                                 _ => {}
+                            }
+                            if done {
+                                iter.set_property(iter_done_key, Value::boolean(true));
                             }
                         }
                         // Create iterator result object { value, done }
@@ -6985,11 +7180,16 @@ impl Vm {
                     let result_val = self.pop()?;
                     if let Some(oid) = result_val.as_object_id() {
                         let done_name = self.interner.intern("done");
-                        let done = self.heap.get(oid)
-                            .and_then(|o| o.get_property(done_name))
-                            .map(|v| v.to_boolean())
-                            .unwrap_or(true);
-                        self.push(Value::boolean(done));
+                        let getter_key = self.interner.intern("__get_done__");
+                        let done_val = if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
+                            && gfn.is_function()
+                        {
+                            self.call_function_this(gfn, result_val, &[])?
+                        } else {
+                            self.heap.get_property_chain(oid, done_name)
+                                .unwrap_or(Value::undefined())
+                        };
+                        self.push(Value::boolean(done_val.to_boolean()));
                     } else {
                         self.push(Value::boolean(true));
                     }
@@ -7000,10 +7200,18 @@ impl Vm {
                     let result_val = self.pop()?;
                     if let Some(oid) = result_val.as_object_id() {
                         let value_name = self.interner.intern("value");
-                        let val = self.heap.get(oid)
-                            .and_then(|o| o.get_property(value_name))
-                            .unwrap_or(Value::undefined());
-                        self.push(val);
+                        // Check getter first, then plain property.
+                        let getter_key = self.interner.intern("__get_value__");
+                        if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
+                            && gfn.is_function()
+                        {
+                            let val = self.call_function_this(gfn, result_val, &[])?;
+                            self.push(val);
+                        } else {
+                            let val = self.heap.get_property_chain(oid, value_name)
+                                .unwrap_or(Value::undefined());
+                            self.push(val);
+                        }
                     } else {
                         self.push(Value::undefined());
                     }
@@ -7012,6 +7220,15 @@ impl Vm {
                 OpCode::IteratorClose => {
                     let iter_val = self.pop()?;
                     if let Some(oid) = iter_val.as_object_id() {
+                        // Per spec, only close if the iterator's [[Done]] flag is false.
+                        // We track this via a __iter_done__ property set by IteratorNext.
+                        let iter_done_key = self.interner.intern("__iter_done__");
+                        let already_done = self.heap.get_property_chain(oid, iter_done_key)
+                            .map(|v| v.to_boolean())
+                            .unwrap_or(false);
+                        if already_done {
+                            continue;
+                        }
                         let is_gen = self.heap.get(oid)
                             .map(|o| matches!(&o.kind, ObjectKind::Generator { .. }))
                             .unwrap_or(false);
@@ -7022,6 +7239,41 @@ impl Vm {
                             // Per spec IteratorClose: call iterator.return() if it exists.
                             // If the call throws, propagate; if it returns a non-object,
                             // throw TypeError.
+                            let return_name = self.interner.intern("return");
+                            let return_fn = self.heap.get_property_chain(oid, return_name);
+                            if let Some(fn_val) = return_fn
+                                && fn_val.is_function()
+                            {
+                                let result = self.call_function_this(fn_val, iter_val, &[])?;
+                                if !result.is_object() && !result.is_function() {
+                                    let err = self.make_native_error(
+                                        "TypeError",
+                                        "Iterator result is not an object",
+                                    );
+                                    self.handle_throw(err)?;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                OpCode::IteratorCloseIfNotDone => {
+                    // Stack: [iter, done] -> []
+                    let done = self.pop()?;
+                    let iter_val = self.pop()?;
+                    if done.to_boolean() {
+                        // Already done — skip close.
+                        continue;
+                    }
+                    if let Some(oid) = iter_val.as_object_id() {
+                        let is_gen = self.heap.get(oid)
+                            .map(|o| matches!(&o.kind, ObjectKind::Generator { .. }))
+                            .unwrap_or(false);
+                        if is_gen {
+                            let return_name = self.interner.intern("return");
+                            let _ = self.exec_generator_method(oid, return_name, &[Value::undefined()]);
+                        } else {
                             let return_name = self.interner.intern("return");
                             let return_fn = self.heap.get_property_chain(oid, return_name);
                             if let Some(fn_val) = return_fn

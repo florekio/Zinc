@@ -59,7 +59,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         | OpCode::Throw | OpCode::PopExcHandler | OpCode::EnterFinally | OpCode::LeaveFinally
         | OpCode::GetIterator | OpCode::GetForInIterator | OpCode::GetAsyncIterator
         | OpCode::GetSuperClass
-        | OpCode::IteratorNext | OpCode::IteratorDone | OpCode::IteratorValue | OpCode::IteratorClose
+        | OpCode::IteratorNext | OpCode::IteratorDone | OpCode::IteratorValue | OpCode::IteratorClose | OpCode::IteratorCloseIfNotDone
         | OpCode::Yield | OpCode::YieldStar | OpCode::Await | OpCode::CreateGenerator
         | OpCode::AsyncReturn | OpCode::AsyncThrow
         | OpCode::ImportDynamic | OpCode::ExportDefault

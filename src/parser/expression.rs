@@ -1460,12 +1460,21 @@ fn expr_to_assignment_target(expr: Expression) -> ParseResult<AssignmentTarget> 
                 match elem {
                     None => elements.push(None),
                     Some(Expression::Spread(s)) => {
-                        match expr_to_param(s.argument) {
-                            Ok(inner) => elements.push(Some(Pattern::Rest(Box::new(RestElement {
+                        // Allow Member expressions inside rest targets (only valid in
+                        // assignment, not parameter contexts) by handling them here
+                        // before falling through to expr_to_param.
+                        let span = s.span;
+                        let arg = s.argument;
+                        let inner = match arg {
+                            Expression::Member(m) => Some(Pattern::Member(m)),
+                            other => expr_to_param(other).ok(),
+                        };
+                        match inner {
+                            Some(inner) => elements.push(Some(Pattern::Rest(Box::new(RestElement {
                                 argument: inner,
-                                span: s.span,
+                                span,
                             })))),
-                            Err(_) => elements.push(None), // e.g. ...x.y — valid target but not a pattern
+                            None => elements.push(None),
                         }
                     }
                     Some(Expression::Assignment(a)) => {
@@ -1485,7 +1494,8 @@ fn expr_to_assignment_target(expr: Expression) -> ParseResult<AssignmentTarget> 
                     Some(Expression::Object(o)) => elements.push(Some(object_expr_to_pattern(o)?)),
                     // Simple identifier
                     Some(Expression::Identifier(id)) => elements.push(Some(Pattern::Identifier(id))),
-                    // Member expressions and other valid assignment targets become holes
+                    // Member expressions are valid LHS targets for destructuring assignment.
+                    Some(Expression::Member(m)) => elements.push(Some(Pattern::Member(m))),
                     Some(_) => elements.push(None),
                 }
             }

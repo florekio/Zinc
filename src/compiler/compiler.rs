@@ -142,8 +142,41 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
             }
         }
+
+        // Hoist top-level function declarations with their value (per spec, function
+        // declarations are hoisted to the top of the script with a closure).
+        let mut hoisted_top_fns: Vec<StringId> = Vec::new();
+        if self.scope_depth == 0 {
+            for stmt in &program.body {
+                if let Statement::Function(f) = stmt
+                    && let Some(name) = f.id
+                {
+                    let line = f.span.start;
+                    let child_chunk = self.compile_function_body(name, &f.params, &f.body, f.is_async, f.is_generator)?;
+                    let chunk_idx = self.chunk.child_chunks.len() as u16;
+                    let upvalue_descs = child_chunk.upvalue_descriptors.clone();
+                    self.chunk.child_chunks.push(child_chunk);
+                    self.chunk.emit_op_u16(OpCode::Closure, chunk_idx, line);
+                    for desc in &upvalue_descs {
+                        self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
+                        self.chunk.emit_byte(desc.index, line);
+                    }
+                    let idx = self.make_string_constant(name);
+                    self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
+                    hoisted_top_fns.push(name);
+                }
+            }
+        }
+
         let len = program.body.len();
         for (i, stmt) in program.body.iter().enumerate() {
+            // Skip already-hoisted top-level function declarations.
+            if let Statement::Function(f) = stmt
+                && let Some(name) = f.id
+                && hoisted_top_fns.contains(&name)
+            {
+                continue;
+            }
             let is_last = i == len - 1;
             if is_last {
                 // For the last statement, if it's an expression, keep value on stack for Halt
@@ -1409,6 +1442,22 @@ impl<'a> Compiler<'a> {
 
     /// bind object properties to locals; source object is at local slot `src_slot`
     fn compile_bind_obj_props_local(&mut self, properties: &[ObjectPatternProperty], src_slot: u8, line: u32) -> Result<(), String> {
+        // RequireObjectCoercible: `const {} = null` / `let {} = undefined` throw TypeError.
+        self.chunk.emit_op_u8(OpCode::GetLocal, src_slot, line);
+        self.chunk.emit_op(OpCode::Dup, line);
+        self.chunk.emit_op(OpCode::Undefined, line);
+        self.chunk.emit_op(OpCode::StrictEq, line);
+        let undef_jump = self.chunk.emit_jump(OpCode::JumpIfTrue, line);
+        self.chunk.emit_op(OpCode::Dup, line);
+        self.chunk.emit_op(OpCode::Null, line);
+        self.chunk.emit_op(OpCode::StrictEq, line);
+        let null_jump = self.chunk.emit_jump(OpCode::JumpIfTrue, line);
+        let skip_throw = self.chunk.emit_jump(OpCode::Jump, line);
+        self.chunk.patch_jump(undef_jump);
+        self.chunk.patch_jump(null_jump);
+        self.emit_throw_type_error("Cannot destructure 'undefined' or 'null'", line);
+        self.chunk.patch_jump(skip_throw);
+        self.chunk.emit_op(OpCode::Pop, line);
         for prop in properties {
             match prop {
                 ObjectPatternProperty::Property { key, value, .. } => {
@@ -1498,6 +1547,7 @@ impl<'a> Compiler<'a> {
         self.add_local(anon);
         self.mark_initialized();
 
+        let mut had_rest = false;
         for elem in elements.iter() {
             match elem {
                 None => {
@@ -1506,6 +1556,7 @@ impl<'a> Compiler<'a> {
                     self.chunk.emit_op(OpCode::Pop, line);
                 }
                 Some(Pattern::Rest(rest)) => {
+                    had_rest = true;
                     self.chunk.emit_op_u16(OpCode::CreateArray, 0, line);
                     let loop_start = self.chunk.len();
                     self.chunk.emit_op_u8(OpCode::GetLocal, iter_slot, line);
@@ -1548,12 +1599,36 @@ impl<'a> Compiler<'a> {
             }
         }
 
+        // Per spec, if pattern didn't exhaust the iterator (no rest), call IteratorClose.
+        // The VM's IteratorClose checks the iter's __iter_done__ flag and skips when set,
+        // so this is safe even when the iterator is already exhausted.
+        if !had_rest {
+            self.chunk.emit_op_u8(OpCode::GetLocal, iter_slot, line);
+            self.chunk.emit_op(OpCode::IteratorClose, line);
+        }
+
         self.locals.pop(); // remove temp iterator tracking (stack value stays; caller Pops)
         Ok(())
     }
 
     /// bind object properties to globals; source is on top of stack (Dup for each prop; caller Pops)
     fn compile_bind_obj_props_global(&mut self, properties: &[ObjectPatternProperty], line: u32) -> Result<(), String> {
+        // RequireObjectCoercible: source is on top of stack, throw if null/undefined.
+        self.chunk.emit_op(OpCode::Dup, line);
+        self.chunk.emit_op(OpCode::Dup, line);
+        self.chunk.emit_op(OpCode::Undefined, line);
+        self.chunk.emit_op(OpCode::StrictEq, line);
+        let undef_jump = self.chunk.emit_jump(OpCode::JumpIfTrue, line);
+        self.chunk.emit_op(OpCode::Dup, line);
+        self.chunk.emit_op(OpCode::Null, line);
+        self.chunk.emit_op(OpCode::StrictEq, line);
+        let null_jump = self.chunk.emit_jump(OpCode::JumpIfTrue, line);
+        let skip_throw = self.chunk.emit_jump(OpCode::Jump, line);
+        self.chunk.patch_jump(undef_jump);
+        self.chunk.patch_jump(null_jump);
+        self.emit_throw_type_error("Cannot destructure 'undefined' or 'null'", line);
+        self.chunk.patch_jump(skip_throw);
+        self.chunk.emit_op(OpCode::Pop, line);
         for prop in properties {
             match prop {
                 ObjectPatternProperty::Property { key, value, .. } => {
@@ -2853,11 +2928,26 @@ impl<'a> Compiler<'a> {
             Statement::Variable(d) if matches!(d.kind, VarKind::Let | VarKind::Const)
         ));
         let mut hoisted_fns: Vec<StringId> = Vec::new();
+        // Function declaration named `arguments` shouldn't shadow the arguments
+        // object when params have expressions (defaults/destructuring/rest), per
+        // spec — the arguments object is required and the user-visible binding.
+        let has_param_exprs = params.iter().any(|p| matches!(
+            p,
+            Pattern::Assignment(_) | Pattern::Array(_) | Pattern::Object(_) | Pattern::Rest(_)
+        ));
+        let arguments_id = self.interner.intern("arguments");
         if !has_top_level_lex {
             for stmt in &body.body {
                 if let Statement::Function(f) = stmt
                     && let Some(name) = f.id
                 {
+                    // Skip hoisting `function arguments(){}` if the arguments object
+                    // is needed (params have expressions or `arguments` isn't a param).
+                    if name == arguments_id
+                        && (has_param_exprs || !params.iter().any(|p| matches!(p, Pattern::Identifier(id) if id.name == arguments_id)))
+                    {
+                        continue;
+                    }
                     let line = f.span.start;
                     let child_chunk = self.compile_function_body(name, &f.params, &f.body, f.is_async, f.is_generator)?;
                     let chunk_idx = self.chunk.child_chunks.len() as u16;
@@ -3419,6 +3509,33 @@ impl<'a> Compiler<'a> {
                 self.compile_set_variable(id.name, line)?;
                 self.chunk.emit_op(OpCode::Pop, line);
             }
+            Pattern::Member(m) => {
+                // Stack: [..., value]. Need: assign value to obj.prop, leaving stack
+                // unchanged on entry but consuming the value.
+                self.compile_expr(&m.object)?;
+                match &m.property {
+                    MemberProperty::Identifier(id) => {
+                        let idx = self.make_string_constant(*id);
+                        // Stack: [..., value, obj]. Need [obj, value] for SetProperty.
+                        self.chunk.emit_op(OpCode::Swap, line);
+                        self.emit_set_property(idx, line);
+                        self.chunk.emit_op(OpCode::Pop, line);
+                    }
+                    MemberProperty::Expression(expr) => {
+                        // Stack: [..., value, obj]; eval key.
+                        self.compile_expr(expr)?;
+                        // Stack: [..., value, obj, key]. Need [obj, key, value] for SetElement.
+                        self.chunk.emit_op(OpCode::Rot3, line);
+                        self.chunk.emit_op(OpCode::Rot3, line);
+                        self.chunk.emit_op(OpCode::SetElement, line);
+                        self.chunk.emit_op(OpCode::Pop, line);
+                    }
+                    _ => {
+                        self.chunk.emit_op(OpCode::Pop, line);
+                        self.chunk.emit_op(OpCode::Pop, line);
+                    }
+                }
+            }
             Pattern::Object(obj) => {
                 for prop in &obj.properties {
                     if let ObjectPatternProperty::Property { key, value, .. } = prop {
@@ -3669,11 +3786,72 @@ impl<'a> Compiler<'a> {
                                             self.chunk.emit_op(OpCode::Pop, line);
                                         }
                                         Pattern::Rest(r) => {
+                                            // Discard the index lookup; collect from i onwards.
                                             self.chunk.emit_op(OpCode::Pop, line);
-                                            if let Pattern::Identifier(id) = &r.argument {
+                                            // Stack: [..., rhs]. We need to slice rhs from i onwards.
+                                            // Build a sub-array via Array.from(rhs).slice(i).
+                                            // Simpler: emit a runtime call: collect via iterator from rhs.
+                                            self.chunk.emit_op(OpCode::Dup, line); // [..., rhs, rhs]
+                                            self.chunk.emit_op(OpCode::GetIterator, line);
+                                            // Skip first i items
+                                            for _ in 0..i {
                                                 self.chunk.emit_op(OpCode::Dup, line);
-                                                self.compile_set_variable(id.name, line)?;
+                                                self.chunk.emit_op(OpCode::IteratorNext, line);
                                                 self.chunk.emit_op(OpCode::Pop, line);
+                                            }
+                                            // Now collect remaining
+                                            self.chunk.emit_op_u16(OpCode::CreateArray, 0, line);
+                                            self.chunk.emit_op(OpCode::Swap, line); // [..., rhs, arr, iter]
+                                            let loop_start = self.chunk.len();
+                                            self.chunk.emit_op(OpCode::Dup, line);
+                                            self.chunk.emit_op(OpCode::IteratorNext, line);
+                                            self.chunk.emit_op(OpCode::Dup, line);
+                                            self.chunk.emit_op(OpCode::IteratorDone, line);
+                                            let exit_jump = self.chunk.emit_jump(OpCode::JumpIfTrue, line);
+                                            self.chunk.emit_op(OpCode::IteratorValue, line);
+                                            self.chunk.emit_op(OpCode::Swap, line); // [..., rhs, arr, value, iter]
+                                            self.chunk.emit_op(OpCode::Rot3, line); // [..., rhs, iter, arr, value]
+                                            self.chunk.emit_op(OpCode::ArrayAppend, line); // [..., rhs, iter, arr]
+                                            self.chunk.emit_op(OpCode::Swap, line); // [..., rhs, arr, iter]
+                                            self.chunk.emit_loop(loop_start, line);
+                                            self.chunk.patch_jump(exit_jump);
+                                            self.chunk.emit_op(OpCode::Pop, line); // pop result
+                                            self.chunk.emit_op(OpCode::Pop, line); // pop iter
+                                            // Stack: [..., rhs, arr]
+                                            // Bind arr to r.argument pattern.
+                                            match &r.argument {
+                                                Pattern::Identifier(id) => {
+                                                    self.compile_set_variable(id.name, line)?;
+                                                    self.chunk.emit_op(OpCode::Pop, line);
+                                                }
+                                                Pattern::Member(m) => {
+                                                    // Stack: [..., arr]. Compile obj.prop = arr.
+                                                    self.compile_expr(&m.object)?;
+                                                    match &m.property {
+                                                        MemberProperty::Identifier(id) => {
+                                                            let idx = self.make_string_constant(*id);
+                                                            // Stack: [arr, obj]. Need [obj, arr] for SetProperty.
+                                                            self.chunk.emit_op(OpCode::Swap, line);
+                                                            self.emit_set_property(idx, line);
+                                                        }
+                                                        MemberProperty::Expression(expr) => {
+                                                            // Stack: [arr, obj]; eval key.
+                                                            self.compile_expr(expr)?;
+                                                            // Stack: [arr, obj, key]. Need [obj, key, arr] for SetElement.
+                                                            self.chunk.emit_op(OpCode::Rot3, line); // [key, arr, obj] - rot3 brings top to bottom-3
+                                                            // Actually rot3([a,b,c]) -> [c,a,b]. So [arr,obj,key] -> [key,arr,obj].
+                                                            self.chunk.emit_op(OpCode::Rot3, line); // Apply twice: [obj,key,arr]
+                                                            self.chunk.emit_op(OpCode::SetElement, line);
+                                                        }
+                                                        _ => { self.chunk.emit_op(OpCode::Pop, line); self.chunk.emit_op(OpCode::Pop, line); }
+                                                    }
+                                                    self.chunk.emit_op(OpCode::Pop, line);
+                                                }
+                                                Pattern::Object(_)
+                                                | Pattern::Array(_) => {
+                                                    self.compile_assign_to_pattern(&r.argument, line)?;
+                                                }
+                                                _ => { self.chunk.emit_op(OpCode::Pop, line); }
                                             }
                                         }
                                         Pattern::Object(_) | Pattern::Array(_) => {
