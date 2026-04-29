@@ -54,7 +54,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         | OpCode::CloseUpvalue
         | OpCode::Return | OpCode::ReturnUndefined | OpCode::LoadCallee
         | OpCode::CreateObject | OpCode::ArraySpread | OpCode::DefineDataProp
-        | OpCode::DefineGetter | OpCode::DefineSetter | OpCode::ObjectSpread
+        | OpCode::DefineGetter | OpCode::DefineSetter | OpCode::ObjectSpread | OpCode::SetObjectProto
         | OpCode::Inherit | OpCode::GetSuperConstructor
         | OpCode::Throw | OpCode::PopExcHandler | OpCode::EnterFinally | OpCode::LeaveFinally
         | OpCode::GetIterator | OpCode::GetForInIterator | OpCode::GetAsyncIterator

@@ -98,6 +98,9 @@ pub enum ObjectKind {
         saved_stack: Vec<Value>,
         saved_upvalues: Vec<Value>,
         this_value: Value,
+        /// Snapshot of the actual call arguments — used by `arguments` references
+        /// inside the generator body across suspensions.
+        saved_args: Vec<Value>,
     },
     /// Regular expression
     RegExp {

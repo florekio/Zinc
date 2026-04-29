@@ -85,6 +85,7 @@ impl Vm {
                     saved_stack,
                     saved_upvalues,
                     this_value,
+                    saved_args,
                 } => Some((
                     *state,
                     *chunk_idx,
@@ -92,12 +93,13 @@ impl Vm {
                     saved_stack.clone(),
                     saved_upvalues.clone(),
                     *this_value,
+                    saved_args.clone(),
                 )),
                 _ => None,
             }
         };
 
-        let (state, chunk_idx, ip, saved_stack, saved_upvalues, this_value) =
+        let (state, chunk_idx, ip, saved_stack, saved_upvalues, this_value, saved_args) =
             gen_data.ok_or_else(|| VmError::TypeError("not a generator".into()))?;
 
         match state {
@@ -134,6 +136,7 @@ impl Vm {
                     .collect();
 
                 // Push generator frame
+                let argc = saved_args.len();
                 self.frames.push(CallFrame {
                     chunk_idx,
                     ip,
@@ -143,8 +146,9 @@ impl Vm {
                     is_constructor: false,
                     pending_super_call: false,
                     generator_id: Some(gen_oid),
-                    argc: 0,
-                    saved_args: Vec::new(), arguments_oid: None,
+                    argc,
+                    saved_args,
+                    arguments_oid: None, is_derived_ctor: false, super_called: false,
                 });
 
                 // For SuspendedYield, the input becomes the result of the yield expression

@@ -6,81 +6,76 @@ Run with: `cargo run --release --bin test262_runner`
 
 ## Results
 
-**92.6% pass rate** — 14,821 of 16,010 active tests pass (2,988 tests skipped).
+**83.7% pass rate** — 13,350 of 15,947 active tests pass (2,988 tests skipped).
 
-The active count nearly doubled from v0.4.0 after the runner stopped pre-skipping
-features that already work (`Symbol.asyncIterator`, `Symbol.matchAll`, change-array-by-copy,
-logical-assignment), wired up the `$DONE` async harness, implemented `with`, and turned
-on `class { static { … } }`. The pass rate dipped a few points but the underlying
-implementation is the same — we now report against thousands of tests we previously
-hid behind `should_skip()`.
+The pass rate dropped from 92.6% because earlier silent assertion no-ops
+(`assert.sameValue` / `assert.throws` weren't actually being called when invoked
+on a function value with user-set properties, so tests "passed" by inaction)
+were fixed in this round. The underlying engine is materially more conformant —
+we now report against thousands of tests whose latent bugs had been hidden.
+Many of the resulting failures are themselves now-fixed (strict-mode property
+writes / deletes, derived-class missing-super, eager generator parameters,
+iterator-close protocol, computed-key class methods, `__proto__: val` literals,
+etc.). Remaining failures are concentrated in eval-time strict early errors,
+private-field brand checks, completion-value semantics, and TDZ for params.
 
 ### Perfect Scores (100%)
 
 | Category | Tests |
 |----------|-------|
-| literals/numeric | 157 |
-| block-scope | 126 |
-| statementList | 80 |
-| literals/string | 67 |
-| white-space | 65 |
-| statements/if | 63 |
+| identifiers | 260 |
+| expressions/assignmenttargettype | 308 |
+| destructuring | 17 |
 | future-reserved-words | 55 |
-| expressions/template-literal | 55 |
-| expressions/async-function | 38 |
-| expressions/strict-equals | 29 |
-| expressions/strict-does-not-equals | 29 |
-| keywords | 25 |
 | reserved-words | 25 |
-| expressions/coalesce | 22 |
+| keywords | 25 |
+| expressions/conditional | 20 |
+| expressions/logical-not | 19 |
 | statements/block | 19 |
-| expressions/conditional | 19 |
-| line-terminators | 18 |
-| expressions/logical-not | 18 |
-| expressions/logical-and | 16 |
-| expressions/logical-or | 16 |
+| expressions/logical-and | 17 |
+| expressions/logical-or | 17 |
+| statements/return | 15 |
 | statements/throw | 14 |
-| statements/return | 14 |
+| expressions/coalesce | 22 |
 | punctuators | 11 |
-| rest-parameters | 11 |
-| expressions/void | 8 |
+| expressions/grouping | 9 |
+| expressions/void | 9 |
 | expressions/this | 6 |
 | expressions/concatenation | 5 |
-| expressions/comma | 4 |
+| expressions/comma | 5 |
 | literals/boolean | 4 |
 | literals/null | 3 |
-| statements/empty | 2 |
 | expressions/relational | 1 |
 
 ### Major Categories (latest run)
 
 | Category | Total | Pass | Rate |
 |----------|-------|------|------|
-| statements/class | 3112 | 2856 | 91.8% |
-| expressions/class | 2831 | 2606 | 92.1% |
-| expressions/object | 864 | 833 | 96.4% |
-| statements/for-of | 733 | 688 | 93.9% |
-| expressions/assignment | 480 | 451 | 94.0% |
-| expressions/compound-assignment | 454 | 410 | 90.3% |
-| statements/function | 451 | 405 | 89.8% |
-| statements/for | 380 | 372 | 97.9% |
-| expressions/arrow-function | 343 | 333 | 97.1% |
-| eval-code | 343 | 245 | 71.4% |
-| expressions/generators | 290 | 280 | 96.6% |
-| statements/generators | 266 | 257 | 96.6% |
-| expressions/function | 264 | 258 | 97.7% |
-| function-code | 217 | 202 | 93.1% |
-| arguments-object | 203 | 166 | 81.8% |
-| statements/variable | 178 | 172 | 96.6% |
-| statements/with | 173 | 126 | 72.8% |
-| statements/const | 136 | 134 | 98.5% |
-| statements/let | 145 | 143 | 98.6% |
-| statements/for-in | 113 | 98 | 86.7% |
-| expressions/async-function | 93 | 83 | 89.2% |
-| statements/switch | 93 | 77 | 82.8% |
-| expressions/super | 92 | 77 | 83.7% |
+| statements/class | 3112 | 2519 | 80.9% |
+| expressions/class | 2831 | 2331 | 82.3% |
+| expressions/object | 864 | 738 | 85.4% |
+| statements/for-of | 733 | 638 | 87.0% |
+| expressions/assignment | 480 | 375 | 78.1% |
+| expressions/compound-assignment | 454 | 386 | 85.0% |
+| statements/function | 451 | 369 | 81.8% |
+| statements/for | 380 | 360 | 94.7% |
+| expressions/arrow-function | 343 | 280 | 81.6% |
+| eval-code | 343 | 158 | 46.1% |
+| expressions/generators | 290 | 244 | 84.1% |
+| statements/generators | 266 | 238 | 89.5% |
+| expressions/function | 264 | 218 | 82.6% |
+| function-code | 217 | 188 | 86.6% |
+| arguments-object | 203 | 153 | 75.4% |
+| statements/variable | 178 | 157 | 88.2% |
+| statements/with | 173 | 110 | 63.6% |
+| statements/const | 136 | 130 | 95.6% |
+| statements/let | 145 | 138 | 95.2% |
+| statements/for-in | 113 | 90 | 79.6% |
+| expressions/async-function | 93 | 79 | 84.9% |
+| statements/switch | 93 | 64 | 68.8% |
+| expressions/super | 92 | 70 | 76.1% |
 | expressions/logical-assignment | 78 | 78 | 100.0% |
-| statements/async-function | 74 | 66 | 89.2% |
+| statements/async-function | 74 | 52 | 70.3% |
 
 ### Skipped Features
 
@@ -105,11 +100,26 @@ Tests requiring these features are currently skipped (2,988 tests):
 | v0.2.0  | 6,476       | 5,461   | 84.3% |
 | v0.3.0  | 9,805       | 9,052   | 92.3% |
 | v0.4.0  | 9,805       | 9,385   | 95.7% |
-| post-v0.4.0 | 16,010  | 14,821  | 92.6% |
+| post-v0.4.0 a | 16,010  | 14,821  | 92.6% |
+| post-v0.4.0 b | 15,947  | 13,350  | 83.7% |
 
-The post-v0.4.0 jump in active tests (9,805 → 16,010) reflects unskipping
-features the engine already implemented and adding `$DONE`/`with`/`static {}`/
-named regex groups support.
+The first post-v0.4.0 jump reflects unskipping features the engine already
+implemented (Symbol.asyncIterator, Symbol.matchAll, change-array-by-copy,
+logical-assignment) and adding the `$DONE` async harness, `with`,
+`class { static {} }`, and named regex groups support.
+
+The second drop (92.6% → 83.7%) is honesty, not regression. Method dispatch on
+function values with user-set properties (`f.method = fn; f.method(args)`) was
+silently a no-op, so any test using `assert.sameValue`/`assert.throws` etc. on
+the harness's user-defined `assert` object "passed" by inaction. Fixing that
+exposed thousands of latent assertion failures, many of which have since been
+fixed (strict-mode property writes/deletes throw, derived-class missing-super
+throws ReferenceError, eager generator parameter destructuring, full iterator
+protocol with conditional close, computed-key class methods, `__proto__: val`
+literals, ToPropertyKey for undefined/null/boolean keys, etc.). The remaining
+failures concentrate in eval-time strict early errors, private-field brand
+checks, completion-value semantics in eval, and parameter TDZ — each its own
+spec rule, not a single underlying bug.
 
 ### Running
 

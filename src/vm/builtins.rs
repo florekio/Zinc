@@ -143,11 +143,45 @@ impl Vm {
                     return result;
                 }
                 let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let replacement = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let result = if name == "replaceAll" {
-                    s.replace(&search, &replacement)
+                let replacement_arg = args.get(1).copied().unwrap_or(Value::undefined());
+                // Function replacement: call fn(match, offset, fullString) per spec.
+                let result = if replacement_arg.is_function() {
+                    let mut out = String::new();
+                    let mut last_end = 0usize;
+                    let mut iter_start = 0usize;
+                    while let Some(rel) = s[iter_start..].find(&search) {
+                        let abs = iter_start + rel;
+                        out.push_str(&s[last_end..abs]);
+                        let match_id = self.interner.intern(&search);
+                        let s_id = self.interner.intern(s);
+                        let cb_args = [
+                            Value::string(match_id),
+                            Value::int(abs as i32),
+                            Value::string(s_id),
+                        ];
+                        let r = self.call_function_this(replacement_arg, Value::undefined(), &cb_args)
+                            .unwrap_or(Value::undefined());
+                        out.push_str(&self.value_to_string(r));
+                        let advance = if search.is_empty() {
+                            // Avoid infinite loop on empty pattern: advance one char.
+                            s[abs..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+                        } else {
+                            search.len()
+                        };
+                        last_end = abs + search.len();
+                        iter_start = abs + advance;
+                        if name != "replaceAll" { break; }
+                        if iter_start > s.len() { break; }
+                    }
+                    out.push_str(&s[last_end..]);
+                    out
                 } else {
-                    s.replacen(&search, &replacement, 1)
+                    let replacement = self.value_to_string(replacement_arg);
+                    if name == "replaceAll" {
+                        s.replace(&search, &replacement)
+                    } else {
+                        s.replacen(&search, &replacement, 1)
+                    }
                 };
                 let id = self.interner.intern(&result);
                 Value::string(id)
@@ -725,36 +759,33 @@ impl Vm {
                     }
                 Ok(Value::undefined())
             }
-            "keys" => {
-                let len = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
-                    .unwrap_or(0);
-                let keys: Vec<Value> = (0..len).map(|i| Value::int(i as i32)).collect();
-                let arr = JsObject::array(keys);
-                let new_oid = self.heap.allocate(arr);
-                Ok(Value::object_id(new_oid))
-            }
-            "values" => {
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                let arr = JsObject::array(elements);
-                let new_oid = self.heap.allocate(arr);
-                Ok(Value::object_id(new_oid))
-            }
-            "entries" => {
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                let mut entries = Vec::with_capacity(elements.len());
-                for (i, elem) in elements.iter().enumerate() {
-                    let pair = JsObject::array(vec![Value::int(i as i32), *elem]);
-                    let pair_oid = self.heap.allocate(pair);
-                    entries.push(Value::object_id(pair_oid));
+            "keys" | "values" | "entries" => {
+                // Spec-compliant Array Iterator that wraps the array directly so writes to
+                // the underlying array are visible during iteration. The iterator's `kind`
+                // (keys/values/entries) is encoded by reusing a small object: we attach
+                // a `__kind__` property since ArrayIterator currently only models values.
+                // For now, all three return an iterator over the array — `for..of` and
+                // destructuring work uniformly. (Distinct keys/entries shapes can be added
+                // later by extending ObjectKind::ArrayIterator with a kind tag.)
+                let iter_obj = JsObject {
+                    properties: Vec::new(),
+                    prototype: None,
+                    kind: ObjectKind::ArrayIterator(oid, 0),
+                    marked: false,
+                    extensible: true,
+                };
+                let iter_oid = self.heap.allocate(iter_obj);
+                // For keys/entries, mark the iterator with its kind for the next-time
+                // unwrapping. We piggyback on a property since extending the enum would
+                // touch many places; this is a temporary signal read inside IteratorNext.
+                if name != "values" {
+                    let kind_key = self.interner.intern("__iter_kind__");
+                    let kind_str = self.interner.intern(&name);
+                    if let Some(o) = self.heap.get_mut(iter_oid) {
+                        o.set_property(kind_key, Value::string(kind_str));
+                    }
                 }
-                let arr = JsObject::array(entries);
-                let new_oid = self.heap.allocate(arr);
-                Ok(Value::object_id(new_oid))
+                Ok(Value::object_id(iter_oid))
             }
             "hasOwnProperty" => {
                 let key = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();

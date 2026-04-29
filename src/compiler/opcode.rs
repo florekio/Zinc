@@ -220,6 +220,9 @@ pub enum OpCode {
     ObjectSpread = 0xA8,
     /// Create RegExp (u16 pattern, u16 flags)
     CreateRegExp = 0xA9,
+    /// `{__proto__: val}` in an object literal: pops val, peeks obj, sets
+    /// obj's prototype to val if val is object or null.
+    SetObjectProto = 0xAA,
 
     // ---- Closures ----
     /// Create closure from child chunk (u16 chunk_index + upvalue descriptors)
@@ -376,7 +379,7 @@ impl OpCode {
             | 0x70..=0x7C
             | 0x80..=0x88
             | 0x90..=0x97
-            | 0xA0..=0xA9
+            | 0xA0..=0xAA
             | 0xB0..=0xB1
             | 0xB8..=0xBF
             | 0xC0..=0xC4
@@ -446,6 +449,7 @@ impl OpCode {
             | OpCode::DefineGetter
             | OpCode::DefineSetter
             | OpCode::ObjectSpread
+            | OpCode::SetObjectProto
             | OpCode::Inherit
             | OpCode::GetSuperConstructor
             | OpCode::Throw

@@ -4,7 +4,7 @@ A JavaScript engine written from scratch in Rust with an **experimental JIT comp
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**95.7% [Test262](docs/TEST262.md) conformance (9,385 / 9,805 tests)** | **90 tests** | **~22,500 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
+**83.7% [Test262](docs/TEST262.md) conformance (13,350 / 15,947 active tests)** | **90 tests** | **~22,500 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
 
 ![Zinc Playground](web/screenshot.png)
 
@@ -132,9 +132,9 @@ bash bench/sunspider/run.sh    # SunSpider benchmarks
 
 ## Test262 Conformance
 
-**95.7%** of tested ECMAScript spec tests pass (9,385 / 9,805 active tests). See [TEST262.md](docs/TEST262.md).
+**83.7%** of tested ECMAScript spec tests pass (13,350 / 15,947 active tests). See [TEST262.md](docs/TEST262.md).
 
-32 categories with **100% pass rate** including: numeric literals, string literals, boolean literals, white-space, statementList, statements/if, expressions/template-literal, expressions/this, expressions/async-function, expressions/strict-equals, expressions/conditional, expressions/coalesce, statements/return, statements/throw, statements/block, block-scope, future-reserved-words, reserved-words, keywords, and more.
+23 categories at **100% pass rate** including: identifiers, expressions/assignmenttargettype, destructuring, future-reserved-words, reserved-words, keywords, expressions/conditional, expressions/logical-not/and/or, statements/block, statements/return, statements/throw, expressions/coalesce, expressions/grouping, expressions/this, expressions/comma, literals/boolean, literals/null, and more.
 
 ```bash
 git clone --depth 1 https://github.com/nicolo-ribaudo/test262.git
@@ -184,7 +184,7 @@ web/                   WASM playground (HTML + compiled WASM)
 
 - **~22,500 lines** of Rust
 - **90 tests** passing
-- **95.7%** Test262 conformance (9,385 / 9,805 active tests)
+- **83.7%** Test262 conformance (13,350 / 15,947 active tests)
 - **1.5 MB** WASM binary (includes regex engine)
 - **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation

@@ -1,5 +1,4 @@
 use crate::compiler::chunk::ChunkFlags;
-use crate::runtime::object::{GeneratorState, JsObject, ObjectKind};
 use crate::runtime::value::Value;
 
 use super::vm::{Vm, VmError, CallFrame};
@@ -44,38 +43,10 @@ impl Vm {
             return Ok(Value::undefined());
         }
 
-        // Generator function: invoking it does NOT execute the body — it
-        // returns a fresh generator object whose .next() will resume the body.
-        if self.chunks[chunk_idx].flags.contains(ChunkFlags::GENERATOR) {
-            let saved_upvalues: Vec<Value> = if closure_id < self.closure_upvalues.len() {
-                self.closure_upvalues[closure_id]
-                    .iter()
-                    .map(|uv| match &uv.location {
-                        super::vm::UpvalueLocation::Open(idx) => {
-                            self.stack.get(*idx).copied().unwrap_or(Value::undefined())
-                        }
-                        super::vm::UpvalueLocation::Closed(v) => *v,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let expected = self.chunks[chunk_idx].param_count as usize;
-            let saved_stack: Vec<Value> = (0..expected.max(args.len()))
-                .map(|i| args.get(i).copied().unwrap_or(Value::undefined()))
-                .collect();
-            let mut gen_obj = JsObject::ordinary();
-            gen_obj.kind = ObjectKind::Generator {
-                state: GeneratorState::SuspendedStart,
-                chunk_idx,
-                ip: 0,
-                saved_stack,
-                saved_upvalues,
-                this_value,
-            };
-            let gen_oid = self.heap.allocate(gen_obj);
-            return Ok(Value::object_id(gen_oid));
-        }
+        // Generator function: fall through to the normal call path. The body's
+        // `CreateGenerator` opcode (emitted in the prologue) captures frame state
+        // and returns a generator object — this makes parameter destructuring
+        // and default-value evaluation eager, per spec.
 
         let func_pos = self.stack.len();
         self.push(func_val);
@@ -114,7 +85,7 @@ impl Vm {
             chunk_idx, ip: 0, base: func_pos + 1,
             upvalues, this_value: effective_this, is_constructor: false,
             pending_super_call: false, generator_id: None, argc: args.len(),
-            saved_args: args.to_vec(), arguments_oid: None,
+            saved_args: args.to_vec(), arguments_oid: None, is_derived_ctor: false, super_called: false,
         });
 
         // Run using the full main dispatch loop, stopping when our frame returns.
