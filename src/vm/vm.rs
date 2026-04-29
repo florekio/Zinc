@@ -647,10 +647,42 @@ impl Vm {
                 Microtask::PromiseReaction { callback, value, result_promise, is_fulfilled } => {
                     if let Some(cb) = callback {
                         match self.call_function(cb, &[value]) {
-                            Ok(result) => self.resolve_promise(result_promise, result)?,
-                            Err(_e) => {
-                                let msg = self.interner.intern("callback error");
-                                self.reject_promise(result_promise, Value::string(msg))?;
+                            Ok(result) => {
+                                // If the callback returned a thenable (Promise),
+                                // adopt its state instead of resolving with the
+                                // promise as the value.
+                                let inner_promise = result.as_object_id().and_then(|oid| {
+                                    self.heap.get(oid).and_then(|o| {
+                                        if matches!(&o.kind, ObjectKind::Promise { .. }) {
+                                            Some(oid)
+                                        } else { None }
+                                    })
+                                });
+                                if let Some(inner_oid) = inner_promise {
+                                    // Adopt the inner promise's state: when it
+                                    // settles, forward to result_promise.
+                                    let then_name = self.interner.intern("then");
+                                    let resolve_sentinel = Value::function(-600_000 - result_promise.0 as i32);
+                                    let reject_sentinel = Value::function(-700_000 - result_promise.0 as i32);
+                                    self.exec_promise_method(inner_oid, then_name, &[resolve_sentinel, reject_sentinel])?;
+                                } else {
+                                    self.resolve_promise(result_promise, result)?;
+                                }
+                            }
+                            Err(VmError::Throw(reason)) => {
+                                self.reject_promise(result_promise, reason)?;
+                            }
+                            Err(VmError::TypeError(msg)) => {
+                                let err = self.make_native_error("TypeError", &msg);
+                                self.reject_promise(result_promise, err)?;
+                            }
+                            Err(VmError::ReferenceError(msg)) => {
+                                let err = self.make_native_error("ReferenceError", &msg);
+                                self.reject_promise(result_promise, err)?;
+                            }
+                            Err(VmError::RuntimeError(msg)) => {
+                                let err = self.make_native_error("Error", &msg);
+                                self.reject_promise(result_promise, err)?;
                             }
                         }
                     } else {
@@ -2899,7 +2931,7 @@ impl Vm {
                                     .chain((0..argc).map(|i| self.stack[func_pos + 1 + i]))
                                     .collect();
                                 self.stack.truncate(func_pos);
-                                let result = self.call_function_this(fn_val, this_val, &call_args)?;
+                                let result = self.call_with_async_wrap(fn_val, this_val, &call_args)?;
                                 self.push(result);
                                 continue;
                             }
@@ -6443,6 +6475,17 @@ impl Vm {
                             let s = self.value_to_string(key);
                             Some(self.interner.intern(&s))
                         };
+                        // Static class methods named "prototype" throw TypeError per spec.
+                        if let Some(nid) = name_id {
+                            let ctor_key = self.interner.intern("__constructor__");
+                            let is_class = self.heap.get(oid)
+                                .map(|o| o.get_property(ctor_key).is_some())
+                                .unwrap_or(false);
+                            if is_class && self.interner.resolve(nid) == "prototype" {
+                                self.throw_type_error("Cannot define static class member 'prototype'")?;
+                                continue;
+                            }
+                        }
                         if let Some(name_id) = name_id
                             && let Some(obj) = self.heap.get_mut(oid) {
                                 obj.set_property(name_id, val);
@@ -6488,6 +6531,15 @@ impl Vm {
                         } else {
                             self.value_to_string(key)
                         };
+                        // Static class accessors named "prototype" throw TypeError per spec.
+                        let ctor_key = self.interner.intern("__constructor__");
+                        let is_class = self.heap.get(oid)
+                            .map(|o| o.get_property(ctor_key).is_some())
+                            .unwrap_or(false);
+                        if is_class && name_str == "prototype" {
+                            self.throw_type_error("Cannot define static class accessor 'prototype'")?;
+                            continue;
+                        }
                         if let Some(obj) = self.heap.get_mut(oid)
                         {
                             // Symbol-keyed accessors are stored under their symbol slot key.
@@ -6672,6 +6724,11 @@ impl Vm {
                     let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
                     let name_id = name_val.as_string_id().unwrap();
                     let method_val = self.pop()?;
+                    // Static class members named "prototype" throw TypeError per spec.
+                    if self.interner.resolve(name_id) == "prototype" {
+                        self.throw_type_error("Cannot define static class member 'prototype'")?;
+                        continue;
+                    }
                     let class_val = self.peek()?;
                     if let Some(class_oid) = class_val.as_object_id()
                         && let Some(class_obj) = self.heap.get_mut(class_oid) {

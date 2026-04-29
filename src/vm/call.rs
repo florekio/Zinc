@@ -80,6 +80,20 @@ impl Vm {
         if (-629..=-590).contains(&packed) {
             return Ok(self.exec_native_method(packed, this_value, args));
         }
+        // Promise resolve/reject sentinels (used by promise chaining for thenable
+        // adoption). Encoding mirrors the Call opcode handler.
+        if packed <= -600_000 && packed > -700_000 {
+            let pid = crate::runtime::object::ObjectId((-600_000 - packed) as u32);
+            let val = args.first().copied().unwrap_or(Value::undefined());
+            self.resolve_promise(pid, val)?;
+            return Ok(Value::undefined());
+        }
+        if packed <= -700_000 && packed > -800_000 {
+            let pid = crate::runtime::object::ObjectId((-700_000 - packed) as u32);
+            let val = args.first().copied().unwrap_or(Value::undefined());
+            self.reject_promise(pid, val)?;
+            return Ok(Value::undefined());
+        }
         let closure_id = ((packed as u32) >> 16) as usize;
         let chunk_idx = (packed & 0xFFFF) as usize;
         if chunk_idx < 1 || chunk_idx >= self.chunks.len() {
