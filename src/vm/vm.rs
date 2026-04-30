@@ -5421,7 +5421,18 @@ impl Vm {
                                 } else { Value::undefined() }
                             }
                             "getOwnPropertyNames" => {
-                                if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
+                                // Native function values (Array, RegExp, etc.) expose
+                                // their three standard own props: length, name, prototype.
+                                if let Some(fv) = args.first() && fv.is_function() {
+                                    let mut names: Vec<Value> = Vec::new();
+                                    for n in ["length", "name", "prototype"] {
+                                        let id = self.interner.intern(n);
+                                        names.push(Value::string(id));
+                                    }
+                                    let arr = JsObject::array(names);
+                                    let arr_oid = self.heap.allocate(arr);
+                                    Value::object_id(arr_oid)
+                                } else if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                                     let mut seen = std::collections::HashSet::new();
                                     let mut names: Vec<Value> = Vec::new();
                                     // For arrays, integer indices come first in numeric order,
