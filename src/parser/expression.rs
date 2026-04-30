@@ -748,7 +748,50 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
         TokenKind::New => {
             p.advance();
             // Parse callee at BP 31 (higher than call BP 30) so () is NOT consumed as a call
-            let callee = parse_expression(p, 31)?;
+            let mut callee = parse_expression(p, 31)?;
+            // Per spec, `new MemberExpression(args)` allows `.`/`[]` chains in
+            // the MemberExpression but stops at the args `()` — so consume any
+            // member-access tail eagerly here, since BP 31 blocked them.
+            loop {
+                if p.at(TokenKind::Dot) {
+                    p.advance();
+                    let start_m = expr_span(&callee).start;
+                    if p.at(TokenKind::PrivateIdentifier) {
+                        let name = p.intern_current();
+                        p.advance();
+                        callee = Expression::Member(Box::new(MemberExpression {
+                            object: callee,
+                            property: MemberProperty::PrivateIdentifier(name),
+                            computed: false,
+                            span: Span::new(start_m, p.pos()),
+                        }));
+                    } else if p.at(TokenKind::Identifier) || is_keyword_property(p.current_kind()) {
+                        let prop_name = p.intern_current();
+                        p.advance();
+                        callee = Expression::Member(Box::new(MemberExpression {
+                            object: callee,
+                            property: MemberProperty::Identifier(prop_name),
+                            computed: false,
+                            span: Span::new(start_m, p.pos()),
+                        }));
+                    } else {
+                        return Err(ParseError::expected("property name", p.current_kind(), p.current().span));
+                    }
+                } else if p.at(TokenKind::LBracket) {
+                    p.advance();
+                    let start_m = expr_span(&callee).start;
+                    let prop = parse_expression(p, 0)?;
+                    p.expect(TokenKind::RBracket)?;
+                    callee = Expression::Member(Box::new(MemberExpression {
+                        object: callee,
+                        property: MemberProperty::Expression(prop),
+                        computed: true,
+                        span: Span::new(start_m, p.pos()),
+                    }));
+                } else {
+                    break;
+                }
+            }
             let args = if p.at(TokenKind::LParen) {
                 parse_arguments(p)?
             } else {
