@@ -845,11 +845,9 @@ impl Vm {
     }
 
     fn get_type_error_prototype(&mut self) -> Option<crate::runtime::object::ObjectId> {
-        let type_error_name = self.interner.intern("TypeError");
-        let proto_key = self.interner.intern("prototype");
-        let ctor = self.globals.get(&type_error_name).copied()?;
-        let oid = ctor.as_object_id()?;
-        self.heap.get(oid)?.get_property(proto_key).and_then(|v| v.as_object_id())
+        // TypeError is a native sentinel function (-511); its prototype is
+        // tracked in func_prototypes, not on the heap.
+        self.func_prototypes.get(&-511).copied()
     }
 
     #[inline(always)]
