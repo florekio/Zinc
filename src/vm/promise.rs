@@ -69,8 +69,7 @@ impl Vm {
                 let on_fulfilled = args.first().copied().filter(|v| v.is_function());
                 let on_rejected = args.get(1).copied().filter(|v| v.is_function());
                 // Create child promise
-                let child = JsObject::promise();
-                let child_id = self.heap.allocate(child);
+                let child_id = self.allocate_promise();
                 let reaction = PromiseReaction { on_fulfilled, on_rejected, promise: child_id };
 
                 // Check current state
@@ -162,15 +161,13 @@ impl Vm {
                         && matches!(&obj.kind, ObjectKind::Promise { .. }) {
                             return Ok(val);
                         }
-                let p = JsObject::promise();
-                let pid = self.heap.allocate(p);
+                let pid = self.allocate_promise();
                 self.resolve_promise(pid, val)?;
                 Ok(Value::object_id(pid))
             }
             "reject" => {
                 let val = args.first().copied().unwrap_or(Value::undefined());
-                let p = JsObject::promise();
-                let pid = self.heap.allocate(p);
+                let pid = self.allocate_promise();
                 self.reject_promise(pid, val)?;
                 Ok(Value::object_id(pid))
             }
@@ -201,8 +198,7 @@ impl Vm {
         };
 
         // Create result promise
-        let result_promise = JsObject::promise();
-        let result_pid = self.heap.allocate(result_promise);
+        let result_pid = self.allocate_promise();
 
         let count = elements.len();
 
@@ -250,8 +246,7 @@ impl Vm {
                     && matches!(&obj.kind, ObjectKind::Promise { .. }) {
                         oid
                     } else {
-                let p = JsObject::promise();
-                let pid = self.heap.allocate(p);
+                let pid = self.allocate_promise();
                 self.resolve_promise(pid, *elem)?;
                 pid
             };

@@ -1,5 +1,4 @@
 use crate::compiler::chunk::ChunkFlags;
-use crate::runtime::object::JsObject;
 use crate::runtime::value::Value;
 
 use super::vm::{Vm, VmError, CallFrame};
@@ -26,8 +25,7 @@ impl Vm {
                 && chunk_idx < self.chunks.len()
                 && self.chunks[chunk_idx].flags.contains(ChunkFlags::ASYNC)
             {
-                let promise = JsObject::promise();
-                let promise_id = self.heap.allocate(promise);
+                let promise_id = self.allocate_promise();
                 match self.call_function_this(func_val, this_value, args) {
                     Ok(val) => { self.resolve_promise(promise_id, val)?; }
                     Err(VmError::Throw(reason)) => {

@@ -207,6 +207,10 @@ pub struct Vm {
     pub(crate) function_prototype: ObjectId,
     /// Singleton Array.prototype object
     pub(crate) array_prototype: ObjectId,
+    /// Singleton Promise.prototype object — set on every new Promise so
+    /// `Object.getPrototypeOf(p) === Promise.prototype` and prototype lookups
+    /// for `then`/`catch`/`finally` still resolve.
+    pub(crate) promise_prototype: ObjectId,
     /// Singleton Boolean.prototype object
     pub(crate) boolean_prototype: ObjectId,
     /// Singleton Number.prototype object
@@ -340,6 +344,16 @@ impl Vm {
         str_proto.define_property(ctor_key, Property::with_flags(Value::function(-504), Property::WRITABLE | Property::CONFIGURABLE));
         let string_prototype = heap.allocate(str_proto);
         func_prototypes.insert(-504i32, string_prototype);
+
+        // Create Promise.prototype (prototype = Object.prototype). The actual
+        // .then/.catch/.finally methods are dispatched specially in CallMethod
+        // for Promise objects, so they don't need to live on this prototype —
+        // but tests check `Object.getPrototypeOf(p) === Promise.prototype`.
+        let mut promise_proto = JsObject::ordinary();
+        promise_proto.prototype = Some(object_prototype);
+        promise_proto.define_property(ctor_key, Property::with_flags(Value::function(-520), Property::WRITABLE | Property::CONFIGURABLE));
+        let promise_prototype = heap.allocate(promise_proto);
+        func_prototypes.insert(-520i32, promise_prototype);
 
         // Create Error.prototype objects so subclasses inherit `name`
         // First create Error.prototype itself
@@ -566,6 +580,7 @@ impl Vm {
             object_prototype,
             function_prototype,
             array_prototype,
+            promise_prototype,
             boolean_prototype,
             number_prototype,
             string_prototype,
@@ -1298,6 +1313,13 @@ impl Vm {
     /// returned (caller must `continue` the main dispatch loop).
     /// If no handler exists the value is stringified and returned as
     /// `Err(VmError::RuntimeError)`.
+    /// Allocate a new Promise with `Promise.prototype` as its [[Prototype]].
+    pub(crate) fn allocate_promise(&mut self) -> ObjectId {
+        let mut p = JsObject::promise();
+        p.prototype = Some(self.promise_prototype);
+        self.heap.allocate(p)
+    }
+
     pub(crate) fn handle_throw(&mut self, val: Value) -> Result<(), VmError> {
         // Protected nested call (e.g. valueOf during a comparison opcode):
         // if the handler that would catch this throw lives in a frame strictly
@@ -2550,8 +2572,7 @@ impl Vm {
                             // Check if this is an async function
                             if self.chunks[chunk_idx].flags.contains(ChunkFlags::ASYNC) {
                                 // Create a promise, run body synchronously, resolve with result
-                                let promise = JsObject::promise();
-                                let promise_id = self.heap.allocate(promise);
+                                let promise_id = self.allocate_promise();
                                 let args_vec: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                                 self.stack.truncate(func_pos);
                                 match self.call_function(func_val, &args_vec) {
@@ -5819,8 +5840,7 @@ impl Vm {
                     // Handle Promise constructor
                     if func_val.is_function() && func_val.as_function() == Some(-520) {
                         let executor = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
-                        let p = JsObject::promise();
-                        let pid = self.heap.allocate(p);
+                        let pid = self.allocate_promise();
                         // Create resolve/reject sentinels
                         let resolve_val = Value::function(-600_000 - pid.0 as i32);
                         let reject_val = Value::function(-700_000 - pid.0 as i32);
