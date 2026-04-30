@@ -5790,7 +5790,8 @@ impl Vm {
                         continue;
                     }
 
-                    // Generator functions and arrow functions can't be constructors.
+                    // Generator functions, arrow functions, async functions, and
+                    // concise methods (object/class shorthand) can't be constructors.
                     if func_val.is_function() {
                         let packed = func_val.as_function().unwrap();
                         if packed > 0 {
@@ -5800,9 +5801,11 @@ impl Vm {
                                 if flags.contains(ChunkFlags::GENERATOR)
                                     || flags.contains(ChunkFlags::ARROW)
                                     || flags.contains(ChunkFlags::ASYNC)
+                                    || flags.contains(ChunkFlags::METHOD)
                                 {
                                     let kind = if flags.contains(ChunkFlags::GENERATOR) { "generator" }
                                         else if flags.contains(ChunkFlags::ASYNC) { "async function" }
+                                        else if flags.contains(ChunkFlags::METHOD) { "method" }
                                         else { "arrow function" };
                                     let msg = format!("{kind} is not a constructor");
                                     let err = self.make_native_error("TypeError", &msg);

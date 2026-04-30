@@ -2159,6 +2159,11 @@ impl<'a> Compiler<'a> {
                             self.compile_expr(expr)?;
                         }
                         self.compile_expr(&m.value)?;
+                        // Concise methods / getters / setters are not constructable.
+                        // Constructors are an exception (compiled via the explicit ctor path).
+                        if !matches!(m.kind, MethodKind::Constructor) {
+                            self.mark_last_child_as_method();
+                        }
                         match m.kind {
                             MethodKind::Get => self.chunk.emit_op(OpCode::DefineGetter, line),
                             MethodKind::Set => self.chunk.emit_op(OpCode::DefineSetter, line),
@@ -2168,6 +2173,9 @@ impl<'a> Compiler<'a> {
                         self.chunk.emit_op(OpCode::Pop, line);
                     } else {
                         self.compile_expr(&m.value)?;
+                        if !matches!(m.kind, MethodKind::Constructor) {
+                            self.mark_last_child_as_method();
+                        }
                         // For getters/setters, use __get_name__ / __set_name__ convention.
                         let actual_key = match m.kind {
                             MethodKind::Get => {
@@ -4474,6 +4482,14 @@ impl<'a> Compiler<'a> {
 
     // ---- new ----
 
+    /// Mark the most recently added child chunk as a concise method.
+    /// Concise methods have no [[Construct]] slot.
+    fn mark_last_child_as_method(&mut self) {
+        if let Some(child) = self.chunk.child_chunks.last_mut() {
+            child.flags |= ChunkFlags::METHOD;
+        }
+    }
+
     fn compile_new(&mut self, n: &NewExpression) -> Result<(), String> {
         let line = n.span.start;
         let has_spread = n.arguments.iter().any(|a| matches!(a, Expression::Spread(_)));
@@ -4577,14 +4593,20 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 self.compile_expr(&p.value)?;
+                // Concise methods (`{ method() {} }`) are not constructable.
+                if p.method {
+                    self.mark_last_child_as_method();
+                }
                 self.chunk.emit_op(OpCode::DefineDataProp, line);
             }
             PropertyKindVal::Get => {
                 self.compile_expr(&p.value)?;
+                self.mark_last_child_as_method();
                 self.chunk.emit_op(OpCode::DefineGetter, line);
             }
             PropertyKindVal::Set => {
                 self.compile_expr(&p.value)?;
+                self.mark_last_child_as_method();
                 self.chunk.emit_op(OpCode::DefineSetter, line);
             }
         }

@@ -12,6 +12,8 @@ bitflags::bitflags! {
         const ASYNC     = 0b0000_0100;
         const MODULE    = 0b0000_1000;
         const ARROW     = 0b0001_0000;
+        /// Concise method (object/class shorthand). Has no [[Construct]] slot.
+        const METHOD    = 0b0010_0000;
     }
 }
 
