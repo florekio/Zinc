@@ -3864,6 +3864,16 @@ impl<'a> Compiler<'a> {
                         }
                     }
                     Pattern::Object(obj_pat) => {
+                        // RequireObjectCoercible: throw TypeError if source is null/undefined.
+                        // Even an empty pattern {} = null must throw per spec.
+                        self.chunk.emit_op(OpCode::Dup, line);
+                        let nullish_jump = self.chunk.emit_jump(OpCode::JumpIfNullishPeek, line);
+                        self.chunk.emit_op(OpCode::Pop, line); // not nullish: drop the dup
+                        let skip_throw = self.chunk.emit_jump(OpCode::Jump, line);
+                        self.chunk.patch_jump(nullish_jump);
+                        self.chunk.emit_op(OpCode::Pop, line); // pop dup
+                        self.emit_throw_type_error("Cannot destructure 'undefined' or 'null'", line);
+                        self.chunk.patch_jump(skip_throw);
                         // Check whether there is a rest element — if so, computed keys must be saved
                         // in the VM's computed_exclusions buffer via PushComputedExclude.
                         let has_rest = obj_pat.properties.iter().any(|p| matches!(p, ObjectPatternProperty::Rest(_)));

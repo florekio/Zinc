@@ -3861,6 +3861,17 @@ impl Vm {
                     let name_id = name_val.as_string_id().unwrap();
                     let val = self.pop()?;
                     let obj_val = self.pop()?;
+                    // Setting a property on null/undefined throws TypeError.
+                    if obj_val.is_null() || obj_val.is_undefined() {
+                        let kind = if obj_val.is_null() { "null" } else { "undefined" };
+                        let name_s = self.interner.resolve(name_id).to_owned();
+                        let err = self.make_native_error(
+                            "TypeError",
+                            &format!("Cannot set properties of {kind} (setting '{name_s}')"),
+                        );
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     if obj_val.is_function() {
                         let sentinel = obj_val.as_function().unwrap();
                         // Built-in read-only properties on native sentinels (Number.MAX_VALUE,
