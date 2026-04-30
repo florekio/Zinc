@@ -4555,12 +4555,9 @@ impl<'a> Compiler<'a> {
             | PropertyKey::StringLiteral(id)
             | PropertyKey::Private(id) => *id,
             PropertyKey::NumberLiteral(n) => {
-                // Convert numeric key to its canonical string form
-                let s = if n.fract() == 0.0 && n.is_finite() && n.abs() < 1e21 {
-                    format!("{}", *n as i64)
-                } else {
-                    format!("{n}")
-                };
+                // Convert numeric key to its canonical (JS-spec) string form so
+                // e.g. 0.0000001 maps to "1e-7", not "0.0000001".
+                let s = js_canonical_number_string(*n);
                 self.interner.intern(&s)
             }
             PropertyKey::Computed(expr) => {
@@ -4890,6 +4887,27 @@ impl<'a> Compiler<'a> {
             self.chunk.emit_op(OpCode::Undefined, line);
         }
         Ok(())
+    }
+}
+
+/// Format a finite f64 the way `Number.prototype.toString` does (shortest
+/// round-trip decimal, with exponential notation for |x| < 1e-6 or |x| >= 1e21).
+fn js_canonical_number_string(f: f64) -> String {
+    if f.is_nan() { return "NaN".into(); }
+    if f.is_infinite() { return if f > 0.0 { "Infinity".into() } else { "-Infinity".into() }; }
+    if f == 0.0 { return "0".into(); }
+    let abs = f.abs();
+    if !(1e-6..1e21).contains(&abs) {
+        let raw = format!("{f:e}");
+        if let Some(epos) = raw.find('e') {
+            let exp = &raw[epos + 1..];
+            if !exp.starts_with('-') && !exp.starts_with('+') {
+                return format!("{}e+{}", &raw[..epos], exp);
+            }
+        }
+        raw
+    } else {
+        format!("{f}")
     }
 }
 

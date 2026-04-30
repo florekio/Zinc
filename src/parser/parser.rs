@@ -415,6 +415,13 @@ fn unescape_string(s: &str) -> String {
                             result.push(ch);
                         }
                 }
+                Some('\n') | Some('\u{2028}') | Some('\u{2029}') => {
+                    // LineContinuation: \<LineTerminator> emits nothing.
+                }
+                Some('\r') => {
+                    // \<CR> or \<CR><LF>: line continuation, both forms produce nothing.
+                    if chars.peek() == Some(&'\n') { chars.next(); }
+                }
                 Some(c) => {
                     // Non-escape characters: \a -> a (identity escape in sloppy mode)
                     result.push(c);
