@@ -2861,6 +2861,17 @@ impl Vm {
                                 *child += base_idx;
                             }
                         }
+                        // Direct eval inherits caller's strict mode. (Indirect eval
+                        // would always be non-strict, but we don't currently distinguish.)
+                        let caller_strict = {
+                            let cur_chunk = self.cur_chunk();
+                            self.chunks[cur_chunk].flags.contains(ChunkFlags::STRICT)
+                        };
+                        if caller_strict {
+                            for c in &mut flat_chunks {
+                                c.flags |= ChunkFlags::STRICT;
+                            }
+                        }
                         self.chunks.extend(flat_chunks);
                         // Execute inheriting the current `this` binding (spec requirement)
                         let eval_fn = Value::function(base_idx as i32);
