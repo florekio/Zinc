@@ -779,6 +779,11 @@ impl<'a> Lexer<'a> {
                 | TokenKind::TemplateLiteralFull
                 | TokenKind::TemplateLiteralTail
                 | TokenKind::RegExp
+                // Contextual keywords parsed as identifiers in expression position
+                // also end an expression — `/` after them is division, not regex.
+                | TokenKind::Of
+                | TokenKind::Let
+                | TokenKind::Static
         )
     }
 

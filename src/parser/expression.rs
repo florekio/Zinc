@@ -414,6 +414,16 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
             Ok(Expression::Identifier(Identifier { name, span }))
         }
 
+        // Contextual keywords used as plain identifiers (e.g. `var of = 1; of++`).
+        // They're only keywords in syntactic positions (for-of, class static, let
+        // declaration) — elsewhere they parse as identifier references.
+        TokenKind::Of | TokenKind::Static => {
+            let span = p.current().span;
+            let name = p.intern_current();
+            p.advance();
+            Ok(Expression::Identifier(Identifier { name, span }))
+        }
+
         // ---- Identifiers ----
         TokenKind::Identifier => {
             let name = p.intern_current();

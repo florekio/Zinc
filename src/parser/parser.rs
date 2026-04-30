@@ -230,6 +230,12 @@ impl<'a> Parser<'a> {
             let name = self.interner.intern("undefined");
             self.advance();
             Ok(name)
+        } else if self.at(TokenKind::Of) || self.at(TokenKind::Let) || self.at(TokenKind::Static) {
+            // Contextual keywords are valid identifier names (in non-strict mode at least).
+            let name = self.current_text().to_owned();
+            let id = self.interner.intern(&name);
+            self.advance();
+            Ok(id)
         } else if self.at_any(FUTURE_RESERVED_WORDS_NON_STRICT) {
             // Future reserved words are valid identifiers in non-strict mode
             let name = self.current_text().to_owned();
