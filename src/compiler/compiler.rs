@@ -1123,12 +1123,14 @@ impl<'a> Compiler<'a> {
         // For fresh-binding-simple the outer end_scope() below handles the iterator.
         self.chunk.patch_jump(exit_jump);
         self.chunk.emit_op(OpCode::Pop, line); // pop result
-        if !fresh_binding_simple {
-            self.chunk.emit_op(OpCode::Pop, line); // pop iterator
-        }
-
-        // Patch break jumps
+        // Patch break jumps to land here. Both natural exit and break go through
+        // IteratorClose; for natural exit the iter's __iter_done__ flag is set
+        // so close becomes a no-op, but for break/throw/return the iterator's
+        // .return() must run.
         self.patch_loop_breaks();
+        if !fresh_binding_simple {
+            self.chunk.emit_op(OpCode::IteratorClose, line); // close + pop iterator
+        }
 
         if !is_var { self.end_scope(); }
         Ok(())
@@ -4754,7 +4756,13 @@ impl<'a> Compiler<'a> {
 
     fn compile_template_literal(&mut self, t: &TemplateLiteral) -> Result<(), String> {
         let line = t.span.start;
-        let mut parts = 0u32;
+        // Always ensure the result of a TemplateLiteral is a string. We do this
+        // by prefixing an empty string, so concatenation with the first
+        // expression goes through Add's string-coercion path (which calls
+        // ToString on each operand and propagates throws).
+        let empty = self.interner.intern("");
+        self.emit_constant(Value::string(empty), line);
+        let mut parts = 1u32;
 
         for (i, quasi) in t.quasis.iter().enumerate() {
             let str_id = quasi.cooked.unwrap_or(quasi.raw);
@@ -4763,26 +4771,18 @@ impl<'a> Compiler<'a> {
 
             if !is_empty {
                 self.emit_constant(Value::string(str_id), line);
-                if parts > 0 {
-                    self.chunk.emit_op(OpCode::Add, line);
-                }
+                self.chunk.emit_op(OpCode::Add, line);
                 parts += 1;
             }
 
             if i < t.expressions.len() {
                 self.compile_expr(&t.expressions[i])?;
-                if parts > 0 {
-                    self.chunk.emit_op(OpCode::Add, line);
-                }
+                self.chunk.emit_op(OpCode::Add, line);
                 parts += 1;
             }
         }
 
-        if parts == 0 {
-            let empty = self.interner.intern("");
-            self.emit_constant(Value::string(empty), line);
-        }
-
+        let _ = parts;
         Ok(())
     }
 
