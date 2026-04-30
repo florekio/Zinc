@@ -3951,7 +3951,9 @@ impl Vm {
                             | (-570, "toStringTag") | (-570, "species") | (-570, "unscopables")
                             | (-570, "asyncIterator") | (-570, "matchAll")
                             | (-507, "prototype") | (-508, "prototype") | (-551, "prototype")
-                        );
+                        )
+                        // Constructor `length` and `name` are non-writable per spec.
+                        || ((-636..=-500).contains(&sentinel) && (name_str == "length" || name_str == "name"));
                         if is_readonly {
                             if in_strict {
                                 let prop = name_str.to_owned();
