@@ -6886,7 +6886,13 @@ impl Vm {
                     let name_id = name_val.as_string_id().unwrap();
                     let method_val = self.pop()?;
                     // Static class members named "prototype" throw TypeError per spec.
-                    if self.interner.resolve(name_id) == "prototype" {
+                    // The compiler mangles getter/setter names to __get_prototype__ /
+                    // __set_prototype__, so check both forms.
+                    let name_str = self.interner.resolve(name_id);
+                    if name_str == "prototype"
+                        || name_str == "__get_prototype__"
+                        || name_str == "__set_prototype__"
+                    {
                         self.throw_type_error("Cannot define static class member 'prototype'")?;
                         continue;
                     }
