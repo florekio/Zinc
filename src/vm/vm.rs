@@ -6872,8 +6872,13 @@ impl Vm {
                     let class_oid = self.heap.allocate(class_obj);
                     // Set proto.constructor = class (non-enumerable, writable, configurable)
                     let constructor_key = self.interner.intern("constructor");
+                    let class_key = self.interner.intern("__class__");
                     if let Some(proto) = self.heap.get_mut(proto_oid) {
                         proto.define_property(constructor_key, Property::with_flags(Value::object_id(class_oid), Property::WRITABLE | Property::CONFIGURABLE));
+                        // Mark the prototype with its owning class so super lookups
+                        // work even when a method is invoked on the prototype directly
+                        // (e.g. `C.prototype.method()`), where `this` is the prototype.
+                        proto.set_property(class_key, Value::object_id(class_oid));
                     }
                     self.push(Value::object_id(class_oid));
                 }
@@ -7126,9 +7131,11 @@ impl Vm {
                             // Static method context: `this` is the class itself
                             self.heap.get(oid).and_then(|o| o.get_property(super_key))
                         } else {
-                            // Instance method context: walk this.__class__.__super__.prototype
-                            self.heap.get(oid)
-                                .and_then(|obj| obj.get_property(class_key))
+                            // Instance method context: walk this.__class__.__super__.prototype.
+                            // Look up __class__ via the prototype chain so the lookup also
+                            // works when `this` is the class prototype itself
+                            // (e.g. `C.prototype.method()`).
+                            self.heap.get_property_chain(oid, class_key)
                                 .and_then(|cv| cv.as_object_id())
                                 .and_then(|cid| self.heap.get(cid))
                                 .and_then(|cls| cls.get_property(super_key))
@@ -7163,8 +7170,7 @@ impl Vm {
                     let ctor_key = self.interner.intern("__constructor__");
 
                     let super_val = this_val.as_object_id()
-                        .and_then(|oid| self.heap.get(oid))
-                        .and_then(|obj| obj.get_property(class_key))
+                        .and_then(|oid| self.heap.get_property_chain(oid, class_key))
                         .and_then(|cv| cv.as_object_id())
                         .and_then(|cid| self.heap.get(cid))
                         .and_then(|cls| cls.get_property(super_key));
