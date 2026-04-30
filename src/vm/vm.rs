@@ -7490,7 +7490,15 @@ impl Vm {
                             // GetMethod: if return is not undefined/null but not callable,
                             // throw TypeError.
                             let return_name = self.interner.intern("return");
-                            let return_fn = self.heap.get_property_chain(oid, return_name);
+                            // Accessor form: a getter for "return".
+                            let return_getter_key = self.interner.intern("__get_return__");
+                            let return_fn = if let Some(g) = self.heap.get_property_chain(oid, return_getter_key)
+                                && g.is_function()
+                            {
+                                Some(self.call_function_this(g, iter_val, &[])?)
+                            } else {
+                                self.heap.get_property_chain(oid, return_name)
+                            };
                             if let Some(fn_val) = return_fn
                                 && !fn_val.is_undefined() && !fn_val.is_null()
                             {

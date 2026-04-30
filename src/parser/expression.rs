@@ -1524,7 +1524,7 @@ fn expr_to_assignment_target(expr: Expression) -> ParseResult<AssignmentTarget> 
                         let left_pat = match a.left {
                             AssignmentTarget::Identifier(id) => Pattern::Identifier(id),
                             AssignmentTarget::Pattern(p) => p,
-                            _ => { elements.push(None); continue; }
+                            AssignmentTarget::Member(m) => Pattern::Member(m),
                         };
                         elements.push(Some(Pattern::Assignment(Box::new(AssignmentPattern {
                             left: left_pat,

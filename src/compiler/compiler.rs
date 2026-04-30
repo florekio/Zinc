@@ -3994,10 +3994,18 @@ impl<'a> Compiler<'a> {
                                         let offset = (target as i16) - (jump_idx as i16) - 3;
                                         self.chunk.code[jump_idx + 1] = (offset >> 8) as u8;
                                         self.chunk.code[jump_idx + 2] = (offset & 0xFF) as u8;
-                                        if let Pattern::Identifier(id) = &a.left {
-                                            self.compile_set_variable(id.name, line)?;
+                                        match &a.left {
+                                            Pattern::Identifier(id) => {
+                                                self.compile_set_variable(id.name, line)?;
+                                                self.chunk.emit_op(OpCode::Pop, line);
+                                            }
+                                            Pattern::Member(_)
+                                            | Pattern::Object(_)
+                                            | Pattern::Array(_) => {
+                                                self.compile_assign_to_pattern(&a.left, line)?;
+                                            }
+                                            _ => { self.chunk.emit_op(OpCode::Pop, line); }
                                         }
-                                        self.chunk.emit_op(OpCode::Pop, line);
                                     }
                                     Pattern::Object(_) | Pattern::Array(_) => {
                                         // Nested destructuring assignment: recurse via the
