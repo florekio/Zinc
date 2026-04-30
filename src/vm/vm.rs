@@ -3456,6 +3456,28 @@ impl Vm {
                             continue;
                         }
                     }
+                    // If constructor's `prototype` property has been user-set to a
+                    // non-object, throw TypeError per spec (OrdinaryHasInstance).
+                    {
+                        let proto_key = self.interner.intern("prototype");
+                        let proto_val = if constructor.is_function() {
+                            let packed = constructor.as_function().unwrap();
+                            if packed < 0 { None } else { self.fn_get_own_prop(packed, proto_key) }
+                        } else if let Some(ctor_oid) = constructor.as_object_id() {
+                            self.heap.get(ctor_oid).and_then(|o| o.get_property(proto_key))
+                        } else { None };
+                        if let Some(pv) = proto_val
+                            && !pv.is_object()
+                            && !pv.is_function()
+                        {
+                            let err = self.make_native_error(
+                                "TypeError",
+                                "Right-hand side of 'instanceof' has non-object prototype",
+                            );
+                            self.handle_throw(err)?;
+                            continue;
+                        }
+                    }
                     let result = if let Some(obj_oid) = obj.as_object_id() {
                         // Get constructor.prototype
                         let ctor_proto = if constructor.is_function() {
@@ -5719,6 +5741,24 @@ impl Vm {
                     let argc = self.read_byte() as usize;
                     let func_pos = self.stack.len() - 1 - argc;
                     let func_val = self.stack[func_pos];
+
+                    // Per spec, IsConstructor check fires AFTER args are evaluated.
+                    // If func_val is neither a function value nor a class-like object,
+                    // throw TypeError. (Class objects have a __constructor__ marker.)
+                    let is_constructable = func_val.is_function() || {
+                        if let Some(oid) = func_val.as_object_id() {
+                            let ctor_key = self.interner.intern("__constructor__");
+                            self.heap.get(oid).map(|o| {
+                                matches!(&o.kind, ObjectKind::Function(_))
+                                    || o.get_property(ctor_key).is_some()
+                            }).unwrap_or(false)
+                        } else { false }
+                    };
+                    if !is_constructable {
+                        let err = self.make_native_error("TypeError", "is not a constructor");
+                        self.handle_throw(err)?;
+                        continue;
+                    }
 
                     // Generator functions and arrow functions can't be constructors.
                     if func_val.is_function() {
