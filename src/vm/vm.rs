@@ -7487,13 +7487,21 @@ impl Vm {
                             let _ = self.exec_generator_method(oid, return_name, &[Value::undefined()]);
                         } else {
                             // Per spec IteratorClose: call iterator.return() if it exists.
-                            // If the call throws, propagate; if it returns a non-object,
+                            // GetMethod: if return is not undefined/null but not callable,
                             // throw TypeError.
                             let return_name = self.interner.intern("return");
                             let return_fn = self.heap.get_property_chain(oid, return_name);
                             if let Some(fn_val) = return_fn
-                                && fn_val.is_function()
+                                && !fn_val.is_undefined() && !fn_val.is_null()
                             {
+                                if !fn_val.is_function() {
+                                    let err = self.make_native_error(
+                                        "TypeError",
+                                        "Iterator's `return` is not callable",
+                                    );
+                                    self.handle_throw(err)?;
+                                    continue;
+                                }
                                 let result = self.call_function_this(fn_val, iter_val, &[])?;
                                 if !result.is_object() && !result.is_function() {
                                     let err = self.make_native_error(
