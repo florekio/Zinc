@@ -703,6 +703,7 @@ impl<'a> Compiler<'a> {
         let line = f.span.start;
         // Only scope for let/const
         let is_var = matches!(&f.left, ForInOfLeft::Variable(decl) if decl.kind == VarKind::Var);
+        let is_const = matches!(&f.left, ForInOfLeft::Variable(decl) if decl.kind == VarKind::Const);
         if !is_var { self.begin_scope(); }
 
         // Declare the loop variable
@@ -715,14 +716,18 @@ impl<'a> Compiler<'a> {
             ForInOfLeft::Pattern(Pattern::Identifier(id)) => Some(id.name),
             _ => None,
         };
+        let mut local_slot: Option<u8> = None;
+        let mut is_global = false;
         if let Some(name) = var_name {
             self.chunk.emit_op(OpCode::Undefined, line);
             if self.scope_depth <= 1 {
                 let idx = self.make_string_constant(name);
                 self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
+                is_global = true;
             } else {
                 self.add_local(name);
                 self.mark_initialized();
+                local_slot = Some((self.locals.len() - 1) as u8);
             }
         }
 
@@ -740,8 +745,25 @@ impl<'a> Compiler<'a> {
 
         self.chunk.emit_op(OpCode::IteratorValue, line);
         if let Some(name) = var_name {
-            self.compile_set_variable(name, line)?;
-            self.chunk.emit_op(OpCode::Pop, line);
+            // For `const x in ...`, the per-iteration BindingInitialization
+            // stores into the loop var directly (bypasses the const check).
+            // After this raw store, mark the local as const so the body's
+            // assignments throw.
+            if is_const {
+                if let Some(slot) = local_slot {
+                    self.chunk.emit_op_u8(OpCode::SetLocal, slot, line);
+                    self.chunk.emit_op(OpCode::Pop, line);
+                    self.locals[slot as usize].is_const = true;
+                } else if is_global {
+                    let idx = self.make_string_constant(name);
+                    self.chunk.emit_op_u16(OpCode::SetGlobal, idx, line);
+                    self.chunk.emit_op(OpCode::Pop, line);
+                    self.const_globals.insert(name);
+                }
+            } else {
+                self.compile_set_variable(name, line)?;
+                self.chunk.emit_op(OpCode::Pop, line);
+            }
         } else {
             self.chunk.emit_op(OpCode::Pop, line);
         }
@@ -867,6 +889,9 @@ impl<'a> Compiler<'a> {
                     self.begin_scope();
                     self.add_local(*name);
                     self.mark_initialized();
+                    if matches!(&f.left, ForInOfLeft::Variable(decl) if decl.kind == VarKind::Const) {
+                        self.locals.last_mut().unwrap().is_const = true;
+                    }
                 } else {
                     self.compile_set_variable(*name, line)?;
                     self.chunk.emit_op(OpCode::Pop, line);
