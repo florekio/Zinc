@@ -6385,7 +6385,18 @@ impl Vm {
                             .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                             .unwrap_or_default()
                     } else { vec![] };
-                    let result = self.call_function(func_val, &args)?;
+                    // Propagate `this` for super() calls with spread arguments.
+                    let is_super = self.frames.last().map(|f| f.pending_super_call).unwrap_or(false);
+                    let result = if is_super {
+                        if let Some(f) = self.frames.last_mut() {
+                            f.pending_super_call = false;
+                            f.super_called = true;
+                        }
+                        let this_val = self.frames.last().unwrap().this_value;
+                        self.call_function_this(func_val, this_val, &args)?
+                    } else {
+                        self.call_function(func_val, &args)?
+                    };
                     self.push(result);
                 }
                 OpCode::SpreadConstruct => {

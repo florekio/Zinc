@@ -4469,10 +4469,28 @@ impl<'a> Compiler<'a> {
         // super(args) — call parent constructor
         if matches!(&c.callee, Expression::Super(_)) {
             self.chunk.emit_op(OpCode::GetSuperConstructor, line);
-            for arg in &c.arguments {
-                self.compile_expr(arg)?;
+            let has_spread = c.arguments.iter().any(|a| matches!(a, Expression::Spread(_)));
+            if has_spread {
+                self.chunk.emit_op_u16(OpCode::CreateArray, 0, line);
+                let mut idx: u32 = 0;
+                for arg in &c.arguments {
+                    if let Expression::Spread(sp) = arg {
+                        self.compile_expr(&sp.argument)?;
+                        self.chunk.emit_op(OpCode::ArraySpread, line);
+                        idx = u32::MAX;
+                    } else {
+                        self.compile_expr(arg)?;
+                        self.chunk.emit_op_u32(OpCode::SetArrayItem, idx, line);
+                        if idx != u32::MAX { idx = idx.saturating_add(1); }
+                    }
+                }
+                self.chunk.emit_op_u8(OpCode::SpreadCall, 0, line);
+            } else {
+                for arg in &c.arguments {
+                    self.compile_expr(arg)?;
+                }
+                self.chunk.emit_op_u8(OpCode::Call, argc, line);
             }
-            self.chunk.emit_op_u8(OpCode::Call, argc, line);
             return Ok(());
         }
 
