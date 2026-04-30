@@ -570,7 +570,19 @@ globalThis.$DONE = $DONE;
 globalThis.fnGlobalObject = fnGlobalObject;
 globalThis.assert = assert;
 globalThis.Test262Error = Test262Error;
-var $262 = {};
+// Minimal $262 stub. Full realm semantics aren't implemented; createRealm
+// returns a fresh object that aliases the current globalThis so most tests
+// that only check for the presence of standard built-ins still work.
+var $262 = {
+    global: globalThis,
+    createRealm: function() {
+        return {
+            global: globalThis,
+            evalScript: function(s) { return eval(s); }
+        };
+    },
+    evalScript: function(s) { return eval(s); }
+};
 "#;
 
 fn run_test(source: &str, meta: &TestMeta, harness_cache: &HashMap<String, String>) -> Result<(), String> {
