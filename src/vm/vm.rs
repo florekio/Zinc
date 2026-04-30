@@ -3945,6 +3945,13 @@ impl Vm {
                             continue;
                         }
                         self.fn_property_overrides.insert((sentinel, name_id), Some(val));
+                        // Keep func_prototypes in sync so `obj instanceof F` reads
+                        // the user-set prototype, not the auto-generated one.
+                        if name_str == "prototype"
+                            && let Some(proto_oid) = val.as_object_id()
+                        {
+                            self.func_prototypes.insert(sentinel, proto_oid);
+                        }
                     } else if let Some(oid) = obj_val.as_object_id() {
                         // Check for setter
                         let name_str = self.interner.resolve(name_id).to_owned();
