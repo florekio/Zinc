@@ -7027,6 +7027,25 @@ impl Vm {
                     let super_val = self.pop()?;
                     let class_val = self.peek()?;
 
+                    // Per spec, the heritage value must be either null or a
+                    // constructor (function / class object). Throw TypeError
+                    // for anything else.
+                    let heritage_ok = super_val.is_null()
+                        || super_val.is_function()
+                        || super_val.as_object_id().and_then(|oid| self.heap.get(oid)).map(|o| {
+                            let ctor_key = self.interner.intern("__constructor__");
+                            matches!(&o.kind, ObjectKind::Function(_))
+                                || o.get_property(ctor_key).is_some()
+                        }).unwrap_or(false);
+                    if !heritage_ok {
+                        let err = self.make_native_error(
+                            "TypeError",
+                            "Class extends value is not a constructor",
+                        );
+                        self.handle_throw(err)?;
+                        continue;
+                    }
+
                     if let Some(class_oid) = class_val.as_object_id() {
                         let proto_key = self.interner.intern("prototype");
 
