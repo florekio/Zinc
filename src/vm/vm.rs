@@ -3950,7 +3950,21 @@ impl Vm {
                         if let Some(sfn) = setter_fn
                             && sfn.is_function()
                         {
-                            let _ = self.call_function_this(sfn, obj_val, &[val]);
+                            // Protect the call so any throw bubbles back to us
+                            // rather than being caught by an outer try block
+                            // before SetProperty's stack manipulation completes.
+                            let prev_protect = self.protect_throw_depth;
+                            self.protect_throw_depth = self.frames.len() + 1;
+                            let r = self.call_function_this(sfn, obj_val, &[val]);
+                            self.protect_throw_depth = prev_protect;
+                            match r {
+                                Ok(_) => {}
+                                Err(VmError::Throw(v)) => {
+                                    self.handle_throw(v)?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            }
                         } else {
                             // Strict-mode check: assigning to a non-writable own data
                             // property, accessor without a setter, or non-extensible
@@ -4222,7 +4236,15 @@ impl Vm {
                             let setter_key = self.interner.intern(&format!("__set_{name_str}__"));
                             if let Some(sfn) = self.heap.get_property_chain(oid, setter_key)
                                 && sfn.is_function() {
-                                    let _ = self.call_function_this(sfn, obj_val, &[val]);
+                                    let prev_protect = self.protect_throw_depth;
+                                    self.protect_throw_depth = self.frames.len() + 1;
+                                    let r = self.call_function_this(sfn, obj_val, &[val]);
+                                    self.protect_throw_depth = prev_protect;
+                                    match r {
+                                        Ok(_) => {}
+                                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                                        Err(e) => return Err(e),
+                                    }
                                     self.push(val);
                                     continue;
                                 }
@@ -4357,7 +4379,15 @@ impl Vm {
                         let setter_key = self.interner.intern(&setter_key_str);
                         let setter_fn = self.heap.get_property_chain(oid, setter_key);
                         if let Some(sfn) = setter_fn && sfn.is_function() {
-                            let _ = self.call_function_this(sfn, obj_val, &[value]);
+                            let prev_protect = self.protect_throw_depth;
+                            self.protect_throw_depth = self.frames.len() + 1;
+                            let r = self.call_function_this(sfn, obj_val, &[value]);
+                            self.protect_throw_depth = prev_protect;
+                            match r {
+                                Ok(_) => {}
+                                Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                                Err(e) => return Err(e),
+                            }
                         } else {
                             // If a private getter exists but no setter, the field is an
                             // accessor without a setter — PrivateSet must throw TypeError.
