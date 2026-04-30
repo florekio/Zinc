@@ -1896,6 +1896,12 @@ impl Vm {
                     let b_is_str = b_prim.is_string() || self.is_cons_string(b_prim) || self.is_string_wrapper(b_prim);
 
                     if a_is_str || b_is_str {
+                        // Per spec, when ToString runs on a Symbol it throws TypeError.
+                        if a_prim.is_symbol() || b_prim.is_symbol() {
+                            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a string");
+                            self.handle_throw(err)?;
+                            continue;
+                        }
                         // Normalize each side to a string-like value (TAG_STRING or ConsString)
                         let left_val = if self.is_string_like(a_prim) {
                             a_prim
@@ -1935,6 +1941,17 @@ impl Vm {
                             self.push(Value::object_id(oid));
                         }
                     } else {
+                        // ToNumber(lhs) before ToNumber(rhs); both throw on Symbol.
+                        if a_prim.is_symbol() {
+                            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+                            self.handle_throw(err)?;
+                            continue;
+                        }
+                        if b_prim.is_symbol() {
+                            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+                            self.handle_throw(err)?;
+                            continue;
+                        }
                         let na = self.to_f64(a_prim);
                         let nb = self.to_f64(b_prim);
                         self.push_number(na + nb);
@@ -3948,6 +3965,17 @@ impl Vm {
                 OpCode::GetElement => {
                     let key = self.pop()?;
                     let obj_val = self.pop()?;
+                    // RequireObjectCoercible: null/undefined base throws TypeError
+                    // BEFORE ToPropertyKey runs on the key.
+                    if obj_val.is_null() || obj_val.is_undefined() {
+                        let kind = if obj_val.is_null() { "null" } else { "undefined" };
+                        let err = self.make_native_error(
+                            "TypeError",
+                            &format!("Cannot read properties of {kind}"),
+                        );
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     // ToPropertyKey: coerce non-string/non-symbol/non-numeric keys
                     // (undefined, null, boolean, function, object) to their string form.
                     let key = if key.is_undefined() {
@@ -4103,6 +4131,18 @@ impl Vm {
                 OpCode::SetElement => {
                     let val = self.pop()?;
                     let key = self.pop()?;
+                    let obj_val = self.pop()?;
+                    // RequireObjectCoercible: null/undefined base throws TypeError
+                    // BEFORE ToPropertyKey runs on the key.
+                    if obj_val.is_null() || obj_val.is_undefined() {
+                        let kind = if obj_val.is_null() { "null" } else { "undefined" };
+                        let err = self.make_native_error(
+                            "TypeError",
+                            &format!("Cannot set properties of {kind}"),
+                        );
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     // ToPropertyKey: flatten ConsString and coerce non-primitive keys.
                     let key = if self.is_cons_string(key) {
                         let flat = self.flatten_cons_to_string(key);
@@ -4117,7 +4157,6 @@ impl Vm {
                         let s = self.value_to_string(key);
                         Value::string(self.interner.intern(&s))
                     } else { key };
-                    let obj_val = self.pop()?;
                     if let Some(oid) = obj_val.as_object_id()
                         && let Some(obj) = self.heap.get_mut(oid)
                     {
@@ -5079,7 +5118,13 @@ impl Vm {
                                 let key_val = args.get(1).copied().unwrap_or(Value::undefined());
                                 let desc_val = args.get(2).copied().unwrap_or(Value::undefined());
                                 if let Some(target_oid) = target.as_object_id() {
-                                    let key_str = self.value_to_string(key_val);
+                                    // Symbol keys use the __sym_N__ encoding so accessor
+                                    // lookups (e.g. @@toPrimitive) resolve correctly.
+                                    let key_str = if key_val.is_symbol() {
+                                        format!("__sym_{}__", key_val.as_symbol_id().unwrap())
+                                    } else {
+                                        self.value_to_string(key_val)
+                                    };
                                     let key_id = self.interner.intern(&key_str);
 
                                     let mut flags = Property::ALL;

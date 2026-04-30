@@ -1355,9 +1355,20 @@ impl Vm {
             // primitive coercion" (return object as-is for back-compat with
             // string contexts) from "all methods returned objects" (throw TypeError).
             let mut tried_method = false;
-            // Check for Symbol.toPrimitive method
-            let sym_key = self.interner.intern(&format!("__sym_{}__", self.sym_to_primitive));
-            if let Some(tp_fn) = self.heap.get_property_chain(oid, sym_key)
+            // Check for Symbol.toPrimitive method (data or accessor).
+            let sym_key_str = format!("__sym_{}__", self.sym_to_primitive);
+            let sym_key = self.interner.intern(&sym_key_str);
+            // Accessor form: __get___sym_N___ — defineProperty stores accessors
+            // under __get_<key>__ where <key> is the Symbol-encoded key.
+            let sym_getter_key = self.interner.intern(&format!("__get_{sym_key_str}__"));
+            let tp_fn = if let Some(getter) = self.heap.get_property_chain(oid, sym_getter_key)
+                && getter.is_function()
+            {
+                Some(self.call_function_this(getter, val, &[])?)
+            } else {
+                self.heap.get_property_chain(oid, sym_key)
+            };
+            if let Some(tp_fn) = tp_fn
                 && tp_fn.is_function()
             {
                 let hint = self.interner.intern(hint_str);
