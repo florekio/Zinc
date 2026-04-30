@@ -3918,6 +3918,30 @@ impl<'a> Compiler<'a> {
                                         self.compile_set_variable(id.name, line)?;
                                         self.chunk.emit_op(OpCode::Pop, line);
                                     }
+                                    Pattern::Member(m) => {
+                                        // Stack: [..., source, value]. Assign value to obj.prop.
+                                        self.compile_expr(&m.object)?;
+                                        match &m.property {
+                                            MemberProperty::Identifier(id) => {
+                                                let idx = self.make_string_constant(*id);
+                                                self.chunk.emit_op(OpCode::Swap, line);
+                                                self.emit_set_property(idx, line);
+                                                self.chunk.emit_op(OpCode::Pop, line);
+                                            }
+                                            MemberProperty::Expression(expr) => {
+                                                self.compile_expr(expr)?;
+                                                // [value, obj, key] -> [obj, key, value]
+                                                self.chunk.emit_op(OpCode::Rot3, line);
+                                                self.chunk.emit_op(OpCode::Rot3, line);
+                                                self.chunk.emit_op(OpCode::SetElement, line);
+                                                self.chunk.emit_op(OpCode::Pop, line);
+                                            }
+                                            _ => {
+                                                self.chunk.emit_op(OpCode::Pop, line);
+                                                self.chunk.emit_op(OpCode::Pop, line);
+                                            }
+                                        }
+                                    }
                                     Pattern::Assignment(a) => {
                                         self.chunk.emit_op(OpCode::Dup, line);
                                         self.chunk.emit_op(OpCode::Undefined, line);

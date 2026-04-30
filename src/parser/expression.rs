@@ -1562,12 +1562,13 @@ fn expr_to_assignment_target(expr: Expression) -> ParseResult<AssignmentTarget> 
                     ObjectProperty::Property(p) => {
                         let value_pat = match p.value {
                             Expression::Identifier(id) => Pattern::Identifier(id),
+                            Expression::Member(m) => Pattern::Member(m),
                             Expression::Assignment(a) => {
                                 // { x = default } or { key: x = default }
                                 let left_pat = match a.left {
                                     AssignmentTarget::Identifier(id) => Pattern::Identifier(id),
                                     AssignmentTarget::Pattern(p) => p,
-                                    _ => continue,
+                                    AssignmentTarget::Member(m) => Pattern::Member(m),
                                 };
                                 Pattern::Assignment(Box::new(AssignmentPattern {
                                     left: left_pat,
