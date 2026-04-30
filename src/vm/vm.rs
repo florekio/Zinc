@@ -3006,13 +3006,24 @@ impl Vm {
                         continue;
                     }
 
-                    // Only throw TypeError for explicit non-callable primitives.
-                    // Leave undefined alone to avoid breaking unimplemented built-ins.
+                    // Throw TypeError for non-callable values: primitives and
+                    // ordinary objects (objects that aren't function-like).
                     let is_explicit_nonfunc = func_val.is_null()
                         || func_val.as_bool().is_some()
                         || func_val.is_number()
                         || func_val.is_int()
-                        || (func_val.is_string() && func_val.as_string_id().is_some());
+                        || (func_val.is_string() && func_val.as_string_id().is_some())
+                        || (func_val.is_object() && !func_val.is_function() && {
+                            // Treat object as non-callable when its kind isn't Function
+                            // and it doesn't have a __constructor__ marker (class).
+                            if let Some(oid) = func_val.as_object_id() {
+                                let ctor_key = self.interner.intern("__constructor__");
+                                self.heap.get(oid).map(|o| {
+                                    !matches!(&o.kind, ObjectKind::Function(_))
+                                        && o.get_property(ctor_key).is_none()
+                                }).unwrap_or(true)
+                            } else { true }
+                        });
                     if is_explicit_nonfunc {
                         let type_name = if func_val.is_null() { "null".to_owned() }
                             else if let Some(b) = func_val.as_bool() { b.to_string() }
