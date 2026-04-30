@@ -7495,7 +7495,15 @@ impl Vm {
                             let return_fn = if let Some(g) = self.heap.get_property_chain(oid, return_getter_key)
                                 && g.is_function()
                             {
-                                Some(self.call_function_this(g, iter_val, &[])?)
+                                let prev_protect = self.protect_throw_depth;
+                                self.protect_throw_depth = self.frames.len() + 1;
+                                let r = self.call_function_this(g, iter_val, &[]);
+                                self.protect_throw_depth = prev_protect;
+                                match r {
+                                    Ok(v) => Some(v),
+                                    Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                                    Err(e) => return Err(e),
+                                }
                             } else {
                                 self.heap.get_property_chain(oid, return_name)
                             };
