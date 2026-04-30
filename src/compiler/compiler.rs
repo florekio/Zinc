@@ -3642,11 +3642,17 @@ impl<'a> Compiler<'a> {
                 } else {
                     self.compile_get_variable(id.name, line)?;
 
-                    // Logical assignment operators need short-circuit.
+                    // Logical assignment operators need short-circuit. Per spec,
+                    // when the RHS is an anonymous function definition and the
+                    // LHS is an identifier, NamedEvaluation gives it the LHS name.
+                    let lazy_name = if Self::is_anonymous_fn_def(&a.right) {
+                        Some(id.name)
+                    } else { None };
                     match a.operator {
                         AssignmentOperator::AndAssign => {
                             let jump = self.chunk.emit_jump(OpCode::JumpIfFalsePeek, line);
                             self.chunk.emit_op(OpCode::Pop, line);
+                            if let Some(n) = lazy_name { self.pending_function_name = Some(n); }
                             self.compile_expr(&a.right)?;
                             self.chunk.patch_jump(jump);
                             self.compile_set_variable(id.name, line)?;
@@ -3655,6 +3661,7 @@ impl<'a> Compiler<'a> {
                         AssignmentOperator::OrAssign => {
                             let jump = self.chunk.emit_jump(OpCode::JumpIfTruePeek, line);
                             self.chunk.emit_op(OpCode::Pop, line);
+                            if let Some(n) = lazy_name { self.pending_function_name = Some(n); }
                             self.compile_expr(&a.right)?;
                             self.chunk.patch_jump(jump);
                             self.compile_set_variable(id.name, line)?;
@@ -3665,6 +3672,7 @@ impl<'a> Compiler<'a> {
                             let end = self.chunk.emit_jump(OpCode::Jump, line);
                             self.chunk.patch_jump(jump);
                             self.chunk.emit_op(OpCode::Pop, line);
+                            if let Some(n) = lazy_name { self.pending_function_name = Some(n); }
                             self.compile_expr(&a.right)?;
                             self.chunk.patch_jump(end);
                             self.compile_set_variable(id.name, line)?;
