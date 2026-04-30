@@ -94,6 +94,10 @@ pub struct Compiler<'a> {
     /// Stack of active finally blocks (None if try has no finally). Used to
     /// inline finally code before break/continue that exits the try block.
     finally_stack: Vec<Option<std::rc::Rc<Vec<Statement>>>>,
+    /// Depth of nested class bodies. Class bodies (including method bodies)
+    /// are implicitly strict per spec; tracking this lets
+    /// compile_function_body_with_self set the STRICT flag for class methods.
+    class_depth: u32,
 }
 
 impl<'a> Compiler<'a> {
@@ -116,6 +120,7 @@ impl<'a> Compiler<'a> {
             pending_label: None,
             pending_function_name: None,
             finally_stack: Vec::new(),
+            class_depth: 0,
         }
     }
 
@@ -2136,6 +2141,14 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_class_body(&mut self, body: &ClassBody, line: u32) -> Result<(), String> {
+        // Class bodies (including method bodies) are implicitly strict.
+        self.class_depth += 1;
+        let r = self.compile_class_body_inner(body, line);
+        self.class_depth -= 1;
+        r
+    }
+
+    fn compile_class_body_inner(&mut self, body: &ClassBody, line: u32) -> Result<(), String> {
         for member in &body.body {
             match member {
                 ClassMember::Method(m) => {
@@ -2805,8 +2818,12 @@ impl<'a> Compiler<'a> {
         if is_generator {
             flags |= ChunkFlags::GENERATOR;
         }
-        // Inherit strict mode from parent, or detect "use strict" directive
-        if self.chunk.flags.contains(ChunkFlags::STRICT) || self.has_use_strict_directive(&body.body) {
+        // Inherit strict mode from parent, or detect "use strict" directive,
+        // or if we're inside a class body (class methods are implicitly strict).
+        if self.chunk.flags.contains(ChunkFlags::STRICT)
+            || self.has_use_strict_directive(&body.body)
+            || self.class_depth > 0
+        {
             flags |= ChunkFlags::STRICT;
         }
         child_chunk.flags = flags;
