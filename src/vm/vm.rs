@@ -7378,7 +7378,13 @@ impl Vm {
                                     // Array: yield "0", "1", "2", ...
                                     (0..elems.len()).map(|i| self.interner.intern(&i.to_string())).collect()
                                 } else {
-                                    // Object: walk prototype chain
+                                    // Object: walk prototype chain. Per spec
+                                    // OrdinaryOwnPropertyKeys + EnumerateObjectProperties,
+                                    // a property name encountered on a child shadows the
+                                    // same name on any prototype regardless of its
+                                    // enumerability — only enumerable own properties are
+                                    // emitted, but non-enumerable ones still mark the
+                                    // name as seen.
                                     let mut all_keys = Vec::new();
                                     let mut seen = std::collections::HashSet::new();
                                     let mut cur = Some(oid);
@@ -7388,8 +7394,9 @@ impl Vm {
                                         if let Some(obj) = self.heap.get(cid) {
                                             for &(k, ref p) in &obj.properties {
                                                 let ks = self.interner.resolve(k);
-                                                if p.is_enumerable() && seen.insert(k)
-                                                    && !is_internal_key(ks) {
+                                                if is_internal_key(ks) { continue; }
+                                                let first_seen = seen.insert(k);
+                                                if first_seen && p.is_enumerable() {
                                                     all_keys.push(k);
                                                 }
                                             }
