@@ -110,6 +110,7 @@ pub(crate) struct CallFrame {
     /// If Some, this frame belongs to a generator object.
     pub(crate) generator_id: Option<crate::runtime::object::ObjectId>,
     /// Number of actual arguments passed to this function call.
+    #[allow(dead_code)]
     pub(crate) argc: usize,
     /// Snapshot of the actual argument values, captured at call time before
     /// locals can overwrite the same stack slots (needed for `arguments` object).
@@ -3228,11 +3229,15 @@ impl Vm {
                     let target_slot = self.read_byte() as usize;
                     let frame = self.frames.last().unwrap();
                     let base = frame.base;
-                    let argc = frame.argc;
-                    // Collect args from start_idx..argc into an array
+                    // Use the actual call-site argc (saved_args.len()) rather than
+                    // the padded `argc`, so undefined slots added to satisfy
+                    // expected formals don't bleed into the rest array.
+                    let actual_argc = frame.saved_args.len();
                     let mut rest_elements = Vec::new();
-                    for i in start_idx..argc {
-                        if base + i < self.stack.len() {
+                    for i in start_idx..actual_argc {
+                        if i < frame.saved_args.len() {
+                            rest_elements.push(frame.saved_args[i]);
+                        } else if base + i < self.stack.len() {
                             rest_elements.push(self.stack[base + i]);
                         }
                     }
