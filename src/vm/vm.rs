@@ -6963,7 +6963,9 @@ impl Vm {
                     let name_key = self.interner.intern("name");
                     class_obj.define_property(name_key, Property::with_flags(Value::string(class_name_id), Property::CONFIGURABLE));
                     let proto_key = self.interner.intern("prototype");
-                    class_obj.set_property(proto_key, Value::object_id(proto_oid));
+                    // class.prototype is non-enumerable, non-writable, non-configurable
+                    // for class declarations (per spec MakeClassConstructor).
+                    class_obj.define_property(proto_key, Property::with_flags(Value::object_id(proto_oid), 0));
                     // Mark as class with default constructor (so typeof returns "function").
                     // Stored as an internal key so it doesn't appear in enumeration.
                     let ctor_key = self.interner.intern("__constructor__");
