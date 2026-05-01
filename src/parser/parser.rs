@@ -370,6 +370,25 @@ fn unescape_string(s: &str) -> String {
                 Some('"') => result.push('"'),
                 Some('`') => result.push('`'),
                 Some('0') if !matches!(chars.peek(), Some('0'..='9')) => result.push('\0'),
+                // Legacy octal escape sequences (Annex B.1.2): \0..\7 followed
+                // by additional octal digits, total up to three.
+                Some(c @ '0'..='7') => {
+                    let mut value = (c as u32) - ('0' as u32);
+                    let max_more = if c <= '3' { 2 } else { 1 };
+                    for _ in 0..max_more {
+                        if let Some(&nc) = chars.peek()
+                            && matches!(nc, '0'..='7')
+                        {
+                            chars.next();
+                            value = value * 8 + (nc as u32 - '0' as u32);
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(ch) = char::from_u32(value) {
+                        result.push(ch);
+                    }
+                }
                 Some('u') => {
                     // \uXXXX or \u{XXXX}
                     let code = if chars.peek() == Some(&'{') {
