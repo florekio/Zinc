@@ -3339,10 +3339,10 @@ impl Vm {
                     } else if obj_val.is_function() {
                         if let Some(key_id) = key.as_string_id() {
                             let sentinel = obj_val.as_function().unwrap();
-                            let key_s = self.interner.resolve(key_id).to_owned();
-                            if matches!(key_s.as_str(), "name" | "length") {
-                                self.fn_property_overrides.insert((sentinel, key_id), None);
-                            }
+                            // Mark the property as deleted so subsequent reads see undefined.
+                            // For "name" / "length" the standard descriptor would otherwise
+                            // resurface; for other user-set properties this clears them.
+                            self.fn_property_overrides.insert((sentinel, key_id), None);
                         }
                         true
                     } else {

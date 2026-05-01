@@ -863,12 +863,13 @@ fn parse_function_declaration(p: &mut Parser, is_async: bool) -> ParseResult<Sta
     p.expect(TokenKind::Function)?;
     let is_generator = p.eat(TokenKind::Star);
 
-    let id = if p.at(TokenKind::Identifier) {
-        let name = p.intern_current();
-        p.advance();
-        Some(name)
-    } else {
+    // Function name accepts identifier or contextual keywords (yield/await are
+    // only reserved inside generator/async bodies; here we are still in the
+    // outer scope when reading the function name).
+    let id = if p.at(TokenKind::LParen) {
         None
+    } else {
+        Some(p.expect_binding_identifier()?)
     };
 
     let params = parse_params(p)?;
