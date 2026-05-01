@@ -37,6 +37,19 @@ impl<'a> Lexer<'a> {
 
     /// Tokenize the entire source, returning all tokens.
     pub fn tokenize(&mut self) -> Vec<Token> {
+        // Hashbang comment (`#!`) is allowed only at the very start of the
+        // source. Consume up to the line terminator before regular tokenization.
+        if self.cursor.pos() == 0
+            && self.cursor.peek() == Some(b'#')
+            && self.cursor.peek_at(1) == Some(b'!')
+        {
+            self.cursor.advance();
+            self.cursor.advance();
+            while let Some(b) = self.cursor.peek() {
+                if matches!(b, b'\n' | b'\r') { break; }
+                self.cursor.advance();
+            }
+        }
         let mut tokens = Vec::new();
         loop {
             let tok = self.next_token();
