@@ -1160,6 +1160,9 @@ impl Vm {
             if let Some(oid) = val.as_object_id()
                 && let Some(obj) = self.heap.get(oid) {
                     if matches!(obj.kind, ObjectKind::ConsString { .. }) { return "string"; }
+                    // Function-kind objects (bound functions, native sentinels wrapped
+                    // as objects, bytecode functions stored as objects) report "function".
+                    if matches!(obj.kind, ObjectKind::Function(_)) { return "function"; }
                     // Classes have __constructor__ — typeof should be "function"
                     for &(k, _) in &obj.properties {
                         if self.interner.resolve(k) == "__constructor__" { return "function"; }
@@ -7084,6 +7087,35 @@ impl Vm {
                         );
                         self.handle_throw(err)?;
                         continue;
+                    }
+
+                    // Per spec (ClassDefinitionEvaluation): the heritage value's
+                    // `prototype` property must be either an object or null.
+                    // Bound functions (and similar exotic callables) lack one,
+                    // which makes them invalid superclass values.
+                    if !super_val.is_null() {
+                        let proto_key_check = self.interner.intern("prototype");
+                        let parent_proto = if let Some(soid) = super_val.as_object_id() {
+                            self.heap.get_property_chain(soid, proto_key_check)
+                        } else { None };
+                        if let Some(pp) = parent_proto {
+                            if !pp.is_null() && !pp.is_object() {
+                                let err = self.make_native_error(
+                                    "TypeError",
+                                    "Class extends value's prototype is not an object or null",
+                                );
+                                self.handle_throw(err)?;
+                                continue;
+                            }
+                        } else if super_val.as_object_id().is_some() {
+                            // Object superclass with no prototype property at all.
+                            let err = self.make_native_error(
+                                "TypeError",
+                                "Class extends value's prototype is not an object or null",
+                            );
+                            self.handle_throw(err)?;
+                            continue;
+                        }
                     }
 
                     if let Some(class_oid) = class_val.as_object_id() {
