@@ -4668,6 +4668,9 @@ impl<'a> Compiler<'a> {
             }
             PropertyKey::Computed(expr) => {
                 self.compile_expr(expr)?;
+                // Per spec, ComputedPropertyName runs ToPropertyKey before the value
+                // expression, so any toString side effects are observable.
+                self.chunk.emit_op(OpCode::ToPropertyKey, line);
             }
         }
         Ok(())

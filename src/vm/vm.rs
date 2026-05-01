@@ -4280,6 +4280,16 @@ impl Vm {
                     } else if key.is_function() {
                         let s = self.value_to_string(key);
                         Value::string(self.interner.intern(&s))
+                    } else if key.is_object() && !key.is_symbol() {
+                        // Object keys: invoke ToPrimitive(string) so the user's toString
+                        // (or valueOf) runs and the result is used as the property name.
+                        let prim = self.try_coerce_to_primitive_hint(key, "string")?;
+                        if prim.is_symbol() {
+                            prim
+                        } else {
+                            let s = self.value_to_string(prim);
+                            Value::string(self.interner.intern(&s))
+                        }
                     } else { key };
                     if let Some(oid) = obj_val.as_object_id()
                         && let Some(obj) = self.heap.get_mut(oid)
@@ -8187,9 +8197,24 @@ impl Vm {
                 }
 
                 OpCode::ToPropertyKey => {
-                    return Err(VmError::RuntimeError(
-                        "ToPropertyKey not yet implemented".into(),
-                    ));
+                    // Spec ToPropertyKey: ToPrimitive(arg, "string"); if symbol return as-is,
+                    // else ToString. Pop the key, push the converted value back.
+                    let key = self.pop()?;
+                    let prim = if key.is_object() && !key.is_symbol() {
+                        self.try_coerce_to_primitive_hint(key, "string")?
+                    } else {
+                        key
+                    };
+                    let result = if prim.is_symbol() || prim.is_string() {
+                        prim
+                    } else if self.is_cons_string(prim) {
+                        let s = self.flatten_cons_to_string(prim);
+                        Value::string(self.interner.intern(&s))
+                    } else {
+                        let s = self.value_to_string(prim);
+                        Value::string(self.interner.intern(&s))
+                    };
+                    self.push(result);
                 }
 
                 OpCode::SetFunctionName => {
