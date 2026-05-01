@@ -332,6 +332,10 @@ impl Vm {
         let mut bool_proto = JsObject::ordinary();
         bool_proto.prototype = Some(object_prototype);
         bool_proto.define_property(ctor_key, Property::with_flags(Value::function(-506), Property::WRITABLE | Property::CONFIGURABLE));
+        let bool_ts_key = interner.intern("toString");
+        bool_proto.define_property(bool_ts_key, Property::with_flags(Value::function(-630), Property::WRITABLE | Property::CONFIGURABLE));
+        let bool_vo_key = interner.intern("valueOf");
+        bool_proto.define_property(bool_vo_key, Property::with_flags(Value::function(-631), Property::WRITABLE | Property::CONFIGURABLE));
         let boolean_prototype = heap.allocate(bool_proto);
         func_prototypes.insert(-506i32, boolean_prototype);
 
@@ -339,6 +343,10 @@ impl Vm {
         let mut num_proto = JsObject::ordinary();
         num_proto.prototype = Some(object_prototype);
         num_proto.define_property(ctor_key, Property::with_flags(Value::function(-505), Property::WRITABLE | Property::CONFIGURABLE));
+        let num_ts_key = interner.intern("toString");
+        num_proto.define_property(num_ts_key, Property::with_flags(Value::function(-632), Property::WRITABLE | Property::CONFIGURABLE));
+        let num_vo_key = interner.intern("valueOf");
+        num_proto.define_property(num_vo_key, Property::with_flags(Value::function(-633), Property::WRITABLE | Property::CONFIGURABLE));
         let number_prototype = heap.allocate(num_proto);
         func_prototypes.insert(-505i32, number_prototype);
 
@@ -346,6 +354,10 @@ impl Vm {
         let mut str_proto = JsObject::ordinary();
         str_proto.prototype = Some(object_prototype);
         str_proto.define_property(ctor_key, Property::with_flags(Value::function(-504), Property::WRITABLE | Property::CONFIGURABLE));
+        let str_ts_key = interner.intern("toString");
+        str_proto.define_property(str_ts_key, Property::with_flags(Value::function(-634), Property::WRITABLE | Property::CONFIGURABLE));
+        let str_vo_key = interner.intern("valueOf");
+        str_proto.define_property(str_vo_key, Property::with_flags(Value::function(-635), Property::WRITABLE | Property::CONFIGURABLE));
         let string_prototype = heap.allocate(str_proto);
         func_prototypes.insert(-504i32, string_prototype);
 
@@ -2956,7 +2968,7 @@ impl Vm {
                             self.push(result);
                             continue;
                         }
-                        if (-629..=-590).contains(&sentinel) {
+                        if (-635..=-590).contains(&sentinel) {
                             // Native this-dependent methods called standalone (this=undefined)
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                             let result = self.exec_native_method(sentinel, Value::undefined(), &args);
@@ -4947,6 +4959,23 @@ impl Vm {
                                     self.push(Value::string(id));
                                     continue;
                                 }
+                                // Wrapper objects (new Boolean/Number/String) format as
+                                // their wrapped primitive value, matching the per-type
+                                // toString defined on Boolean/Number/String.prototype.
+                                if let Some(o) = self.heap.get(oid)
+                                    && let ObjectKind::Wrapper(inner) = &o.kind
+                                {
+                                    let inner = *inner;
+                                    let s = if inner.is_boolean() {
+                                        if inner.to_boolean() { "true".to_owned() } else { "false".to_owned() }
+                                    } else {
+                                        self.value_to_string(inner)
+                                    };
+                                    let id = self.interner.intern(&s);
+                                    self.stack.truncate(obj_pos);
+                                    self.push(Value::string(id));
+                                    continue;
+                                }
                                 // Return [object Type] string
                                 let tag = if let Some(o) = self.heap.get(oid) {
                                     match &o.kind {
@@ -4967,6 +4996,15 @@ impl Vm {
                                 continue;
                             }
                             "valueOf" => {
+                                // Wrapper objects valueOf returns the wrapped primitive.
+                                if let Some(o) = self.heap.get(oid)
+                                    && let ObjectKind::Wrapper(inner) = &o.kind
+                                {
+                                    let inner = *inner;
+                                    self.stack.truncate(obj_pos);
+                                    self.push(inner);
+                                    continue;
+                                }
                                 self.stack.truncate(obj_pos);
                                 self.push(obj_val);
                                 continue;

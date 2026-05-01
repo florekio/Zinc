@@ -1299,6 +1299,60 @@ impl Vm {
             -597 => { // Function.prototype.bind — should be intercepted by CallMethod, fallback here
                 Value::undefined()
             }
+            // Boolean.prototype.toString / valueOf — unwrap a Boolean primitive or wrapper.
+            -630 | -631 => {
+                let inner = if this_val.is_boolean() {
+                    this_val
+                } else if let Some(oid) = this_val.as_object_id()
+                    && let Some(obj) = self.heap.get(oid)
+                    && let ObjectKind::Wrapper(v) = &obj.kind
+                    && v.is_boolean()
+                {
+                    *v
+                } else {
+                    return Value::undefined();
+                };
+                if sentinel == -630 {
+                    let s = if inner.to_boolean() { "true" } else { "false" };
+                    Value::string(self.interner.intern(s))
+                } else {
+                    inner
+                }
+            }
+            // Number.prototype.toString / valueOf — unwrap a Number primitive or wrapper.
+            -632 | -633 => {
+                let inner = if this_val.is_int() || this_val.is_number() {
+                    this_val
+                } else if let Some(oid) = this_val.as_object_id()
+                    && let Some(obj) = self.heap.get(oid)
+                    && let ObjectKind::Wrapper(v) = &obj.kind
+                    && (v.is_int() || v.is_number())
+                {
+                    *v
+                } else {
+                    return Value::undefined();
+                };
+                if sentinel == -632 {
+                    let s = self.value_to_string(inner);
+                    Value::string(self.interner.intern(&s))
+                } else {
+                    inner
+                }
+            }
+            // String.prototype.toString / valueOf — unwrap a String primitive or wrapper.
+            -634 | -635 => {
+                if this_val.is_string() {
+                    this_val
+                } else if let Some(oid) = this_val.as_object_id()
+                    && let Some(obj) = self.heap.get(oid)
+                    && let ObjectKind::Wrapper(v) = &obj.kind
+                    && v.is_string()
+                {
+                    *v
+                } else {
+                    Value::undefined()
+                }
+            }
             // Array.prototype methods: dispatch via exec_array_method using this_val as array
             sentinel if (-629..=-600).contains(&sentinel) => {
                 let method_name = match sentinel {
