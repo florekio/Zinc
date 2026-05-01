@@ -3351,6 +3351,19 @@ impl<'a> Compiler<'a> {
 
     fn compile_binary(&mut self, b: &BinaryExpression) -> Result<(), String> {
         let line = b.span.start;
+        // `#name in obj` — PrivateIdentifier is parsed as an Identifier with a
+        // leading `#`. Detect that exact form here and emit HasPrivate.
+        if b.operator == BinaryOperator::In
+            && let Expression::Identifier(id) = &b.left
+        {
+            let name = self.interner.resolve(id.name).to_owned();
+            if name.starts_with('#') {
+                self.compile_expr(&b.right)?;
+                let cidx = self.chunk.add_constant(crate::runtime::value::Value::string(id.name));
+                self.chunk.emit_op_u16(OpCode::HasPrivate, cidx, b.span.start);
+                return Ok(());
+            }
+        }
         self.compile_expr(&b.left)?;
         self.compile_expr(&b.right)?;
         let op = match b.operator {

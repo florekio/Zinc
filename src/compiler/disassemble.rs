@@ -127,7 +127,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         }
 
         OpCode::GetSuper
-        | OpCode::GetPrivate | OpCode::SetPrivate
+        | OpCode::GetPrivate | OpCode::SetPrivate | OpCode::HasPrivate
         | OpCode::DefineMethod | OpCode::Class
         | OpCode::ClassStaticMethod | OpCode::ClassMethod
         | OpCode::ClassField | OpCode::ClassStaticField | OpCode::ClassPrivateMethod

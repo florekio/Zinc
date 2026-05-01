@@ -4539,6 +4539,33 @@ impl Vm {
                     self.push(value);
                 }
 
+                OpCode::HasPrivate => {
+                    // `#name in obj` — check whether the object exposes the
+                    // private name as a field, method, or accessor on the
+                    // prototype chain. Per spec, RHS must be an object.
+                    let name_idx = self.read_u16() as usize;
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
+                    let name_id = name_val.as_string_id().unwrap();
+                    let obj_val = self.pop()?;
+                    let Some(oid) = obj_val.as_object_id() else {
+                        let err = self.make_native_error(
+                            "TypeError",
+                            "Cannot use 'in' operator to search for private name in non-object",
+                        );
+                        self.handle_throw(err)?;
+                        continue;
+                    };
+                    let name_str = self.interner.resolve(name_id).to_owned();
+                    let priv_key = self.interner.intern(&format!("__priv_{name_str}__"));
+                    let getter_key = self.interner.intern(&format!("__get_{name_str}__"));
+                    let setter_key = self.interner.intern(&format!("__set_{name_str}__"));
+                    let has = self.heap.get_property_chain(oid, priv_key).is_some()
+                        || self.heap.get_property_chain(oid, getter_key).is_some()
+                        || self.heap.get_property_chain(oid, setter_key).is_some()
+                        || self.heap.get_property_chain(oid, name_id).is_some();
+                    self.push(Value::boolean(has));
+                }
+
                 OpCode::CallMethod => {
                     let argc = self.read_byte() as usize;
                     let method_name_idx = self.read_u16() as usize;

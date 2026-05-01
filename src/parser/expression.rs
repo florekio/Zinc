@@ -424,6 +424,15 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
             Ok(Expression::Identifier(Identifier { name, span }))
         }
 
+        // `#name in obj` — only valid in this exact form per spec. Other
+        // appearances of a leading PrivateIdentifier are rejected later.
+        TokenKind::PrivateIdentifier => {
+            let span = p.current().span;
+            let name = p.intern_current();
+            p.advance();
+            Ok(Expression::Identifier(Identifier { name, span }))
+        }
+
         // ---- Identifiers ----
         TokenKind::Identifier => {
             let name = p.intern_current();

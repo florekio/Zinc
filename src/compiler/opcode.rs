@@ -179,6 +179,8 @@ pub enum OpCode {
     GetPrivate = 0x87,
     /// Set private field #name (u16 name)
     SetPrivate = 0x88,
+    /// `#name in obj` (u16 name): pops obj, pushes boolean
+    HasPrivate = 0x89,
 
     // ---- Function Calls ----
     /// Call function (u8 argc): stack=[fn, arg0..argN]
@@ -379,7 +381,7 @@ impl OpCode {
             | 0x50..=0x55
             | 0x60..=0x67
             | 0x70..=0x7C
-            | 0x80..=0x88
+            | 0x80..=0x89
             | 0x90..=0x97
             | 0xA0..=0xAA
             | 0xB0..=0xB1
@@ -529,6 +531,7 @@ impl OpCode {
             | OpCode::OptionalChain
             | OpCode::GetPrivate
             | OpCode::SetPrivate
+            | OpCode::HasPrivate
             | OpCode::CreateArray
             | OpCode::DefineMethod
             | OpCode::Closure
