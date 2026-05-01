@@ -5545,21 +5545,37 @@ impl Vm {
                                     let raw_props: Vec<StringId> = self.heap.get(oid)
                                         .map(|o| o.properties.iter().map(|(k, _)| *k).collect())
                                         .unwrap_or_default();
+                                    // Per spec OrdinaryOwnPropertyKeys: integer indices
+                                    // come first in ascending numeric order, then the
+                                    // remaining string keys in insertion order.
+                                    let mut numeric: Vec<(u32, String)> = Vec::new();
+                                    let mut string_keys: Vec<String> = Vec::new();
                                     for k in raw_props {
                                         let s = self.interner.resolve(k).to_owned();
-                                        // Convert __get_X__ / __set_X__ → X
                                         let real = if (s.starts_with("__get_") || s.starts_with("__set_")) && s.ends_with("__") {
                                             s[6..s.len()-2].to_owned()
                                         } else if is_internal_key(&s) {
-                                            // Skip other internal keys (__class__, __priv_#x__, etc.)
                                             continue;
                                         } else {
-                                            s.clone()
+                                            s
                                         };
-                                        if seen.insert(real.clone()) {
-                                            let id = self.interner.intern(&real);
-                                            names.push(Value::string(id));
+                                        if !seen.insert(real.clone()) { continue; }
+                                        if let Ok(n) = real.parse::<u32>()
+                                            && n.to_string() == real
+                                        {
+                                            numeric.push((n, real));
+                                        } else {
+                                            string_keys.push(real);
                                         }
+                                    }
+                                    numeric.sort_by_key(|&(n, _)| n);
+                                    for (_, s) in numeric {
+                                        let id = self.interner.intern(&s);
+                                        names.push(Value::string(id));
+                                    }
+                                    for s in string_keys {
+                                        let id = self.interner.intern(&s);
+                                        names.push(Value::string(id));
                                     }
                                     let arr = JsObject::array(names);
                                     Value::object_id(self.heap.allocate(arr))
