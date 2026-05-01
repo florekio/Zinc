@@ -327,6 +327,15 @@ impl<'a> Parser<'a> {
         } else if text.starts_with("0b") || text.starts_with("0B") {
             let clean: String = text[2..].chars().filter(|&c| c != '_').collect();
             i64::from_str_radix(&clean, 2).unwrap_or(0) as f64
+        } else if text.len() > 1
+            && text.starts_with('0')
+            && text.bytes().all(|b| b.is_ascii_digit())
+            && text.bytes().all(|b| matches!(b, b'0'..=b'7'))
+        {
+            // Legacy octal integer literal (Annex B.1.1): a leading 0 followed
+            // only by octal digits is parsed as octal in non-strict mode. Any
+            // 8/9 digit, decimal point, or exponent makes it a regular decimal.
+            i64::from_str_radix(text, 8).unwrap_or(0) as f64
         } else {
             let clean: String = text.chars().filter(|&c| c != '_').collect();
             clean.parse::<f64>().unwrap_or(f64::NAN)
