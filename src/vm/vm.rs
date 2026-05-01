@@ -126,6 +126,10 @@ pub(crate) struct CallFrame {
     /// True once `super()` has been called inside this constructor frame.
     /// Used together with `is_derived_ctor` to detect missing-super returns.
     pub(crate) super_called: bool,
+    /// The `new.target` value for this frame: the constructor used in the
+    /// `new` expression, or `undefined` for non-constructor calls. Arrow
+    /// functions inherit this from the enclosing scope at call time.
+    pub(crate) new_target: Value,
 }
 
 /// An active exception handler (pushed by PushExcHandler).
@@ -553,7 +557,7 @@ impl Vm {
         
         Self {
             chunks,
-            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::object_id(global_this_oid), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0, saved_args: Vec::new(), arguments_oid: None, is_derived_ctor: false, super_called: false }],
+            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::object_id(global_this_oid), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0, saved_args: Vec::new(), arguments_oid: None, is_derived_ctor: false, super_called: false, new_target: Value::undefined() }],
             stack: Vec::with_capacity(256),
             globals,
             interner,
@@ -2682,6 +2686,13 @@ impl Vm {
                             let saved_args: Vec<Value> = (0..actual_argc)
                                 .map(|i| self.stack.get(func_pos + 1 + i).copied().unwrap_or(Value::undefined()))
                                 .collect();
+                            // Arrow functions inherit new.target from the enclosing
+                            // scope; ordinary calls (not via `new`) have new.target = undefined.
+                            let new_target = if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
+                                self.frames.last().map(|f| f.new_target).unwrap_or(Value::undefined())
+                            } else {
+                                Value::undefined()
+                            };
                             self.frames.push(CallFrame {
                                 chunk_idx,
                                 ip: 0,
@@ -2693,6 +2704,7 @@ impl Vm {
                                 generator_id: None,
                                 argc,
                                 saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
+                                new_target,
                             });
                             continue;
                         }
@@ -5062,6 +5074,7 @@ impl Vm {
                                         upvalues, this_value: obj_val, is_constructor: false,
                                         pending_super_call: false, generator_id: None, argc,
                                         saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
+                                        new_target: Value::undefined(),
                                     });
                                     continue;
                                 }
@@ -6308,6 +6321,7 @@ impl Vm {
                                         pending_super_call: false, generator_id: None, argc,
                                         saved_args, arguments_oid: None,
                                         is_derived_ctor: is_derived, super_called: false,
+                                        new_target: func_val,
                                     });
                                     continue;
                                 }
@@ -6379,6 +6393,7 @@ impl Vm {
                                 generator_id: None,
                                 argc,
                                 saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
+                                new_target: func_val,
                             });
                             continue;
                         }
@@ -8057,7 +8072,12 @@ impl Vm {
 
                 OpCode::Debugger => { /* no-op in non-debug mode */ }
 
-                OpCode::NewTarget | OpCode::ImportMeta => {
+                OpCode::NewTarget => {
+                    let nt = self.frames.last().map(|f| f.new_target).unwrap_or(Value::undefined());
+                    self.push(nt);
+                }
+
+                OpCode::ImportMeta => {
                     return Err(VmError::RuntimeError(format!(
                         "{opcode:?} not yet implemented"
                     )));

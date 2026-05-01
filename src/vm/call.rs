@@ -136,11 +136,19 @@ impl Vm {
 
         let stop_depth = self.frames.len();
 
+        // Arrow functions inherit new.target from the enclosing scope; ordinary
+        // calls (not via `new`) have new.target = undefined.
+        let new_target = if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
+            self.frames.last().map(|f| f.new_target).unwrap_or(Value::undefined())
+        } else {
+            Value::undefined()
+        };
         self.frames.push(CallFrame {
             chunk_idx, ip: 0, base: func_pos + 1,
             upvalues, this_value: effective_this, is_constructor: false,
             pending_super_call: false, generator_id: None, argc: args.len(),
             saved_args: args.to_vec(), arguments_oid: None, is_derived_ctor: false, super_called: false,
+            new_target,
         });
 
         // Run using the full main dispatch loop, stopping when our frame returns.

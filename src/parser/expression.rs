@@ -757,6 +757,23 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
         // ---- new ----
         TokenKind::New => {
             p.advance();
+            // `new.target` meta-property — only valid inside a function body but
+            // syntactically belongs here. The compiler emits OpCode::NewTarget,
+            // which returns undefined outside a constructor call.
+            if p.at(TokenKind::Dot) {
+                p.advance();
+                if !p.at(TokenKind::Identifier) || p.current_text() != "target" {
+                    return Err(ParseError::expected("'target' after 'new.'", p.current_kind(), p.current().span));
+                }
+                let meta = p.interner.intern("new");
+                let property = p.interner.intern("target");
+                p.advance();
+                return Ok(Expression::MetaProperty(MetaProperty {
+                    meta,
+                    property,
+                    span: Span::new(start, p.pos()),
+                }));
+            }
             // Parse callee at BP 31 (higher than call BP 30) so () is NOT consumed as a call
             let mut callee = parse_expression(p, 31)?;
             // Per spec, `new MemberExpression(args)` allows `.`/`[]` chains in

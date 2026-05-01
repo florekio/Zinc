@@ -149,6 +149,7 @@ impl Vm {
                     argc,
                     saved_args,
                     arguments_oid: None, is_derived_ctor: false, super_called: false,
+                    new_target: Value::undefined(),
                 });
 
                 // For SuspendedYield, the input becomes the result of the yield expression
