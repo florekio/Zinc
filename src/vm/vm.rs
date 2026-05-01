@@ -130,6 +130,10 @@ pub(crate) struct CallFrame {
     /// `new` expression, or `undefined` for non-constructor calls. Arrow
     /// functions inherit this from the enclosing scope at call time.
     pub(crate) new_target: Value,
+    /// Set by the Call opcode while dispatching a `super()` call. After the
+    /// parent constructor returns and yields an object, the child constructor
+    /// must rebind its `this` to that object (per spec BindThisValue).
+    pub(crate) await_super_result: bool,
 }
 
 /// An active exception handler (pushed by PushExcHandler).
@@ -569,7 +573,7 @@ impl Vm {
         
         Self {
             chunks,
-            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::object_id(global_this_oid), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0, saved_args: Vec::new(), arguments_oid: None, is_derived_ctor: false, super_called: false, new_target: Value::undefined() }],
+            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::object_id(global_this_oid), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0, saved_args: Vec::new(), arguments_oid: None, is_derived_ctor: false, super_called: false, new_target: Value::undefined(), await_super_result: false }],
             stack: Vec::with_capacity(256),
             globals,
             interner,
@@ -2682,7 +2686,12 @@ impl Vm {
                             // Check if this is a super() call
                             let is_super = self.frames.last().map(|f| f.pending_super_call).unwrap_or(false);
                             let this_val = if is_super {
-                                if let Some(f) = self.frames.last_mut() { f.pending_super_call = false; }
+                                if let Some(f) = self.frames.last_mut() {
+                                    f.pending_super_call = false;
+                                    // Mark caller so the parent ctor's return value can rebind
+                                    // `this` per BindThisValue.
+                                    f.await_super_result = true;
+                                }
                                 self.frames.last().unwrap().this_value
                             } else if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
                                 // Arrow functions inherit `this` from enclosing scope
@@ -2717,6 +2726,7 @@ impl Vm {
                                 argc,
                                 saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
                                 new_target,
+                                await_super_result: false,
                             });
                             continue;
                         }
@@ -3103,6 +3113,16 @@ impl Vm {
                     if frame.is_constructor && !result.is_object() && !result.is_function() {
                         result = frame.this_value;
                     }
+                    // BindThisValue: if the caller is awaiting a super() result, rebind
+                    // its `this` to whatever the parent constructor produced.
+                    if let Some(caller) = self.frames.last_mut()
+                        && caller.await_super_result
+                    {
+                        caller.await_super_result = false;
+                        if result.is_object() {
+                            caller.this_value = result;
+                        }
+                    }
                     // Generator return: mark completed, produce {value, done: true}
                     if let Some(gid) = frame.generator_id {
                         if let Some(obj) = self.heap.get_mut(gid)
@@ -3144,6 +3164,15 @@ impl Vm {
                     let result = if frame.is_constructor { frame.this_value } else { Value::undefined() };
                     if !self.closure_upvalues.is_empty() {
                         self.close_upvalues_above(frame.base.saturating_sub(1));
+                    }
+                    // BindThisValue: see Return opcode for context.
+                    if let Some(caller) = self.frames.last_mut()
+                        && caller.await_super_result
+                    {
+                        caller.await_super_result = false;
+                        if result.is_object() {
+                            caller.this_value = result;
+                        }
                     }
                     // Generator return: mark completed, produce {value: undefined, done: true}
                     if let Some(gid) = frame.generator_id {
@@ -5123,6 +5152,7 @@ impl Vm {
                                         pending_super_call: false, generator_id: None, argc,
                                         saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
                                         new_target: Value::undefined(),
+                                        await_super_result: false,
                                     });
                                     continue;
                                 }
@@ -6407,6 +6437,7 @@ impl Vm {
                                         saved_args, arguments_oid: None,
                                         is_derived_ctor: is_derived, super_called: false,
                                         new_target: func_val,
+                                        await_super_result: false,
                                     });
                                     continue;
                                 }
@@ -6479,6 +6510,7 @@ impl Vm {
                                 argc,
                                 saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
                                 new_target: func_val,
+                                await_super_result: false,
                             });
                             continue;
                         }

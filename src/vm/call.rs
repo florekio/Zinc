@@ -149,6 +149,7 @@ impl Vm {
             pending_super_call: false, generator_id: None, argc: args.len(),
             saved_args: args.to_vec(), arguments_oid: None, is_derived_ctor: false, super_called: false,
             new_target,
+            await_super_result: false,
         });
 
         // Run using the full main dispatch loop, stopping when our frame returns.
