@@ -5184,14 +5184,35 @@ impl Vm {
                                             .unwrap_or_default();
                                         let mut numeric: Vec<(u64, StringId)> = Vec::new();
                                         let mut string: Vec<StringId> = Vec::new();
+                                        let mut seen: std::collections::HashSet<StringId> = std::collections::HashSet::new();
                                         for (k, en) in props {
                                             if !en { continue; }
-                                            let name = self.interner.resolve(k);
-                                            if is_internal_key(name) { continue; }
+                                            // Accessor properties are stored under
+                                            // __get_NAME__ / __set_NAME__ — surface the
+                                            // bare NAME and dedupe so a paired getter/setter
+                                            // produces one entry.
+                                            let accessor_inner = {
+                                                let name = self.interner.resolve(k);
+                                                if let Some(rest) = name.strip_prefix("__get_").and_then(|s| s.strip_suffix("__")) {
+                                                    Some(rest.to_owned())
+                                                } else if let Some(rest) = name.strip_prefix("__set_").and_then(|s| s.strip_suffix("__")) {
+                                                    Some(rest.to_owned())
+                                                } else if is_internal_key(name) {
+                                                    continue;
+                                                } else {
+                                                    None
+                                                }
+                                            };
+                                            let key = match accessor_inner {
+                                                Some(s) => self.interner.intern(&s),
+                                                None => k,
+                                            };
+                                            if !seen.insert(key) { continue; }
+                                            let name = self.interner.resolve(key);
                                             if let Ok(n) = name.parse::<u64>() {
-                                                numeric.push((n, k));
+                                                numeric.push((n, key));
                                             } else {
-                                                string.push(k);
+                                                string.push(key);
                                             }
                                         }
                                         numeric.sort_by_key(|&(n, _)| n);
@@ -6923,19 +6944,20 @@ impl Vm {
                     let mut proto = JsObject::ordinary();
                     proto.prototype = Some(self.object_prototype);
                     let proto_oid = self.heap.allocate(proto);
-                    // The class itself is represented as an ordinary object with a __proto__ property
+                    // The class itself is represented as an ordinary object with a __proto__ property.
+                    // Per spec, function objects expose `length`, `name`, `prototype` own
+                    // properties in that order (visible in Object.getOwnPropertyNames).
                     let mut class_obj = JsObject::ordinary();
-                    let proto_key = self.interner.intern("prototype");
-                    class_obj.set_property(proto_key, Value::object_id(proto_oid));
-                    // Mark as class with default constructor (so typeof returns "function")
-                    let ctor_key = self.interner.intern("__constructor__");
-                    class_obj.set_property(ctor_key, Value::undefined());
-                    // Set name: non-writable, non-enumerable, configurable
-                    let name_key = self.interner.intern("name");
-                    class_obj.define_property(name_key, Property::with_flags(Value::string(class_name_id), Property::CONFIGURABLE));
-                    // Set length: 0 default (updated when constructor is found)
                     let length_key = self.interner.intern("length");
                     class_obj.define_property(length_key, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
+                    let name_key = self.interner.intern("name");
+                    class_obj.define_property(name_key, Property::with_flags(Value::string(class_name_id), Property::CONFIGURABLE));
+                    let proto_key = self.interner.intern("prototype");
+                    class_obj.set_property(proto_key, Value::object_id(proto_oid));
+                    // Mark as class with default constructor (so typeof returns "function").
+                    // Stored as an internal key so it doesn't appear in enumeration.
+                    let ctor_key = self.interner.intern("__constructor__");
+                    class_obj.set_property(ctor_key, Value::undefined());
                     let class_oid = self.heap.allocate(class_obj);
                     // Set proto.constructor = class (non-enumerable, writable, configurable)
                     let constructor_key = self.interner.intern("constructor");
