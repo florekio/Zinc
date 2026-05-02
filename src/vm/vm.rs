@@ -4120,22 +4120,45 @@ impl Vm {
                                 Err(e) => return Err(e),
                             }
                         } else {
-                            // Strict-mode check: assigning to a non-writable own data
-                            // property, accessor without a setter, or non-extensible
-                            // object's missing property must throw TypeError.
+                            // Strict-mode check: assigning to a non-writable data
+                            // property anywhere on the prototype chain, an accessor
+                            // without a setter, or a non-extensible object's missing
+                            // property must throw TypeError.
                             let in_strict = self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT);
                             let is_readonly_own = self.heap.get(oid).and_then(|o| {
                                 o.get_property_descriptor(name_id).filter(|p| !p.is_writable())
                             }).is_some();
+                            // Walk prototype chain for an inherited non-writable data
+                            // property only when no own property exists.
+                            let has_own_data = self.heap.get(oid)
+                                .map(|o| o.has_own_property(name_id))
+                                .unwrap_or(false);
+                            let is_readonly_proto = if !has_own_data {
+                                let mut cur = self.heap.get(oid).and_then(|o| o.prototype);
+                                let mut depth = 0;
+                                let mut found = false;
+                                while let Some(pid) = cur {
+                                    if depth > 64 { break; }
+                                    if let Some(p) = self.heap.get(pid) {
+                                        if let Some(desc) = p.get_property_descriptor(name_id) {
+                                            if !desc.is_writable() { found = true; }
+                                            break;
+                                        }
+                                        cur = p.prototype;
+                                    } else { break; }
+                                    depth += 1;
+                                }
+                                found
+                            } else { false };
                             let extensible = self.heap.get(oid).map(|o| o.extensible).unwrap_or(true);
                             let has_own = self.heap.get(oid)
                                 .map(|o| o.has_own_property(name_id))
                                 .unwrap_or(false);
-                            if in_strict && (is_readonly_own || has_getter || (!extensible && !has_own)) {
+                            if in_strict && (is_readonly_own || is_readonly_proto || has_getter || (!extensible && !has_own)) {
                                 let prop = self.interner.resolve(name_id).to_owned();
                                 let msg = if has_getter {
                                     format!("Cannot set property '{prop}' which has only a getter")
-                                } else if is_readonly_own {
+                                } else if is_readonly_own || is_readonly_proto {
                                     format!("Cannot assign to read only property '{prop}'")
                                 } else {
                                     format!("Cannot add property {prop}, object is not extensible")
@@ -4146,6 +4169,12 @@ impl Vm {
                             }
                             // In non-strict mode with a getter and no setter, silently fail.
                             if has_getter {
+                                self.push(val);
+                                continue;
+                            }
+                            // Non-strict: silently no-op when an inherited
+                            // non-writable property would be shadowed.
+                            if is_readonly_proto {
                                 self.push(val);
                                 continue;
                             }
@@ -6843,7 +6872,19 @@ impl Vm {
                                             continue;
                                         }
                                     };
-                                    let iter_val = self.call_function_this(iter_fn, source, &[])?;
+                                    // Protect the @@iterator / next / value reads so any
+                                    // throw they produce bubbles back here rather than
+                                    // being caught by an outer try/catch — handle_throw
+                                    // is the right place to route the error.
+                                    let prev_protect = self.protect_throw_depth;
+                                    self.protect_throw_depth = self.frames.len() + 1;
+                                    let iter_call = self.call_function_this(iter_fn, source, &[]);
+                                    self.protect_throw_depth = prev_protect;
+                                    let iter_val = match iter_call {
+                                        Ok(v) => v,
+                                        Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                                        Err(e) => return Err(e),
+                                    };
                                     if !iter_val.is_object() {
                                         let err = self.make_native_error(
                                             "TypeError",
@@ -6866,7 +6907,15 @@ impl Vm {
                                             self.handle_throw(err)?;
                                             break;
                                         }
-                                        let step = self.call_function_this(next_fn, iter_val, &[])?;
+                                        let prev_protect = self.protect_throw_depth;
+                                        self.protect_throw_depth = self.frames.len() + 1;
+                                        let step_call = self.call_function_this(next_fn, iter_val, &[]);
+                                        self.protect_throw_depth = prev_protect;
+                                        let step = match step_call {
+                                            Ok(v) => v,
+                                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; break; }
+                                            Err(e) => return Err(e),
+                                        };
                                         if !step.is_object() {
                                             let err = self.make_native_error(
                                                 "TypeError",
