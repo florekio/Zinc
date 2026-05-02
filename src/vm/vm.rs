@@ -1922,15 +1922,17 @@ impl Vm {
                     let b = self.pop()?;
                     let a = self.pop()?;
 
-                    // ToPrimitive for objects before type check (throws propagate via VmError::Throw)
-                    let a_prim = if a.is_object() {
+                    // ToPrimitive for objects/functions before type check
+                    // (throws propagate via VmError::Throw). try_coerce_to_primitive_hint
+                    // also handles function-tagged Values.
+                    let a_prim = if a.is_object() || a.is_function() {
                         match self.try_coerce_to_primitive_hint(a, "default") {
                             Ok(v) => v,
                             Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                             Err(e) => return Err(e),
                         }
                     } else { a };
-                    let b_prim = if b.is_object() {
+                    let b_prim = if b.is_object() || b.is_function() {
                         match self.try_coerce_to_primitive_hint(b, "default") {
                             Ok(v) => v,
                             Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
@@ -5156,6 +5158,32 @@ impl Vm {
                                 let result = self.is_prototype_of(obj_val, target);
                                 self.stack.truncate(obj_pos);
                                 self.push(Value::boolean(result));
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // toString / valueOf on function values
+                    if obj_val.is_function() {
+                        let mn = self.interner.resolve(method_name).to_owned();
+                        match mn.as_str() {
+                            "toString" => {
+                                let sentinel = obj_val.as_function().unwrap();
+                                let name_id = self.interner.intern("name");
+                                let name = self.fn_get_own_prop(sentinel, name_id)
+                                    .and_then(|v| v.as_string_id())
+                                    .map(|sid| self.interner.resolve(sid).to_owned())
+                                    .unwrap_or_default();
+                                let s = format!("function {name}() {{ [native code] }}");
+                                let id = self.interner.intern(&s);
+                                self.stack.truncate(obj_pos);
+                                self.push(Value::string(id));
+                                continue;
+                            }
+                            "valueOf" => {
+                                self.stack.truncate(obj_pos);
+                                self.push(obj_val);
                                 continue;
                             }
                             _ => {}

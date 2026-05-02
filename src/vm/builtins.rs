@@ -1425,6 +1425,20 @@ impl Vm {
     }
 
     fn try_coerce_to_primitive_hint_inner(&mut self, val: Value, hint_str: &str) -> Result<Value, super::vm::VmError> {
+        // Function values are tagged primitives in the VM but spec-wise are
+        // ordinary objects. Coerce them to a string via the canonical
+        // toString form so they participate in '+' / '<' / '==' correctly.
+        if val.is_function() {
+            let _ = hint_str;
+            let sentinel = val.as_function().unwrap();
+            let name_id = self.interner.intern("name");
+            let name = self.fn_get_own_prop(sentinel, name_id)
+                .and_then(|v| v.as_string_id())
+                .map(|sid| self.interner.resolve(sid).to_owned())
+                .unwrap_or_default();
+            let formatted = format!("function {name}() {{ [native code] }}");
+            return Ok(Value::string(self.interner.intern(&formatted)));
+        }
         if let Some(oid) = val.as_object_id() {
             if let Some(obj) = self.heap.get(oid)
                 && let ObjectKind::Wrapper(inner) = &obj.kind {
