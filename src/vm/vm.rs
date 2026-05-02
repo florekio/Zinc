@@ -4212,9 +4212,16 @@ impl Vm {
                                 self.push(val);
                                 continue;
                             }
-                            // Float index
-                            if let Some(idx) = key.as_number() {
-                                let val = elements.get(idx as usize).copied().unwrap_or(Value::undefined());
+                            // Float index — only canonical integers count as
+                            // array indices; fractional numbers fall through
+                            // to string-property lookup.
+                            if let Some(n) = key.as_number()
+                                && n >= 0.0
+                                && n.fract() == 0.0
+                                && n.is_finite()
+                                && n < 4_294_967_295.0
+                            {
+                                let val = elements.get(n as usize).copied().unwrap_or(Value::undefined());
                                 self.push(val);
                                 continue;
                             }
@@ -4234,10 +4241,13 @@ impl Vm {
                             }
                         }
                         // String property lookup — check getter first, then plain property
-                        // Flatten ConsString keys before lookup
+                        // Flatten ConsString and numeric keys to strings before lookup.
                         let key = if self.is_cons_string(key) {
                             let flat = self.flatten_cons_to_string(key);
                             Value::string(self.interner.intern(&flat))
+                        } else if key.as_number().is_some() && key.as_string_id().is_none() {
+                            let s = self.value_to_string(key);
+                            Value::string(self.interner.intern(&s))
                         } else { key };
                         if let Some(name_id) = key.as_string_id() {
                             let name_str = self.interner.resolve(name_id).to_owned();
@@ -4384,8 +4394,16 @@ impl Vm {
                                 self.push(val);
                                 continue;
                             }
-                            if let Some(idx) = key.as_number() {
-                                let idx = idx as usize;
+                            // Per spec, only canonical-integer keys in [0, 2^32 - 1)
+                            // count as array indices. Fractional numbers like 1.1
+                            // become string-keyed properties on the object.
+                            if let Some(n) = key.as_number()
+                                && n >= 0.0
+                                && n.fract() == 0.0
+                                && n.is_finite()
+                                && n < 4_294_967_295.0
+                            {
+                                let idx = n as usize;
                                 while elements.len() <= idx {
                                     elements.push(Value::undefined());
                                 }
@@ -4394,6 +4412,11 @@ impl Vm {
                                 continue;
                             }
                         }
+                        // Numeric non-array-index keys become string-keyed properties.
+                        let key = if key.as_number().is_some() && key.as_string_id().is_none() {
+                            let s = self.value_to_string(key);
+                            Value::string(self.interner.intern(&s))
+                        } else { key };
                         if let Some(name_id) = key.as_string_id() {
                             // Check for setter first
                             let name_str = self.interner.resolve(name_id).to_owned();
