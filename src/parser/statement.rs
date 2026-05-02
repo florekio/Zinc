@@ -398,7 +398,10 @@ fn parse_do_while(p: &mut Parser) -> ParseResult<Statement> {
     p.expect(TokenKind::LParen)?;
     let test = parse_expression(p, 0)?;
     p.expect(TokenKind::RParen)?;
-    p.expect_semicolon()?;
+    // Per spec, ASI after the `)` of a do-while applies even without a line
+    // terminator: the semicolon is treated as inserted whenever the next
+    // token would otherwise be invalid here.
+    let _ = p.eat(TokenKind::Semicolon);
     Ok(Statement::DoWhile(Box::new(DoWhileStatement {
         body,
         test,
