@@ -4612,6 +4612,18 @@ impl Vm {
                     let obj_pos = self.stack.len() - 1 - argc;
                     let obj_val = self.stack[obj_pos];
 
+                    // Per spec, calling a method on null/undefined throws TypeError
+                    // before the method is even read.
+                    if obj_val.is_null() || obj_val.is_undefined() {
+                        let kind = if obj_val.is_null() { "null" } else { "undefined" };
+                        let prop = self.interner.resolve(method_name).to_owned();
+                        let msg = format!("Cannot read properties of {kind} (reading '{prop}')");
+                        self.stack.truncate(obj_pos);
+                        let err = self.make_native_error("TypeError", &msg);
+                        self.handle_throw(err)?;
+                        continue;
+                    }
+
                     // Look up the method on the object (walking prototype chain)
                     let method_val = if let Some(oid) = obj_val.as_object_id() {
                         self.heap.get_property_chain(oid, method_name)
