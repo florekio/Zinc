@@ -913,7 +913,7 @@ impl Vm {
             "sqrt" => a().sqrt(),
             "cbrt" => a().cbrt(),
             "sign" => a().signum(),
-            "pow" => a().powf(b()),
+            "pow" => { let av = a(); let bv = b(); if av.abs() == 1.0 && bv.is_infinite() { f64::NAN } else { av.powf(bv) } },
             "log" => a().ln(),
             "log2" => a().log2(),
             "log10" => a().log10(),
@@ -1003,7 +1003,7 @@ impl Vm {
             -704 => a0.ceil(),
             -705 => a0.round(),
             -706 => a0.sqrt(),
-            -707 => a0.powf(a1),
+            -707 => { if a0.abs() == 1.0 && a1.is_infinite() { f64::NAN } else { a0.powf(a1) } },
             -708 => { // max
                 if args.is_empty() { return Value::number(f64::NEG_INFINITY); }
                 let mut m = f64::NEG_INFINITY;

@@ -2038,7 +2038,16 @@ impl Vm {
 
                 OpCode::Exp => {
                     match self.pop_numbers() {
-                        Ok((a, b)) => self.push_number(a.powf(b)),
+                        Ok((a, b)) => {
+                            // Per spec, if abs(base) is 1 and exponent is ±∞, the result
+                            // is NaN. Rust's powf follows IEEE 754 and returns 1 here.
+                            let result = if a.abs() == 1.0 && b.is_infinite() {
+                                f64::NAN
+                            } else {
+                                a.powf(b)
+                            };
+                            self.push_number(result);
+                        }
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
                     }
@@ -4998,7 +5007,12 @@ impl Vm {
                                 "ceil" => Value::number(self.to_f64(arg0).ceil()),
                                 "round" => Value::number(self.to_f64(arg0).round()),
                                 "sqrt" => Value::number(self.to_f64(arg0).sqrt()),
-                                "pow" => Value::number(self.to_f64(arg0).powf(self.to_f64(arg1))),
+                                "pow" => {
+                                    let av = self.to_f64(arg0);
+                                    let bv = self.to_f64(arg1);
+                                    let r = if av.abs() == 1.0 && bv.is_infinite() { f64::NAN } else { av.powf(bv) };
+                                    Value::number(r)
+                                },
                                 "max" => Value::number(self.to_f64(arg0).max(self.to_f64(arg1))),
                                 "min" => Value::number(self.to_f64(arg0).min(self.to_f64(arg1))),
                                 _ => {
