@@ -386,6 +386,8 @@ impl Vm {
         let message_key_ep = interner.intern("message");
         let empty_str_ep = interner.intern("");
         error_proto.define_property(message_key_ep, Property::with_flags(Value::string(empty_str_ep), Property::WRITABLE | Property::CONFIGURABLE));
+        let constructor_key_ep = interner.intern("constructor");
+        error_proto.define_property(constructor_key_ep, Property::with_flags(Value::function(-510), Property::WRITABLE | Property::CONFIGURABLE));
         let error_prototype_oid = heap.allocate(error_proto);
         func_prototypes.insert(-510i32, error_prototype_oid);
 
@@ -402,6 +404,8 @@ impl Vm {
             let message_key = interner.intern("message");
             let empty_str = interner.intern("");
             proto.define_property(message_key, Property::with_flags(Value::string(empty_str), Property::WRITABLE | Property::CONFIGURABLE));
+            let ctor_key = interner.intern("constructor");
+            proto.define_property(ctor_key, Property::with_flags(Value::function(sentinel), Property::WRITABLE | Property::CONFIGURABLE));
             let ep = heap.allocate(proto);
             func_prototypes.insert(sentinel, ep);
         }
@@ -3457,6 +3461,13 @@ impl Vm {
                     // Otherwise: remove from both maps. Returns true even for unresolvable
                     // (per spec, `delete x` where x has no binding succeeds).
                     self.globals.remove(&name_id);
+                    // Also clear the Vec-based fast path so subsequent reads go
+                    // through the slow lookup and miss correctly.
+                    let idx = name_id.0 as usize;
+                    if idx < self.globals_vec.len() {
+                        self.globals_vec[idx] = Value::null();
+                    }
+                    self.global_version += 1;
                     if let Some(obj) = self.heap.get_mut(gt_oid)
                         && let Some(pos) = obj.properties.iter().position(|(k, _)| *k == name_id)
                     {
