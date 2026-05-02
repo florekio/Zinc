@@ -1425,6 +1425,7 @@ impl Vm {
         let name_str = self.interner.resolve(name_id).to_owned();
         match sentinel {
             -505 => match name_str.as_str() {
+                "prototype" => Value::object_id(self.number_prototype),
                 "NaN" => Value::number(f64::NAN),
                 "POSITIVE_INFINITY" => Value::number(f64::INFINITY),
                 "NEGATIVE_INFINITY" => Value::number(f64::NEG_INFINITY),
@@ -1459,6 +1460,7 @@ impl Vm {
                 _ => Value::undefined(),
             },
             -504 => match name_str.as_str() {
+                "prototype" => Value::object_id(self.string_prototype),
                 "fromCharCode" => Value::function(-534),
                 "fromCodePoint" => Value::function(-535),
                 "raw" => Value::function(-536),
@@ -3879,6 +3881,7 @@ impl Vm {
                         }
                         let result = match sentinel {
                             -505 => match name_str {
+                                "prototype" => Value::object_id(self.number_prototype),
                                 "NaN" => Value::number(f64::NAN),
                                 "POSITIVE_INFINITY" => Value::number(f64::INFINITY),
                                 "NEGATIVE_INFINITY" => Value::number(f64::NEG_INFINITY),
@@ -3895,6 +3898,10 @@ impl Vm {
                                 "parseFloat" => Value::function(-501),
                                 _ => Value::undefined(),
                             },
+                            -506 => match name_str {
+                                "prototype" => Value::object_id(self.boolean_prototype),
+                                _ => Value::undefined(),
+                            },
                             -570 => match name_str {
                                 "iterator" => Value::symbol(self.sym_iterator),
                                 "hasInstance" => Value::symbol(self.sym_has_instance),
@@ -3907,6 +3914,7 @@ impl Vm {
                                 _ => Value::undefined(),
                             },
                             -504 => match name_str {
+                                "prototype" => Value::object_id(self.string_prototype),
                                 // String static methods exposed as sentinels
                                 "fromCharCode" => Value::function(-534),
                                 "fromCodePoint" => Value::function(-535),
@@ -3972,6 +3980,30 @@ impl Vm {
                         self.push(Value::function(-505));
                     } else if obj_val.is_boolean() && name_str == "constructor" {
                         self.push(Value::function(-506));
+                    } else if let Some(proto_oid) = if obj_val.is_int() || obj_val.is_number() {
+                        Some(self.number_prototype)
+                    } else if obj_val.as_bool().is_some() {
+                        Some(self.boolean_prototype)
+                    } else {
+                        None
+                    } {
+                        // Property access on a primitive walks its wrapper's
+                        // prototype chain: Number.prototype, Boolean.prototype, etc.
+                        // Getters on user-extended Object.prototype are invoked
+                        // with `this` set to the boxed primitive (sloppy semantics).
+                        let getter_key = self.interner.intern(&format!("__get_{name_str}__"));
+                        let getter_fn = self.heap.get_property_chain(proto_oid, getter_key);
+                        if let Some(gfn) = getter_fn
+                            && gfn.is_function()
+                        {
+                            let this_val = self.box_primitive(obj_val);
+                            let result = self.call_function_this(gfn, this_val, &[])?;
+                            self.push(result);
+                            continue;
+                        }
+                        let val = self.heap.get_property_chain(proto_oid, name_id)
+                            .unwrap_or(Value::undefined());
+                        self.push(val);
                     } else {
                         self.push(Value::undefined());
                     }
