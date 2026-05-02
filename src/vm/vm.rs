@@ -3959,7 +3959,24 @@ impl Vm {
                                 _ => Value::undefined(),
                             },
                             _ => {
-                                // User-defined function properties
+                                // User-defined function properties.
+                                // Arrow functions and strict-mode functions have
+                                // 'caller' and 'arguments' as poison-pill accessors
+                                // that throw TypeError on access.
+                                if matches!(name_str, "caller" | "arguments") && sentinel >= 0 {
+                                    let chunk_idx = (sentinel & 0xFFFF) as usize;
+                                    let is_restricted = chunk_idx < self.chunks.len()
+                                        && (self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW)
+                                            || self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT));
+                                    if is_restricted {
+                                        let err = self.make_native_error(
+                                            "TypeError",
+                                            &format!("'{name_str}' may not be accessed on strict mode functions"),
+                                        );
+                                        self.handle_throw(err)?;
+                                        continue;
+                                    }
+                                }
                                 match name_str {
                                     "prototype" => {
                                         if let Some(&proto_oid) = self.func_prototypes.get(&sentinel) {
@@ -4080,6 +4097,23 @@ impl Vm {
                             // Non-strict: silently no-op.
                             self.push(val);
                             continue;
+                        }
+                        // Restricted-properties poison pill: arrow functions and
+                        // strict-mode functions throw TypeError on caller/arguments
+                        // assignment regardless of caller strictness.
+                        if matches!(name_str, "caller" | "arguments") && sentinel >= 0 {
+                            let chunk_idx = (sentinel & 0xFFFF) as usize;
+                            let is_restricted = chunk_idx < self.chunks.len()
+                                && (self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW)
+                                    || self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT));
+                            if is_restricted {
+                                let err = self.make_native_error(
+                                    "TypeError",
+                                    &format!("'{name_str}' may not be set on strict mode functions"),
+                                );
+                                self.handle_throw(err)?;
+                                continue;
+                            }
                         }
                         self.fn_property_overrides.insert((sentinel, name_id), Some(val));
                         // Keep func_prototypes in sync so `obj instanceof F` reads
