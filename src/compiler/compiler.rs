@@ -2172,6 +2172,9 @@ impl<'a> Compiler<'a> {
                         }
                         if let PropertyKey::Computed(expr) = &m.key {
                             self.compile_expr(expr)?;
+                            // Per spec, computed property names run ToPropertyKey
+                            // before the method body / value expression is evaluated.
+                            self.chunk.emit_op(OpCode::ToPropertyKey, line);
                         }
                         self.compile_expr(&m.value)?;
                         // Concise methods / getters / setters are not constructable.
@@ -2215,9 +2218,11 @@ impl<'a> Compiler<'a> {
                         self.chunk.emit_op_u16(op, idx, line);
                     }
                 }
-                ClassMember::Property(p) => {
+                 ClassMember::Property(p) => {
                     if matches!(&p.key, PropertyKey::Computed(_) | PropertyKey::NumberLiteral(_)) {
-                        // Computed key: emit key expr, then value, then computed opcode
+                        // Computed key: emit key expr, then value, then computed opcode.
+                        // (compile_property_key already emits ToPropertyKey for the
+                        // Computed variant.)
                         self.compile_property_key(&p.key, line)?;
                         if let Some(val) = &p.value {
                             self.compile_expr(val)?;
