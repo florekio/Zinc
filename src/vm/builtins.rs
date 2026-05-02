@@ -5,6 +5,31 @@ use crate::util::interner::StringId;
 use super::vm::{Vm, VmError};
 
 impl Vm {
+    /// Box a primitive value into its corresponding wrapper object
+    /// (Number/String/Boolean) so it can act as `this` in non-strict
+    /// callable code. Non-primitives are returned unchanged.
+    pub(crate) fn box_primitive(&mut self, val: Value) -> Value {
+        let (proto, inner) = if val.is_int() || val.is_number() {
+            (self.number_prototype, val)
+        } else if val.is_string() || self.is_cons_string(val) {
+            (self.string_prototype, val)
+        } else if val.as_bool().is_some() {
+            (self.boolean_prototype, val)
+        } else {
+            return val;
+        };
+        let mut obj = JsObject::ordinary();
+        obj.kind = ObjectKind::Wrapper(inner);
+        obj.prototype = Some(proto);
+        if let Some(sid) = inner.as_string_id() {
+            let len = self.interner.resolve(sid).chars().count() as i32;
+            let len_key = self.interner.intern("length");
+            obj.set_property(len_key, Value::int(len));
+        }
+        let oid = self.heap.allocate(obj);
+        Value::object_id(oid)
+    }
+
     // ---- String method dispatch ----
     pub(crate) fn exec_string_method(&mut self, s: &str, method_name: StringId, args: &[Value]) -> Value {
         let name = self.interner.resolve(method_name).to_owned();
