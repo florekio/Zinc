@@ -4645,12 +4645,25 @@ impl Vm {
                             }
                         }
 
+                    // Wrapper objects (`new Number(x)` / `new String(x)` /
+                    // `new Boolean(x)`) expose primitive method dispatch so e.g.
+                    // `new Number(1).toFixed(2)` works. Use the inner primitive
+                    // for the type-driven branches below.
+                    let effective_val = if let Some(oid) = obj_val.as_object_id()
+                        && let Some(obj) = self.heap.get(oid)
+                        && let ObjectKind::Wrapper(inner) = &obj.kind
+                    {
+                        *inner
+                    } else {
+                        obj_val
+                    };
+
                     // Check if the obj is a string (or ConsString) and dispatch string method
-                    let string_for_method = if obj_val.is_string() {
-                        let sid = obj_val.as_string_id().unwrap();
+                    let string_for_method = if effective_val.is_string() {
+                        let sid = effective_val.as_string_id().unwrap();
                         Some(self.interner.resolve(sid).to_owned())
-                    } else if self.is_cons_string(obj_val) {
-                        Some(self.flatten_cons_to_string(obj_val))
+                    } else if self.is_cons_string(effective_val) {
+                        Some(self.flatten_cons_to_string(effective_val))
                     } else {
                         None
                     };
@@ -4663,27 +4676,27 @@ impl Vm {
                     }
 
                     // Number primitive methods: (42).toString(16), (3.14).toFixed(2)
-                    if obj_val.is_number() || obj_val.is_int() {
+                    if effective_val.is_number() || effective_val.is_int() {
                         let mn = self.interner.resolve(method_name).to_owned();
-                        let n = self.to_f64(obj_val);
+                        let n = self.to_f64(effective_val);
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                         let result = match mn.as_str() {
                             "toString" => {
                                 let radix = args.first().and_then(|v| v.as_number()).unwrap_or(10.0) as u32;
                                 let s = if radix == 10 {
-                                    self.value_to_string(obj_val)
+                                    self.value_to_string(effective_val)
                                 } else if n.fract() == 0.0 && n.is_finite() {
                                     // Integer with non-10 radix
                                     let i = n as i64;
                                     if i >= 0 { radix_fmt(i as u64, radix) }
                                     else { format!("-{}", radix_fmt((-i) as u64, radix)) }
                                 } else {
-                                    self.value_to_string(obj_val)
+                                    self.value_to_string(effective_val)
                                 };
                                 let id = self.interner.intern(&s);
                                 Value::string(id)
                             }
-                            "valueOf" => obj_val,
+                            "valueOf" => effective_val,
                             "toFixed" => {
                                 let digits = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
                                 let s = format!("{:.prec$}", n, prec = digits);
@@ -4746,15 +4759,15 @@ impl Vm {
                     }
 
                     // Boolean primitive methods: true.toString()
-                    if obj_val.is_boolean() {
+                    if effective_val.is_boolean() {
                         let mn = self.interner.resolve(method_name).to_owned();
                         let result = match mn.as_str() {
                             "toString" => {
-                                let s = if obj_val.as_bool().unwrap() { "true" } else { "false" };
+                                let s = if effective_val.as_bool().unwrap() { "true" } else { "false" };
                                 let id = self.interner.intern(s);
                                 Value::string(id)
                             }
-                            "valueOf" => obj_val,
+                            "valueOf" => effective_val,
                             _ => Value::undefined(),
                         };
                         self.stack.truncate(obj_pos);
