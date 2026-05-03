@@ -108,6 +108,50 @@ impl Vm {
             self.reject_promise(pid, val)?;
             return Ok(Value::undefined());
         }
+        // Promise combinator (Promise.all/race/allSettled/any) resolve callback.
+        // Mirrors the inline Call opcode encoding so microtask drain can route.
+        if packed <= -800_000 && packed > -900_000 {
+            let encoded = (-800_000 - packed) as u32;
+            let tracker_oid = crate::runtime::object::ObjectId(encoded / 1024);
+            let index = (encoded % 1024) as usize;
+            let val = args.first().copied().unwrap_or(Value::undefined());
+            self.handle_combinator_resolve(tracker_oid, index, val)?;
+            return Ok(Value::undefined());
+        }
+        // Promise combinator reject callback.
+        if packed <= -900_000 && packed > -1_000_000 {
+            let encoded = (-900_000 - packed) as u32;
+            let tracker_oid = crate::runtime::object::ObjectId(encoded / 1024);
+            let index = (encoded % 1024) as usize;
+            let val = args.first().copied().unwrap_or(Value::undefined());
+            self.handle_combinator_reject(tracker_oid, index, val)?;
+            return Ok(Value::undefined());
+        }
+        // Promise.prototype.finally fulfill wrapper: call the user finally cb,
+        // then propagate the original value.
+        if packed <= -1_100_000 && packed > -1_200_000 {
+            let tracker_oid = crate::runtime::object::ObjectId((-1_100_000 - packed) as u32);
+            let val = args.first().copied().unwrap_or(Value::undefined());
+            if let Some(obj) = self.heap.get(tracker_oid)
+                && let crate::runtime::object::ObjectKind::FinallyTracker { callback, .. } = &obj.kind
+            {
+                let cb = *callback;
+                let _ = self.call_function(cb, &[]);
+            }
+            return Ok(val);
+        }
+        if packed <= -1_200_000 && packed > -1_300_000 {
+            let tracker_oid = crate::runtime::object::ObjectId((-1_200_000 - packed) as u32);
+            let val = args.first().copied().unwrap_or(Value::undefined());
+            if let Some(obj) = self.heap.get(tracker_oid)
+                && let crate::runtime::object::ObjectKind::FinallyTracker { callback, .. } = &obj.kind
+            {
+                let cb = *callback;
+                let _ = self.call_function(cb, &[]);
+            }
+            // Reject: bubble the rejection by returning Throw.
+            return Err(VmError::Throw(val));
+        }
         let closure_id = ((packed as u32) >> 16) as usize;
         let chunk_idx = (packed & 0xFFFF) as usize;
         if chunk_idx < 1 || chunk_idx >= self.chunks.len() {
