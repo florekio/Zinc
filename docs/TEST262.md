@@ -6,7 +6,7 @@ Run with: `cargo run --release --bin test262_runner`
 
 ## Results
 
-**87.0% pass rate** — 13,866 of 15,947 active tests pass (2,988 tests skipped).
+**89.7% pass rate** — 14,215 of 15,855 active tests pass (2,986 tests skipped).
 
 The pass rate dropped from 92.6% because earlier silent assertion no-ops
 (`assert.sameValue` / `assert.throws` weren't actually being called when invoked
@@ -79,7 +79,7 @@ private-field brand checks, completion-value semantics, and TDZ for params.
 
 ### Skipped Features
 
-Tests requiring these features are currently skipped (2,988 tests):
+Tests requiring these features are currently skipped (2,986 tests):
 
 - `Proxy`, `Reflect`
 - `SharedArrayBuffer`, `Atomics`
@@ -103,6 +103,7 @@ Tests requiring these features are currently skipped (2,988 tests):
 | post-v0.4.0 a | 16,010  | 14,821  | 92.6% |
 | post-v0.4.0 b | 15,947  | 13,350  | 83.7% |
 | post-v0.4.0 c | 15,947  | 13,866  | 87.0% |
+| post-v0.4.0 d | 15,855  | 14,215  | 89.7% |
 
 The first post-v0.4.0 jump reflects unskipping features the engine already
 implemented (Symbol.asyncIterator, Symbol.matchAll, change-array-by-copy,
