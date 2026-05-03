@@ -1266,11 +1266,18 @@ impl Vm {
                     self.value_to_string(key_val)
                 };
                 let key_id = self.interner.intern(&key);
+                let getter_key = self.interner.intern(&format!("__get_{key}__"));
+                let setter_key = self.interner.intern(&format!("__set_{key}__"));
                 if let Some(oid) = this_val.as_object_id() {
-                    let is_enum = self.heap.get(oid)
-                        .and_then(|o| o.get_property_descriptor(key_id))
-                        .map(|p| p.is_enumerable())
-                        .unwrap_or(false);
+                    let is_enum = self.heap.get(oid).and_then(|o| {
+                        // Accessor properties are stored under __get_/__set_;
+                        // their descriptor's enumerable flag is the property's.
+                        o.get_property_descriptor(key_id)
+                            .or_else(|| o.get_property_descriptor(getter_key))
+                            .or_else(|| o.get_property_descriptor(setter_key))
+                    })
+                    .map(|p| p.is_enumerable())
+                    .unwrap_or(false);
                     Value::boolean(is_enum)
                 } else { Value::boolean(false) }
             }

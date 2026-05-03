@@ -5171,8 +5171,14 @@ impl Vm {
                                     self.value_to_string(key_val)
                                 };
                                 let key_id = self.interner.intern(&key);
+                                let getter_key = self.interner.intern(&format!("__get_{key}__"));
+                                let setter_key = self.interner.intern(&format!("__set_{key}__"));
                                 let is_enum = self.heap.get(oid)
-                                    .and_then(|o| o.get_property_descriptor(key_id))
+                                    .and_then(|o| {
+                                        o.get_property_descriptor(key_id)
+                                            .or_else(|| o.get_property_descriptor(getter_key))
+                                            .or_else(|| o.get_property_descriptor(setter_key))
+                                    })
                                     .map(|p| p.is_enumerable())
                                     .unwrap_or(false);
                                 self.stack.truncate(obj_pos);
@@ -7474,12 +7480,29 @@ impl Vm {
 
                     // Per spec (ClassDefinitionEvaluation): the heritage value's
                     // `prototype` property must be either an object or null.
-                    // Bound functions (and similar exotic callables) lack one,
-                    // which makes them invalid superclass values.
+                    // Bound functions and built-in functions (Math.abs, Math.floor,
+                    // etc.) lack one, which makes them invalid superclass values.
                     if !super_val.is_null() {
                         let proto_key_check = self.interner.intern("prototype");
                         let parent_proto = if let Some(soid) = super_val.as_object_id() {
                             self.heap.get_property_chain(soid, proto_key_check)
+                        } else if super_val.is_function() {
+                            let sentinel = super_val.as_function().unwrap();
+                            // User function-overrides take precedence (e.g. fn.prototype = 42).
+                            if let Some(Some(ov)) = self.fn_property_overrides.get(&(sentinel, proto_key_check)).copied() {
+                                Some(ov)
+                            } else {
+                                // Built-in math/global sentinels have no prototype.
+                                let has_default = (-516..=-510).contains(&sentinel)
+                                    || matches!(sentinel, -504 | -505 | -506 | -507 | -508 | -520 | -551
+                                        | -540 | -541 | -542 | -543 | -550 | -570)
+                                    || sentinel >= 0; // user-defined functions auto-allocate
+                                if has_default {
+                                    None // resolution happens later; treat as "object"
+                                } else {
+                                    Some(Value::undefined()) // built-in like Math.abs
+                                }
+                            }
                         } else { None };
                         if let Some(pp) = parent_proto {
                             if !pp.is_null() && !pp.is_object() {
@@ -7664,24 +7687,43 @@ impl Vm {
                                     // same name on any prototype regardless of its
                                     // enumerability — only enumerable own properties are
                                     // emitted, but non-enumerable ones still mark the
-                                    // name as seen.
+                                    // name as seen. Accessor properties stored under
+                                    // __get_NAME__ / __set_NAME__ surface as the bare
+                                    // NAME so for-in mirrors Object.keys behaviour.
                                     let mut all_keys = Vec::new();
-                                    let mut seen = std::collections::HashSet::new();
+                                    let mut seen: std::collections::HashSet<StringId> = std::collections::HashSet::new();
                                     let mut cur = Some(oid);
                                     let mut depth = 0;
                                     while let Some(cid) = cur {
                                         if depth > 64 { break; }
-                                        if let Some(obj) = self.heap.get(cid) {
-                                            for &(k, ref p) in &obj.properties {
-                                                let ks = self.interner.resolve(k);
-                                                if is_internal_key(ks) { continue; }
-                                                let first_seen = seen.insert(k);
-                                                if first_seen && p.is_enumerable() {
-                                                    all_keys.push(k);
+                                        let entries: Vec<(StringId, bool)> = if let Some(obj) = self.heap.get(cid) {
+                                            obj.properties.iter().map(|&(k, ref p)| (k, p.is_enumerable())).collect()
+                                        } else { break };
+                                        let next_proto = self.heap.get(cid).and_then(|o| o.prototype);
+                                        for (k, en) in entries {
+                                            let exposed_str: Option<String> = {
+                                                let name = self.interner.resolve(k);
+                                                if let Some(rest) = name.strip_prefix("__get_").and_then(|s| s.strip_suffix("__")) {
+                                                    Some(rest.to_owned())
+                                                } else if let Some(rest) = name.strip_prefix("__set_").and_then(|s| s.strip_suffix("__")) {
+                                                    Some(rest.to_owned())
+                                                } else if is_internal_key(name) {
+                                                    None
+                                                } else {
+                                                    Some(name.to_owned())
                                                 }
+                                            };
+                                            let Some(ns) = exposed_str else { continue };
+                                            // Skip names that look like internal keys after unwrapping
+                                            // (e.g. accessor of a __sym_N__ symbol).
+                                            if is_internal_key(&ns) { continue; }
+                                            let key = self.interner.intern(&ns);
+                                            let first_seen = seen.insert(key);
+                                            if first_seen && en {
+                                                all_keys.push(key);
                                             }
-                                            cur = obj.prototype;
-                                        } else { break; }
+                                        }
+                                        cur = next_proto;
                                         depth += 1;
                                     }
                                     all_keys
