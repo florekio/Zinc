@@ -4022,6 +4022,29 @@ impl Vm {
                             -508 => match name_str {
                                 // Object static properties
                                 "prototype" => Value::object_id(self.object_prototype),
+                                // Lazily wrap `Object.defineProperty` as a callable so the
+                                // `var f = Object.defineProperty; f(obj, key, desc)` pattern
+                                // (used by test262's propertyHelper.js, MDN-style helpers,
+                                // etc.) works. Cached in fn_property_overrides so identity
+                                // is stable across reads.
+                                "defineProperty" => {
+                                    let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                                        |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
+                                            Ok(vm.object_define_property(args))
+                                        }
+                                    );
+                                    let fn_obj = JsObject {
+                                        properties: Vec::new(),
+                                        prototype: None,
+                                        kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
+                                        marked: false,
+                                        extensible: true,
+                                    };
+                                    let oid = self.heap.allocate(fn_obj);
+                                    let val = Value::object_id(oid);
+                                    self.fn_property_overrides.insert((-508, name_id), Some(val));
+                                    val
+                                }
                                 _ => Value::undefined(),
                             },
                             -551 => match name_str {
@@ -5667,77 +5690,7 @@ impl Vm {
                                 }
                                 Value::object_id(self.heap.allocate(obj))
                             }
-                            "defineProperty" => {
-                                let target = args.first().copied().unwrap_or(Value::undefined());
-                                let key_val = args.get(1).copied().unwrap_or(Value::undefined());
-                                let desc_val = args.get(2).copied().unwrap_or(Value::undefined());
-                                if let Some(target_oid) = target.as_object_id() {
-                                    // Symbol keys use the __sym_N__ encoding so accessor
-                                    // lookups (e.g. @@toPrimitive) resolve correctly.
-                                    let key_str = if key_val.is_symbol() {
-                                        format!("__sym_{}__", key_val.as_symbol_id().unwrap())
-                                    } else {
-                                        self.value_to_string(key_val)
-                                    };
-                                    let key_id = self.interner.intern(&key_str);
-
-                                    let mut flags = Property::ALL;
-                                    let mut value = Value::undefined();
-
-                                    if let Some(desc_oid) = desc_val.as_object_id() {
-                                        let writable_key = self.interner.intern("writable");
-                                        let enumerable_key = self.interner.intern("enumerable");
-                                        let configurable_key = self.interner.intern("configurable");
-                                        let value_key = self.interner.intern("value");
-                                        let get_key = self.interner.intern("get");
-                                        let set_key = self.interner.intern("set");
-
-                                        if let Some(v) = self.heap.get_property_chain(desc_oid, value_key) {
-                                            value = v;
-                                        }
-                                        flags = 0;
-                                        if let Some(v) = self.heap.get_property_chain(desc_oid, writable_key)
-                                            && v.to_boolean() { flags |= Property::WRITABLE; }
-                                        if let Some(v) = self.heap.get_property_chain(desc_oid, enumerable_key)
-                                            && v.to_boolean() { flags |= Property::ENUMERABLE; }
-                                        if let Some(v) = self.heap.get_property_chain(desc_oid, configurable_key)
-                                            && v.to_boolean() { flags |= Property::CONFIGURABLE; }
-                                        // Handle getter/setter — accessor flags carry the
-                                        // configurable/enumerable bits from the descriptor.
-                                        let accessor_flags = flags & (Property::ENUMERABLE | Property::CONFIGURABLE);
-                                        if let Some(getter) = self.heap.get_property_chain(desc_oid, get_key)
-                                            && getter.is_function() {
-                                                let getter_key = self.interner.intern(&format!("__get_{key_str}__"));
-                                                if let Some(obj) = self.heap.get_mut(target_oid) {
-                                                    obj.define_property(getter_key,
-                                                        Property::with_flags(getter, accessor_flags));
-                                                }
-                                            }
-                                        if let Some(setter) = self.heap.get_property_chain(desc_oid, set_key)
-                                            && setter.is_function() {
-                                                let setter_key = self.interner.intern(&format!("__set_{key_str}__"));
-                                                if let Some(obj) = self.heap.get_mut(target_oid) {
-                                                    obj.define_property(setter_key,
-                                                        Property::with_flags(setter, accessor_flags));
-                                                }
-                                            }
-                                    }
-                                    // Only create data property if no getter/setter was defined
-                                    // (accessor and data descriptors are mutually exclusive)
-                                    let has_accessor = self.heap.get(target_oid)
-                                        .map(|o| {
-                                            let gk = self.interner.intern(&format!("__get_{key_str}__"));
-                                            let sk = self.interner.intern(&format!("__set_{key_str}__"));
-                                            o.has_own_property(gk) || o.has_own_property(sk)
-                                        })
-                                        .unwrap_or(false);
-                                    if !has_accessor
-                                        && let Some(obj) = self.heap.get_mut(target_oid) {
-                                            obj.define_property(key_id, Property::with_flags(value, flags));
-                                    }
-                                    target
-                                } else { target }
-                            }
+                            "defineProperty" => self.object_define_property(&args),
                             "defineProperties" => {
                                 // Simplified: treat like Object.assign for now
                                 args.first().copied().unwrap_or(Value::undefined())
@@ -8687,6 +8640,72 @@ impl Vm {
 }
 
 impl Vm {
+    /// Object.defineProperty(target, key, descriptor). Extracted so that both
+    /// the inline `Object.defineProperty(...)` CallMethod path and the
+    /// extracted-as-Native-fn path (`var f = Object.defineProperty; f(...)`)
+    /// share one implementation.
+    pub(crate) fn object_define_property(&mut self, args: &[Value]) -> Value {
+        let target = args.first().copied().unwrap_or(Value::undefined());
+        let key_val = args.get(1).copied().unwrap_or(Value::undefined());
+        let desc_val = args.get(2).copied().unwrap_or(Value::undefined());
+        let Some(target_oid) = target.as_object_id() else { return target };
+        let key_str = if key_val.is_symbol() {
+            format!("__sym_{}__", key_val.as_symbol_id().unwrap())
+        } else {
+            self.value_to_string(key_val)
+        };
+        let key_id = self.interner.intern(&key_str);
+        let mut flags = Property::ALL;
+        let mut value = Value::undefined();
+        if let Some(desc_oid) = desc_val.as_object_id() {
+            let writable_key = self.interner.intern("writable");
+            let enumerable_key = self.interner.intern("enumerable");
+            let configurable_key = self.interner.intern("configurable");
+            let value_key = self.interner.intern("value");
+            let get_key = self.interner.intern("get");
+            let set_key = self.interner.intern("set");
+            if let Some(v) = self.heap.get_property_chain(desc_oid, value_key) {
+                value = v;
+            }
+            flags = 0;
+            if let Some(v) = self.heap.get_property_chain(desc_oid, writable_key)
+                && v.to_boolean() { flags |= Property::WRITABLE; }
+            if let Some(v) = self.heap.get_property_chain(desc_oid, enumerable_key)
+                && v.to_boolean() { flags |= Property::ENUMERABLE; }
+            if let Some(v) = self.heap.get_property_chain(desc_oid, configurable_key)
+                && v.to_boolean() { flags |= Property::CONFIGURABLE; }
+            let accessor_flags = flags & (Property::ENUMERABLE | Property::CONFIGURABLE);
+            if let Some(getter) = self.heap.get_property_chain(desc_oid, get_key)
+                && getter.is_function() {
+                    let getter_key = self.interner.intern(&format!("__get_{key_str}__"));
+                    if let Some(obj) = self.heap.get_mut(target_oid) {
+                        obj.define_property(getter_key,
+                            Property::with_flags(getter, accessor_flags));
+                    }
+                }
+            if let Some(setter) = self.heap.get_property_chain(desc_oid, set_key)
+                && setter.is_function() {
+                    let setter_key = self.interner.intern(&format!("__set_{key_str}__"));
+                    if let Some(obj) = self.heap.get_mut(target_oid) {
+                        obj.define_property(setter_key,
+                            Property::with_flags(setter, accessor_flags));
+                    }
+                }
+        }
+        let has_accessor = self.heap.get(target_oid)
+            .map(|o| {
+                let gk = self.interner.intern(&format!("__get_{key_str}__"));
+                let sk = self.interner.intern(&format!("__set_{key_str}__"));
+                o.has_own_property(gk) || o.has_own_property(sk)
+            })
+            .unwrap_or(false);
+        if !has_accessor
+            && let Some(obj) = self.heap.get_mut(target_oid) {
+                obj.define_property(key_id, Property::with_flags(value, flags));
+        }
+        target
+    }
+
     /// Implements `Function(...)` and `new Function(...)`: concatenates params,
     /// compiles `function(p1,p2,...){ body }`, and returns a callable function value.
     pub(crate) fn construct_function(&mut self, args: &[Value]) -> Result<Value, VmError> {
