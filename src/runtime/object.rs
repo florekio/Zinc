@@ -2,7 +2,15 @@ use crate::runtime::value::Value;
 use crate::util::interner::StringId;
 
 pub type PropertyKey = StringId;
-pub type NativeFn = fn(&mut ObjectHeap, Value, &[Value]) -> Result<Value, Value>;
+/// Host-supplied native function. Receives `&mut Vm` so the host code can
+/// allocate strings, call back into JS, throw via VmError, and inspect/mutate
+/// the heap. Boxed so closures with embedder state are usable too.
+///
+/// Returning Err(value) re-throws `value` as a JS exception in the caller's
+/// frame.
+pub type NativeFn = std::sync::Arc<
+    dyn Fn(&mut crate::vm::vm::Vm, Value, &[Value]) -> Result<Value, Value> + Send + Sync,
+>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectId(pub u32);
@@ -148,6 +156,11 @@ pub enum ObjectKind {
     /// Lazy concatenated string. Left and right are either TAG_STRING (StringId)
     /// or another ConsString ObjectId. `len` caches the total char count for O(1) .length.
     ConsString { left: Value, right: Value, len: u32 },
+    /// Host-owned object: tag identifies the host class (assigned by the
+    /// embedder via `Engine::register_host_class`); payload is an opaque
+    /// 64-bit handle the host uses to find the backing data (typically an
+    /// index into a side table). Not traced as a Value graph by the GC.
+    Host { tag: u32, payload: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -382,6 +395,7 @@ impl ObjectHeap {
             ObjectKind::Ordinary
             | ObjectKind::KeyIterator(_, _)
             | ObjectKind::RegExp { .. }
+            | ObjectKind::Host { .. }
             | ObjectKind::Date(_) => {}
         }
 

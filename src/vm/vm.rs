@@ -1757,6 +1757,56 @@ impl Vm {
         }
     }
 
+    /// Append a freshly-compiled chunk tree to this VM and execute the new
+    /// top chunk as a fresh script-level frame. Globals, the heap, and any
+    /// previously-registered host functions are preserved across calls — this
+    /// is how the embedder runs multiple `<script>` tags on a single
+    /// long-lived `Engine`.
+    pub fn load_and_run(&mut self, chunk: Chunk) -> Result<Value, VmError> {
+        // Flatten the new chunk tree onto the existing chunks vec; the new
+        // top chunk lands at `top_idx`, and its sub-chunks follow.
+        let top_idx = self.chunks.len();
+        Self::flatten_chunk(chunk, &mut self.chunks);
+        // Push a fresh top-level frame for the new script. Its base is the
+        // current stack length so it doesn't clobber any persisted state.
+        let base = self.stack.len();
+        let stop_depth = self.frames.len();
+        // Slot -1 of the new frame holds the "callee" placeholder; push one.
+        self.stack.push(Value::undefined());
+        let global_this = Value::object_id(self.global_this_oid);
+        self.frames.push(CallFrame {
+            chunk_idx: top_idx,
+            ip: 0,
+            base: base + 1,
+            upvalues: Vec::new(),
+            this_value: global_this,
+            is_constructor: false,
+            pending_super_call: false,
+            generator_id: None,
+            argc: 0,
+            saved_args: Vec::new(),
+            arguments_oid: None,
+            is_derived_ctor: false,
+            super_called: false,
+            new_target: Value::undefined(),
+            await_super_result: false,
+        });
+        let result = match self.run_until(stop_depth) {
+            Ok(v) => v,
+            Err(VmError::Throw(val)) => {
+                let msg = self.value_to_string(val);
+                return Err(VmError::RuntimeError(msg));
+            }
+            Err(e) => return Err(e),
+        };
+        if self.is_cons_string(result) {
+            let id = self.flatten_to_string_id(result);
+            Ok(Value::string(id))
+        } else {
+            Ok(result)
+        }
+    }
+
     /// Attempt to JIT-compile and run the loop portion of chunk 0.
     /// If successful, updates globals and advances the initial frame's IP
     /// so the interpreter resumes after the JIT-ed bytecode.
@@ -3003,6 +3053,27 @@ impl Vm {
                             self.stack.truncate(func_pos);
                             self.push(result);
                             continue;
+                        }
+                    }
+
+                    // Host-supplied native function (registered via Engine::register_host_fn).
+                    if let Some(oid) = func_val.as_object_id() {
+                        let native_fn = self.heap.get(oid).and_then(|o| {
+                            if let ObjectKind::Function(crate::runtime::object::FunctionKind::Native { func, .. }) = &o.kind {
+                                Some(func.clone())
+                            } else { None }
+                        });
+                        if let Some(func) = native_fn {
+                            let args_vec: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
+                            // Per spec, an ordinary call gets `this = undefined`; non-strict
+                            // wraps to globalThis. Match the bytecode-call default here so
+                            // host code sees the same shape.
+                            let this_val = Value::undefined();
+                            self.stack.truncate(func_pos);
+                            match (func)(self, this_val, &args_vec) {
+                                Ok(v) => { self.push(v); continue; }
+                                Err(reason) => { self.handle_throw(reason)?; continue; }
+                            }
                         }
                     }
 
@@ -4738,6 +4809,27 @@ impl Vm {
                     } else {
                         None
                     };
+
+                    // Host-supplied native function looked up via prototype chain
+                    // (registered with Engine::register_host_fn or attached as a
+                    // method on a host object). Receiver is bound as `this`.
+                    if let Some(mv) = method_val
+                        && let Some(method_oid) = mv.as_object_id()
+                    {
+                        let native_fn = self.heap.get(method_oid).and_then(|o| {
+                            if let ObjectKind::Function(crate::runtime::object::FunctionKind::Native { func, .. }) = &o.kind {
+                                Some(func.clone())
+                            } else { None }
+                        });
+                        if let Some(func) = native_fn {
+                            let args_vec: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            self.stack.truncate(obj_pos);
+                            match (func)(self, obj_val, &args_vec) {
+                                Ok(v) => { self.push(v); continue; }
+                                Err(reason) => { self.handle_throw(reason)?; continue; }
+                            }
+                        }
+                    }
 
                     // Check for console.log/warn/error sentinels
                     if let Some(mv) = method_val

@@ -52,6 +52,22 @@ impl Vm {
 
     /// Call a closure with a specific `this` binding.
     pub(crate) fn call_function_this(&mut self, func_val: Value, this_value: Value, args: &[Value]) -> Result<Value, VmError> {
+        // Host-supplied native function (heap-allocated callable).
+        if let Some(oid) = func_val.as_object_id() {
+            let native_fn = self.heap.get(oid).and_then(|o| {
+                if let crate::runtime::object::ObjectKind::Function(
+                    crate::runtime::object::FunctionKind::Native { func, .. },
+                ) = &o.kind {
+                    Some(func.clone())
+                } else { None }
+            });
+            if let Some(func) = native_fn {
+                return match (func)(self, this_value, args) {
+                    Ok(v) => Ok(v),
+                    Err(reason) => Err(VmError::Throw(reason)),
+                };
+            }
+        }
         if !func_val.is_function() {
             return Ok(Value::undefined());
         }
