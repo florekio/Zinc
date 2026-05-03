@@ -1645,8 +1645,10 @@ impl<'a> Compiler<'a> {
 
     /// bind object properties to globals; source is on top of stack (Dup for each prop; caller Pops)
     fn compile_bind_obj_props_global(&mut self, properties: &[ObjectPatternProperty], line: u32) -> Result<(), String> {
-        // RequireObjectCoercible: source is on top of stack, throw if null/undefined.
-        self.chunk.emit_op(OpCode::Dup, line);
+        // RequireObjectCoercible on TOS source, then save to a temp local so
+        // we can read it at a known stack slot from each property iteration.
+        // This avoids leaving the source on the operand stack where nested
+        // array/object destructuring would mistake its slot for the iterator's.
         self.chunk.emit_op(OpCode::Dup, line);
         self.chunk.emit_op(OpCode::Undefined, line);
         self.chunk.emit_op(OpCode::StrictEq, line);
@@ -1660,11 +1662,17 @@ impl<'a> Compiler<'a> {
         self.chunk.patch_jump(null_jump);
         self.emit_throw_type_error("Cannot destructure 'undefined' or 'null'", line);
         self.chunk.patch_jump(skip_throw);
-        self.chunk.emit_op(OpCode::Pop, line);
+        // Source is still on stack — register it as a temp local so iter_slot
+        // calculations are stable even when nested destructuring pushes more
+        // operands.
+        let src_slot = self.locals.len() as u8;
+        let anon_src = self.interner.intern("__obj_src__");
+        self.add_local(anon_src);
+        self.mark_initialized();
         for prop in properties {
             match prop {
                 ObjectPatternProperty::Property { key, value, .. } => {
-                    self.chunk.emit_op(OpCode::Dup, line);
+                    self.chunk.emit_op_u8(OpCode::GetLocal, src_slot, line);
                     match key {
                         PropertyKey::Identifier(id) | PropertyKey::StringLiteral(id) => {
                             let idx = self.make_string_constant(*id);
@@ -1702,7 +1710,7 @@ impl<'a> Compiler<'a> {
                                 }
                             } else { None }
                         }).collect();
-                        self.chunk.emit_op(OpCode::Dup, line);
+                        self.chunk.emit_op_u8(OpCode::GetLocal, src_slot, line);
                         self.chunk.emit_byte(OpCode::ObjectRest as u8, line);
                         self.chunk.code.push(excluded.len() as u8);
                         for k in &excluded {
@@ -1716,6 +1724,9 @@ impl<'a> Compiler<'a> {
                 }
             }
         }
+        // Drop the temp source local. Caller still expects the original source
+        // value on the stack (compile_bind_value_global emits a Pop after us).
+        self.locals.pop();
         Ok(())
     }
 
