@@ -2562,16 +2562,24 @@ impl Vm {
                     if idx >= self.globals_vec.len() { self.globals_vec.resize(idx + 1, Value::null()); }
                     self.globals_vec[idx] = val;
                     self.global_version += 1;
-                    // Mirror onto globalThis only for names already defined there as
-                    // writable own properties (created by DefineGlobal). This keeps
-                    // user-side `Object.getOwnPropertyDescriptor(this, name)` in sync
-                    // with the live binding, without polluting globalThis with every
-                    // ad-hoc global assignment.
+                    // Mirror onto globalThis. Per spec, PutValue on an unresolvable
+                    // reference in non-strict mode creates a writable/enumerable/
+                    // configurable property on the global object; explicit `var`
+                    // declarations (DefineGlobal) create writable/enumerable but
+                    // non-configurable. Preserve existing flags if already there.
                     let global_this_oid = self.global_this_oid;
-                    if let Some(obj) = self.heap.get_mut(global_this_oid)
-                        && obj.has_own_property(name_id)
-                    {
-                        obj.set_property(name_id, val);
+                    if let Some(obj) = self.heap.get_mut(global_this_oid) {
+                        if obj.has_own_property(name_id) {
+                            obj.set_property(name_id, val);
+                        } else {
+                            obj.define_property(
+                                name_id,
+                                Property::with_flags(
+                                    val,
+                                    Property::WRITABLE | Property::ENUMERABLE | Property::CONFIGURABLE,
+                                ),
+                            );
+                        }
                     }
                 }
 
@@ -3031,6 +3039,70 @@ impl Vm {
                                         ),
                                     );
                                     obj.set_property(stack_key, Value::string(stack_id));
+                                }
+                            }
+                            self.stack.truncate(func_pos);
+                            self.push(this_val);
+                            continue;
+                        }
+                        // super() to native collection / date constructors:
+                        // mutate `this` (the subclass-allocated instance) so it
+                        // has the proper internal kind, and return it.
+                        if is_super_call && matches!(sentinel, -540 | -541 | -542 | -543 | -550) {
+                            if let Some(f) = self.frames.last_mut() { f.pending_super_call = false; }
+                            let this_val = self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined());
+                            if let Some(this_oid) = this_val.as_object_id() {
+                                let new_kind = match sentinel {
+                                    -540 => {
+                                        let mut entries = Vec::new();
+                                        if argc > 0
+                                            && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
+                                            && let Some(obj) = self.heap.get(arr_oid)
+                                            && let ObjectKind::Array(ref elems) = obj.kind
+                                        {
+                                            let elems = elems.clone();
+                                            for elem in &elems {
+                                                if let Some(pair_oid) = elem.as_object_id()
+                                                    && let Some(pair_obj) = self.heap.get(pair_oid)
+                                                    && let ObjectKind::Array(ref pair) = pair_obj.kind
+                                                    && pair.len() >= 2
+                                                {
+                                                    entries.push((pair[0], pair[1]));
+                                                }
+                                            }
+                                        }
+                                        ObjectKind::Map { entries }
+                                    }
+                                    -541 => {
+                                        let mut entries = Vec::new();
+                                        if argc > 0
+                                            && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
+                                            && let Some(obj) = self.heap.get(arr_oid)
+                                            && let ObjectKind::Array(ref elems) = obj.kind
+                                        {
+                                            entries = elems.clone();
+                                        }
+                                        ObjectKind::Set { entries }
+                                    }
+                                    -542 => ObjectKind::WeakMap { entries: Vec::new() },
+                                    -543 => ObjectKind::WeakSet { entries: Vec::new() },
+                                    -550 => {
+                                        let ms = if argc == 0 {
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_millis() as f64)
+                                                .unwrap_or(0.0)
+                                        } else if argc == 1 {
+                                            self.to_f64(self.stack[func_pos + 1])
+                                        } else {
+                                            0.0
+                                        };
+                                        ObjectKind::Date(ms)
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                if let Some(obj) = self.heap.get_mut(this_oid) {
+                                    obj.kind = new_kind;
                                 }
                             }
                             self.stack.truncate(func_pos);
@@ -3620,8 +3692,11 @@ impl Vm {
                                     .and_then(|oid| self.heap.get(oid))
                                     .map(|o| matches!(&o.kind, ObjectKind::Function(_)))
                                     .unwrap_or(false);
-                            self.push(Value::boolean(is_fn));
-                            continue;
+                            if is_fn {
+                                self.push(Value::boolean(true));
+                                continue;
+                            }
+                            // Fall through for subclass detection.
                         }
                         if s == -520 {
                             // Promise constructor: true if obj is a Promise object
@@ -3629,8 +3704,11 @@ impl Vm {
                                 .and_then(|oid| self.heap.get(oid))
                                 .map(|o| matches!(&o.kind, ObjectKind::Promise { .. }))
                                 .unwrap_or(false);
-                            self.push(Value::boolean(is_prom));
-                            continue;
+                            if is_prom {
+                                self.push(Value::boolean(true));
+                                continue;
+                            }
+                            // Fall through for subclass detection.
                         }
                         if (-543..=-540).contains(&s) {
                             // Map (-540), Set (-541), WeakMap (-542), WeakSet (-543)
@@ -3645,8 +3723,11 @@ impl Vm {
                                     | (ObjectKind::WeakSet { .. }, -543)
                                 ))
                                 .unwrap_or(false);
-                            self.push(Value::boolean(is_match));
-                            continue;
+                            if is_match {
+                                self.push(Value::boolean(true));
+                                continue;
+                            }
+                            // Fall through to prototype-chain walk for subclass detection.
                         }
                         if s == -550 {
                             // Date
@@ -3654,8 +3735,11 @@ impl Vm {
                                 .and_then(|oid| self.heap.get(oid))
                                 .map(|o| matches!(&o.kind, ObjectKind::Date(_)))
                                 .unwrap_or(false);
-                            self.push(Value::boolean(is_date));
-                            continue;
+                            if is_date {
+                                self.push(Value::boolean(true));
+                                continue;
+                            }
+                            // Fall through to prototype-chain walk for subclass detection.
                         }
                     }
                     // If constructor's `prototype` property has been user-set to a
@@ -3750,6 +3834,11 @@ impl Vm {
                         if let Some(kid) = key.as_string_id() {
                             // Walk prototype chain for 'in' operator
                             self.heap.get_property_chain(oid, kid).is_some()
+                        } else if let Some(sym_id) = key.as_symbol_id() {
+                            // Symbol keys are stored as `__sym_<id>__`
+                            let key_str = format!("__sym_{sym_id}__");
+                            let key_id = self.interner.intern(&key_str);
+                            self.heap.get_property_chain(oid, key_id).is_some()
                         } else if let Some(idx) = key.as_int() {
                             // Numeric key: check array elements
                             self.heap.get(oid)
@@ -4543,7 +4632,11 @@ impl Vm {
                     } else if key.is_object() && !key.is_symbol() {
                         // Object keys: invoke ToPrimitive(string) so the user's toString
                         // (or valueOf) runs and the result is used as the property name.
-                        let prim = self.try_coerce_to_primitive_hint(key, "string")?;
+                        let prim = match self.try_coerce_to_primitive_hint(key, "string") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        };
                         if prim.is_symbol() {
                             prim
                         } else {
@@ -6660,7 +6753,9 @@ impl Vm {
                             while let Some(v) = cur_val {
                                 if v.is_function() {
                                     let sentinel = v.as_function().unwrap();
-                                    if (-516..=-510).contains(&sentinel) {
+                                    if (-516..=-510).contains(&sentinel)
+                                        || matches!(sentinel, -540 | -541 | -542 | -543 | -550)
+                                    {
                                         native_super_sentinel = Some(sentinel);
                                     }
                                     break;
@@ -6762,6 +6857,7 @@ impl Vm {
                         // Per spec, "message" descriptor is { writable: true, enumerable: false,
                         // configurable: true } — only created when an argument is provided.
                         if let Some(sentinel) = native_super_sentinel
+                            && (-516..=-510).contains(&sentinel)
                             && argc > 0
                             && !self.stack[func_pos + 1].is_undefined()
                         {
@@ -6787,6 +6883,66 @@ impl Vm {
                                     );
                                     obj.set_property(stack_key, Value::string(stack_id));
                                 }
+                            }
+                        }
+                        // Default ctor extending Map/Set/WeakMap/WeakSet/Date: mutate
+                        // `this` so it has the proper internal kind. (Mirror what
+                        // super() to that sentinel would do.)
+                        if let Some(sentinel) = native_super_sentinel
+                            && matches!(sentinel, -540 | -541 | -542 | -543 | -550)
+                            && let Some(this_oid) = this_val.as_object_id()
+                        {
+                            let new_kind = match sentinel {
+                                -540 => {
+                                    let mut entries = Vec::new();
+                                    if argc > 0
+                                        && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
+                                        && let Some(obj) = self.heap.get(arr_oid)
+                                        && let ObjectKind::Array(ref elems) = obj.kind
+                                    {
+                                        let elems = elems.clone();
+                                        for elem in &elems {
+                                            if let Some(pair_oid) = elem.as_object_id()
+                                                && let Some(pair_obj) = self.heap.get(pair_oid)
+                                                && let ObjectKind::Array(ref pair) = pair_obj.kind
+                                                && pair.len() >= 2
+                                            {
+                                                entries.push((pair[0], pair[1]));
+                                            }
+                                        }
+                                    }
+                                    ObjectKind::Map { entries }
+                                }
+                                -541 => {
+                                    let mut entries = Vec::new();
+                                    if argc > 0
+                                        && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
+                                        && let Some(obj) = self.heap.get(arr_oid)
+                                        && let ObjectKind::Array(ref elems) = obj.kind
+                                    {
+                                        entries = elems.clone();
+                                    }
+                                    ObjectKind::Set { entries }
+                                }
+                                -542 => ObjectKind::WeakMap { entries: Vec::new() },
+                                -543 => ObjectKind::WeakSet { entries: Vec::new() },
+                                -550 => {
+                                    let ms = if argc == 0 {
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as f64)
+                                            .unwrap_or(0.0)
+                                    } else if argc == 1 {
+                                        self.to_f64(self.stack[func_pos + 1])
+                                    } else {
+                                        0.0
+                                    };
+                                    ObjectKind::Date(ms)
+                                }
+                                _ => unreachable!(),
+                            };
+                            if let Some(obj) = self.heap.get_mut(this_oid) {
+                                obj.kind = new_kind;
                             }
                         }
                         // No constructor -- just return the object with prototype methods
@@ -7057,16 +7213,40 @@ impl Vm {
                                             break;
                                         }
                                         let step_oid = step.as_object_id().unwrap();
+                                        // Read `done` with getter support (IteratorComplete)
                                         let done_key = self.interner.intern("done");
-                                        let done = self.heap.get(step_oid)
-                                            .and_then(|o| o.get_property(done_key))
-                                            .map(|v| v.to_boolean())
-                                            .unwrap_or(true);
+                                        let done_getter_key = self.interner.intern("__get_done__");
+                                        let done_gfn = self.heap.get_property_chain(step_oid, done_getter_key)
+                                            .filter(|v| v.is_function());
+                                        let done = if let Some(gfn) = done_gfn {
+                                            match self.call_function_this(gfn, step, &[]) {
+                                                Ok(v) => v.to_boolean(),
+                                                Err(VmError::Throw(v)) => { self.handle_throw(v)?; break; }
+                                                Err(e) => return Err(e),
+                                            }
+                                        } else {
+                                            self.heap.get(step_oid)
+                                                .and_then(|o| o.get_property(done_key))
+                                                .map(|v| v.to_boolean())
+                                                .unwrap_or(true)
+                                        };
                                         if done { break; }
+                                        // Read `value` with getter support (IteratorValue)
                                         let value_key = self.interner.intern("value");
-                                        let val = self.heap.get(step_oid)
-                                            .and_then(|o| o.get_property(value_key))
-                                            .unwrap_or(Value::undefined());
+                                        let value_getter_key = self.interner.intern("__get_value__");
+                                        let value_gfn = self.heap.get_property_chain(step_oid, value_getter_key)
+                                            .filter(|v| v.is_function());
+                                        let val = if let Some(gfn) = value_gfn {
+                                            match self.call_function_this(gfn, step, &[]) {
+                                                Ok(v) => v,
+                                                Err(VmError::Throw(v)) => { self.handle_throw(v)?; break; }
+                                                Err(e) => return Err(e),
+                                            }
+                                        } else {
+                                            self.heap.get(step_oid)
+                                                .and_then(|o| o.get_property(value_key))
+                                                .unwrap_or(Value::undefined())
+                                        };
                                         result.push(val);
                                         if result.len() > 100_000 { break; }
                                     }
@@ -7341,6 +7521,11 @@ impl Vm {
                     // Per spec, function objects expose `length`, `name`, `prototype` own
                     // properties in that order (visible in Object.getOwnPropertyNames).
                     let mut class_obj = JsObject::ordinary();
+                    // Per spec MakeClassConstructor: a class without `extends`
+                    // has [[Prototype]] = %Function.prototype% so static methods
+                    // and `Object.getPrototypeOf(C)` resolve correctly. Inherit
+                    // overrides this when an extends clause is present.
+                    class_obj.prototype = Some(self.function_prototype);
                     let length_key = self.interner.intern("length");
                     class_obj.define_property(length_key, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
                     let name_key = self.interner.intern("name");
@@ -7576,7 +7761,7 @@ impl Vm {
                                 // Built-in math/global sentinels have no prototype.
                                 let has_default = (-516..=-510).contains(&sentinel)
                                     || matches!(sentinel, -504 | -505 | -506 | -507 | -508 | -520 | -551
-                                        | -540 | -541 | -542 | -543 | -550 | -570)
+                                        | -540 | -541 | -542 | -543 | -550 | -570 | -580)
                                     || sentinel >= 0; // user-defined functions auto-allocate
                                 if has_default {
                                     None // resolution happens later; treat as "object"
@@ -7619,7 +7804,29 @@ impl Vm {
                                 -507 => Some(self.array_prototype),
                                 -508 => Some(self.object_prototype),
                                 -551 => Some(self.function_prototype),
-                                _ => self.func_prototypes.get(&sentinel).copied(),
+                                _ => {
+                                    // Lazily allocate the sentinel's prototype on first
+                                    // use so `class Sub extends Date {}` (and other
+                                    // built-ins like Map/Set/Error/RegExp) gets its
+                                    // prototype chain linked even when Date.prototype
+                                    // hasn't been read yet.
+                                    if let Some(&pid) = self.func_prototypes.get(&sentinel) {
+                                        Some(pid)
+                                    } else if sentinel >= 0 || sentinel <= -1000 {
+                                        // User-defined or sentinel-encoded callbacks: skip.
+                                        None
+                                    } else {
+                                        let mut proto = JsObject::ordinary();
+                                        proto.prototype = Some(self.object_prototype);
+                                        let ctor_key = self.interner.intern("constructor");
+                                        proto.define_property(ctor_key, Property::with_flags(
+                                            super_val, Property::WRITABLE | Property::CONFIGURABLE
+                                        ));
+                                        let pid = self.heap.allocate(proto);
+                                        self.func_prototypes.insert(sentinel, pid);
+                                        Some(pid)
+                                    }
+                                }
                             }
                         } else { None };
 
@@ -7633,6 +7840,18 @@ impl Vm {
                             && let Some(sub_proto_obj) = self.heap.get_mut(sub_pid)
                         {
                             sub_proto_obj.prototype = Some(super_pid);
+                        }
+
+                        // Per spec ClassDefinitionEvaluation: the subclass
+                        // constructor's [[Prototype]] is the parent constructor.
+                        // For heap-object superclasses, store directly. For
+                        // native sentinels we fall back to Function.prototype
+                        // since sentinel functions can't be stored in the
+                        // prototype field.
+                        if let Some(super_oid) = super_val.as_object_id()
+                            && let Some(class_obj) = self.heap.get_mut(class_oid)
+                        {
+                            class_obj.prototype = Some(super_oid);
                         }
 
                         // Store superclass reference for super() calls
@@ -7843,25 +8062,25 @@ impl Vm {
                             self.push(iter_val);
                             continue;
                         }
-                        // Generators are their own iterators
+                        // Generators and built-in iterator objects are their own iterators
                         let is_generator = self.heap.get(oid)
-                            .map(|o| matches!(&o.kind, ObjectKind::Generator { .. }))
+                            .map(|o| matches!(&o.kind, ObjectKind::Generator { .. }
+                                | ObjectKind::ArrayIterator(..)
+                                | ObjectKind::MapIterator(..)
+                                | ObjectKind::SetIterator(..)
+                                | ObjectKind::KeyIterator(..)))
                             .unwrap_or(false);
                         if is_generator {
                             self.push(val); // pass through as-is
                         } else if self.heap.get(oid)
                             .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
                             .unwrap_or(false) {
-                            // Array iterator
-                            let iter_obj = JsObject {
-                                properties: Vec::new(),
-                                prototype: None,
-                                kind: ObjectKind::ArrayIterator(oid, 0),
-                                marked: false,
-                                extensible: true,
-                            };
-                            let iter_id = self.heap.allocate(iter_obj);
-                            self.push(Value::object_id(iter_id));
+                            // Arrays should always reach the user_iter_fn path above
+                            // via Array.prototype[Symbol.iterator]. If we got here, the
+                            // user has deliberately removed it; throw per spec.
+                            let err = self.make_native_error("TypeError", "object is not iterable");
+                            self.handle_throw(err)?;
+                            continue;
                         } else if self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Map { .. })).unwrap_or(false) {
                             // Live Map iterator: holds reference to the original Map
                             let iter_obj = JsObject {
@@ -8638,7 +8857,11 @@ impl Vm {
                     // else ToString. Pop the key, push the converted value back.
                     let key = self.pop()?;
                     let prim = if key.is_object() && !key.is_symbol() {
-                        self.try_coerce_to_primitive_hint(key, "string")?
+                        match self.try_coerce_to_primitive_hint(key, "string") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
                     } else {
                         key
                     };

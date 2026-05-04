@@ -5,7 +5,7 @@ use super::vm::{Vm, VmError, CallFrame};
 
 impl Vm {
     /// Call a closure value with the given arguments and run it to completion.
-    pub(crate) fn call_function(&mut self, func_val: Value, args: &[Value]) -> Result<Value, VmError> {
+    pub fn call_function(&mut self, func_val: Value, args: &[Value]) -> Result<Value, VmError> {
         self.call_function_this(func_val, Value::undefined(), args)
     }
 
@@ -51,7 +51,7 @@ impl Vm {
     }
 
     /// Call a closure with a specific `this` binding.
-    pub(crate) fn call_function_this(&mut self, func_val: Value, this_value: Value, args: &[Value]) -> Result<Value, VmError> {
+    pub fn call_function_this(&mut self, func_val: Value, this_value: Value, args: &[Value]) -> Result<Value, VmError> {
         // Host-supplied native function (heap-allocated callable).
         if let Some(oid) = func_val.as_object_id() {
             let native_fn = self.heap.get(oid).and_then(|o| {

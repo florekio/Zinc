@@ -43,10 +43,35 @@ pub fn parse_statement(p: &mut Parser) -> ParseResult<Statement> {
             Ok(Statement::Debugger(span))
         }
         // Check for labeled statement: `identifier : statement`
+        // `yield` and `await` are valid label identifiers in non-strict / non-module code.
         TokenKind::Identifier if p.peek().kind == TokenKind::Colon => {
             let start = p.pos();
             let label = p.intern_current();
             p.advance(); // identifier
+            p.advance(); // colon
+            let body = parse_statement(p)?;
+            Ok(Statement::Labeled(Box::new(LabeledStatement {
+                label,
+                body,
+                span: Span::new(start, p.pos()),
+            })))
+        }
+        TokenKind::Yield if !p.in_generator() && p.peek().kind == TokenKind::Colon => {
+            let start = p.pos();
+            let label = p.intern_current();
+            p.advance(); // yield
+            p.advance(); // colon
+            let body = parse_statement(p)?;
+            Ok(Statement::Labeled(Box::new(LabeledStatement {
+                label,
+                body,
+                span: Span::new(start, p.pos()),
+            })))
+        }
+        TokenKind::Await if !p.in_async() && p.peek().kind == TokenKind::Colon => {
+            let start = p.pos();
+            let label = p.intern_current();
+            p.advance(); // await
             p.advance(); // colon
             let body = parse_statement(p)?;
             Ok(Statement::Labeled(Box::new(LabeledStatement {

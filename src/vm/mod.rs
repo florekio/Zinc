@@ -2,6 +2,7 @@
 pub mod vm;
 mod builtins;
 mod call;
+mod embed;
 mod json;
 mod promise;
 mod generator;

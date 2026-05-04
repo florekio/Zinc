@@ -851,7 +851,9 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
         TokenKind::Yield => {
             p.advance();
             let delegate = p.eat(TokenKind::Star);
-            let argument = if !p.preceded_by_newline()
+            // For `yield *`, no ASI applies between `*` and the argument;
+            // the newline restriction only applies to bare `yield`.
+            let argument = if (delegate || !p.preceded_by_newline())
                 && !p.at_any(&[
                     TokenKind::Semicolon,
                     TokenKind::RBrace,
