@@ -37,6 +37,30 @@ impl Vm {
         Value::object_id(self.heap.allocate(obj))
     }
 
+    /// Allocate a JS object whose internal kind is `Host { tag,
+    /// payload }`, returning a `Value` the embedder can hand to JS.
+    /// Mirrors `Engine::alloc_host_object` but lives on `Vm` so it
+    /// can be called from inside a `register_host_fn` callback
+    /// (which only borrows `&mut Vm`). This is what
+    /// `document.createElement` and friends need: a way to mint a
+    /// fresh handle for a node the script has just created.
+    ///
+    /// `tag` is the raw `HostTag.0` value from the embedder — pass
+    /// it through whatever side channel makes sense (typically
+    /// captured into the closure at `Engine::register_host_class`
+    /// time). `payload` is an opaque 64-bit handle the embedder
+    /// interprets, usually an index into a side table.
+    pub fn alloc_host_object(&mut self, tag: u32, payload: u64) -> Value {
+        let obj = JsObject {
+            properties: Vec::new(),
+            prototype: None,
+            kind: ObjectKind::Host { tag, payload },
+            marked: false,
+            extensible: true,
+        };
+        Value::object_id(self.heap.allocate(obj))
+    }
+
     /// Read a named own-or-inherited property on a JS object value.
     /// Returns `None` if `target` isn't an object or the property is missing.
     /// Walks the prototype chain. Does NOT invoke getters.
