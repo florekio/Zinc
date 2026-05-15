@@ -644,13 +644,35 @@ impl Vm {
     }
 
     /// Close all open upvalues that point to stack slots >= `from`.
+    ///
+    /// Heavy scripts (Google's homepage submit pipeline is the
+    /// canonical example) accumulate stale `Open` upvalues in
+    /// `closure_upvalues` storage: their original stack slot was
+    /// already truncated away on a previous `Return`, but the
+    /// upvalue itself outlived the closure that captured it. The
+    /// next time `close_upvalues_above` runs with a low `from`,
+    /// the naive `self.stack[stack_idx]` panics with "index out
+    /// of bounds".
+    ///
+    /// The right long-term fix is to call `close_upvalues_above`
+    /// at every stack-shrink site — but the VM has ~15 of those
+    /// and threading the call through each is a larger
+    /// refactor. For now: bound-check the indexing and close any
+    /// stale upvalue to `undefined`. A subsequent read of the
+    /// upvalue then returns `undefined` cleanly instead of
+    /// crashing the host.
     pub(crate) fn close_upvalues_above(&mut self, from: usize) {
+        let stack_len = self.stack.len();
         // Close upvalues in all frames
         for frame in &mut self.frames {
             for uv in &mut frame.upvalues {
                 if let UpvalueLocation::Open(stack_idx) = &uv.location
                     && *stack_idx >= from {
-                        let val = self.stack[*stack_idx];
+                        let val = if *stack_idx < stack_len {
+                            self.stack[*stack_idx]
+                        } else {
+                            Value::undefined()
+                        };
                         uv.location = UpvalueLocation::Closed(val);
                     }
             }
@@ -660,7 +682,11 @@ impl Vm {
             for uv in closure_uvs {
                 if let UpvalueLocation::Open(stack_idx) = &uv.location
                     && *stack_idx >= from {
-                        let val = self.stack[*stack_idx];
+                        let val = if *stack_idx < stack_len {
+                            self.stack[*stack_idx]
+                        } else {
+                            Value::undefined()
+                        };
                         uv.location = UpvalueLocation::Closed(val);
                     }
             }

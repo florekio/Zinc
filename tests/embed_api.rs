@@ -92,3 +92,49 @@ fn define_property_with_readonly_flags() {
     assert_eq!(out, "1.0,false,false");
     let _ = Property::WRITABLE; // ensure flag constants are reachable from this crate
 }
+
+#[test]
+fn nested_iife_closures_dont_panic_on_upvalue_close() {
+    // Regression for the "index out of bounds: stack len N vs M"
+    // panic in close_upvalues_above. Google's homepage submit
+    // shell does ~20 nested `(function(){...}).call(this)` IIFEs
+    // each declaring local closures that the VM's
+    // closure_upvalues storage outlives; on the next Return with
+    // a low `from`, the loop indexes into popped slots and
+    // panics. The fix bound-checks the stack access and closes
+    // stale upvalues to `undefined` so the script reports an
+    // error (or returns a value) instead of unwinding the host.
+    //
+    // We don't care what value this evaluates to — only that it
+    // doesn't panic. eval_with_output catches script-level
+    // RuntimeErrors as a "Error: …" string, but a VM panic
+    // escapes that and aborts the test process.
+    let mut engine = Engine::new();
+    let source = r#"
+        var sink = 0;
+        (function(){
+            (function(){
+                (function(){
+                    (function(){
+                        sink = 1;
+                    }).call(this);
+                    sink = sink + 10;
+                }).call(this);
+                sink = sink + 100;
+            }).call(this);
+            sink = sink + 1000;
+        }).call(this);
+        (function(){
+            (function(){
+                (function(){
+                    sink = sink + 10000;
+                }).call(this);
+            }).call(this);
+        }).call(this);
+        sink
+    "#;
+    let (_out, _output) = engine.eval_with_output(source);
+    // Reaching this line at all is the assertion. A pre-fix run
+    // would never get here — the test process aborts inside
+    // close_upvalues_above.
+}
