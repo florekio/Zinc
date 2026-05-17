@@ -3271,7 +3271,26 @@ impl Vm {
                                 let sid = func_val.as_string_id().unwrap();
                                 format!("\"{}\"", self.interner.resolve(sid))
                             } else { self.value_to_string(func_val) };
-                        let msg = format!("{type_name} is not a function");
+                        // Annotate with source line + chunk-byte
+                        // offset so the embedder can correlate
+                        // back to the offending call site. Crucial
+                        // for diagnosing Closure-compiled bundles
+                        // where the failing call is one of
+                        // thousands and the receiver tells you
+                        // nothing about *which* call.
+                        let (line, pc, ck_idx) = if let Some(f) = self.frames.last() {
+                            (
+                                self.chunks[f.chunk_idx].get_line(f.ip as u32),
+                                f.ip,
+                                f.chunk_idx,
+                            )
+                        } else {
+                            (0, 0, 0)
+                        };
+                        let _ = ck_idx;
+                        let msg = format!(
+                            "{type_name} is not a function (at line {line}, bytecode pc {pc})"
+                        );
                         self.stack.truncate(func_pos);
                         self.throw_type_error(&msg)?;
                         continue;
@@ -3933,7 +3952,12 @@ impl Vm {
                         self.pop()?;
                         let type_name = if peeked.is_null() { "null" } else { "undefined" };
                         let prop = self.interner.resolve(name_id).to_owned();
-                        let msg = format!("Cannot read properties of {type_name} (reading '{prop}')");
+                        let (line, pc) = if let Some(f) = self.frames.last() {
+                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip)
+                        } else { (0, 0) };
+                        let msg = format!(
+                            "Cannot read properties of {type_name} (reading '{prop}') (at line {line}, pc {pc})"
+                        );
                         let err = self.make_native_error("TypeError", &msg);
                         self.handle_throw(err)?;
                         continue;
@@ -4943,7 +4967,12 @@ impl Vm {
                     if obj_val.is_null() || obj_val.is_undefined() {
                         let kind = if obj_val.is_null() { "null" } else { "undefined" };
                         let prop = self.interner.resolve(method_name).to_owned();
-                        let msg = format!("Cannot read properties of {kind} (reading '{prop}')");
+                        let (line, pc) = if let Some(f) = self.frames.last() {
+                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip)
+                        } else { (0, 0) };
+                        let msg = format!(
+                            "Cannot read properties of {kind} (reading '{prop}') (at line {line}, pc {pc})"
+                        );
                         self.stack.truncate(obj_pos);
                         let err = self.make_native_error("TypeError", &msg);
                         self.handle_throw(err)?;
