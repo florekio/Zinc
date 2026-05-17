@@ -3314,6 +3314,45 @@ impl Vm {
                         self.throw_type_error(&msg)?;
                         continue;
                     }
+                    // Object with `__constructor__` marker called as a plain
+                    // function (no `new`). The earlier is_explicit_nonfunc
+                    // check exempts these from the TypeError path because
+                    // they ARE callable — dispatch through the stored
+                    // constructor function instead of silently returning
+                    // undefined. Closure-compiled bundles call class-like
+                    // objects this way: google.com /search's xjs bundle has
+                    // a dispatcher object whose `__constructor__` slot
+                    // holds the real callable.
+                    if func_val.is_object() && !func_val.is_function() {
+                        if let Some(oid) = func_val.as_object_id() {
+                            let ctor_key = self.interner.intern("__constructor__");
+                            let ctor_val = self.heap.get(oid)
+                                .and_then(|o| o.get_property(ctor_key))
+                                .filter(|v| v.is_function());
+                            if let Some(ctor) = ctor_val {
+                                let args: Vec<Value> = (0..argc)
+                                    .map(|i| self.stack[func_pos + 1 + i])
+                                    .collect();
+                                self.stack.truncate(func_pos);
+                                match self.call_with_async_wrap(ctor, Value::undefined(), &args) {
+                                    Ok(result) => { self.push(result); continue; }
+                                    Err(VmError::Throw(reason)) => { self.handle_throw(reason)?; continue; }
+                                    Err(VmError::TypeError(msg)) => {
+                                        let err = self.make_native_error("TypeError", &msg);
+                                        self.handle_throw(err)?; continue;
+                                    }
+                                    Err(VmError::ReferenceError(msg)) => {
+                                        let err = self.make_native_error("ReferenceError", &msg);
+                                        self.handle_throw(err)?; continue;
+                                    }
+                                    Err(VmError::RuntimeError(msg)) => {
+                                        let err = self.make_native_error("Error", &msg);
+                                        self.handle_throw(err)?; continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Unknown/undefined — silently return undefined
                     self.stack.truncate(func_pos);
                     self.push(Value::undefined());
