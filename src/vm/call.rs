@@ -68,6 +68,21 @@ impl Vm {
                 };
             }
         }
+        // Class-like objects: if the callee carries a `__constructor__`
+        // slot, the runtime treats it as callable (mirrors typeof
+        // returning "function"). Unwrap to the underlying function and
+        // dispatch through that — otherwise call.apply.bind / super()
+        // and any other indirect call would silently produce undefined
+        // and break Closure-compiled bundles (google.com /search).
+        if !func_val.is_function() && let Some(oid) = func_val.as_object_id() {
+            let ctor_key = self.interner.intern("__constructor__");
+            if let Some(ctor) = self.heap.get(oid)
+                .and_then(|o| o.get_property(ctor_key))
+                .filter(|v| v.is_function())
+            {
+                return self.call_function_this(ctor, this_value, args);
+            }
+        }
         if !func_val.is_function() {
             return Ok(Value::undefined());
         }

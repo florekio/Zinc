@@ -3265,9 +3265,18 @@ impl Vm {
                         continue;
                     }
 
-                    // Throw TypeError for non-callable values: primitives and
-                    // ordinary objects (objects that aren't function-like).
+                    // Throw TypeError for non-callable values: primitives,
+                    // undefined / symbols, and ordinary objects (objects
+                    // that aren't function-like). Previously undefined fell
+                    // through to a silent-undefined push, which masked real
+                    // bundle bugs — calling `someUndefVar(args)` would
+                    // succeed-with-undefined, then the next `.method` access
+                    // would explode with a confusing TypeError far from the
+                    // actual cause. Per spec, calling undefined throws
+                    // TypeError ("undefined is not a function").
                     let is_explicit_nonfunc = func_val.is_null()
+                        || func_val.is_undefined()
+                        || func_val.is_symbol()
                         || func_val.as_bool().is_some()
                         || func_val.is_number()
                         || func_val.is_int()
@@ -4010,11 +4019,12 @@ impl Vm {
                         self.pop()?;
                         let type_name = if peeked.is_null() { "null" } else { "undefined" };
                         let prop = self.interner.resolve(name_id).to_owned();
-                        let (line, pc) = if let Some(f) = self.frames.last() {
-                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip)
-                        } else { (0, 0) };
+                        let (line, pc, chunk_name) = if let Some(f) = self.frames.last() {
+                            let cn = self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned();
+                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip, cn)
+                        } else { (0, 0, String::new()) };
                         let msg = format!(
-                            "Cannot read properties of {type_name} (reading '{prop}') (at line {line}, pc {pc})"
+                            "Cannot read properties of {type_name} (reading '{prop}') (at line {line}, pc {pc}, chunk '{chunk_name}')"
                         );
                         let err = self.make_native_error("TypeError", &msg);
                         self.handle_throw(err)?;
@@ -5040,11 +5050,12 @@ impl Vm {
                     if obj_val.is_null() || obj_val.is_undefined() {
                         let kind = if obj_val.is_null() { "null" } else { "undefined" };
                         let prop = self.interner.resolve(method_name).to_owned();
-                        let (line, pc) = if let Some(f) = self.frames.last() {
-                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip)
-                        } else { (0, 0) };
+                        let (line, pc, chunk_name) = if let Some(f) = self.frames.last() {
+                            let cn = self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned();
+                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip, cn)
+                        } else { (0, 0, String::new()) };
                         let msg = format!(
-                            "Cannot read properties of {kind} (reading '{prop}') (at line {line}, pc {pc})"
+                            "Cannot read properties of {kind} (reading '{prop}') (at line {line}, pc {pc}, chunk '{chunk_name}')"
                         );
                         self.stack.truncate(obj_pos);
                         let err = self.make_native_error("TypeError", &msg);
@@ -5236,8 +5247,21 @@ impl Vm {
                         continue;
                     }
 
-                    // Check for Function.prototype.call/apply/bind
-                    if obj_val.is_function() || (obj_val.is_object() && obj_val.as_object_id()
+                    // Check for Function.prototype.call/apply/bind. The
+                    // receiver matches when it's a function value, an
+                    // object whose kind is Function, OR an object with a
+                    // `__constructor__` slot (class). For the class case
+                    // call_function_this unwraps the slot and dispatches
+                    // through the stored constructor; without this the
+                    // method lookup would fall through to silent
+                    // undefined and break Closure bundles that emit
+                    // `Parent.call(this, …)` super-call patterns.
+                    let is_class_obj = obj_val.is_object() && obj_val.as_object_id()
+                        .and_then(|oid| {
+                            let ctor_key = self.interner.intern("__constructor__");
+                            self.heap.get(oid).map(|o| o.get_property(ctor_key).is_some())
+                        }).unwrap_or(false);
+                    if obj_val.is_function() || is_class_obj || (obj_val.is_object() && obj_val.as_object_id()
                         .and_then(|oid| self.heap.get(oid))
                         .map(|o| matches!(&o.kind, ObjectKind::Function(_)))
                         .unwrap_or(false))
