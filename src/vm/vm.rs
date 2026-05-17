@@ -2674,6 +2674,25 @@ impl Vm {
                     let mut argc = self.read_byte() as usize;
                     let func_pos = self.stack.len() - 1 - argc;
                     let func_val = self.stack[func_pos];
+                    // Embedder-controlled trace: set `ZINC_TRACE_CALLS=1`
+                    // to dump every OpCall's receiver shape +
+                    // bytecode position. Bulky output — turn off in
+                    // production. Built behind an env-var check so
+                    // the hot path is unaffected when not tracing.
+                    if std::env::var("ZINC_TRACE_CALLS").is_ok() {
+                        let (line, pc) = if let Some(f) = self.frames.last() {
+                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip)
+                        } else { (0, 0) };
+                        let receiver = self.value_to_string(func_val);
+                        let callable = if func_val.is_function() { "fn" }
+                            else if func_val.is_object() { "obj" }
+                            else if func_val.is_null() { "null" }
+                            else if func_val.is_undefined() { "undef" }
+                            else { "other" };
+                        eprintln!(
+                            "[zinc-trace] Call line={line} pc={pc} kind={callable} recv={receiver} argc={argc}"
+                        );
+                    }
                     // Remember the actual user-passed arg count before padding so the
                     // arguments object reflects the call site, not the formal parameter
                     // list.
@@ -4961,6 +4980,21 @@ impl Vm {
                     // Stack layout: [..., obj, arg0, ..., argN]
                     let obj_pos = self.stack.len() - 1 - argc;
                     let obj_val = self.stack[obj_pos];
+                    if std::env::var("ZINC_TRACE_CALLS").is_ok() {
+                        let (line, pc) = if let Some(f) = self.frames.last() {
+                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip)
+                        } else { (0, 0) };
+                        let method = self.interner.resolve(method_name).to_owned();
+                        let recv_kind = if obj_val.is_function() { "fn" }
+                            else if obj_val.is_object() { "obj" }
+                            else if obj_val.is_null() { "null" }
+                            else if obj_val.is_undefined() { "undef" }
+                            else { "other" };
+                        let recv = self.value_to_string(obj_val);
+                        eprintln!(
+                            "[zinc-trace] CallMethod line={line} pc={pc} recv-kind={recv_kind} recv={recv} method={method} argc={argc}"
+                        );
+                    }
 
                     // Per spec, calling a method on null/undefined throws TypeError
                     // before the method is even read.
