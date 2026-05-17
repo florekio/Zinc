@@ -3306,18 +3306,18 @@ impl Vm {
                         // where the failing call is one of
                         // thousands and the receiver tells you
                         // nothing about *which* call.
-                        let (line, pc, ck_idx) = if let Some(f) = self.frames.last() {
+                        let (line, pc, chunk_name) = if let Some(f) = self.frames.last() {
+                            let cn = self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned();
                             (
                                 self.chunks[f.chunk_idx].get_line(f.ip as u32),
                                 f.ip,
-                                f.chunk_idx,
+                                cn,
                             )
                         } else {
-                            (0, 0, 0)
+                            (0, 0, String::new())
                         };
-                        let _ = ck_idx;
                         let msg = format!(
-                            "{type_name} is not a function (at line {line}, bytecode pc {pc})"
+                            "{type_name} is not a function (at line {line}, bytecode pc {pc}, chunk '{chunk_name}')"
                         );
                         self.stack.truncate(func_pos);
                         self.throw_type_error(&msg)?;
