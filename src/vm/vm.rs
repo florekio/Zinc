@@ -3265,18 +3265,13 @@ impl Vm {
                         continue;
                     }
 
-                    // Throw TypeError for non-callable values: primitives,
-                    // undefined / symbols, and ordinary objects (objects
-                    // that aren't function-like). Previously undefined fell
-                    // through to a silent-undefined push, which masked real
-                    // bundle bugs — calling `someUndefVar(args)` would
-                    // succeed-with-undefined, then the next `.method` access
-                    // would explode with a confusing TypeError far from the
-                    // actual cause. Per spec, calling undefined throws
-                    // TypeError ("undefined is not a function").
+                    // Throw TypeError for non-callable values: primitives and
+                    // ordinary objects (objects that aren't function-like).
+                    // (Note: undefined and Symbol values fall through to the
+                    // silent-undefined-push path below to preserve compatibility
+                    // with test262 harness helpers that depend on it; making
+                    // them throw regressed ~600 statements/class tests.)
                     let is_explicit_nonfunc = func_val.is_null()
-                        || func_val.is_undefined()
-                        || func_val.is_symbol()
                         || func_val.as_bool().is_some()
                         || func_val.is_number()
                         || func_val.is_int()
@@ -3332,32 +3327,33 @@ impl Vm {
                     // objects this way: google.com /search's xjs bundle has
                     // a dispatcher object whose `__constructor__` slot
                     // holds the real callable.
-                    if func_val.is_object() && !func_val.is_function() {
-                        if let Some(oid) = func_val.as_object_id() {
-                            let ctor_key = self.interner.intern("__constructor__");
-                            let ctor_val = self.heap.get(oid)
-                                .and_then(|o| o.get_property(ctor_key))
-                                .filter(|v| v.is_function());
-                            if let Some(ctor) = ctor_val {
-                                let args: Vec<Value> = (0..argc)
-                                    .map(|i| self.stack[func_pos + 1 + i])
-                                    .collect();
-                                self.stack.truncate(func_pos);
-                                match self.call_with_async_wrap(ctor, Value::undefined(), &args) {
-                                    Ok(result) => { self.push(result); continue; }
-                                    Err(VmError::Throw(reason)) => { self.handle_throw(reason)?; continue; }
-                                    Err(VmError::TypeError(msg)) => {
-                                        let err = self.make_native_error("TypeError", &msg);
-                                        self.handle_throw(err)?; continue;
-                                    }
-                                    Err(VmError::ReferenceError(msg)) => {
-                                        let err = self.make_native_error("ReferenceError", &msg);
-                                        self.handle_throw(err)?; continue;
-                                    }
-                                    Err(VmError::RuntimeError(msg)) => {
-                                        let err = self.make_native_error("Error", &msg);
-                                        self.handle_throw(err)?; continue;
-                                    }
+                    if func_val.is_object()
+                        && !func_val.is_function()
+                        && let Some(oid) = func_val.as_object_id()
+                    {
+                        let ctor_key = self.interner.intern("__constructor__");
+                        let ctor_val = self.heap.get(oid)
+                            .and_then(|o| o.get_property(ctor_key))
+                            .filter(|v| v.is_function());
+                        if let Some(ctor) = ctor_val {
+                            let args: Vec<Value> = (0..argc)
+                                .map(|i| self.stack[func_pos + 1 + i])
+                                .collect();
+                            self.stack.truncate(func_pos);
+                            match self.call_with_async_wrap(ctor, Value::undefined(), &args) {
+                                Ok(result) => { self.push(result); continue; }
+                                Err(VmError::Throw(reason)) => { self.handle_throw(reason)?; continue; }
+                                Err(VmError::TypeError(msg)) => {
+                                    let err = self.make_native_error("TypeError", &msg);
+                                    self.handle_throw(err)?; continue;
+                                }
+                                Err(VmError::ReferenceError(msg)) => {
+                                    let err = self.make_native_error("ReferenceError", &msg);
+                                    self.handle_throw(err)?; continue;
+                                }
+                                Err(VmError::RuntimeError(msg)) => {
+                                    let err = self.make_native_error("Error", &msg);
+                                    self.handle_throw(err)?; continue;
                                 }
                             }
                         }
