@@ -267,10 +267,17 @@ impl<'a> Lexer<'a> {
 
             b'/' => {
                 self.cursor.advance();
-                if self.cursor.eat(b'=') {
-                    TokenKind::SlashAssign
-                } else if self.can_be_regex_start() {
+                // Check regex context FIRST. Otherwise `/=…/` (a regex
+                // matching `=`-prefixed strings, common in real-world
+                // minified code) tokenises as `SlashAssign` and the
+                // rest of the regex bleeds into the next tokens. Real
+                // browsers always disambiguate against the preceding
+                // token before falling back to the division-assign
+                // shape.
+                if self.can_be_regex_start() {
                     return self.scan_regexp(start, preceded_by_newline);
+                } else if self.cursor.eat(b'=') {
+                    TokenKind::SlashAssign
                 } else {
                     TokenKind::Slash
                 }
@@ -974,8 +981,31 @@ mod tests {
 
     #[test]
     fn test_assignment_operators() {
-        let result = tokenize("+= -= *= /= %= **= &&= ||= ??= <<= >>= >>>=");
-        let kinds: Vec<_> = result.iter().map(|(k, _)| *k).collect();
+        // Each operator is preceded by an identifier so the regex /
+        // division disambiguation lands on the division side
+        // consistently. (After an isolated `*=`, a `/` would
+        // correctly start a regex literal — `x *= /re/` is valid
+        // JS where the RHS is a regex.)
+        let result = tokenize("a += b; a -= b; a *= b; a /= b; a %= b; a **= b; a &&= b; a ||= b; a ??= b; a <<= b; a >>= b; a >>>= b");
+        let kinds: Vec<_> = result
+            .iter()
+            .map(|(k, _)| *k)
+            .filter(|k| matches!(
+                k,
+                TokenKind::PlusAssign
+                    | TokenKind::MinusAssign
+                    | TokenKind::StarAssign
+                    | TokenKind::SlashAssign
+                    | TokenKind::PercentAssign
+                    | TokenKind::StarStarAssign
+                    | TokenKind::AmpAmpAssign
+                    | TokenKind::PipePipeAssign
+                    | TokenKind::QuestionQuestionAssign
+                    | TokenKind::LtLtAssign
+                    | TokenKind::GtGtAssign
+                    | TokenKind::GtGtGtAssign
+            ))
+            .collect();
         assert_eq!(kinds, vec![
             TokenKind::PlusAssign,
             TokenKind::MinusAssign,
@@ -990,6 +1020,28 @@ mod tests {
             TokenKind::GtGtAssign,
             TokenKind::GtGtGtAssign,
         ]);
+    }
+
+    #[test]
+    fn regex_after_open_paren_is_not_slash_assign() {
+        // Real-world minified code: `.replace(/=/g, "")` — the `/=`
+        // bytes inside the replace call MUST tokenise as a regex
+        // start, not as `SlashAssign`. The fix here was the
+        // reason google.com /search couldn't render: Google's
+        // bundle includes this exact pattern and Zinc was
+        // mis-tokenising it, cascading into syntax errors that
+        // broke function declarations and ultimately produced
+        // ReferenceError on otherwise-valid parameter names.
+        let result = tokenize(r#"x.replace(/=/g, "")"#);
+        let kinds: Vec<_> = result.iter().map(|(k, _)| *k).collect();
+        assert!(
+            kinds.contains(&TokenKind::RegExp),
+            "expected a RegExp token, got {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&TokenKind::SlashAssign),
+            "should not have tokenised /= as SlashAssign inside a regex context",
+        );
     }
 
     #[test]
