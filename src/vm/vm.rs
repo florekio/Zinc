@@ -1504,21 +1504,29 @@ impl Vm {
                 "name" => { let id = self.interner.intern("Array"); Value::string(id) }
                 "length" => Value::int(1),
                 "call" | "apply" | "bind" => obj_val,
-                _ => Value::undefined(),
+                // Constructors are functions; inherited methods
+                // (hasOwnProperty, isPrototypeOf, …) resolve through
+                // Function.prototype → Object.prototype. e.g.
+                // `Array.hasOwnProperty.call(o, k)` (common in
+                // minified libs like Highlight.js).
+                _ => self.heap.get_property_chain(self.function_prototype, name_id)
+                    .unwrap_or(Value::undefined()),
             },
             -508 => match name_str.as_str() {
                 "prototype" => Value::object_id(self.object_prototype),
                 "name" => { let id = self.interner.intern("Object"); Value::string(id) }
                 "length" => Value::int(1),
                 "call" | "apply" | "bind" => obj_val,
-                _ => Value::undefined(),
+                _ => self.heap.get_property_chain(self.function_prototype, name_id)
+                    .unwrap_or(Value::undefined()),
             },
             -551 => match name_str.as_str() {
                 "prototype" => Value::object_id(self.function_prototype),
                 "name" => { let id = self.interner.intern("Function"); Value::string(id) }
                 "length" => Value::int(1),
                 "call" | "apply" | "bind" => obj_val,
-                _ => Value::undefined(),
+                _ => self.heap.get_property_chain(self.function_prototype, name_id)
+                    .unwrap_or(Value::undefined()),
             },
             _ => match name_str.as_str() {
                 "prototype" => {
@@ -1546,7 +1554,12 @@ impl Vm {
                 "constructor" => Value::function(-551),
                 "name" | "length" => self.fn_get_own_prop(sentinel, name_id).unwrap_or(Value::undefined()),
                 "call" | "apply" | "bind" => obj_val,
-                _ => Value::undefined(),
+                // Inherited methods resolve through Function.prototype →
+                // Object.prototype so every function value exposes
+                // hasOwnProperty / isPrototypeOf / propertyIsEnumerable /
+                // toString / valueOf (`fn.hasOwnProperty(...)` etc.).
+                _ => self.heap.get_property_chain(self.function_prototype, name_id)
+                    .unwrap_or(Value::undefined()),
             },
         }
     }
@@ -4225,7 +4238,10 @@ impl Vm {
                             -507 => match name_str {
                                 // Array static properties
                                 "prototype" => Value::object_id(self.array_prototype),
-                                _ => Value::undefined(),
+                                // Inherited function methods (hasOwnProperty,
+                                // call, …) via Function.prototype → Object.prototype.
+                                _ => self.heap.get_property_chain(self.function_prototype, name_id)
+                                    .unwrap_or(Value::undefined()),
                             },
                             -508 => match name_str {
                                 // Object static properties
@@ -4253,12 +4269,14 @@ impl Vm {
                                     self.fn_property_overrides.insert((-508, name_id), Some(val));
                                     val
                                 }
-                                _ => Value::undefined(),
+                                _ => self.heap.get_property_chain(self.function_prototype, name_id)
+                                    .unwrap_or(Value::undefined()),
                             },
                             -551 => match name_str {
                                 // Function static properties
                                 "prototype" => Value::object_id(self.function_prototype),
-                                _ => Value::undefined(),
+                                _ => self.heap.get_property_chain(self.function_prototype, name_id)
+                                    .unwrap_or(Value::undefined()),
                             },
                             _ => {
                                 // User-defined function properties.
@@ -4310,7 +4328,13 @@ impl Vm {
                                         // Return function sentinel for method dispatch
                                         obj_val
                                     }
-                                    _ => Value::undefined(),
+                                    // Inherited methods (hasOwnProperty,
+                                    // isPrototypeOf, propertyIsEnumerable,
+                                    // toString, valueOf) via Function.prototype
+                                    // → Object.prototype. Lets `fn.hasOwnProperty(k)`
+                                    // and `Ctor.hasOwnProperty.call(o, k)` work.
+                                    _ => self.heap.get_property_chain(self.function_prototype, name_id)
+                                        .unwrap_or(Value::undefined()),
                                 }
                             }
                         };
@@ -8924,7 +8948,23 @@ impl Vm {
                     }
                 }
 
-                OpCode::ImportDynamic | OpCode::ExportDefault => {
+                OpCode::ImportDynamic => {
+                    // `import(specifier)` returns a Promise of the module
+                    // namespace. This embedder has no module loader for
+                    // network/dynamic chunks, so we can't actually resolve
+                    // it. Return a perpetually-pending promise: code that
+                    // does `import(x).then(cb)` registers its continuation
+                    // but it simply never fires — the same observable
+                    // behavior as a chunk that takes forever to load. This
+                    // is far less disruptive than throwing (which aborts
+                    // the whole script) or rejecting (which can surface as
+                    // an unhandled-rejection). Pop the already-evaluated
+                    // specifier off the stack first.
+                    let _specifier = self.pop()?;
+                    let pid = self.allocate_promise();
+                    self.push(Value::object_id(pid));
+                }
+                OpCode::ExportDefault => {
                     return Err(VmError::RuntimeError(format!(
                         "{opcode:?} not yet implemented"
                     )));
@@ -8952,9 +8992,19 @@ impl Vm {
                 }
 
                 OpCode::ImportMeta => {
-                    return Err(VmError::RuntimeError(format!(
-                        "{opcode:?} not yet implemented"
-                    )));
+                    // `import.meta` — a host-populated module-scope object.
+                    // The only widely-used field is `import.meta.url`. We
+                    // don't track a per-module URL in this embedder, so
+                    // expose an object with an empty `url` string. Reading
+                    // any other property yields undefined (ordinary object),
+                    // which is what most feature-probing code tolerates.
+                    let mut obj = JsObject::ordinary();
+                    obj.prototype = Some(self.object_prototype);
+                    let url_key = self.interner.intern("url");
+                    let empty = self.interner.intern("");
+                    obj.set_property(url_key, Value::string(empty));
+                    let oid = self.heap.allocate(obj);
+                    self.push(Value::object_id(oid));
                 }
 
                 OpCode::TemplateTag => {

@@ -561,6 +561,42 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
             Ok(Expression::Super(span))
         }
 
+        // `import.meta` meta-property and dynamic `import(specifier)`.
+        // Both forms appear in expression position (the statement-level
+        // `import … from …` is handled separately in statement.rs).
+        TokenKind::Import => {
+            p.advance(); // consume 'import'
+            if p.at(TokenKind::Dot) {
+                p.advance();
+                if !p.at(TokenKind::Identifier) || p.current_text() != "meta" {
+                    return Err(ParseError::expected("'meta' after 'import.'", p.current_kind(), p.current().span));
+                }
+                let meta = p.interner.intern("import");
+                let property = p.interner.intern("meta");
+                p.advance();
+                return Ok(Expression::MetaProperty(MetaProperty {
+                    meta,
+                    property,
+                    span: Span::new(start, p.pos()),
+                }));
+            }
+            // Dynamic import: import(specifier). A single AssignmentExpression
+            // argument; an optional second options arg (import attributes) is
+            // tolerated and ignored.
+            p.expect(TokenKind::LParen)?;
+            let source = parse_expression(p, 2)?;
+            if p.eat(TokenKind::Comma) && !p.at(TokenKind::RParen) {
+                // Discard the options/attributes argument — we don't honor it.
+                let _ = parse_expression(p, 2)?;
+                p.eat(TokenKind::Comma); // trailing comma
+            }
+            p.expect(TokenKind::RParen)?;
+            Ok(Expression::Import(Box::new(ImportExpression {
+                source,
+                span: Span::new(start, p.pos()),
+            })))
+        }
+
         // ---- Grouping / Arrow ----
         TokenKind::LParen => {
             p.advance(); // (

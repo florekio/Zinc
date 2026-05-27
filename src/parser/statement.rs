@@ -80,6 +80,12 @@ pub fn parse_statement(p: &mut Parser) -> ParseResult<Statement> {
                 span: Span::new(start, p.pos()),
             })))
         }
+        // `import(...)` / `import.meta` at statement start are expressions,
+        // not import declarations — delegate to the expression-statement path
+        // so the primary-expression parser handles them.
+        TokenKind::Import if matches!(p.peek().kind, TokenKind::LParen | TokenKind::Dot) => {
+            parse_expression_statement(p)
+        }
         TokenKind::Import => parse_import_declaration(p),
         TokenKind::Export => parse_export_declaration(p),
         _ => parse_expression_statement(p),
