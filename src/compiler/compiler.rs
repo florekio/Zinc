@@ -49,6 +49,14 @@ struct CompilerUpvalue {
     is_local: bool,
 }
 
+/// One enclosing function scope on the capture chain. Holds that function's
+/// locals and upvalues so a nested function can both mark an outer local
+/// captured and thread an upvalue through every intermediate function.
+struct EnclosingFrame {
+    locals: Vec<Local>,
+    upvalues: Vec<CompilerUpvalue>,
+}
+
 // ---------------------------------------------------------------------------
 // Loop / break / continue bookkeeping
 // ---------------------------------------------------------------------------
@@ -81,10 +89,14 @@ pub struct Compiler<'a> {
     scope_depth: u32,
     interner: &'a mut Interner,
     loops: Vec<LoopCtx>,
-    /// Parent compiler's locals (for upvalue resolution across function boundaries).
-    /// This is set when compiling a nested function.
-    enclosing_locals: Option<Vec<Local>>,
-    enclosing_upvalues: Option<Vec<CompilerUpvalue>>,
+    /// Stack of enclosing function scopes, outermost first and the immediate
+    /// parent last. Each frame owns that function's locals + upvalues so that
+    /// resolving a free variable can (a) mark the owning local captured and
+    /// (b) thread an upvalue through every intermediate function — i.e. proper
+    /// transitive capture from grandparent (and deeper) scopes, not just the
+    /// immediate parent. Frames are pushed when descending into a nested
+    /// function and popped (with their mutations intact) on the way out.
+    enclosing_chain: Vec<EnclosingFrame>,
     /// Set of global-scope const variable names (to prevent reassignment).
     const_globals: std::collections::HashSet<StringId>,
     /// Label from an enclosing labeled statement, to be adopted by the next loop.
@@ -114,8 +126,7 @@ impl<'a> Compiler<'a> {
             scope_depth: 0,
             interner,
             loops: Vec::new(),
-            enclosing_locals: None,
-            enclosing_upvalues: None,
+            enclosing_chain: Vec::new(),
             const_globals: std::collections::HashSet::new(),
             pending_label: None,
             pending_function_name: None,
@@ -293,33 +304,67 @@ impl<'a> Compiler<'a> {
         None
     }
 
-    /// Try to resolve a variable as an upvalue (captured from enclosing scope).
+    /// Try to resolve a variable as an upvalue captured from an enclosing
+    /// scope. Walks the enclosing chain from the immediate parent outward;
+    /// when it finds the owning local at some ancestor level it threads an
+    /// upvalue through every function in between (transitive capture), so a
+    /// grandparent (or deeper) binding is reachable even when the intermediate
+    /// functions never reference it themselves.
     fn resolve_upvalue(&mut self, name: StringId) -> Option<u8> {
-        // Check if the variable is in the enclosing function's locals
-        if let Some(ref mut enc_locals) = self.enclosing_locals {
-            for (i, local) in enc_locals.iter_mut().enumerate().rev() {
+        let n = self.enclosing_chain.len();
+        if n == 0 {
+            return None;
+        }
+        // level indexes enclosing_chain; start at the immediate parent (last).
+        self.resolve_upvalue_at(name, n - 1)
+    }
+
+    /// Resolve `name` against the function at chain index `level`, returning
+    /// the upvalue index added to that function's *child* (the function at
+    /// `level + 1`, or the current function when `level + 1 == chain.len()`).
+    fn resolve_upvalue_at(&mut self, name: StringId, level: usize) -> Option<u8> {
+        // 1. Is `name` an own local of frame[level]? Mark it captured.
+        let local_idx = {
+            let frame = &mut self.enclosing_chain[level];
+            let mut found = None;
+            for (i, local) in frame.locals.iter_mut().enumerate().rev() {
                 if local.name == name {
                     local.captured = true;
-                    return Some(self.add_upvalue(i as u8, true));
+                    found = Some(i);
+                    break;
                 }
             }
+            found
+        };
+        if let Some(i) = local_idx {
+            return Some(self.add_upvalue_at(level + 1, i as u8, true));
         }
-
-        // TODO: transitive upvalue capture (capturing from grandparent scopes)
-        // Currently only supports one level of capture (enclosing locals).
-
+        // 2. Otherwise recurse into the grandparent; if found, the upvalue it
+        //    added to frame[level] becomes a (non-local) upvalue of frame[level+1].
+        if level == 0 {
+            return None;
+        }
+        if let Some(parent_uv) = self.resolve_upvalue_at(name, level - 1) {
+            return Some(self.add_upvalue_at(level + 1, parent_uv, false));
+        }
         None
     }
 
-    fn add_upvalue(&mut self, index: u8, is_local: bool) -> u8 {
-        // Check if we already have this upvalue
-        for (i, uv) in self.upvalues.iter().enumerate() {
+    /// Add (deduplicated) an upvalue to the function at chain index `level`,
+    /// or to the current function when `level == chain.len()`. Returns its index.
+    fn add_upvalue_at(&mut self, level: usize, index: u8, is_local: bool) -> u8 {
+        let upvalues = if level == self.enclosing_chain.len() {
+            &mut self.upvalues
+        } else {
+            &mut self.enclosing_chain[level].upvalues
+        };
+        for (i, uv) in upvalues.iter().enumerate() {
             if uv.index == index && uv.is_local == is_local {
                 return i as u8;
             }
         }
-        let idx = self.upvalues.len() as u8;
-        self.upvalues.push(CompilerUpvalue { index, is_local });
+        let idx = upvalues.len() as u8;
+        upvalues.push(CompilerUpvalue { index, is_local });
         idx
     }
 
@@ -2104,6 +2149,24 @@ impl<'a> Compiler<'a> {
         let name = f.id.unwrap_or_else(|| self.interner.intern("<anonymous>"));
         let line = f.span.start;
 
+        // At function scope, reserve the local slot BEFORE compiling the body so
+        // the function is in scope for itself — recursion (`function e(){…e()…}`)
+        // and any nested closure that captures the declaration both resolve it as
+        // an upvalue rather than a missing global. This path runs when the
+        // top-level hoist was skipped (body has top-level let/const), which modern
+        // strict bundles routinely hit. At global scope the name is a global, so
+        // self-reference resolves via GetGlobal and no slot is needed.
+        let reserved_slot = if self.scope_depth == 0 {
+            None
+        } else if let Some(slot) = self.resolve_local(name) {
+            Some(slot)
+        } else {
+            self.chunk.emit_op(OpCode::Undefined, line);
+            self.add_local(name);
+            self.mark_initialized();
+            Some(self.locals.len() - 1)
+        };
+
         let child_chunk =
             self.compile_function_body(name, &f.params, &f.body, f.is_async, f.is_generator)?;
         let chunk_idx = self.chunk.child_chunks.len() as u16;
@@ -2116,12 +2179,19 @@ impl<'a> Compiler<'a> {
             self.chunk.emit_byte(desc.index, line);
         }
 
-        if self.scope_depth == 0 {
-            let idx = self.make_string_constant(name);
-            self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
-        } else {
-            self.add_local(name);
-            self.mark_initialized();
+        match reserved_slot {
+            None => {
+                let idx = self.make_string_constant(name);
+                self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
+            }
+            Some(slot) => {
+                if slot <= u8::MAX as usize {
+                    self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
+                } else {
+                    self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
+                }
+                self.chunk.emit_op(OpCode::Pop, line);
+            }
         }
         Ok(())
     }
@@ -2844,18 +2914,17 @@ impl<'a> Compiler<'a> {
         }
         child_chunk.flags = flags;
 
-        // Swap compiler state -- save parent's locals so inner functions can capture them.
+        // Swap compiler state -- push parent's locals + upvalues onto the
+        // enclosing chain so nested functions can capture them transitively.
         let parent_chunk = std::mem::replace(&mut self.chunk, child_chunk);
         let parent_locals = std::mem::take(&mut self.locals);
         let parent_upvalues = std::mem::take(&mut self.upvalues);
         let parent_depth = self.scope_depth;
         let parent_loops = std::mem::take(&mut self.loops);
-        let parent_enclosing_locals = self.enclosing_locals.take();
-        let parent_enclosing_upvalues = self.enclosing_upvalues.take();
-
-        // Make parent's locals available for upvalue resolution
-        self.enclosing_locals = Some(parent_locals.clone());
-        self.enclosing_upvalues = Some(parent_upvalues.clone());
+        self.enclosing_chain.push(EnclosingFrame {
+            locals: parent_locals,
+            upvalues: parent_upvalues,
+        });
 
         self.scope_depth = 1; // function body is its own scope
 
@@ -3005,40 +3074,54 @@ impl<'a> Compiler<'a> {
         ));
         let arguments_id = self.interner.intern("arguments");
         if !has_top_level_lex {
-            for stmt in &body.body {
+            // Two-pass hoist so a function declaration is in scope *before* its
+            // own body compiles — otherwise a nested function that references
+            // the declaration (recursion, or a closure that calls back into a
+            // sibling) resolves it as a missing global. Pass 1 reserves a local
+            // slot for every hoisted name; pass 2 compiles the bodies and
+            // assigns each closure into its reserved slot.
+            let mut hoist_targets: Vec<(StringId, usize, usize)> = Vec::new(); // (name, slot, stmt_idx)
+            for (idx, stmt) in body.body.iter().enumerate() {
                 if let Statement::Function(f) = stmt
                     && let Some(name) = f.id
                 {
-                    // Skip hoisting `function arguments(){}` if the arguments object
-                    // is needed (params have expressions or `arguments` isn't a param).
                     if name == arguments_id
                         && (has_param_exprs || !params.iter().any(|p| matches!(p, Pattern::Identifier(id) if id.name == arguments_id)))
                     {
                         continue;
                     }
                     let line = f.span.start;
-                    let child_chunk = self.compile_function_body(name, &f.params, &f.body, f.is_async, f.is_generator)?;
-                    let chunk_idx = self.chunk.child_chunks.len() as u16;
-                    let upvalue_descs = child_chunk.upvalue_descriptors.clone();
-                    self.chunk.child_chunks.push(child_chunk);
-                    self.chunk.emit_op_u16(OpCode::Closure, chunk_idx, line);
-                    for desc in &upvalue_descs {
-                        self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
-                        self.chunk.emit_byte(desc.index, line);
-                    }
-                    if let Some(slot) = self.resolve_local(name) {
-                        if slot <= u8::MAX as usize {
-                            self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
-                        } else {
-                            self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
-                        }
-                        self.chunk.emit_op(OpCode::Pop, line);
+                    let slot = if let Some(slot) = self.resolve_local(name) {
+                        slot
                     } else {
+                        // Reserve a slot initialized to undefined; pass 2 overwrites it.
+                        self.chunk.emit_op(OpCode::Undefined, line);
                         self.add_local(name);
                         self.mark_initialized();
-                    }
+                        self.locals.len() - 1
+                    };
+                    hoist_targets.push((name, slot, idx));
                     hoisted_fns.push(name);
                 }
+            }
+            for (name, slot, idx) in hoist_targets {
+                let Statement::Function(f) = &body.body[idx] else { unreachable!() };
+                let line = f.span.start;
+                let child_chunk = self.compile_function_body(name, &f.params, &f.body, f.is_async, f.is_generator)?;
+                let chunk_idx = self.chunk.child_chunks.len() as u16;
+                let upvalue_descs = child_chunk.upvalue_descriptors.clone();
+                self.chunk.child_chunks.push(child_chunk);
+                self.chunk.emit_op_u16(OpCode::Closure, chunk_idx, line);
+                for desc in &upvalue_descs {
+                    self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
+                    self.chunk.emit_byte(desc.index, line);
+                }
+                if slot <= u8::MAX as usize {
+                    self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
+                } else {
+                    self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
+                }
+                self.chunk.emit_op(OpCode::Pop, line);
             }
         }
 
@@ -3076,21 +3159,15 @@ impl<'a> Compiler<'a> {
         // Swap back.
         let compiled = std::mem::replace(&mut self.chunk, parent_chunk);
 
-        // Propagate captured flags back to parent locals
-        let mut restored_locals = parent_locals;
-        if let Some(enc_locals) = self.enclosing_locals.take() {
-            for (i, enc) in enc_locals.iter().enumerate() {
-                if enc.captured && i < restored_locals.len() {
-                    restored_locals[i].captured = true;
-                }
-            }
-        }
-        self.locals = restored_locals;
-        self.upvalues = parent_upvalues;
+        // Pop the parent's frame off the chain. Its locals (captured flags
+        // updated) and upvalues (any transitively-threaded upvalues added
+        // while compiling this child) are restored directly — no copy-back
+        // needed, the frame *is* the parent's state.
+        let parent_frame = self.enclosing_chain.pop().expect("enclosing frame");
+        self.locals = parent_frame.locals;
+        self.upvalues = parent_frame.upvalues;
         self.scope_depth = parent_depth;
         self.loops = parent_loops;
-        self.enclosing_locals = parent_enclosing_locals;
-        self.enclosing_upvalues = parent_enclosing_upvalues;
 
         Ok(compiled)
     }
@@ -3119,12 +3196,12 @@ impl<'a> Compiler<'a> {
         let parent_upvalues = std::mem::take(&mut self.upvalues);
         let parent_depth = self.scope_depth;
         let parent_loops = std::mem::take(&mut self.loops);
-        let parent_enclosing_locals = self.enclosing_locals.take();
-        let parent_enclosing_upvalues = self.enclosing_upvalues.take();
-
-        // Make parent's locals available for upvalue resolution (enables nested closures)
-        self.enclosing_locals = Some(parent_locals.clone());
-        self.enclosing_upvalues = Some(parent_upvalues.clone());
+        // Push parent's scope onto the chain so the arrow body (and anything
+        // nested in it) can capture transitively.
+        self.enclosing_chain.push(EnclosingFrame {
+            locals: parent_locals,
+            upvalues: parent_upvalues,
+        });
 
         self.scope_depth = 1;
 
@@ -3242,19 +3319,14 @@ impl<'a> Compiler<'a> {
 
         let compiled = std::mem::replace(&mut self.chunk, parent_chunk);
 
-        // Propagate captured flags back to parent locals
-        let mut restored_locals = parent_locals;
-        for uv in &self.upvalues {
-            if uv.is_local && (uv.index as usize) < restored_locals.len() {
-                restored_locals[uv.index as usize].captured = true;
-            }
-        }
-        self.locals = restored_locals;
-        self.upvalues = parent_upvalues;
+        // Pop the parent frame; its locals (captured flags set during
+        // resolution) and upvalues (transitively threaded) are restored
+        // directly.
+        let parent_frame = self.enclosing_chain.pop().expect("enclosing frame");
+        self.locals = parent_frame.locals;
+        self.upvalues = parent_frame.upvalues;
         self.scope_depth = parent_depth;
         self.loops = parent_loops;
-        self.enclosing_locals = parent_enclosing_locals;
-        self.enclosing_upvalues = parent_enclosing_upvalues;
 
         Ok(compiled)
     }
