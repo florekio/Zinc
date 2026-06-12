@@ -83,6 +83,39 @@ impl Vm {
                 return self.call_function_this(ctor, this_value, args);
             }
         }
+        // Bound / bytecode / sentinel FUNCTION OBJECTS: unwrap to the
+        // underlying callable. `arr[i](...)` desugars to `.call(...)`
+        // which lands here, and React's useState setter is a bound
+        // function read out of the hook array — both silently produced
+        // undefined before.
+        if !func_val.is_function() && let Some(oid) = func_val.as_object_id() {
+            use crate::runtime::object::FunctionKind as FK;
+            enum Unwrapped {
+                Bound(crate::runtime::object::ObjectId, Value, Vec<Value>),
+                Direct(i32),
+            }
+            let unwrapped = self.heap.get(oid).and_then(|o| match &o.kind {
+                crate::runtime::object::ObjectKind::Function(FK::Bound { target, this_val, args }) =>
+                    Some(Unwrapped::Bound(*target, *this_val, args.clone())),
+                crate::runtime::object::ObjectKind::Function(FK::Bytecode { chunk_idx, .. }) =>
+                    Some(Unwrapped::Direct(*chunk_idx as i32)),
+                crate::runtime::object::ObjectKind::Function(FK::NativeSentinel { sentinel }) =>
+                    Some(Unwrapped::Direct(*sentinel)),
+                _ => None,
+            });
+            match unwrapped {
+                Some(Unwrapped::Bound(target, bound_this, bound_args)) => {
+                    let full: Vec<Value> =
+                        bound_args.into_iter().chain(args.iter().copied()).collect();
+                    // Recurse: the target may itself be a function object.
+                    return self.call_function_this(Value::object_id(target), bound_this, &full);
+                }
+                Some(Unwrapped::Direct(packed)) => {
+                    return self.call_function_this(Value::function(packed), this_value, args);
+                }
+                None => {}
+            }
+        }
         if !func_val.is_function() {
             return Ok(Value::undefined());
         }

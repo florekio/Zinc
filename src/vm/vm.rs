@@ -5347,6 +5347,55 @@ impl Vm {
                                 Err(reason) => { self.handle_throw(reason)?; continue; }
                             }
                         }
+                        // Bound / bytecode / sentinel FUNCTION OBJECTS called
+                        // as methods (`obj.m(...)`, `arr[i](...)`): unwrap the
+                        // same way the plain-Call opcode does. They silently
+                        // fell through to the undefined-push tail before —
+                        // React's useState setter is a bound function read
+                        // out of the hook array.
+                        enum MethodFnKind {
+                            Bound(crate::runtime::object::ObjectId, Value, Vec<Value>),
+                            Direct(i32),
+                        }
+                        let kind_call = self.heap.get(method_oid).and_then(|o| match &o.kind {
+                            ObjectKind::Function(crate::runtime::object::FunctionKind::Bound { target, this_val, args }) =>
+                                Some(MethodFnKind::Bound(*target, *this_val, args.clone())),
+                            ObjectKind::Function(crate::runtime::object::FunctionKind::Bytecode { chunk_idx, .. }) =>
+                                Some(MethodFnKind::Direct(*chunk_idx as i32)),
+                            ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { sentinel }) =>
+                                Some(MethodFnKind::Direct(*sentinel)),
+                            _ => None,
+                        });
+                        if let Some(kind_call) = kind_call {
+                            let call_args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            self.truncate_stack(obj_pos);
+                            match kind_call {
+                                MethodFnKind::Bound(target_oid, this_val, bound_args) => {
+                                    let target_fn = self.heap.get(target_oid).and_then(|o| match &o.kind {
+                                        ObjectKind::Function(crate::runtime::object::FunctionKind::Bytecode { chunk_idx, .. }) =>
+                                            Some(Value::function(*chunk_idx as i32)),
+                                        ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { sentinel }) =>
+                                            Some(Value::function(*sentinel)),
+                                        _ => None,
+                                    });
+                                    if let Some(fn_val) = target_fn {
+                                        let full: Vec<Value> =
+                                            bound_args.into_iter().chain(call_args).collect();
+                                        let result = self.call_with_async_wrap(fn_val, this_val, &full)?;
+                                        self.push(result);
+                                    } else {
+                                        self.push(Value::undefined());
+                                    }
+                                    continue;
+                                }
+                                MethodFnKind::Direct(packed) => {
+                                    let result =
+                                        self.call_with_async_wrap(Value::function(packed), obj_val, &call_args)?;
+                                    self.push(result);
+                                    continue;
+                                }
+                            }
+                        }
                     }
 
                     // Check for console.log/warn/error sentinels
@@ -9482,6 +9531,21 @@ impl Vm {
         let wrapper_fn = Value::function(base_idx as i32);
         let result = self.call_function(wrapper_fn, &[])?;
         Ok(result)
+    }
+
+    /// Embedder-facing: enqueue `callback` on the engine's microtask
+    /// queue (drained by `drain_microtasks` — end of eval, end of
+    /// tick). Backs `queueMicrotask`: running such callbacks
+    /// synchronously breaks run-to-completion, which React's
+    /// sync-flush scheduling observes immediately.
+    pub fn host_enqueue_microtask(&mut self, callback: Value) {
+        let pid = self.allocate_promise();
+        self.microtask_queue.push(Microtask::PromiseReaction {
+            callback: Some(callback),
+            value: Value::undefined(),
+            result_promise: pid,
+            is_fulfilled: true,
+        });
     }
 
     /// `Symbol.for(key)`: one shared symbol per key, registered globally.
