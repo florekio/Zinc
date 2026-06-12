@@ -2959,6 +2959,153 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// Hoist `var` names of a function/arrow body: reserve an
+    /// undefined-initialized local slot for every var declared anywhere in
+    /// the body (parameters keep their slots).
+    fn hoist_body_vars(&mut self, body_stmts: &[Statement]) {
+        let mut hoisted_names = Vec::new();
+        for stmt in body_stmts {
+            collect_var_declarations(stmt, &mut hoisted_names);
+        }
+        let param_names: Vec<StringId> = self.locals.iter().map(|l| l.name).collect();
+        for name in hoisted_names {
+            // Don't re-declare parameters
+            if !param_names.contains(&name) && self.resolve_local(name).is_none() {
+                self.chunk.emit_op(OpCode::Undefined, 0);
+                self.add_local(name);
+                self.mark_initialized();
+            }
+        }
+    }
+
+    /// Hoist top-level function declarations of a function/arrow body:
+    /// each `function f() {...}` is initialized at the top with its closure,
+    /// shadowing any same-named parameter or var binding (per spec, function
+    /// declarations have higher precedence than params/vars in function code).
+    /// Returns the hoisted names so the statement loop can skip the
+    /// declarations. Shared by compile_function_body_with_self and
+    /// compile_arrow_body — webpack module wrappers are arrows whose bodies
+    /// rely on hoisting (React's renderer calls helpers declared later).
+    ///
+    /// Top-level `let` / `const` complicate the hoist: pre-compiling inner
+    /// functions would resolve those bindings as missing upvalues since
+    /// their slots are not yet allocated. When every top-level lexical is a
+    /// simple identifier, we reserve their slots (undefined) BEFORE the
+    /// hoist so function bodies resolve them as locals/upvalues; the
+    /// declaration statement later assigns into the reserved slot (tracked
+    /// in `predeclared_lex`). DuckDuckGo's SSG script needs this — an IIFE
+    /// opening with `let e = ...` calls memoized helpers declared after the
+    /// call site; skipping the hoist left them undefined at the call.
+    ///
+    /// Destructuring lexicals (`let {a} = ...`) still skip the hoist —
+    /// their binding path allocates slots mid-pattern and can't be
+    /// pre-reserved without reworking it. Note TDZ is currently NOT
+    /// enforced at runtime (InitLet is a no-op), so reserving as undefined
+    /// does not change observable TDZ behavior.
+    fn hoist_body_functions(
+        &mut self,
+        body_stmts: &[Statement],
+        params: &[Pattern],
+    ) -> Result<Vec<StringId>, String> {
+        let has_top_level_lex = body_stmts.iter().any(|s| matches!(
+            s,
+            Statement::Variable(d) if matches!(d.kind, VarKind::Let | VarKind::Const)
+        ));
+        let lex_all_simple = body_stmts.iter().all(|s| match s {
+            Statement::Variable(d) if matches!(d.kind, VarKind::Let | VarKind::Const) => d
+                .declarations
+                .iter()
+                .all(|dec| matches!(&dec.id, Pattern::Identifier(_))),
+            _ => true,
+        });
+        let has_fn_decls = body_stmts
+            .iter()
+            .any(|s| matches!(s, Statement::Function(f) if f.id.is_some()));
+        let do_hoist = !has_top_level_lex || (lex_all_simple && has_fn_decls);
+        let mut hoisted_fns: Vec<StringId> = Vec::new();
+        // Function declaration named `arguments` shouldn't shadow the arguments
+        // object when params have expressions (defaults/destructuring/rest), per
+        // spec — the arguments object is required and the user-visible binding.
+        let has_param_exprs = params.iter().any(|p| matches!(
+            p,
+            Pattern::Assignment(_) | Pattern::Array(_) | Pattern::Object(_) | Pattern::Rest(_)
+        ));
+        let arguments_id = self.interner.intern("arguments");
+        if do_hoist {
+            // Reserve slots for top-level lexicals first (see above)
+            // so the hoisted function bodies can capture them.
+            if has_top_level_lex {
+                for stmt in body_stmts {
+                    if let Statement::Variable(d) = stmt
+                        && matches!(d.kind, VarKind::Let | VarKind::Const)
+                    {
+                        for dec in &d.declarations {
+                            if let Pattern::Identifier(id) = &dec.id
+                                && self.resolve_local(id.name).is_none()
+                            {
+                                self.chunk.emit_op(OpCode::Undefined, dec.span.start);
+                                self.add_local(id.name);
+                                self.mark_initialized();
+                                self.predeclared_lex.push(id.name);
+                            }
+                        }
+                    }
+                }
+            }
+            // Two-pass hoist so a function declaration is in scope *before* its
+            // own body compiles — otherwise a nested function that references
+            // the declaration (recursion, or a closure that calls back into a
+            // sibling) resolves it as a missing global. Pass 1 reserves a local
+            // slot for every hoisted name; pass 2 compiles the bodies and
+            // assigns each closure into its reserved slot.
+            let mut hoist_targets: Vec<(StringId, usize, usize)> = Vec::new(); // (name, slot, stmt_idx)
+            for (idx, stmt) in body_stmts.iter().enumerate() {
+                if let Statement::Function(f) = stmt
+                    && let Some(name) = f.id
+                {
+                    if name == arguments_id
+                        && (has_param_exprs || !params.iter().any(|p| matches!(p, Pattern::Identifier(id) if id.name == arguments_id)))
+                    {
+                        continue;
+                    }
+                    let line = f.span.start;
+                    let slot = if let Some(slot) = self.resolve_local(name) {
+                        slot
+                    } else {
+                        // Reserve a slot initialized to undefined; pass 2 overwrites it.
+                        self.chunk.emit_op(OpCode::Undefined, line);
+                        self.add_local(name);
+                        self.mark_initialized();
+                        self.locals.len() - 1
+                    };
+                    hoist_targets.push((name, slot, idx));
+                    hoisted_fns.push(name);
+                }
+            }
+            for (name, slot, idx) in hoist_targets {
+                let Statement::Function(f) = &body_stmts[idx] else { unreachable!() };
+                let line = f.span.start;
+                let child_chunk = self.compile_function_body(name, &f.params, &f.body, f.is_async, f.is_generator)?;
+                let chunk_idx = self.chunk.child_chunks.len() as u16;
+                let upvalue_descs = child_chunk.upvalue_descriptors.clone();
+                self.chunk.child_chunks.push(child_chunk);
+                self.chunk.emit_op_u16(OpCode::Closure, chunk_idx, line);
+                for desc in &upvalue_descs {
+                    self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
+                    self.chunk.emit_byte((desc.index >> 8) as u8, line);
+                    self.chunk.emit_byte((desc.index & 0xFF) as u8, line);
+                }
+                if slot <= u8::MAX as usize {
+                    self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
+                } else {
+                    self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
+                }
+                self.chunk.emit_op(OpCode::Pop, line);
+            }
+        }
+        Ok(hoisted_fns)
+    }
+
     fn compile_function_body(
         &mut self,
         name: StringId,
@@ -3117,21 +3264,7 @@ impl<'a> Compiler<'a> {
         }
 
         // Hoist var declarations inside the function body.
-        {
-            let mut hoisted_names = Vec::new();
-            for stmt in &body.body {
-                collect_var_declarations(stmt, &mut hoisted_names);
-            }
-            let param_names: Vec<StringId> = self.locals.iter().map(|l| l.name).collect();
-            for name in hoisted_names {
-                // Don't re-declare parameters
-                if !param_names.contains(&name) && self.resolve_local(name).is_none() {
-                    self.chunk.emit_op(OpCode::Undefined, 0);
-                    self.add_local(name);
-                    self.mark_initialized();
-                }
-            }
-        }
+        self.hoist_body_vars(&body.body);
 
         // Named function expression self-binding: `function f() { ...f()... }` exposes
         // `f` inside the body as an immutable reference to the function itself.
@@ -3145,123 +3278,7 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        // Hoist function declarations: each top-level `function f() {...}` in the body
-        // is initialized at the top with its closure, shadowing any same-named parameter
-        // or var binding (per spec, function declarations have higher precedence than
-        // params/vars in function code).
-        //
-        // Top-level `let` / `const` complicate the hoist: pre-compiling inner
-        // functions would resolve those bindings as missing upvalues since
-        // their slots are not yet allocated. When every top-level lexical is a
-        // simple identifier, we reserve their slots (undefined) BEFORE the
-        // hoist so function bodies resolve them as locals/upvalues; the
-        // declaration statement later assigns into the reserved slot (tracked
-        // in `predeclared_lex`). DuckDuckGo's SSG script needs this — an IIFE
-        // opening with `let e = ...` calls memoized helpers declared after the
-        // call site; skipping the hoist left them undefined at the call.
-        //
-        // Destructuring lexicals (`let {a} = ...`) still skip the hoist —
-        // their binding path allocates slots mid-pattern and can't be
-        // pre-reserved without reworking it. Note TDZ is currently NOT
-        // enforced at runtime (InitLet is a no-op), so reserving as undefined
-        // does not change observable TDZ behavior.
-        let has_top_level_lex = body.body.iter().any(|s| matches!(
-            s,
-            Statement::Variable(d) if matches!(d.kind, VarKind::Let | VarKind::Const)
-        ));
-        let lex_all_simple = body.body.iter().all(|s| match s {
-            Statement::Variable(d) if matches!(d.kind, VarKind::Let | VarKind::Const) => d
-                .declarations
-                .iter()
-                .all(|dec| matches!(&dec.id, Pattern::Identifier(_))),
-            _ => true,
-        });
-        let has_fn_decls = body
-            .body
-            .iter()
-            .any(|s| matches!(s, Statement::Function(f) if f.id.is_some()));
-        let do_hoist = !has_top_level_lex || (lex_all_simple && has_fn_decls);
-        let mut hoisted_fns: Vec<StringId> = Vec::new();
-        // Function declaration named `arguments` shouldn't shadow the arguments
-        // object when params have expressions (defaults/destructuring/rest), per
-        // spec — the arguments object is required and the user-visible binding.
-        let has_param_exprs = params.iter().any(|p| matches!(
-            p,
-            Pattern::Assignment(_) | Pattern::Array(_) | Pattern::Object(_) | Pattern::Rest(_)
-        ));
-        let arguments_id = self.interner.intern("arguments");
-        if do_hoist {
-            // Reserve slots for top-level lexicals first (see comment above)
-            // so the hoisted function bodies can capture them.
-            if has_top_level_lex {
-                for stmt in &body.body {
-                    if let Statement::Variable(d) = stmt
-                        && matches!(d.kind, VarKind::Let | VarKind::Const)
-                    {
-                        for dec in &d.declarations {
-                            if let Pattern::Identifier(id) = &dec.id
-                                && self.resolve_local(id.name).is_none()
-                            {
-                                self.chunk.emit_op(OpCode::Undefined, dec.span.start);
-                                self.add_local(id.name);
-                                self.mark_initialized();
-                                self.predeclared_lex.push(id.name);
-                            }
-                        }
-                    }
-                }
-            }
-            // Two-pass hoist so a function declaration is in scope *before* its
-            // own body compiles — otherwise a nested function that references
-            // the declaration (recursion, or a closure that calls back into a
-            // sibling) resolves it as a missing global. Pass 1 reserves a local
-            // slot for every hoisted name; pass 2 compiles the bodies and
-            // assigns each closure into its reserved slot.
-            let mut hoist_targets: Vec<(StringId, usize, usize)> = Vec::new(); // (name, slot, stmt_idx)
-            for (idx, stmt) in body.body.iter().enumerate() {
-                if let Statement::Function(f) = stmt
-                    && let Some(name) = f.id
-                {
-                    if name == arguments_id
-                        && (has_param_exprs || !params.iter().any(|p| matches!(p, Pattern::Identifier(id) if id.name == arguments_id)))
-                    {
-                        continue;
-                    }
-                    let line = f.span.start;
-                    let slot = if let Some(slot) = self.resolve_local(name) {
-                        slot
-                    } else {
-                        // Reserve a slot initialized to undefined; pass 2 overwrites it.
-                        self.chunk.emit_op(OpCode::Undefined, line);
-                        self.add_local(name);
-                        self.mark_initialized();
-                        self.locals.len() - 1
-                    };
-                    hoist_targets.push((name, slot, idx));
-                    hoisted_fns.push(name);
-                }
-            }
-            for (name, slot, idx) in hoist_targets {
-                let Statement::Function(f) = &body.body[idx] else { unreachable!() };
-                let line = f.span.start;
-                let child_chunk = self.compile_function_body(name, &f.params, &f.body, f.is_async, f.is_generator)?;
-                let chunk_idx = self.chunk.child_chunks.len() as u16;
-                let upvalue_descs = child_chunk.upvalue_descriptors.clone();
-                self.chunk.child_chunks.push(child_chunk);
-                self.chunk.emit_op_u16(OpCode::Closure, chunk_idx, line);
-                for desc in &upvalue_descs {
-                    self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
-                    self.chunk.emit_byte((desc.index >> 8) as u8, line);
-            self.chunk.emit_byte((desc.index & 0xFF) as u8, line);
-                }
-                if slot <= u8::MAX as usize {
-                    self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
-                } else {
-                    self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
-                }
-                self.chunk.emit_op(OpCode::Pop, line);
-            }
-        }
+        let hoisted_fns = self.hoist_body_functions(&body.body, params)?;
 
         // For generator functions, emit a CreateGenerator opcode here so the
         // parameter destructuring and other prologue work runs eagerly when the
@@ -3442,7 +3459,18 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::Return, line);
             }
             ArrowBody::Block(block) => {
+                // Same var + function-declaration hoisting as plain function
+                // bodies — webpack module wrappers `(e,t,n)=>{...}` declare
+                // helpers after their first use (React's framework chunk).
+                self.hoist_body_vars(&block.body);
+                let hoisted_fns = self.hoist_body_functions(&block.body, params)?;
                 for stmt in &block.body {
+                    if let Statement::Function(f) = stmt
+                        && let Some(name) = f.id
+                        && hoisted_fns.contains(&name)
+                    {
+                        continue;
+                    }
                     self.compile_statement(stmt)?;
                 }
                 let line = self.current_line();
