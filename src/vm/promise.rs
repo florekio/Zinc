@@ -420,4 +420,39 @@ impl Vm {
         }
         Ok(())
     }
+
+    // ---- Embedder-facing promise API ------------------------------------
+    //
+    // Lets a host function hand a *pending* promise to JS and settle it
+    // later — after a native async operation (network fetch, file read)
+    // completes on another thread. The pending promise is pinned as a GC
+    // root until settlement so the host's ObjectId can never dangle or
+    // be reused; settling unpins it (reachability via reactions keeps it
+    // alive from there if JS still cares).
+    //
+    // Settlement enqueues reactions as microtasks — the embedder runs
+    // `drain_microtasks()` afterwards, exactly as it already does for
+    // timer callbacks.
+
+    /// Allocate a pending promise, pin it, and return `(handle, value)`:
+    /// keep the handle to settle it later, hand the value to JS.
+    pub fn host_promise_create(&mut self) -> (ObjectId, Value) {
+        let pid = self.allocate_promise();
+        self.host_roots.push(pid);
+        (pid, Value::object_id(pid))
+    }
+
+    /// Fulfill a promise created with [`host_promise_create`]. No-op if
+    /// it already settled.
+    pub fn host_promise_resolve(&mut self, pid: ObjectId, value: Value) {
+        self.host_roots.retain(|&r| r != pid);
+        let _ = self.resolve_promise(pid, value);
+    }
+
+    /// Reject a promise created with [`host_promise_create`]. No-op if
+    /// it already settled.
+    pub fn host_promise_reject(&mut self, pid: ObjectId, reason: Value) {
+        self.host_roots.retain(|&r| r != pid);
+        let _ = self.reject_promise(pid, reason);
+    }
 }

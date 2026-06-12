@@ -186,6 +186,11 @@ pub struct Vm {
     /// expectations are met.
     pub(crate) protect_throw_depth: usize,
     pub(crate) microtask_queue: Vec<Microtask>,
+    /// Heap objects the embedder holds across VM re-entries (e.g. a
+    /// pending promise it will settle from `host_promise_resolve`
+    /// once an async operation finishes). Treated as GC roots until
+    /// unpinned.
+    pub(crate) host_roots: Vec<ObjectId>,
     /// Active `with`-scope objects (innermost last). Names resolve here before globals.
     pub(crate) with_stack: Vec<ObjectId>,
     /// Upvalues for each closure, indexed by closure_id.
@@ -590,6 +595,7 @@ impl Vm {
             exc_handlers: Vec::new(),
             protect_throw_depth: 0,
             microtask_queue: Vec::new(),
+            host_roots: Vec::new(),
             with_stack: Vec::new(),
             closure_upvalues: Vec::new(),
             #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
@@ -845,6 +851,9 @@ impl Vm {
         // Root 9: math_oid, json_oid
         if let Some(oid) = self.math_oid { roots.push(oid); }
         if let Some(oid) = self.json_oid { roots.push(oid); }
+
+        // Root 10: embedder-pinned objects (pending host promises etc.)
+        roots.extend_from_slice(&self.host_roots);
 
         self.heap.mark_from_roots(&roots);
         self.heap.sweep();
