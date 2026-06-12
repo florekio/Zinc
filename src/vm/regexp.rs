@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use regex::Regex;
+use fancy_regex::Regex;
 
 use crate::runtime::object::{JsObject, ObjectId, ObjectKind};
 use crate::runtime::value::Value;
@@ -88,7 +88,9 @@ impl Vm {
                     .unwrap_or_default();
                 let (re, _global) = self.regex_cache.get_or_compile(&pattern, &flags)
                     .map_err(VmError::RuntimeError)?;
-                Ok(Value::boolean(re.is_match(&input)))
+                // fancy-regex matching is fallible (backtrack limit);
+                // treat a blown limit as "no match" rather than a throw.
+                Ok(Value::boolean(re.is_match(&input).unwrap_or(false)))
             }
             "exec" => {
                 let input = args
@@ -97,7 +99,7 @@ impl Vm {
                     .unwrap_or_default();
                 let (re, _global) = self.regex_cache.get_or_compile(&pattern, &flags)
                     .map_err(VmError::RuntimeError)?;
-                match re.captures(&input) {
+                match re.captures(&input).ok().flatten() {
                     Some(caps) => {
                         // Build result array: [full_match, ...groups]
                         let mut elements = Vec::new();
@@ -208,6 +210,7 @@ impl Vm {
                     // Return array of all matches
                     let matches: Vec<Value> = re
                         .find_iter(s)
+                        .filter_map(Result::ok)
                         .map(|m| {
                             let id = self.interner.intern(m.as_str());
                             Value::string(id)
@@ -222,7 +225,7 @@ impl Vm {
                     }
                 } else {
                     // Return single match result (like exec)
-                    match re.captures(s) {
+                    match re.captures(s).ok().flatten() {
                         Some(caps) => {
                             let mut elements = Vec::new();
                             for i in 0..caps.len() {
@@ -242,7 +245,7 @@ impl Vm {
                 }
             }
             "search" => {
-                match re.find(s) {
+                match re.find(s).ok().flatten() {
                     Some(m) => Some(Value::int(m.start() as i32)),
                     None => Some(Value::int(-1)),
                 }
@@ -250,6 +253,7 @@ impl Vm {
             "split" => {
                 let parts: Vec<Value> = re
                     .split(s)
+                    .filter_map(Result::ok)
                     .map(|part| {
                         let id = self.interner.intern(part);
                         Value::string(id)

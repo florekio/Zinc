@@ -2818,7 +2818,8 @@ impl Vm {
                     let slot = self.read_u16() as usize;
                     let val = self.peek()?;
                     let base = self.frames.last().unwrap().base;
-                    self.stack[base + slot] = val;
+                    let idx = base + slot;
+                    if idx < self.stack.len() { self.stack[idx] = val; }
                 }
 
                 // ---- Functions -------------------------------------------
