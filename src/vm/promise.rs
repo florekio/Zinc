@@ -251,11 +251,15 @@ impl Vm {
                 pid
             };
 
-            // Create resolve/reject callback sentinels
-            // Sentinel encoding: -800_000 - (tracker_oid * 1024 + index) for resolve
-            //                    -900_000 - (tracker_oid * 1024 + index) for reject
-            let resolve_sentinel = Value::function(-800_000 - (tracker_oid.0 as i32 * 1024 + i as i32));
-            let reject_sentinel = Value::function(-900_000 - (tracker_oid.0 as i32 * 1024 + i as i32));
+            // Create resolve/reject callback sentinels.
+            // Encoding: -1_000_000_000 - (tracker_oid * 2048 + index * 2 + is_reject).
+            // The old -800_000/-900_000 ranges were only 100k wide: any
+            // tracker allocated at heap id >= 98 overflowed into the next
+            // range and Promise.all silently misrouted its callbacks
+            // (resolve decoded as reject for a different tracker).
+            let encoded = tracker_oid.0 as i64 * 2048 + i as i64 * 2;
+            let resolve_sentinel = Value::function((-1_000_000_000i64 - encoded) as i32);
+            let reject_sentinel = Value::function((-1_000_000_000i64 - encoded - 1) as i32);
 
             // Attach .then(resolve_cb, reject_cb)
             let then_name = self.interner.intern("then");

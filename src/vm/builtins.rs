@@ -794,7 +794,7 @@ impl Vm {
                 // later by extending ObjectKind::ArrayIterator with a kind tag.)
                 let iter_obj = JsObject {
                     properties: Vec::new(),
-                    prototype: None,
+                    prototype: Some(self.iterator_prototype_oid()),
                     kind: ObjectKind::ArrayIterator(oid, 0),
                     marked: false,
                     extensible: true,

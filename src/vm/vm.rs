@@ -244,6 +244,13 @@ pub struct Vm {
     /// `Object.getPrototypeOf(p) === Promise.prototype` and prototype lookups
     /// for `then`/`catch`/`finally` still resolve.
     pub(crate) promise_prototype: ObjectId,
+    /// Lazily-created shared prototype for builtin iterator objects
+    /// (Array/Map/Set/Key iterators). Holds a native `next` so
+    /// `Object.getPrototypeOf([].values()).next` is callable — core-js's
+    /// defineIterator (DuckDuckGo's polyfills bundle) requires it.
+    /// `.next()` CALLS still dispatch on ObjectKind first; this object
+    /// serves property reads and getPrototypeOf.
+    pub(crate) iterator_prototype: Option<ObjectId>,
     /// Singleton Boolean.prototype object
     pub(crate) boolean_prototype: ObjectId,
     /// Singleton Number.prototype object
@@ -575,6 +582,71 @@ impl Vm {
         globals.insert(symbol_name, Value::function(-570));
         let map_name = interner.intern("Map");
         globals.insert(map_name, Value::function(-540));
+        // Map.prototype / Set.prototype with extractable this-aware
+        // methods. Instance calls (m.entries()) still dispatch on
+        // ObjectKind in CallMethod first; these NativeFns serve property
+        // reads and the uncurry-this pattern — core-js does
+        // `var entries = uncurry(Map.prototype.entries); entries(map)`
+        // while feature-testing collections (DuckDuckGo's polyfills
+        // bundle), and reads `instance.set` as a value before .call-ing
+        // it. Each NativeFn delegates to exec_map_method/exec_set_method
+        // so semantics can't drift from the dispatch path.
+        {
+            let make_delegate = |is_map: bool, name: &str| -> crate::runtime::object::NativeFn {
+                let name = name.to_owned();
+                std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| -> Result<Value, Value> {
+                    let kind_ok = this.as_object_id().is_some_and(|o| {
+                        vm.heap.get(o).is_some_and(|x| if is_map {
+                            matches!(&x.kind, ObjectKind::Map { .. })
+                        } else {
+                            matches!(&x.kind, ObjectKind::Set { .. })
+                        })
+                    });
+                    let Some(oid) = this.as_object_id().filter(|_| kind_ok) else {
+                        let which = if is_map { "Map" } else { "Set" };
+                        let msg = format!("{which} method called on incompatible receiver");
+                        return Err(vm.make_native_error("TypeError", &msg));
+                    };
+                    let mid = vm.interner.intern(&name);
+                    let res = if is_map {
+                        vm.exec_map_method(oid, mid, args)
+                    } else {
+                        vm.exec_set_method(oid, mid, args)
+                    };
+                    match res {
+                        Ok(v) => Ok(v),
+                        Err(VmError::Throw(v)) => Err(v),
+                        Err(e) => {
+                            let msg = format!("{e:?}");
+                            Err(vm.make_native_error("Error", &msg))
+                        }
+                    }
+                })
+            };
+            let seed = |sentinel: i32, is_map: bool, names: &[&str],
+                            heap: &mut ObjectHeap, interner: &mut Interner,
+                            func_prototypes: &mut HashMap<i32, ObjectId>| {
+                let mut proto = JsObject::ordinary();
+                proto.prototype = Some(object_prototype);
+                proto.define_property(ctor_key, Property::with_flags(Value::function(sentinel), Property::WRITABLE | Property::CONFIGURABLE));
+                for name in names {
+                    let key = interner.intern(name);
+                    let fn_obj = JsObject {
+                        properties: Vec::new(),
+                        prototype: None,
+                        kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: key, func: make_delegate(is_map, name) }),
+                        marked: false,
+                        extensible: true,
+                    };
+                    let val = Value::object_id(heap.allocate(fn_obj));
+                    proto.define_property(key, Property::with_flags(val, Property::WRITABLE | Property::CONFIGURABLE));
+                }
+                let proto_oid = heap.allocate(proto);
+                func_prototypes.insert(sentinel, proto_oid);
+            };
+            seed(-540, true, &["get", "set", "has", "delete", "clear", "forEach", "keys", "values", "entries"], &mut heap, &mut interner, &mut func_prototypes);
+            seed(-541, false, &["add", "has", "delete", "clear", "forEach", "keys", "values", "entries"], &mut heap, &mut interner, &mut func_prototypes);
+        }
         let set_name = interner.intern("Set");
         globals.insert(set_name, Value::function(-541));
         let weakmap_name = interner.intern("WeakMap");
@@ -641,7 +713,7 @@ impl Vm {
             v
         };
 
-        
+
         Self {
             chunks,
             frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::object_id(global_this_oid), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0, saved_args: Vec::new(), arguments_oid: None, is_derived_ctor: false, super_called: false, new_target: Value::undefined(), await_super_result: false }],
@@ -674,6 +746,7 @@ impl Vm {
             function_prototype,
             array_prototype,
             promise_prototype,
+            iterator_prototype: None,
             boolean_prototype,
             number_prototype,
             string_prototype,
@@ -922,6 +995,28 @@ impl Vm {
         // Root 8: function prototype cache
         for &oid in self.func_prototypes.values() {
             roots.push(oid);
+        }
+        // Root 8b: shared builtin-iterator prototype. Without this the
+        // cached oid dangles after a sweep and every later iterator
+        // chains to a recycled object (silent corruption; surfaced as
+        // async-generator tests hanging once allocation crossed the GC
+        // threshold).
+        if let Some(oid) = self.iterator_prototype {
+            roots.push(oid);
+        }
+
+        // Root 8c: function property overrides — holds the lazily
+        // created NativeFn objects for extracted statics
+        // (Object.create, Object.defineProperty, ...) plus user-set
+        // function properties. These were collectable before; tests
+        // only survived because GC rarely fired between caching and
+        // use.
+        for ov in self.fn_property_overrides.values() {
+            if let Some(val) = ov
+                && let Some(oid) = trace_value(*val)
+            {
+                roots.push(oid);
+            }
         }
 
         // Root 9: math_oid, json_oid
@@ -1542,6 +1637,64 @@ impl Vm {
         let val = Value::object_id(oid);
         self.fn_property_overrides.insert((-508, name_id), Some(val));
         Some(val)
+    }
+
+    /// Lazily create the shared builtin-iterator prototype: an ordinary
+    /// object (chained to Object.prototype) with native `next` / `return`
+    /// that step the receiver via iterator_next_step. Assigned as the
+    /// `prototype` of Array/Map/Set/Key iterator objects at creation.
+    pub(crate) fn iterator_prototype_oid(&mut self) -> ObjectId {
+        if let Some(oid) = self.iterator_prototype {
+            return oid;
+        }
+        let mut proto = JsObject::ordinary();
+        proto.prototype = Some(self.object_prototype);
+        let next_id = self.interner.intern("next");
+        let next_fn: crate::runtime::object::NativeFn = std::sync::Arc::new(
+            |vm: &mut Vm, this: Value, _args: &[Value]| -> Result<Value, Value> {
+                let Some(oid) = this.as_object_id() else {
+                    let err = vm.make_native_error("TypeError", "next called on non-iterator");
+                    return Err(err);
+                };
+                match vm.iterator_next_step(oid) {
+                    Ok(v) => Ok(v),
+                    Err(VmError::Throw(v)) => Err(v),
+                    Err(e) => {
+                        let msg = format!("{e:?}");
+                        Err(vm.make_native_error("Error", &msg))
+                    }
+                }
+            },
+        );
+        let next_obj = JsObject {
+            properties: Vec::new(),
+            prototype: None,
+            kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: next_id, func: next_fn }),
+            marked: false,
+            extensible: true,
+        };
+        let next_val = Value::object_id(self.heap.allocate(next_obj));
+        proto.set_property(next_id, next_val);
+        // %IteratorPrototype%[Symbol.iterator]() returns `this` per spec —
+        // makes builtin iterators themselves iterable (`new Map(m.entries())`,
+        // spread over extracted iterators, ...).
+        let sym_key = self.interner.intern(&format!("__sym_{}__", self.sym_iterator));
+        let self_id = self.interner.intern("[Symbol.iterator]");
+        let self_fn: crate::runtime::object::NativeFn = std::sync::Arc::new(
+            |_vm: &mut Vm, this: Value, _args: &[Value]| -> Result<Value, Value> { Ok(this) },
+        );
+        let self_obj = JsObject {
+            properties: Vec::new(),
+            prototype: None,
+            kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: self_id, func: self_fn }),
+            marked: false,
+            extensible: true,
+        };
+        let self_val = Value::object_id(self.heap.allocate(self_obj));
+        proto.set_property(sym_key, self_val);
+        let oid = self.heap.allocate(proto);
+        self.iterator_prototype = Some(oid);
+        oid
     }
 
     pub(crate) fn exec_object_static(&mut self, mn: &str, args: &[Value]) -> Result<Option<Value>, VmError> {
@@ -3624,25 +3777,19 @@ impl Vm {
                             self.push(Value::undefined());
                             continue;
                         }
-                        // Promise combinator resolve callback
-                        if s <= -800_000 && s > -900_000 {
-                            let encoded = (-800_000 - s) as u32;
-                            let tracker_oid = ObjectId(encoded / 1024);
-                            let index = (encoded % 1024) as usize;
+                        // Promise combinator callbacks (see promise.rs encoding).
+                        if s <= -1_000_000_000 && s > -2_100_000_000 {
+                            let encoded = (-1_000_000_000i64 - s as i64) as u32;
+                            let tracker_oid = ObjectId(encoded / 2048);
+                            let index = ((encoded % 2048) / 2) as usize;
+                            let is_reject = encoded & 1 == 1;
                             let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
                             self.truncate_stack(func_pos);
-                            self.handle_combinator_resolve(tracker_oid, index, val)?;
-                            self.push(Value::undefined());
-                            continue;
-                        }
-                        // Promise combinator reject callback
-                        if s <= -900_000 && s > -1_000_000 {
-                            let encoded = (-900_000 - s) as u32;
-                            let tracker_oid = ObjectId(encoded / 1024);
-                            let index = (encoded % 1024) as usize;
-                            let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
-                            self.truncate_stack(func_pos);
-                            self.handle_combinator_reject(tracker_oid, index, val)?;
+                            if is_reject {
+                                self.handle_combinator_reject(tracker_oid, index, val)?;
+                            } else {
+                                self.handle_combinator_resolve(tracker_oid, index, val)?;
+                            }
                             self.push(Value::undefined());
                             continue;
                         }
@@ -6773,6 +6920,35 @@ impl Vm {
                             "from" => {
                                 let source = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
                                 let map_fn = if argc > 1 { Some(self.stack[obj_pos + 2]) } else { None };
+                                // Generic iterables (not Array/Set/Map kinds, which have
+                                // fast paths below) drive the iterator protocol with
+                                // per-item mapping and IteratorClose on a mapfn throw —
+                                // core-js probes exactly this (SAFE_CLOSING) before
+                                // trusting native collections; without it every Map/Set
+                                // gets wrapped in its compatibility shell.
+                                let is_known_kind = source.as_object_id()
+                                    .and_then(|o| self.heap.get(o))
+                                    .map(|o| matches!(&o.kind,
+                                        ObjectKind::Array(_) | ObjectKind::Set { .. } | ObjectKind::Map { .. }))
+                                    .unwrap_or(false);
+                                if !is_known_kind && source.as_object_id().is_some() {
+                                    match self.array_from_iterable(source, map_fn) {
+                                        Ok(Some(values)) => {
+                                            let arr = JsObject::array(values);
+                                            let new_oid = self.heap.allocate(arr);
+                                            self.truncate_stack(obj_pos);
+                                            self.push(Value::object_id(new_oid));
+                                            continue;
+                                        }
+                                        Ok(None) => {} // not iterable: array-like fallback below
+                                        Err(VmError::Throw(v)) => {
+                                            self.truncate_stack(obj_pos);
+                                            self.handle_throw(v)?;
+                                            continue;
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                }
                                 let mut result = Vec::new();
                                 // Collect raw elements first
                                 let raw_elems: Vec<Value> = if let Some(src_oid) = source.as_object_id() {
@@ -6790,7 +6966,7 @@ impl Vm {
                                             _ => {
                                                 // Try array-like with length
                                                 let length_key = self.interner.intern("length");
-                                                if let Some(len_val) = obj.get_property(length_key) {
+                                                if let Some(len_val) = self.heap.get(src_oid).and_then(|o| o.get_property(length_key)) {
                                                     if let Some(len) = len_val.as_number() {
                                                         let n = len as usize;
                                                         let mut items = Vec::with_capacity(n);
@@ -7036,23 +7212,46 @@ impl Vm {
                         match sentinel {
                             -540 => { // new Map()
                                 let mut entries = Vec::new();
-                                // Optional iterable argument (array of [key, value] pairs)
-                                if argc > 0
-                                    && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
+                                // Optional iterable argument: arrays fast-path;
+                                // anything else goes through the iterator
+                                // protocol (generators, map.entries(), core-js
+                                // correctness probes, ...).
+                                if argc > 0 {
+                                    let arg = self.stack[func_pos + 1];
+                                    let elems: Vec<Value> = if let Some(arr_oid) = arg.as_object_id()
                                         && let Some(obj) = self.heap.get(arr_oid)
-                                            && let ObjectKind::Array(ref elems) = obj.kind {
-                                                let elems = elems.clone();
-                                                for elem in &elems {
-                                                    if let Some(pair_oid) = elem.as_object_id()
-                                                        && let Some(pair_obj) = self.heap.get(pair_oid)
-                                                            && let ObjectKind::Array(ref pair) = pair_obj.kind
-                                                                && pair.len() >= 2 {
-                                                                    entries.push((pair[0], pair[1]));
-                                                                }
-                                                }
+                                        && let ObjectKind::Array(ref elems) = obj.kind
+                                    {
+                                        elems.clone()
+                                    } else if !arg.is_null() && !arg.is_undefined() {
+                                        match self.collect_iterable(arg) {
+                                            Ok(Some(items)) => items,
+                                            Ok(None) => Vec::new(),
+                                            Err(VmError::Throw(v)) => {
+                                                self.truncate_stack(func_pos);
+                                                self.handle_throw(v)?;
+                                                continue;
                                             }
+                                            Err(e) => return Err(e),
+                                        }
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    for elem in &elems {
+                                        if let Some(pair_oid) = elem.as_object_id()
+                                            && let Some(pair_obj) = self.heap.get(pair_oid)
+                                                && let ObjectKind::Array(ref pair) = pair_obj.kind
+                                                    && pair.len() >= 2 {
+                                                        entries.push((pair[0], pair[1]));
+                                                    }
+                                    }
+                                }
                                 let obj = JsObject {
-                                    properties: Vec::new(), prototype: None,
+                                    properties: Vec::new(),
+                                    // Chain to Map.prototype so property READS of
+                                    // methods (`m.set` as a value) resolve; calls
+                                    // still kind-dispatch first.
+                                    prototype: self.func_prototypes.get(&-540).copied(),
                                     kind: ObjectKind::Map { entries }, marked: false, extensible: true,
                                 };
                                 let oid = self.heap.allocate(obj);
@@ -7062,14 +7261,37 @@ impl Vm {
                             }
                             -541 => { // new Set()
                                 let mut entries = Vec::new();
-                                if argc > 0
-                                    && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
+                                if argc > 0 {
+                                    let arg = self.stack[func_pos + 1];
+                                    if let Some(arr_oid) = arg.as_object_id()
                                         && let Some(obj) = self.heap.get(arr_oid)
-                                            && let ObjectKind::Array(ref elems) = obj.kind {
-                                                entries = elems.clone();
+                                        && let ObjectKind::Array(ref elems) = obj.kind
+                                    {
+                                        entries = elems.clone();
+                                    } else if !arg.is_null() && !arg.is_undefined() {
+                                        match self.collect_iterable(arg) {
+                                            Ok(Some(items)) => entries = items,
+                                            Ok(None) => {}
+                                            Err(VmError::Throw(v)) => {
+                                                self.truncate_stack(func_pos);
+                                                self.handle_throw(v)?;
+                                                continue;
                                             }
+                                            Err(e) => return Err(e),
+                                        }
+                                    }
+                                    // Set semantics: dedupe (SameValueZero-ish via strict_eq).
+                                    let mut deduped: Vec<Value> = Vec::with_capacity(entries.len());
+                                    for v in entries {
+                                        if !deduped.iter().any(|d| self.strict_eq(*d, v)) {
+                                            deduped.push(v);
+                                        }
+                                    }
+                                    entries = deduped;
+                                }
                                 let obj = JsObject {
-                                    properties: Vec::new(), prototype: None,
+                                    properties: Vec::new(),
+                                    prototype: self.func_prototypes.get(&-541).copied(),
                                     kind: ObjectKind::Set { entries }, marked: false, extensible: true,
                                 };
                                 let oid = self.heap.allocate(obj);
@@ -7747,8 +7969,11 @@ impl Vm {
                                     // Generic iterable: look up @@iterator and run the protocol.
                                     let sym_iter_key = self.interner.intern(&format!("__sym_{}__", self.sym_iterator));
                                     let iter_fn = self.heap.get_property_chain(src_oid, sym_iter_key);
+                                    let callable = |vm: &Vm, v: Value| v.is_function()
+                                        || v.as_object_id().is_some_and(|o| vm.heap.get(o)
+                                            .is_some_and(|x| matches!(&x.kind, ObjectKind::Function(_))));
                                     let iter_fn = match iter_fn {
-                                        Some(v) if v.is_function() => v,
+                                        Some(v) if callable(self, v) => v,
                                         _ => {
                                             let err = self.make_native_error(
                                                 "TypeError",
@@ -7785,7 +8010,7 @@ impl Vm {
                                     loop {
                                         let next_fn = self.heap.get_property_chain(iter_oid, next_key)
                                             .unwrap_or(Value::undefined());
-                                        if !next_fn.is_function() {
+                                        if !callable(self, next_fn) {
                                             let err = self.make_native_error(
                                                 "TypeError",
                                                 "iterator.next is not a function",
@@ -8658,8 +8883,9 @@ impl Vm {
                                 }
                             })
                             .unwrap_or_default();
+                        let iter_proto = self.iterator_prototype_oid();
                         let iter_obj = JsObject {
-                            properties: Vec::new(), prototype: None,
+                            properties: Vec::new(), prototype: Some(iter_proto),
                             kind: ObjectKind::KeyIterator(keys, 0),
                             marked: false, extensible: true,
                         };
@@ -8667,8 +8893,9 @@ impl Vm {
                         self.push(Value::object_id(iter_id));
                     } else {
                         // Primitive: empty iterator
+                        let iter_proto = self.iterator_prototype_oid();
                         let iter_obj = JsObject {
-                            properties: Vec::new(), prototype: None,
+                            properties: Vec::new(), prototype: Some(iter_proto),
                             kind: ObjectKind::KeyIterator(Vec::new(), 0),
                             marked: false, extensible: true,
                         };
@@ -8711,9 +8938,10 @@ impl Vm {
                             continue;
                         } else if self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Map { .. })).unwrap_or(false) {
                             // Live Map iterator: holds reference to the original Map
+                            let iter_proto = self.iterator_prototype_oid();
                             let iter_obj = JsObject {
                                 properties: Vec::new(),
-                                prototype: None,
+                                prototype: Some(iter_proto),
                                 kind: ObjectKind::MapIterator(oid, 0),
                                 marked: false,
                                 extensible: true,
@@ -8722,9 +8950,10 @@ impl Vm {
                             self.push(Value::object_id(iter_id));
                         } else if self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Set { .. })).unwrap_or(false) {
                             // Live Set iterator: holds reference to the original Set
+                            let iter_proto = self.iterator_prototype_oid();
                             let iter_obj = JsObject {
                                 properties: Vec::new(),
-                                prototype: None,
+                                prototype: Some(iter_proto),
                                 kind: ObjectKind::SetIterator(oid, 0),
                                 marked: false,
                                 extensible: true,
@@ -8747,9 +8976,10 @@ impl Vm {
                         }).collect();
                         let arr = JsObject::array(chars);
                         let arr_oid = self.heap.allocate(arr);
+                        let iter_proto = self.iterator_prototype_oid();
                         let iter_obj = JsObject {
                             properties: Vec::new(),
-                            prototype: None,
+                            prototype: Some(iter_proto),
                             kind: ObjectKind::ArrayIterator(arr_oid, 0),
                             marked: false,
                             extensible: true,
