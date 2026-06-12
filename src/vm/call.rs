@@ -88,8 +88,32 @@ impl Vm {
         }
         let packed = func_val.as_function().unwrap();
         // Native global function sentinels (no this)
-        if (-536..=-500).contains(&packed) {
+        if (-536..=-500).contains(&packed) && packed != -507 {
             return Ok(self.exec_global_fn(packed, args));
+        }
+        if packed == -507 {
+            // Array called as a function constructs, per spec.
+            let elements: Vec<Value> = if args.len() == 1 {
+                if let Some(n) = args[0].as_number()
+                    && n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64
+                {
+                    vec![Value::undefined(); n as usize]
+                } else if let Some(n) = args[0].as_int() {
+                    if n >= 0 { vec![Value::undefined(); n as usize] } else { vec![args[0]] }
+                } else {
+                    vec![args[0]]
+                }
+            } else {
+                args.to_vec()
+            };
+            let mut arr_obj = crate::runtime::object::JsObject::array(elements);
+            arr_obj.prototype = Some(self.array_prototype);
+            let oid = self.heap.allocate(arr_obj);
+            return Ok(Value::object_id(oid));
+        }
+        if packed == -750 {
+            // Extracted Object.assign value
+            return Ok(self.exec_object_assign(args));
         }
         // Math method sentinels (-700 to -726)
         if (-726..=-700).contains(&packed) {
@@ -242,7 +266,7 @@ impl Vm {
             while self.frames.len() > stop_depth {
                 self.frames.pop();
             }
-            self.stack.truncate(func_pos);
+            self.truncate_stack(func_pos);
         }
         result
     }

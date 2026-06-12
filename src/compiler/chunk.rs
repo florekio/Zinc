@@ -61,7 +61,8 @@ pub struct Chunk {
 pub struct UpvalueDescriptor {
     /// Index: if `is_local` is true, this is a local slot in the *enclosing* function.
     /// If false, this is an upvalue index in the enclosing function's upvalue list.
-    pub index: u8,
+    /// u16 — enclosing functions in minified bundles exceed 256 local slots.
+    pub index: u16,
     /// True if capturing directly from the enclosing function's locals.
     /// False if capturing from the enclosing function's upvalues (transitive capture).
     pub is_local: bool,

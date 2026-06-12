@@ -45,7 +45,11 @@ use crate::compiler::chunk::UpvalueDescriptor;
 
 #[derive(Clone)]
 struct CompilerUpvalue {
-    index: u8,
+    /// Local slot in the enclosing function (is_local) or upvalue index
+    /// in the enclosing function's list. u16: minified bundles routinely
+    /// exceed 256 locals per function — truncating made closures capture
+    /// the wrong variable (react-dom's `new Y(...)` saw a number).
+    index: u16,
     is_local: bool,
 }
 
@@ -175,7 +179,8 @@ impl<'a> Compiler<'a> {
                     self.chunk.emit_op_u16(OpCode::Closure, chunk_idx, line);
                     for desc in &upvalue_descs {
                         self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
-                        self.chunk.emit_byte(desc.index, line);
+                        self.chunk.emit_byte((desc.index >> 8) as u8, line);
+            self.chunk.emit_byte((desc.index & 0xFF) as u8, line);
                     }
                     let idx = self.make_string_constant(name);
                     self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
@@ -310,7 +315,7 @@ impl<'a> Compiler<'a> {
     /// upvalue through every function in between (transitive capture), so a
     /// grandparent (or deeper) binding is reachable even when the intermediate
     /// functions never reference it themselves.
-    fn resolve_upvalue(&mut self, name: StringId) -> Option<u8> {
+    fn resolve_upvalue(&mut self, name: StringId) -> Option<u16> {
         let n = self.enclosing_chain.len();
         if n == 0 {
             return None;
@@ -322,7 +327,7 @@ impl<'a> Compiler<'a> {
     /// Resolve `name` against the function at chain index `level`, returning
     /// the upvalue index added to that function's *child* (the function at
     /// `level + 1`, or the current function when `level + 1 == chain.len()`).
-    fn resolve_upvalue_at(&mut self, name: StringId, level: usize) -> Option<u8> {
+    fn resolve_upvalue_at(&mut self, name: StringId, level: usize) -> Option<u16> {
         // 1. Is `name` an own local of frame[level]? Mark it captured.
         let local_idx = {
             let frame = &mut self.enclosing_chain[level];
@@ -337,7 +342,7 @@ impl<'a> Compiler<'a> {
             found
         };
         if let Some(i) = local_idx {
-            return Some(self.add_upvalue_at(level + 1, i as u8, true));
+            return Some(self.add_upvalue_at(level + 1, i as u16, true));
         }
         // 2. Otherwise recurse into the grandparent; if found, the upvalue it
         //    added to frame[level] becomes a (non-local) upvalue of frame[level+1].
@@ -352,7 +357,7 @@ impl<'a> Compiler<'a> {
 
     /// Add (deduplicated) an upvalue to the function at chain index `level`,
     /// or to the current function when `level == chain.len()`. Returns its index.
-    fn add_upvalue_at(&mut self, level: usize, index: u8, is_local: bool) -> u8 {
+    fn add_upvalue_at(&mut self, level: usize, index: u16, is_local: bool) -> u16 {
         let upvalues = if level == self.enclosing_chain.len() {
             &mut self.upvalues
         } else {
@@ -360,10 +365,10 @@ impl<'a> Compiler<'a> {
         };
         for (i, uv) in upvalues.iter().enumerate() {
             if uv.index == index && uv.is_local == is_local {
-                return i as u8;
+                return i as u16;
             }
         }
-        let idx = upvalues.len() as u8;
+        let idx = upvalues.len() as u16;
         upvalues.push(CompilerUpvalue { index, is_local });
         idx
     }
@@ -379,7 +384,11 @@ impl<'a> Compiler<'a> {
                     .emit_op_u16(OpCode::GetLocalWide, slot as u16, line);
             }
         } else if let Some(uv_idx) = self.resolve_upvalue(name) {
-            self.chunk.emit_op_u8(OpCode::GetUpvalue, uv_idx, line);
+            if uv_idx <= u8::MAX as u16 {
+                self.chunk.emit_op_u8(OpCode::GetUpvalue, uv_idx as u8, line);
+            } else {
+                self.chunk.emit_op_u16(OpCode::GetUpvalueWide, uv_idx, line);
+            }
         } else {
             let idx = self.make_string_constant(name);
             self.chunk.emit_op_u16(OpCode::GetGlobal, idx, line);
@@ -402,7 +411,11 @@ impl<'a> Compiler<'a> {
                     .emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
             }
         } else if let Some(uv_idx) = self.resolve_upvalue(name) {
-            self.chunk.emit_op_u8(OpCode::SetUpvalue, uv_idx, line);
+            if uv_idx <= u8::MAX as u16 {
+                self.chunk.emit_op_u8(OpCode::SetUpvalue, uv_idx as u8, line);
+            } else {
+                self.chunk.emit_op_u16(OpCode::SetUpvalueWide, uv_idx, line);
+            }
         } else {
             if self.const_globals.contains(&name) {
                 let var_name = self.interner.resolve(name).to_owned();
@@ -2176,7 +2189,8 @@ impl<'a> Compiler<'a> {
         // Emit upvalue descriptors inline after the Closure opcode
         for desc in &upvalue_descs {
             self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
-            self.chunk.emit_byte(desc.index, line);
+            self.chunk.emit_byte((desc.index >> 8) as u8, line);
+            self.chunk.emit_byte((desc.index & 0xFF) as u8, line);
         }
 
         match reserved_slot {
@@ -2354,7 +2368,8 @@ impl<'a> Compiler<'a> {
                     self.chunk.emit_op_u16(OpCode::Closure, chunk_idx, line);
                     for desc in &uv_descs {
                         self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
-                        self.chunk.emit_byte(desc.index, line);
+                        self.chunk.emit_byte((desc.index >> 8) as u8, line);
+            self.chunk.emit_byte((desc.index & 0xFF) as u8, line);
                     }
                     // Stack: [class, class, fn]
                     // Use Function.prototype.call to invoke with this=class:
@@ -3114,7 +3129,8 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op_u16(OpCode::Closure, chunk_idx, line);
                 for desc in &upvalue_descs {
                     self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
-                    self.chunk.emit_byte(desc.index, line);
+                    self.chunk.emit_byte((desc.index >> 8) as u8, line);
+            self.chunk.emit_byte((desc.index & 0xFF) as u8, line);
                 }
                 if slot <= u8::MAX as usize {
                     self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
@@ -4847,7 +4863,8 @@ impl<'a> Compiler<'a> {
         for desc in &uv_descs {
             let line = f.span.start;
             self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
-            self.chunk.emit_byte(desc.index, line);
+            self.chunk.emit_byte((desc.index >> 8) as u8, line);
+            self.chunk.emit_byte((desc.index & 0xFF) as u8, line);
         }
         Ok(())
     }
@@ -4877,7 +4894,8 @@ impl<'a> Compiler<'a> {
         for desc in &uv_descs {
             let line = a.span.start;
             self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
-            self.chunk.emit_byte(desc.index, line);
+            self.chunk.emit_byte((desc.index >> 8) as u8, line);
+            self.chunk.emit_byte((desc.index & 0xFF) as u8, line);
         }
         Ok(())
     }

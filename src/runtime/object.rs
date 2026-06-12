@@ -172,7 +172,10 @@ pub enum CombinatorKind {
 }
 
 pub enum FunctionKind {
-    /// Index into VM's chunk list for bytecode functions
+    /// Packed function value (closure_id << 16 | chunk_idx) for bytecode
+    /// functions — the FULL packing, so wrapping (e.g. Function.bind) and
+    /// unwrapping round-trips the closure identity. Dropping the high bits
+    /// detached bound functions from their captured upvalues.
     Bytecode { chunk_idx: usize, name: StringId },
     /// Native/builtin function
     Native { name: StringId, func: NativeFn },

@@ -83,7 +83,7 @@ impl std::error::Error for VmError {}
 
 /// An upvalue: a reference to a variable that may still be on the stack (open)
 /// or has been moved to the heap (closed).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum UpvalueLocation {
     /// Points to a stack slot (variable still on stack).
     Open(usize),
@@ -91,9 +91,24 @@ pub(crate) enum UpvalueLocation {
     Closed(Value),
 }
 
-#[derive(Clone)]
+/// One captured variable, shared (Lua-style) between every closure that
+/// captures it: all holders see writes and the close transition through
+/// the same Rc'd cell. Cloning an Upvalue clones the handle, not the
+/// location — that sharing is what makes sibling closures communicating
+/// through a captured variable (every scheduler / state machine in
+/// minified bundles) actually work.
+#[derive(Clone, Debug)]
 pub(crate) struct Upvalue {
-    pub(crate) location: UpvalueLocation,
+    pub(crate) cell: std::rc::Rc<std::cell::RefCell<UpvalueLocation>>,
+}
+
+impl Upvalue {
+    pub(crate) fn get(&self, stack: &[Value]) -> Value {
+        match &*self.cell.borrow() {
+            UpvalueLocation::Open(idx) => stack.get(*idx).copied().unwrap_or(Value::undefined()),
+            UpvalueLocation::Closed(v) => *v,
+        }
+    }
 }
 
 pub(crate) struct CallFrame {
@@ -195,6 +210,10 @@ pub struct Vm {
     pub(crate) with_stack: Vec<ObjectId>,
     /// Upvalues for each closure, indexed by closure_id.
     pub(crate) closure_upvalues: Vec<Vec<Upvalue>>,
+    /// Live `Open` upvalue cells keyed by absolute stack slot, so every
+    /// closure capturing the same variable shares one cell. Entries are
+    /// removed (and their cells flipped to `Closed`) when the slot dies.
+    pub(crate) open_upvalues: std::collections::HashMap<usize, std::rc::Rc<std::cell::RefCell<UpvalueLocation>>>,
     /// Call counter per chunk index (for JIT hotspot detection).
     #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
     pub(crate) call_counts: HashMap<usize, u32>,
@@ -378,6 +397,46 @@ impl Vm {
         let mut promise_proto = JsObject::ordinary();
         promise_proto.prototype = Some(object_prototype);
         promise_proto.define_property(ctor_key, Property::with_flags(Value::function(-520), Property::WRITABLE | Property::CONFIGURABLE));
+        // Real, extractable method values too: bundles lift them off the
+        // prototype (`Promise.prototype.then.bind(Promise.resolve())` is
+        // Preact's microtask scheduler). Each delegates to the same
+        // dispatch CallMethod uses.
+        for mname in ["then", "catch", "finally"] {
+            let m_key = interner.intern(mname);
+            let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                move |vm: &mut Vm, this: Value, args: &[Value]| -> Result<Value, Value> {
+                    let Some(oid) = this.as_object_id() else {
+                        return Ok(Value::undefined());
+                    };
+                    let m_id = vm.interner.intern(mname);
+                    vm.exec_promise_method(oid, m_id, args).map_err(|e| match e {
+                        VmError::Throw(v) => v,
+                        other => {
+                            let msg = format!("{other:?}");
+                            vm.make_native_error("TypeError", &msg)
+                        }
+                    })
+                },
+            );
+            let fobj = JsObject {
+                properties: Vec::new(),
+                prototype: None,
+                kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native {
+                    name: m_key,
+                    func,
+                }),
+                marked: false,
+                extensible: true,
+            };
+            let f_oid = heap.allocate(fobj);
+            promise_proto.define_property(
+                m_key,
+                Property::with_flags(
+                    Value::object_id(f_oid),
+                    Property::WRITABLE | Property::CONFIGURABLE,
+                ),
+            );
+        }
         let promise_prototype = heap.allocate(promise_proto);
         func_prototypes.insert(-520i32, promise_prototype);
 
@@ -598,6 +657,7 @@ impl Vm {
             host_roots: Vec::new(),
             with_stack: Vec::new(),
             closure_upvalues: Vec::new(),
+            open_upvalues: std::collections::HashMap::new(),
             #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
             call_counts: HashMap::new(),
             #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
@@ -667,34 +727,47 @@ impl Vm {
     /// stale upvalue to `undefined`. A subsequent read of the
     /// upvalue then returns `undefined` cleanly instead of
     /// crashing the host.
+    /// Close any open upvalue cells whose slots are about to be
+    /// destroyed, then shrink the stack. Every stack shrink must go
+    /// through here: truncating past an open cell without closing it
+    /// leaves the cell aimed at memory a later frame will reuse, so a
+    /// surviving closure reads foreign values (react-dom's scheduler
+    /// state silently became another frame's locals this way).
+    pub(crate) fn truncate_stack(&mut self, to: usize) {
+        if !self.open_upvalues.is_empty() {
+            self.close_upvalues_above(to);
+        }
+        self.stack.truncate(to);
+    }
+
     pub(crate) fn close_upvalues_above(&mut self, from: usize) {
         let stack_len = self.stack.len();
-        // Close upvalues in all frames
-        for frame in &mut self.frames {
-            for uv in &mut frame.upvalues {
-                if let UpvalueLocation::Open(stack_idx) = &uv.location
-                    && *stack_idx >= from {
-                        let val = if *stack_idx < stack_len {
-                            self.stack[*stack_idx]
-                        } else {
-                            Value::undefined()
-                        };
-                        uv.location = UpvalueLocation::Closed(val);
-                    }
-            }
-        }
-        // Close upvalues in the closure storage
-        for closure_uvs in &mut self.closure_upvalues {
-            for uv in closure_uvs {
-                if let UpvalueLocation::Open(stack_idx) = &uv.location
-                    && *stack_idx >= from {
-                        let val = if *stack_idx < stack_len {
-                            self.stack[*stack_idx]
-                        } else {
-                            Value::undefined()
-                        };
-                        uv.location = UpvalueLocation::Closed(val);
-                    }
+        let dead: Vec<usize> = self
+            .open_upvalues
+            .keys()
+            .copied()
+            .filter(|idx| *idx >= from)
+            .collect();
+        static WATCH: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let watch = *WATCH.get_or_init(|| std::env::var("ZINC_WATCH_SLOT").ok().and_then(|v| v.parse().ok()));
+        for idx in dead {
+            if let Some(cell) = self.open_upvalues.remove(&idx) {
+                let val = if idx < stack_len {
+                    self.stack[idx]
+                } else {
+                    // Stale entry whose slot was already truncated away
+                    // on a path that didn't close — degrade to undefined.
+                    Value::undefined()
+                };
+                if watch == Some(idx) {
+                    eprintln!(
+                        "[slotwatch] CLOSE slot {} from={} stack_len={} value={} chunk={} ip={}",
+                        idx, from, stack_len, self.type_of_value(val),
+                        self.frames.last().map(|f| self.interner.resolve(self.chunks[f.chunk_idx].name).to_string()).unwrap_or_default(),
+                        self.frames.last().map(|f| f.ip).unwrap_or(0)
+                    );
+                }
+                *cell.borrow_mut() = UpvalueLocation::Closed(val);
             }
         }
     }
@@ -801,7 +874,7 @@ impl Vm {
             if let Some(oid) = trace_value(frame.this_value) { roots.push(oid); }
             if let Some(gid) = frame.generator_id { roots.push(gid); }
             for uv in &frame.upvalues {
-                if let UpvalueLocation::Closed(val) = &uv.location
+                if let UpvalueLocation::Closed(val) = &*uv.cell.borrow()
                     && let Some(oid) = trace_value(*val)
                 {
                     roots.push(oid);
@@ -812,7 +885,7 @@ impl Vm {
         // Root 5: closure upvalues
         for closure_uvs in &self.closure_upvalues {
             for uv in closure_uvs {
-                if let UpvalueLocation::Closed(val) = &uv.location
+                if let UpvalueLocation::Closed(val) = &*uv.cell.borrow()
                     && let Some(oid) = trace_value(*val)
                 {
                     roots.push(oid);
@@ -894,7 +967,7 @@ impl Vm {
             while self.frames.len() > handler.frame_idx + 1 {
                 self.frames.pop();
             }
-            self.stack.truncate(handler.stack_depth);
+            self.truncate_stack(handler.stack_depth);
             self.with_stack.truncate(handler.with_depth);
             self.push(Value::object_id(oid));
             self.frames.last_mut().unwrap().ip = handler.catch_target as usize;
@@ -1404,7 +1477,7 @@ impl Vm {
             while self.frames.len() > handler.frame_idx + 1 {
                 self.frames.pop();
             }
-            self.stack.truncate(handler.stack_depth);
+            self.truncate_stack(handler.stack_depth);
             // Pop any with-scopes entered since the handler was pushed.
             self.with_stack.truncate(handler.with_depth);
             self.push(val);
@@ -1526,6 +1599,9 @@ impl Vm {
                 "name" => { let id = self.interner.intern("Object"); Value::string(id) }
                 "length" => Value::int(1),
                 "call" | "apply" | "bind" => obj_val,
+                // Extractable static: `var assign = Object.assign` is the
+                // standard minified-bundle prologue (React, Preact, ...).
+                "assign" => Value::function(-750),
                 _ => self.heap.get_property_chain(self.function_prototype, name_id)
                     .unwrap_or(Value::undefined()),
             },
@@ -1814,6 +1890,29 @@ impl Vm {
         // Flatten the new chunk tree onto the existing chunks vec; the new
         // top chunk lands at `top_idx`, and its sub-chunks follow.
         let top_idx = self.chunks.len();
+        // Debug aid: ZINC_DISASM_CHUNK=<name|index|*> dumps matching chunks
+        // BEFORE flattening (the disassembler needs child_chunks intact to
+        // size inline Closure descriptors). Indices mirror flatten order.
+        if let Ok(want) = std::env::var("ZINC_DISASM_CHUNK") {
+            fn walk(c: &Chunk, idx: &mut usize, want: &str, vm_interner: &Interner) {
+                let cname = vm_interner.resolve(c.name);
+                if want == "*" {
+                    eprintln!(
+                        "[chunk {} name='{}' locals={} params={} upvalues={} code={}B]",
+                        idx, cname, c.local_count, c.param_count, c.upvalue_count, c.code.len()
+                    );
+                } else if want == idx.to_string() || cname == want {
+                    eprintln!("==== disasm {want} (chunk {idx}) ====");
+                    eprintln!("{}", crate::compiler::disassemble::disassemble(c, vm_interner));
+                }
+                *idx += 1;
+                for child in &c.child_chunks {
+                    walk(child, idx, want, vm_interner);
+                }
+            }
+            let mut idx = top_idx;
+            walk(&chunk, &mut idx, &want, &self.interner);
+        }
         Self::flatten_chunk(chunk, &mut self.chunks);
         // Push a fresh top-level frame for the new script. Its base is the
         // current stack length so it doesn't clobber any persisted state.
@@ -1933,7 +2032,7 @@ impl Vm {
                 }
                 let frame = self.frames.pop().unwrap();
                 let result = if frame.is_constructor { frame.this_value } else { Value::undefined() };
-                self.stack.truncate(frame.base.saturating_sub(1));
+                self.truncate_stack(frame.base.saturating_sub(1));
                 if self.frames.len() <= stop_depth {
                     return Ok(result);
                 }
@@ -1980,7 +2079,7 @@ impl Vm {
                 OpCode::PopN => {
                     let n = self.read_byte() as usize;
                     let new_len = self.stack.len().saturating_sub(n);
-                    self.stack.truncate(new_len);
+                    self.truncate_stack(new_len);
                 }
 
                 OpCode::Dup => {
@@ -2395,7 +2494,18 @@ impl Vm {
                     let name_id = name_val.as_string_id().ok_or_else(|| {
                         VmError::RuntimeError("expected string constant for variable name".into())
                     })?;
-                    let val = self.globals.get(&name_id).copied().unwrap_or(Value::undefined());
+                    // Mirror GetGlobal: names absent from the globals map can
+                    // still live as properties on the globalThis object
+                    // (`this.X = …` at script level — the UMD-wrapper
+                    // pattern). `typeof` must agree with bare reads.
+                    let val = match self.globals.get(&name_id).copied() {
+                        Some(v) => v,
+                        None => self
+                            .heap
+                            .get(self.global_this_oid)
+                            .and_then(|o| o.get_property(name_id))
+                            .unwrap_or(Value::undefined()),
+                    };
                     let type_str = self.type_of_value(val);
                     let id = self.interner.intern(type_str);
                     self.push(Value::string(id));
@@ -2743,7 +2853,7 @@ impl Vm {
                                 // Create a promise, run body synchronously, resolve with result
                                 let promise_id = self.allocate_promise();
                                 let args_vec: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
-                                self.stack.truncate(func_pos);
+                                self.truncate_stack(func_pos);
                                 match self.call_function(func_val, &args_vec) {
                                     Ok(val) => { self.resolve_promise(promise_id, val)?; }
                                     Err(VmError::Throw(reason)) => {
@@ -2793,7 +2903,7 @@ impl Vm {
                                         } else { 0 };
                                         jit_fn.call(arg)
                                     };
-                                    self.stack.truncate(func_pos);
+                                    self.truncate_stack(func_pos);
                                     if result >= i32::MIN as i64 && result <= i32::MAX as i64 {
                                         self.push(Value::int(result as i32));
                                     } else {
@@ -2887,7 +2997,7 @@ impl Vm {
                             // Promise resolve
                             let pid = ObjectId((-600_000 - s) as u32);
                             let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             self.resolve_promise(pid, val)?;
                             self.push(Value::undefined());
                             continue;
@@ -2896,7 +3006,7 @@ impl Vm {
                             // Promise reject
                             let pid = ObjectId((-700_000 - s) as u32);
                             let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             self.reject_promise(pid, val)?;
                             self.push(Value::undefined());
                             continue;
@@ -2907,7 +3017,7 @@ impl Vm {
                             let tracker_oid = ObjectId(encoded / 1024);
                             let index = (encoded % 1024) as usize;
                             let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             self.handle_combinator_resolve(tracker_oid, index, val)?;
                             self.push(Value::undefined());
                             continue;
@@ -2918,7 +3028,7 @@ impl Vm {
                             let tracker_oid = ObjectId(encoded / 1024);
                             let index = (encoded % 1024) as usize;
                             let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             self.handle_combinator_reject(tracker_oid, index, val)?;
                             self.push(Value::undefined());
                             continue;
@@ -2927,7 +3037,7 @@ impl Vm {
                         if s <= -1_100_000 && s > -1_200_000 {
                             let tracker_oid = ObjectId((-1_100_000 - s) as u32);
                             let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             // Call the finally callback, then resolve with original value
                             if let Some(obj) = self.heap.get(tracker_oid)
                                 && let ObjectKind::FinallyTracker { callback, .. } = &obj.kind {
@@ -2941,7 +3051,7 @@ impl Vm {
                         if s <= -1_200_000 && s > -1_300_000 {
                             let tracker_oid = ObjectId((-1_200_000 - s) as u32);
                             let val = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             if let Some(obj) = self.heap.get(tracker_oid)
                                 && let ObjectKind::FinallyTracker { callback, .. } = &obj.kind {
                                     let cb = *callback;
@@ -2964,7 +3074,7 @@ impl Vm {
                             self.symbol_descriptions.resize(id as usize + 1, None);
                         }
                         self.symbol_descriptions[id as usize] = desc;
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         self.push(Value::symbol(id));
                         continue;
                     }
@@ -2979,7 +3089,7 @@ impl Vm {
                             marked: false, extensible: true,
                         };
                         let oid = self.heap.allocate(obj);
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         self.push(Value::object_id(oid));
                         continue;
                     }
@@ -2992,7 +3102,7 @@ impl Vm {
                             .unwrap_or(0.0);
                         let s = format_date(ms);
                         let id = self.interner.intern(&s);
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         self.push(Value::string(id));
                         continue;
                     }
@@ -3000,7 +3110,7 @@ impl Vm {
                     // Function(...args) — last arg is body, previous args are param names
                     if func_val.is_function() && func_val.as_function() == Some(-551) {
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         let result = self.construct_function(&args)?;
                         self.push(result);
                         continue;
@@ -3009,7 +3119,7 @@ impl Vm {
                     // Check for eval()
                     if func_val.is_function() && func_val.as_function() == Some(-560) {
                         let code = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         // eval with non-string argument returns the argument
                         if !code.is_string() {
                             self.push(code);
@@ -3057,6 +3167,7 @@ impl Vm {
                                 c.flags |= ChunkFlags::STRICT;
                             }
                         }
+                        self.maybe_disasm_chunks(&flat_chunks);
                         self.chunks.extend(flat_chunks);
                         // Execute inheriting the current `this` binding (spec requirement)
                         let eval_fn = Value::function(base_idx as i32);
@@ -3067,7 +3178,7 @@ impl Vm {
                         // Eval chunks end in Halt, which doesn't unwind the call frame.
                         // Clean up leftover frame and stack slots.
                         while self.frames.len() > frames_before { self.frames.pop(); }
-                        self.stack.truncate(stack_before);
+                        self.truncate_stack(stack_before);
                         self.push(result);
                         continue;
                     }
@@ -3108,7 +3219,7 @@ impl Vm {
                                     obj.set_property(stack_key, Value::string(stack_id));
                                 }
                             }
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             self.push(this_val);
                             continue;
                         }
@@ -3172,21 +3283,58 @@ impl Vm {
                                     obj.kind = new_kind;
                                 }
                             }
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             self.push(this_val);
                             continue;
                         }
-                        if (-536..=-500).contains(&sentinel) {
+                        // -507 is excluded: in exec_global_fn that id means
+                        // Array.isArray (method dispatch), but a plain
+                        // `Array(n)` call must CONSTRUCT (spec: Array called
+                        // as a function behaves like `new Array`). It falls
+                        // through to the constructor handler below.
+                        if (-536..=-500).contains(&sentinel) && sentinel != -507 {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                             let result = self.exec_global_fn(sentinel, &args);
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
+                            self.push(result);
+                            continue;
+                        }
+                        if sentinel == -507 {
+                            // Array called as a function constructs (spec:
+                            // identical to `new Array(...)`).
+                            let elements: Vec<Value> = if argc == 1 {
+                                let only = self.stack[func_pos + 1];
+                                if let Some(n) = only.as_number()
+                                    && n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64
+                                {
+                                    vec![Value::undefined(); n as usize]
+                                } else if let Some(n) = only.as_int() {
+                                    if n >= 0 { vec![Value::undefined(); n as usize] } else { vec![only] }
+                                } else {
+                                    vec![only]
+                                }
+                            } else {
+                                (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect()
+                            };
+                            let mut arr_obj = JsObject::array(elements);
+                            arr_obj.prototype = Some(self.array_prototype);
+                            let oid = self.heap.allocate(arr_obj);
+                            self.truncate_stack(func_pos);
+                            self.push(Value::object_id(oid));
+                            continue;
+                        }
+                        if sentinel == -750 {
+                            // Extracted Object.assign value
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
+                            let result = self.exec_object_assign(&args);
+                            self.truncate_stack(func_pos);
                             self.push(result);
                             continue;
                         }
                         if (-726..=-700).contains(&sentinel) {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                             let result = self.exec_math_sentinel(sentinel, &args);
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             self.push(result);
                             continue;
                         }
@@ -3194,7 +3342,7 @@ impl Vm {
                             // Native this-dependent methods called standalone (this=undefined)
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                             let result = self.exec_native_method(sentinel, Value::undefined(), &args);
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             self.push(result);
                             continue;
                         }
@@ -3213,7 +3361,7 @@ impl Vm {
                             // wraps to globalThis. Match the bytecode-call default here so
                             // host code sees the same shape.
                             let this_val = Value::undefined();
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             match (func)(self, this_val, &args_vec) {
                                 Ok(v) => { self.push(v); continue; }
                                 Err(reason) => { self.handle_throw(reason)?; continue; }
@@ -3247,7 +3395,7 @@ impl Vm {
                                 let call_args: Vec<Value> = bound_args.into_iter()
                                     .chain((0..argc).map(|i| self.stack[func_pos + 1 + i]))
                                     .collect();
-                                self.stack.truncate(func_pos);
+                                self.truncate_stack(func_pos);
                                 let result = self.call_with_async_wrap(fn_val, this_val, &call_args)?;
                                 self.push(result);
                                 continue;
@@ -3282,7 +3430,7 @@ impl Vm {
                             obj.set_property(prim_key, arg);
                             Value::object_id(self.heap.allocate(obj))
                         };
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         self.push(result);
                         continue;
                     }
@@ -3336,7 +3484,7 @@ impl Vm {
                         let msg = format!(
                             "{type_name} is not a function (at line {line}, bytecode pc {pc}, chunk '{chunk_name}')"
                         );
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         self.throw_type_error(&msg)?;
                         continue;
                     }
@@ -3361,7 +3509,7 @@ impl Vm {
                             let args: Vec<Value> = (0..argc)
                                 .map(|i| self.stack[func_pos + 1 + i])
                                 .collect();
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             match self.call_with_async_wrap(ctor, Value::undefined(), &args) {
                                 Ok(result) => { self.push(result); continue; }
                                 Err(VmError::Throw(reason)) => { self.handle_throw(reason)?; continue; }
@@ -3381,7 +3529,7 @@ impl Vm {
                         }
                     }
                     // Unknown/undefined — silently return undefined
-                    self.stack.truncate(func_pos);
+                    self.truncate_stack(func_pos);
                     self.push(Value::undefined());
                 }
 
@@ -3426,14 +3574,14 @@ impl Vm {
                         {
                             *state = GeneratorState::Completed;
                         }
-                        self.stack.truncate(frame.base.saturating_sub(1));
+                        self.truncate_stack(frame.base.saturating_sub(1));
                         let iter_result = self.make_iter_result(result, true)?;
                         self.push(iter_result);
                     } else if self.frames.len() <= stop_depth {
-                        self.stack.truncate(frame.base.saturating_sub(1));
+                        self.truncate_stack(frame.base.saturating_sub(1));
                         return Ok(result);
                     } else {
-                        self.stack.truncate(frame.base.saturating_sub(1));
+                        self.truncate_stack(frame.base.saturating_sub(1));
                         self.push(result);
                     }
                 }
@@ -3477,14 +3625,14 @@ impl Vm {
                         {
                             *state = GeneratorState::Completed;
                         }
-                        self.stack.truncate(frame.base.saturating_sub(1));
+                        self.truncate_stack(frame.base.saturating_sub(1));
                         let iter_result = self.make_iter_result(Value::undefined(), true)?;
                         self.push(iter_result);
                     } else if self.frames.len() <= stop_depth {
-                        self.stack.truncate(frame.base.saturating_sub(1));
+                        self.truncate_stack(frame.base.saturating_sub(1));
                         return Ok(result);
                     } else {
-                        self.stack.truncate(frame.base.saturating_sub(1));
+                        self.truncate_stack(frame.base.saturating_sub(1));
                         self.push(result);
                     }
                 }
@@ -3555,10 +3703,7 @@ impl Vm {
                     let val = {
                         let frame = self.frames.last().unwrap();
                         if idx < frame.upvalues.len() {
-                            match &frame.upvalues[idx].location {
-                                UpvalueLocation::Open(stack_idx) => self.stack[*stack_idx],
-                                UpvalueLocation::Closed(val) => *val,
-                            }
+                            frame.upvalues[idx].get(&self.stack)
                         } else {
                             Value::undefined()
                         }
@@ -3566,25 +3711,58 @@ impl Vm {
                     self.push(val);
                 }
 
+                OpCode::GetUpvalueWide => {
+                    let idx = self.read_u16() as usize;
+                    let val = {
+                        let frame = self.frames.last().unwrap();
+                        if idx < frame.upvalues.len() {
+                            frame.upvalues[idx].get(&self.stack)
+                        } else {
+                            Value::undefined()
+                        }
+                    };
+                    self.push(val);
+                }
+
+                OpCode::SetUpvalueWide => {
+                    let idx = self.read_u16() as usize;
+                    let val = self.peek()?;
+                    let frame_idx = self.frames.len() - 1;
+                    if idx < self.frames[frame_idx].upvalues.len() {
+                        // Shared cell: every closure capturing this variable
+                        // observes the write, matching real closure semantics.
+                        let cell = self.frames[frame_idx].upvalues[idx].cell.clone();
+                        let loc = cell.borrow().clone();
+                        match loc {
+                            UpvalueLocation::Open(stack_idx) => {
+                                if stack_idx < self.stack.len() {
+                                    self.stack[stack_idx] = val;
+                                }
+                            }
+                            UpvalueLocation::Closed(_) => {
+                                *cell.borrow_mut() = UpvalueLocation::Closed(val);
+                            }
+                        }
+                    }
+                }
+
                 OpCode::SetUpvalue => {
                     let idx = self.read_byte() as usize;
                     let val = self.peek()?;
                     let frame_idx = self.frames.len() - 1;
                     if idx < self.frames[frame_idx].upvalues.len() {
-                        match self.frames[frame_idx].upvalues[idx].location {
+                        // Shared cell: every closure capturing this variable
+                        // observes the write, matching real closure semantics.
+                        let cell = self.frames[frame_idx].upvalues[idx].cell.clone();
+                        let loc = cell.borrow().clone();
+                        match loc {
                             UpvalueLocation::Open(stack_idx) => {
-                                self.stack[stack_idx] = val;
+                                if stack_idx < self.stack.len() {
+                                    self.stack[stack_idx] = val;
+                                }
                             }
                             UpvalueLocation::Closed(_) => {
-                                self.frames[frame_idx].upvalues[idx].location = UpvalueLocation::Closed(val);
-                                // Also update the canonical closure storage so future calls see the change
-                                // Find which closure this frame belongs to and update it
-                                for closure_uvs in &mut self.closure_upvalues {
-                                    if idx < closure_uvs.len()
-                                        && let UpvalueLocation::Closed(_) = &closure_uvs[idx].location {
-                                            closure_uvs[idx].location = UpvalueLocation::Closed(val);
-                                        }
-                                }
+                                *cell.borrow_mut() = UpvalueLocation::Closed(val);
                             }
                         }
                     }
@@ -3595,23 +3773,8 @@ impl Vm {
                     // all upvalues that reference that stack slot.
                     let stack_idx = self.stack.len() - 1;
                     let val = self.stack[stack_idx];
-                    // Walk all frames and close any upvalues pointing to this slot
-                    for frame in &mut self.frames {
-                        for uv in &mut frame.upvalues {
-                            if let UpvalueLocation::Open(si) = &uv.location
-                                && *si == stack_idx {
-                                    uv.location = UpvalueLocation::Closed(val);
-                                }
-                        }
-                    }
-                    // Also close in closure_upvalues storage
-                    for closure_uvs in &mut self.closure_upvalues {
-                        for uv in closure_uvs {
-                            if let UpvalueLocation::Open(si) = &uv.location
-                                && *si == stack_idx {
-                                    uv.location = UpvalueLocation::Closed(val);
-                                }
-                        }
+                    if let Some(cell) = self.open_upvalues.remove(&stack_idx) {
+                        *cell.borrow_mut() = UpvalueLocation::Closed(val);
                     }
                     self.pop()?;
                 }
@@ -4260,6 +4423,27 @@ impl Vm {
                                 // (used by test262's propertyHelper.js, MDN-style helpers,
                                 // etc.) works. Cached in fn_property_overrides so identity
                                 // is stable across reads.
+                                // Same lazy-callable trick for `Object.assign` —
+                                // `var assign = Object.assign;` is the standard
+                                // minified-bundle prologue (React, Preact, ...).
+                                "assign" => {
+                                    let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                                        |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
+                                            Ok(vm.exec_object_assign(args))
+                                        }
+                                    );
+                                    let fn_obj = JsObject {
+                                        properties: Vec::new(),
+                                        prototype: None,
+                                        kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
+                                        marked: false,
+                                        extensible: true,
+                                    };
+                                    let oid = self.heap.allocate(fn_obj);
+                                    let val = Value::object_id(oid);
+                                    self.fn_property_overrides.insert((-508, name_id), Some(val));
+                                    val
+                                }
                                 "defineProperty" => {
                                     let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
                                         |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
@@ -5086,7 +5270,7 @@ impl Vm {
                         let msg = format!(
                             "Cannot read properties of {kind} (reading '{prop}') (at line {line}, pc {pc}, chunk '{chunk_name}')"
                         );
-                        self.stack.truncate(obj_pos);
+                        self.truncate_stack(obj_pos);
                         let err = self.make_native_error("TypeError", &msg);
                         self.handle_throw(err)?;
                         continue;
@@ -5112,7 +5296,7 @@ impl Vm {
                         });
                         if let Some(func) = native_fn {
                             let args_vec: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             match (func)(self, obj_val, &args_vec) {
                                 Ok(v) => { self.push(v); continue; }
                                 Err(reason) => { self.handle_throw(reason)?; continue; }
@@ -5140,7 +5324,7 @@ impl Vm {
                                     }
                                 }
                                 self.output.push(line);
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::undefined());
                                 continue;
                             }
@@ -5171,7 +5355,7 @@ impl Vm {
                     if let Some(s) = string_for_method {
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                         let result = self.exec_string_method(&s, method_name, &args);
-                        self.stack.truncate(obj_pos);
+                        self.truncate_stack(obj_pos);
                         self.push(result);
                         continue;
                     }
@@ -5254,7 +5438,7 @@ impl Vm {
                             }
                             _ => Value::undefined(),
                         };
-                        self.stack.truncate(obj_pos);
+                        self.truncate_stack(obj_pos);
                         self.push(result);
                         continue;
                     }
@@ -5271,7 +5455,7 @@ impl Vm {
                             "valueOf" => effective_val,
                             _ => Value::undefined(),
                         };
-                        self.stack.truncate(obj_pos);
+                        self.truncate_stack(obj_pos);
                         self.push(result);
                         continue;
                     }
@@ -5300,7 +5484,7 @@ impl Vm {
                             "call" => {
                                 let this_arg = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
                                 let call_args: Vec<Value> = (1..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 let result = self.call_with_async_wrap(obj_val, this_arg, &call_args)?;
                                 self.push(result);
                                 continue;
@@ -5316,7 +5500,7 @@ impl Vm {
                                                 call_args = elems.clone();
                                             }
                                 }
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 let result = self.call_with_async_wrap(obj_val, this_arg, &call_args)?;
                                 self.push(result);
                                 continue;
@@ -5337,10 +5521,13 @@ impl Vm {
                                             };
                                             self.heap.allocate(fobj)
                                         } else {
-                                            // User bytecode function — wrap as Bytecode
-                                            let chunk_idx = (packed & 0xFFFF) as usize;
-                                            let name = if chunk_idx < self.chunks.len() { self.chunks[chunk_idx].name } else { self.interner.intern("<bound>") };
-                                            let fobj = JsObject::function_bytecode(chunk_idx, name);
+                                            // User bytecode function — wrap as Bytecode,
+                                            // keeping the FULL packed value (closure_id in
+                                            // the high bits) so the bound function still
+                                            // sees its captured upvalues when called.
+                                            let chunk_only = (packed & 0xFFFF) as usize;
+                                            let name = if chunk_only < self.chunks.len() { self.chunks[chunk_only].name } else { self.interner.intern("<bound>") };
+                                            let fobj = JsObject::function_bytecode(packed as usize, name);
                                             self.heap.allocate(fobj)
                                         }
                                     };
@@ -5354,7 +5541,7 @@ impl Vm {
                                     marked: false, extensible: true,
                                 };
                                 let bound_oid = self.heap.allocate(bound);
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::object_id(bound_oid));
                                 continue;
                             }
@@ -5368,7 +5555,7 @@ impl Vm {
                             && matches!(&obj.kind, ObjectKind::Array(_)) {
                                 let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                                 let result = self.exec_array_method(oid, method_name, &args)?;
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(result);
                                 continue;
                             }
@@ -5385,7 +5572,7 @@ impl Vm {
                                 && self.chunks[gen_chunk].flags.contains(ChunkFlags::ASYNC);
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             // Clear CallMethod operands before resuming
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             let action = self.exec_generator_method(oid, method_name, &args);
                             match action {
                                 Ok(crate::vm::generator::GeneratorAction::Done(result)) => {
@@ -5424,7 +5611,7 @@ impl Vm {
                         {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_regexp_method(oid, method_name, &args)?;
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -5435,13 +5622,13 @@ impl Vm {
                             let mn = self.interner.resolve(method_name);
                             if mn == "size" {
                                 let sz = if let ObjectKind::Map { entries } = &self.heap.get(oid).unwrap().kind { entries.len() } else { 0 };
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::int(sz as i32));
                                 continue;
                             }
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_map_method(oid, method_name, &args)?;
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -5452,13 +5639,13 @@ impl Vm {
                             let mn = self.interner.resolve(method_name);
                             if mn == "size" {
                                 let sz = if let ObjectKind::Set { entries } = &self.heap.get(oid).unwrap().kind { entries.len() } else { 0 };
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::int(sz as i32));
                                 continue;
                             }
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_set_method(oid, method_name, &args)?;
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -5468,7 +5655,7 @@ impl Vm {
                         {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_weakmap_method(oid, method_name, &args)?;
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -5499,7 +5686,7 @@ impl Vm {
                                 }
                                 _ => Value::undefined(),
                             };
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -5509,7 +5696,7 @@ impl Vm {
                         {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_weakset_method(oid, method_name, &args)?;
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -5540,7 +5727,7 @@ impl Vm {
                                     self.exec_math_method(method_name, &args)
                                 }
                             };
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -5548,7 +5735,7 @@ impl Vm {
                         if self.json_oid == Some(oid) {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_json_method(method_name, &args);
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -5580,7 +5767,7 @@ impl Vm {
                                         || o.has_own_property(getter_key)
                                         || o.has_own_property(setter_key)
                                 }).unwrap_or(false);
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::boolean(has));
                                 continue;
                             }
@@ -5602,7 +5789,7 @@ impl Vm {
                                     })
                                     .map(|p| p.is_enumerable())
                                     .unwrap_or(false);
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::boolean(is_enum));
                                 continue;
                             }
@@ -5623,7 +5810,7 @@ impl Vm {
                                 } else { None };
                                 if let Some(s) = error_str {
                                     let id = self.interner.intern(&s);
-                                    self.stack.truncate(obj_pos);
+                                    self.truncate_stack(obj_pos);
                                     self.push(Value::string(id));
                                     continue;
                                 }
@@ -5640,7 +5827,7 @@ impl Vm {
                                         self.value_to_string(inner)
                                     };
                                     let id = self.interner.intern(&s);
-                                    self.stack.truncate(obj_pos);
+                                    self.truncate_stack(obj_pos);
                                     self.push(Value::string(id));
                                     continue;
                                 }
@@ -5659,7 +5846,7 @@ impl Vm {
                                     }
                                 } else { "[object Object]" };
                                 let id = self.interner.intern(tag);
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::string(id));
                                 continue;
                             }
@@ -5669,18 +5856,18 @@ impl Vm {
                                     && let ObjectKind::Wrapper(inner) = &o.kind
                                 {
                                     let inner = *inner;
-                                    self.stack.truncate(obj_pos);
+                                    self.truncate_stack(obj_pos);
                                     self.push(inner);
                                     continue;
                                 }
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(obj_val);
                                 continue;
                             }
                             "isPrototypeOf" => {
                                 let target = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
                                 let result = self.is_prototype_of(obj_val, target);
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::boolean(result));
                                 continue;
                             }
@@ -5701,12 +5888,12 @@ impl Vm {
                                     .unwrap_or_default();
                                 let s = format!("function {name}() {{ [native code] }}");
                                 let id = self.interner.intern(&s);
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::string(id));
                                 continue;
                             }
                             "valueOf" => {
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(obj_val);
                                 continue;
                             }
@@ -5722,7 +5909,7 @@ impl Vm {
                             let key_id = self.interner.intern(&key);
                             let sentinel = obj_val.as_function().unwrap();
                             let has = self.fn_get_own_prop(sentinel, key_id).is_some();
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(Value::boolean(has));
                             continue;
                         }
@@ -5737,7 +5924,7 @@ impl Vm {
                         {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.call_function_this(method_fn, obj_val, &args)?;
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -5783,7 +5970,7 @@ impl Vm {
                                         let args_vec: Vec<Value> = (0..argc)
                                             .map(|i| self.stack[obj_pos + 1 + i])
                                             .collect();
-                                        self.stack.truncate(obj_pos);
+                                        self.truncate_stack(obj_pos);
                                         let result = self.call_with_async_wrap(mv, obj_val, &args_vec)?;
                                         self.push(result);
                                         continue;
@@ -5832,7 +6019,7 @@ impl Vm {
                         if kind_match && mn == "next" {
                             // Step the iterator and produce { value, done }.
                             let result = self.iterator_next_step(oid)?;
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -5841,7 +6028,7 @@ impl Vm {
                             // return { value: arg, done: true } as a courtesy.
                             let arg = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
                             let res = self.make_iter_result(arg, true)?;
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(res);
                             continue;
                         }
@@ -5855,7 +6042,7 @@ impl Vm {
                         if is_promise {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_promise_method(oid, method_name, &args)?;
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -5957,27 +6144,7 @@ impl Vm {
                                     Value::object_id(self.heap.allocate(arr))
                                 } else { Value::undefined() }
                             }
-                            "assign" => {
-                                let target = args.first().copied().unwrap_or(Value::undefined());
-                                if let Some(target_oid) = target.as_object_id() {
-                                    for source_val in args.iter().skip(1) {
-                                        if let Some(src_oid) = source_val.as_object_id() {
-                                            let props: Vec<(StringId, Value)> = self.heap.get(src_oid)
-                                                .map(|o| o.properties.iter()
-                                                    .filter(|(k, p)| p.is_enumerable()
-                                                        && !is_internal_key(self.interner.resolve(*k)))
-                                                    .map(|&(k, ref p)| (k, p.value)).collect())
-                                                .unwrap_or_default();
-                                            for (k, v) in props {
-                                                if let Some(obj) = self.heap.get_mut(target_oid) {
-                                                    obj.set_property(k, v);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    target
-                                } else { target }
-                            }
+                            "assign" => self.exec_object_assign(&args),
                             "create" => {
                                 let proto = args.first().copied().unwrap_or(Value::null());
                                 let mut obj = JsObject::ordinary();
@@ -6361,7 +6528,7 @@ impl Vm {
                             }
                             _ => Value::undefined(),
                         };
-                        self.stack.truncate(obj_pos);
+                        self.truncate_stack(obj_pos);
                         self.push(result);
                         continue;
                     }
@@ -6376,7 +6543,7 @@ impl Vm {
                                     .and_then(|oid| self.heap.get(oid))
                                     .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
                                     .unwrap_or(false);
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::boolean(is_arr));
                                 continue;
                             }
@@ -6433,7 +6600,7 @@ impl Vm {
                                 }
                                 let arr = JsObject::array(result);
                                 let new_oid = self.heap.allocate(arr);
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::object_id(new_oid));
                                 continue;
                             }
@@ -6441,7 +6608,7 @@ impl Vm {
                                 let items: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                                 let arr = JsObject::array(items);
                                 let new_oid = self.heap.allocate(arr);
-                                self.stack.truncate(obj_pos);
+                                self.truncate_stack(obj_pos);
                                 self.push(Value::object_id(new_oid));
                                 continue;
                             }
@@ -6466,7 +6633,7 @@ impl Vm {
                             "parse" => Value::number(f64::NAN),
                             _ => Value::undefined(),
                         };
-                        self.stack.truncate(obj_pos);
+                        self.truncate_stack(obj_pos);
                         self.push(result);
                         continue;
                     }
@@ -6483,7 +6650,7 @@ impl Vm {
                                 }
                             }
                             let id = self.interner.intern(&result);
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(Value::string(id));
                             continue;
                         }
@@ -6507,7 +6674,7 @@ impl Vm {
                                 }
                             }
                             let id = self.interner.intern(&result);
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(Value::string(id));
                             continue;
                         }
@@ -6528,7 +6695,7 @@ impl Vm {
                         if let Some(s) = sentinel {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_global_fn(s, &args);
-                            self.stack.truncate(obj_pos);
+                            self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
                         }
@@ -6538,13 +6705,13 @@ impl Vm {
                     if obj_val.is_function() && obj_val.as_function() == Some(-520) {
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                         let result = self.exec_promise_static(method_name, &args)?;
-                        self.stack.truncate(obj_pos);
+                        self.truncate_stack(obj_pos);
                         self.push(result);
                         continue;
                     }
 
                     // Generic method call fallthrough - push undefined
-                    self.stack.truncate(obj_pos);
+                    self.truncate_stack(obj_pos);
                     self.push(Value::undefined());
                 }
 
@@ -6566,7 +6733,18 @@ impl Vm {
                         } else { false }
                     };
                     if !is_constructable {
-                        let err = self.make_native_error("TypeError", "is not a constructor");
+                        // Same location annotation as property-read errors —
+                        // on a minified bundle the line/pc is the only way to
+                        // find which expression produced the non-constructor.
+                        let (line, pc, chunk_name) = if let Some(f) = self.frames.last() {
+                            let cn = self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned();
+                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip, cn)
+                        } else { (0, 0, String::new()) };
+                        let kind = self.type_of_value(func_val);
+                        let msg = format!(
+                            "{kind} is not a constructor (at line {line}, pc {pc}, chunk '{chunk_name}')"
+                        );
+                        let err = self.make_native_error("TypeError", &msg);
                         self.handle_throw(err)?;
                         continue;
                     }
@@ -6608,7 +6786,7 @@ impl Vm {
                         if executor.is_function() {
                             let _ = self.call_function(executor, &[resolve_val, reject_val]);
                         }
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         self.push(Value::object_id(pid));
                         continue;
                     }
@@ -6639,7 +6817,7 @@ impl Vm {
                                     kind: ObjectKind::Map { entries }, marked: false, extensible: true,
                                 };
                                 let oid = self.heap.allocate(obj);
-                                self.stack.truncate(func_pos);
+                                self.truncate_stack(func_pos);
                                 self.push(Value::object_id(oid));
                                 continue;
                             }
@@ -6656,7 +6834,7 @@ impl Vm {
                                     kind: ObjectKind::Set { entries }, marked: false, extensible: true,
                                 };
                                 let oid = self.heap.allocate(obj);
-                                self.stack.truncate(func_pos);
+                                self.truncate_stack(func_pos);
                                 self.push(Value::object_id(oid));
                                 continue;
                             }
@@ -6666,7 +6844,7 @@ impl Vm {
                                     kind: ObjectKind::WeakMap { entries: Vec::new() }, marked: false, extensible: true,
                                 };
                                 let oid = self.heap.allocate(obj);
-                                self.stack.truncate(func_pos);
+                                self.truncate_stack(func_pos);
                                 self.push(Value::object_id(oid));
                                 continue;
                             }
@@ -6676,7 +6854,7 @@ impl Vm {
                                     kind: ObjectKind::WeakSet { entries: Vec::new() }, marked: false, extensible: true,
                                 };
                                 let oid = self.heap.allocate(obj);
-                                self.stack.truncate(func_pos);
+                                self.truncate_stack(func_pos);
                                 self.push(Value::object_id(oid));
                                 continue;
                             }
@@ -6697,7 +6875,7 @@ impl Vm {
                                     marked: false, extensible: true,
                                 };
                                 let oid = self.heap.allocate(obj);
-                                self.stack.truncate(func_pos);
+                                self.truncate_stack(func_pos);
                                 self.push(Value::object_id(oid));
                                 continue;
                             }
@@ -6715,7 +6893,7 @@ impl Vm {
                             marked: false, extensible: true,
                         };
                         let oid = self.heap.allocate(obj);
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         self.push(Value::object_id(oid));
                         continue;
                     }
@@ -6723,7 +6901,7 @@ impl Vm {
                     // new Function(...args)
                     if func_val.is_function() && func_val.as_function() == Some(-551) {
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         let result = self.construct_function(&args)?;
                         self.push(result);
                         continue;
@@ -6751,7 +6929,7 @@ impl Vm {
                         if let Some(o) = self.heap.get_mut(oid) {
                             o.prototype = Some(self.array_prototype);
                         }
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         self.push(Value::object_id(oid));
                         continue;
                     }
@@ -6794,7 +6972,7 @@ impl Vm {
                                     obj.set_property(len_key, Value::int(len));
                                 }
                             let oid = self.heap.allocate(obj);
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             self.push(Value::object_id(oid));
                             continue;
                         }
@@ -6818,7 +6996,7 @@ impl Vm {
                             JsObject::array(Vec::new())
                         };
                         let oid = self.heap.allocate(arr);
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         self.push(Value::object_id(oid));
                         continue;
                     }
@@ -6828,7 +7006,7 @@ impl Vm {
                         let mut obj = JsObject::ordinary();
                         obj.prototype = Some(self.object_prototype);
                         let oid = self.heap.allocate(obj);
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         self.push(Value::object_id(oid));
                         continue;
                     }
@@ -6874,7 +7052,7 @@ impl Vm {
                             let stack_id = self.interner.intern(&stack_str);
                             err_obj.set_property(stack_key, Value::string(stack_id));
                             let oid = self.heap.allocate(err_obj);
-                            self.stack.truncate(func_pos);
+                            self.truncate_stack(func_pos);
                             self.push(Value::object_id(oid));
                             continue;
                         }
@@ -7127,7 +7305,7 @@ impl Vm {
                             }
                         }
                         // No constructor -- just return the object with prototype methods
-                        self.stack.truncate(func_pos);
+                        self.truncate_stack(func_pos);
                         self.push(this_val);
                         continue;
                     }
@@ -7168,7 +7346,7 @@ impl Vm {
                         }
                     }
 
-                    self.stack.truncate(func_pos);
+                    self.truncate_stack(func_pos);
                     self.push(this_val);
                 }
 
@@ -7214,7 +7392,7 @@ impl Vm {
                     // Push back the bytecode equivalent of Construct
                     // We can't easily call Construct from here since it's part of the run loop.
                     // Instead, inline the logic: use call_function_this with a new object
-                    self.stack.truncate(self.stack.len() - argc - 1); // pop everything we just pushed
+                    self.truncate_stack(self.stack.len() - argc - 1); // pop everything we just pushed
 
                     // Now call construct logic manually for user functions
                     if func_val.is_function() {
@@ -7644,23 +7822,34 @@ impl Vm {
                     let mut upvalues = Vec::with_capacity(upvalue_count);
                     for _ in 0..upvalue_count {
                         let is_local = self.read_byte() != 0;
-                        let index = self.read_byte() as usize;
+                        let index = self.read_u16() as usize;
 
                         if is_local {
-                            // Capture from current frame's local stack slot
+                            // Capture from current frame's local stack slot,
+                            // sharing the cell with every other closure that
+                            // captures the same slot (open-upvalue registry).
                             let base = self.frames.last().unwrap().base;
                             let stack_idx = base + index;
-                            upvalues.push(Upvalue {
-                                location: UpvalueLocation::Open(stack_idx),
-                            });
+                            let cell = self
+                                .open_upvalues
+                                .entry(stack_idx)
+                                .or_insert_with(|| {
+                                    std::rc::Rc::new(std::cell::RefCell::new(
+                                        UpvalueLocation::Open(stack_idx),
+                                    ))
+                                })
+                                .clone();
+                            upvalues.push(Upvalue { cell });
                         } else {
-                            // Capture from current frame's upvalue (transitive)
+                            // Transitive capture: share the parent's cell.
                             let parent_uv = self.frames.last().unwrap().upvalues.get(index).cloned();
                             if let Some(uv) = parent_uv {
                                 upvalues.push(uv);
                             } else {
                                 upvalues.push(Upvalue {
-                                    location: UpvalueLocation::Closed(Value::undefined()),
+                                    cell: std::rc::Rc::new(std::cell::RefCell::new(
+                                        UpvalueLocation::Closed(Value::undefined()),
+                                    )),
                                 });
                             }
                         }
@@ -7670,6 +7859,25 @@ impl Vm {
                     // We need a way to associate upvalues with the closure value.
                     // For now, use the closure_upvalues map.
                     let closure_id = self.closure_upvalues.len();
+                    {
+                        static WATCH_UV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+                        let watch_uv = WATCH_UV.get_or_init(|| std::env::var("ZINC_WATCH_UV").ok());
+                        if let Some(w) = watch_uv
+                            && abs_idx < self.chunks.len()
+                            && self.interner.resolve(self.chunks[abs_idx].name) == w {
+                            eprintln!("[uvwatch] closure_id={} for chunk '{}' created; upvalues:", closure_id, w);
+                            for (i, uv) in upvalues.iter().enumerate() {
+                                eprintln!("[uvwatch]   uv{} = {:?}", i, uv.cell.borrow());
+                            }
+                            eprintln!("[uvwatch]   frame base={} stack_len={}", self.frames.last().map(|f| f.base).unwrap_or(0), self.stack.len());
+                            for (i, uv) in upvalues.iter().enumerate() {
+                                if let UpvalueLocation::Open(si) = &*uv.cell.borrow() {
+                                    let v = self.stack.get(*si).copied().unwrap_or(Value::undefined());
+                                    eprintln!("[uvwatch]   uv{} stack[{}] currently = {:?}", i, si, self.type_of_value(v));
+                                }
+                            }
+                        }
+                    }
                     self.closure_upvalues.push(upvalues);
                     // Encode closure_id in high bits, chunk_idx in low bits
                     // Use a special encoding: negative int where abs value encodes both
@@ -8652,12 +8860,7 @@ impl Vm {
                         let saved_stack: Vec<Value> = self.stack[base..].to_vec();
 
                         // Resolve upvalues to values
-                        let saved_upvalues: Vec<Value> = self.frames.last().unwrap().upvalues.iter().map(|uv| {
-                            match &uv.location {
-                                UpvalueLocation::Open(idx) => self.stack.get(*idx).copied().unwrap_or(Value::undefined()),
-                                UpvalueLocation::Closed(v) => *v,
-                            }
-                        }).collect();
+                        let saved_upvalues: Vec<Value> = self.frames.last().unwrap().upvalues.iter().map(|uv| uv.get(&self.stack)).collect();
 
                         // Update generator object
                         if let Some(obj) = self.heap.get_mut(gid)
@@ -8672,7 +8875,7 @@ impl Vm {
 
                         // Pop the generator frame
                         self.frames.pop();
-                        self.stack.truncate(base - 1); // remove placeholder too
+                        self.truncate_stack(base - 1); // remove placeholder too
 
                         // Push {value, done: false}; for async generators, wrap in a
                         // resolved Promise so the caller sees Promise<{value, done}>.
@@ -8699,12 +8902,7 @@ impl Vm {
                     // Save operand+local stack between base and current sp.
                     let saved_stack: Vec<Value> = self.stack[frame.base..].to_vec();
                     // Capture upvalues' current values.
-                    let saved_upvalues: Vec<Value> = frame.upvalues.iter().map(|uv| {
-                        match &uv.location {
-                            UpvalueLocation::Open(idx) => self.stack.get(*idx).copied().unwrap_or(Value::undefined()),
-                            UpvalueLocation::Closed(v) => *v,
-                        }
-                    }).collect();
+                    let saved_upvalues: Vec<Value> = frame.upvalues.iter().map(|uv| uv.get(&self.stack)).collect();
                     let mut gen_obj = JsObject::ordinary();
                     gen_obj.kind = ObjectKind::Generator {
                         state: GeneratorState::SuspendedStart,
@@ -8717,7 +8915,7 @@ impl Vm {
                     };
                     let gen_oid = self.heap.allocate(gen_obj);
                     // Drop the frame's stack slots (back to func slot).
-                    self.stack.truncate(frame.base.saturating_sub(1));
+                    self.truncate_stack(frame.base.saturating_sub(1));
                     if self.frames.len() <= stop_depth {
                         return Ok(Value::object_id(gen_oid));
                     }
@@ -8894,6 +9092,7 @@ impl Vm {
                                 *child += base_idx;
                             }
                         }
+                        self.maybe_disasm_chunks(&flat_chunks);
                         self.chunks.extend(flat_chunks);
 
                         // Save current globals
@@ -9050,7 +9249,7 @@ impl Vm {
                     // Build args: [strings_array, ...exprs]
                     let mut args = vec![Value::object_id(arr_oid)];
                     args.extend(exprs);
-                    self.stack.truncate(tag_pos);
+                    self.truncate_stack(tag_pos);
                     let result = self.call_function(tag, &args)?;
                     self.push(result);
                 }
@@ -9216,11 +9415,50 @@ impl Vm {
                 *child += base_idx;
             }
         }
+        self.maybe_disasm_chunks(&flat_chunks);
         self.chunks.extend(flat_chunks);
         // Run the outer wrapper to evaluate the function expression
         let wrapper_fn = Value::function(base_idx as i32);
         let result = self.call_function(wrapper_fn, &[])?;
         Ok(result)
+    }
+
+    /// Object.assign(target, ...sources) — shared by the CallMethod
+    /// dispatch and the extractable `Object.assign` value (sentinel
+    /// -750): minified bundles alias `var assign = Object.assign;`.
+    pub(crate) fn exec_object_assign(&mut self, args: &[Value]) -> Value {
+        let target = args.first().copied().unwrap_or(Value::undefined());
+        if let Some(target_oid) = target.as_object_id() {
+            for source_val in args.iter().skip(1) {
+                if let Some(src_oid) = source_val.as_object_id() {
+                    let props: Vec<(StringId, Value)> = self.heap.get(src_oid)
+                        .map(|o| o.properties.iter()
+                            .filter(|(k, p)| p.is_enumerable()
+                                && !is_internal_key(self.interner.resolve(*k)))
+                            .map(|&(k, ref p)| (k, p.value)).collect())
+                        .unwrap_or_default();
+                    for (k, v) in props {
+                        if let Some(obj) = self.heap.get_mut(target_oid) {
+                            obj.set_property(k, v);
+                        }
+                    }
+                }
+            }
+        }
+        target
+    }
+
+    /// Debug aid: ZINC_DISASM_CHUNK=<name> dumps the bytecode of every
+    /// newly-registered chunk with that name to stderr.
+    fn maybe_disasm_chunks(&self, flat_chunks: &[crate::compiler::chunk::Chunk]) {
+        if let Ok(want) = std::env::var("ZINC_DISASM_CHUNK") {
+            for c in flat_chunks {
+                if self.interner.resolve(c.name) == want {
+                    eprintln!("==== disasm {want} ====");
+                    eprintln!("{}", crate::compiler::disassemble::disassemble(c, &self.interner));
+                }
+            }
+        }
     }
 }
 

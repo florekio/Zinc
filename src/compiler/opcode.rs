@@ -149,6 +149,9 @@ pub enum OpCode {
     SetUpvalue = 0x75,
     /// Close over local on stack top
     CloseUpvalue = 0x76,
+    /// Push captured upvalue (u16 index) -- wide. Minified bundles
+    /// (react-dom) capture hundreds of sibling functions per closure.
+    GetUpvalueWide = 0x77,
     /// Push global by name (u16 constant index)
     GetGlobal = 0x78,
     /// Set global by name (u16 constant index)
@@ -159,6 +162,8 @@ pub enum OpCode {
     InitLet = 0x7B,
     /// Throw ReferenceError if slot uninitialized (u8 slot)
     CheckTdz = 0x7C,
+    /// Set captured upvalue (u16 index) -- wide
+    SetUpvalueWide = 0x7D,
 
     // ---- Property Access ----
     /// obj.name -- replace obj with value (u16 name constant)
@@ -380,7 +385,7 @@ impl OpCode {
             | 0x40..=0x49
             | 0x50..=0x55
             | 0x60..=0x67
-            | 0x70..=0x7C
+            | 0x70..=0x7D
             | 0x80..=0x89
             | 0x90..=0x97
             | 0xA0..=0xAA
@@ -522,6 +527,8 @@ impl OpCode {
             | OpCode::Loop
             | OpCode::GetLocalWide
             | OpCode::SetLocalWide
+            | OpCode::GetUpvalueWide
+            | OpCode::SetUpvalueWide
             | OpCode::GetGlobal
             | OpCode::SetGlobal
             | OpCode::DefineGlobal

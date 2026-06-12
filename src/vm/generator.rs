@@ -131,7 +131,9 @@ impl Vm {
                 let upvalues = saved_upvalues
                     .iter()
                     .map(|v| Upvalue {
-                        location: UpvalueLocation::Closed(*v),
+                        cell: std::rc::Rc::new(std::cell::RefCell::new(
+                            UpvalueLocation::Closed(*v),
+                        )),
                     })
                     .collect();
 

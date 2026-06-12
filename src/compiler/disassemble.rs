@@ -12,6 +12,10 @@ pub fn disassemble(chunk: &Chunk, interner: &Interner) -> String {
         "locals: {} params: {} upvalues: {}\n",
         chunk.local_count, chunk.param_count, chunk.upvalue_count
     ));
+    for (i, d) in chunk.upvalue_descriptors.iter().enumerate() {
+        let kind = if d.is_local { "parent-local" } else { "parent-upvalue" };
+        out.push_str(&format!("  upvalue {i}: {kind} {}\n", d.index));
+    }
 
     let mut offset = 0;
     while offset < chunk.code.len() {
@@ -144,6 +148,12 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
             offset + 3
         }
 
+        OpCode::GetUpvalueWide | OpCode::SetUpvalueWide => {
+            let idx = chunk.read_u16(offset + 1);
+            out.push_str(&format!("{op:<20} upvalue:{idx}\n"));
+            offset + 3
+        }
+
         OpCode::CreateArray => {
             let hint = chunk.read_u16(offset + 1);
             out.push_str(&format!("{op:<20} hint_len:{hint}\n"));
@@ -189,10 +199,10 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
             let mut off = offset + 3;
             for _ in 0..child.upvalue_count {
                 let is_local = chunk.code[off];
-                let index = chunk.code[off + 1];
+                let index = ((chunk.code[off + 1] as u16) << 8) | chunk.code[off + 2] as u16;
                 let kind = if is_local != 0 { "local" } else { "upvalue" };
                 out.push_str(&format!("              | {kind} {index}\n"));
-                off += 2;
+                off += 3;
             }
             off
         }
