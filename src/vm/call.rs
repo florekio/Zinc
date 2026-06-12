@@ -51,6 +51,53 @@ impl Vm {
     }
 
     /// Call a closure with a specific `this` binding.
+
+    /// Build a bound-function object over `target` (a function value —
+    /// sentinel, packed bytecode closure, or function object), per
+    /// Function.prototype.bind. Shared by the named `.bind(...)` method
+    /// dispatch and the extracted-value sentinel (-597).
+    pub(crate) fn make_bound_function(&mut self, target: Value, bound_this: Value, bound_args: Vec<Value>) -> Value {
+        use crate::runtime::object::{JsObject, ObjectKind, FunctionKind};
+        let func_obj_id = if let Some(oid) = target.as_object_id() {
+            oid
+        } else if let Some(packed) = target.as_function() {
+            if packed < 0 {
+                let fobj = JsObject {
+                    properties: Vec::new(), prototype: None,
+                    kind: ObjectKind::Function(FunctionKind::NativeSentinel { sentinel: packed }),
+                    marked: false, extensible: true,
+                };
+                self.heap.allocate(fobj)
+            } else {
+                // Keep the FULL packed value (closure id in the high
+                // bits) so the bound function sees its upvalues.
+                let chunk_only = (packed & 0xFFFF) as usize;
+                let name = if chunk_only < self.chunks.len() { self.chunks[chunk_only].name } else { self.interner.intern("<bound>") };
+                let fobj = JsObject::function_bytecode(packed as usize, name);
+                self.heap.allocate(fobj)
+            }
+        } else {
+            // Not callable: produce a bound shell over undefined — calls
+            // will return undefined like other non-callable paths.
+            let fobj = JsObject {
+                properties: Vec::new(), prototype: None,
+                kind: ObjectKind::Function(FunctionKind::NativeSentinel { sentinel: 0 }),
+                marked: false, extensible: true,
+            };
+            self.heap.allocate(fobj)
+        };
+        let bound = JsObject {
+            properties: Vec::new(), prototype: None,
+            kind: ObjectKind::Function(FunctionKind::Bound {
+                target: func_obj_id,
+                this_val: bound_this,
+                args: bound_args,
+            }),
+            marked: false, extensible: true,
+        };
+        Value::object_id(self.heap.allocate(bound))
+    }
+
     pub fn call_function_this(&mut self, func_val: Value, this_value: Value, args: &[Value]) -> Result<Value, VmError> {
         // Host-supplied native function (heap-allocated callable).
         if let Some(oid) = func_val.as_object_id() {
@@ -120,6 +167,54 @@ impl Vm {
             return Ok(Value::undefined());
         }
         let packed = func_val.as_function().unwrap();
+        // Function.prototype.call / apply / bind extracted as VALUES
+        // (sentinels -595/-596/-597). `this_value` is the target
+        // function. core-js's uncurryThis is `bind.bind(call, call)` —
+        // calling its result lands here with this = the function being
+        // uncurried; without this dispatch every uncurried primordial
+        // silently returned undefined.
+        if packed == -595 {
+            let new_this = args.first().copied().unwrap_or(Value::undefined());
+            let rest: &[Value] = args.get(1..).unwrap_or(&[]);
+            return self.call_function_this(this_value, new_this, rest);
+        }
+        if packed == -596 {
+            let new_this = args.first().copied().unwrap_or(Value::undefined());
+            let list: Vec<Value> = args.get(1).and_then(|v| v.as_object_id())
+                .and_then(|oid| self.heap.get(oid))
+                .and_then(|o| if let crate::runtime::object::ObjectKind::Array(e) = &o.kind { Some(e.clone()) } else { None })
+                .unwrap_or_default();
+            return self.call_function_this(this_value, new_this, &list);
+        }
+        if packed == -597 {
+            let bound_this = args.first().copied().unwrap_or(Value::undefined());
+            let bound_args: Vec<Value> = args.get(1..).map(|s| s.to_vec()).unwrap_or_default();
+            return Ok(self.make_bound_function(this_value, bound_this, bound_args));
+        }
+        // Extracted String.prototype methods (sentinels -200 - idx).
+        // `this_value` is the receiver string; core-js uncurries these
+        // constantly (`b("".slice)`, `b("".charCodeAt)`, ...).
+        if (-224..=-200).contains(&packed) {
+            const STRING_METHOD_NAMES: &[&str] = &[
+                "charAt", "charCodeAt", "indexOf", "lastIndexOf", "includes",
+                "startsWith", "endsWith", "slice", "substring", "toUpperCase",
+                "toLowerCase", "trim", "trimStart", "trimEnd", "split",
+                "replace", "repeat", "padStart", "padEnd", "concat",
+                "match", "search", "replaceAll", "codePointAt", "at",
+            ];
+            let idx = (-200 - packed) as usize;
+            if idx < STRING_METHOD_NAMES.len() {
+                let s = if self.is_cons_string(this_value) {
+                    self.flatten_cons_to_string(this_value)
+                } else if let Some(sid) = this_value.as_string_id() {
+                    self.interner.resolve(sid).to_owned()
+                } else {
+                    self.value_to_string(this_value)
+                };
+                let mid = self.interner.intern(STRING_METHOD_NAMES[idx]);
+                return Ok(self.exec_string_method(&s, mid, args));
+            }
+        }
         // Native global function sentinels (no this)
         if (-536..=-500).contains(&packed) && packed != -507 {
             return Ok(self.exec_global_fn(packed, args));

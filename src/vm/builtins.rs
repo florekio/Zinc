@@ -1173,7 +1173,12 @@ impl Vm {
             }
             -508 => { // Object(v) — coerce to object
                 let arg = args.first().copied().unwrap_or(Value::undefined());
-                if arg.is_object() {
+                // ToObject of an object — and functions ARE objects —
+                // returns the value unchanged. core-js's toIndexedObject
+                // runs every descriptor target through Object(t); minting
+                // a fresh wrapper made hasOwn/getOwnPropertyDescriptor on
+                // function targets miss everything.
+                if arg.is_object() || arg.is_function() {
                     return arg;
                 }
                 let mut obj = crate::runtime::object::JsObject::ordinary();
@@ -1181,6 +1186,14 @@ impl Vm {
                 if !arg.is_null() && !arg.is_undefined() {
                     let prim_key = self.interner.intern("__primitive__");
                     obj.set_property(prim_key, arg);
+                }
+                // Symbol wrappers chain to Symbol.prototype so
+                // `Object(sym) instanceof Symbol` holds — part of
+                // core-js's NATIVE_SYMBOL detection; failing it swaps in
+                // the full Symbol shim (which replaces defineProperty
+                // globally and cascades).
+                if arg.is_symbol() {
+                    obj.prototype = Some(self.symbol_prototype_oid());
                 }
                 Value::object_id(self.heap.allocate(obj))
             }
@@ -1503,7 +1516,12 @@ impl Vm {
             // Both methods returned objects (or weren't callable in a way that produced
             // a primitive) — per spec, OrdinaryToPrimitive throws TypeError.
             if tried_method {
-                let err = self.make_native_error("TypeError", "Cannot convert object to primitive value");
+                let (line, pc, chunk_name) = if let Some(f) = self.frames.last() {
+                    let cn = self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned();
+                    (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip, cn)
+                } else { (0, 0, String::new()) };
+                let msg = format!("Cannot convert object to primitive value (at line {line}, pc {pc}, chunk '{chunk_name}')");
+                let err = self.make_native_error("TypeError", &msg);
                 return Err(super::vm::VmError::Throw(err));
             }
         }
