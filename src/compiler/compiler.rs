@@ -109,11 +109,22 @@ pub struct Compiler<'a> {
     pending_function_name: Option<StringId>,
     /// Stack of active finally blocks (None if try has no finally). Used to
     /// inline finally code before break/continue that exits the try block.
-    finally_stack: Vec<Option<std::rc::Rc<Vec<Statement>>>>,
+    /// One entry per try statement currently being compiled (innermost
+    /// last): the finally body to inline on early exits (None if the try
+    /// has no finalizer), and whether the runtime exception handler is
+    /// still active in that region (true inside the try block; false
+    /// inside the catch block, where handle_throw already popped it).
+    finally_stack: Vec<(Option<std::rc::Rc<Vec<Statement>>>, bool)>,
     /// Depth of nested class bodies. Class bodies (including method bodies)
     /// are implicitly strict per spec; tracking this lets
     /// compile_function_body_with_self set the STRICT flag for class methods.
     class_depth: u32,
+    /// Top-level `let` / `const` names whose slots were reserved at function
+    /// entry by the hoist pass (so hoisted function declarations can close
+    /// over them). When the actual declaration statement compiles, it assigns
+    /// into the reserved slot instead of pushing a new local, consuming its
+    /// entry here. Saved/restored around each nested function body.
+    predeclared_lex: Vec<StringId>,
 }
 
 impl<'a> Compiler<'a> {
@@ -136,6 +147,7 @@ impl<'a> Compiler<'a> {
             pending_function_name: None,
             finally_stack: Vec::new(),
             class_depth: 0,
+            predeclared_lex: Vec::new(),
         }
     }
 
@@ -307,6 +319,19 @@ impl<'a> Compiler<'a> {
             }
         }
         None
+    }
+
+    /// If `name` is a top-level lexical whose slot was reserved at function
+    /// entry by the hoist pass, consume the reservation and return the slot.
+    /// Only applies at the function body's own scope (depth 1) — `let` in a
+    /// nested block is a distinct binding and must get a fresh local.
+    fn take_predeclared_lex(&mut self, name: StringId) -> Option<usize> {
+        if self.scope_depth != 1 {
+            return None;
+        }
+        let pos = self.predeclared_lex.iter().position(|&n| n == name)?;
+        self.predeclared_lex.swap_remove(pos);
+        self.resolve_local(name)
     }
 
     /// Try to resolve a variable as an upvalue captured from an enclosing
@@ -531,6 +556,19 @@ impl<'a> Compiler<'a> {
                                 self.chunk.emit_op_u16(OpCode::SetGlobal, idx, line);
                                 self.chunk.emit_op(OpCode::Pop, line);
                             }
+                        } else if let Some(slot) = self.take_predeclared_lex(name) {
+                            // Slot was reserved at function entry by the
+                            // hoist pass — assign into it instead of pushing
+                            // a fresh local.
+                            if decl.kind == VarKind::Const {
+                                self.locals[slot].is_const = true;
+                            }
+                            if slot <= u8::MAX as usize {
+                                self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
+                            } else {
+                                self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
+                            }
+                            self.chunk.emit_op(OpCode::Pop, line);
                         } else {
                             self.add_local(name);
                             self.mark_initialized();
@@ -544,6 +582,12 @@ impl<'a> Compiler<'a> {
                         }
                     } else if decl.kind == VarKind::Var {
                         // var without init: hoisting already initialized to undefined; no-op
+                    } else if let Some(slot) = self.take_predeclared_lex(name) {
+                        // Pre-reserved slot already holds undefined; just
+                        // record constness.
+                        if decl.kind == VarKind::Const {
+                            self.locals[slot].is_const = true;
+                        }
                     } else {
                         // let/const without init: create binding initialized to undefined
                         self.chunk.emit_op(OpCode::Undefined, line);
@@ -1301,10 +1345,19 @@ impl<'a> Compiler<'a> {
 
     fn compile_return(&mut self, r: &ReturnStatement) -> Result<(), String> {
         let line = r.span.start;
+        // A return from inside try blocks must unwind their exception
+        // handlers (and run finally bodies) — otherwise the handlers go
+        // stale on the VM's exc_handlers stack and a LATER unrelated throw
+        // "returns" to a dead frame's catch target, jumping mid-instruction.
+        // DuckDuckGo's localStorage probe (`try { ...; return e=!0 }`)
+        // surfaced exactly that. The argument compiles BEFORE the unwind so
+        // a throw during its evaluation still reaches this try's catch.
         if let Some(arg) = &r.argument {
             self.compile_expr(arg)?;
+            self.compile_inline_finallys(0, line)?;
             self.chunk.emit_op(OpCode::Return, line);
         } else {
+            self.compile_inline_finallys(0, line)?;
             self.chunk.emit_op(OpCode::ReturnUndefined, line);
         }
         Ok(())
@@ -1319,18 +1372,28 @@ impl<'a> Compiler<'a> {
         if depth <= target_try_depth {
             return Ok(());
         }
-        // Collect Rc clones first to release the borrow on self.finally_stack
-        let finallys: Vec<Option<std::rc::Rc<Vec<Statement>>>> =
-            self.finally_stack[target_try_depth..depth].iter().rev().cloned().collect();
-        for finally_opt in finallys {
-            self.chunk.emit_op(OpCode::PopExcHandler, line);
+        // Detach the levels being unwound while their bodies compile — a
+        // `return` / `break` INSIDE an inlined finally calls back into this
+        // function, and with the levels still on the stack it would re-inline
+        // the same blocks forever (stack overflow at compile time).
+        let unwound = self.finally_stack.split_off(target_try_depth);
+        for (finally_opt, handler_active) in unwound.iter().rev() {
+            // Inside a catch block the runtime handler is already gone
+            // (handle_throw popped it on entry) — emitting a pop here
+            // would remove an unrelated OUTER handler instead.
+            if *handler_active {
+                self.chunk.emit_op(OpCode::PopExcHandler, line);
+            }
             if let Some(stmts_rc) = finally_opt {
-                let stmts = (*stmts_rc).clone();
+                let stmts = (**stmts_rc).clone();
                 for stmt in &stmts {
                     self.compile_statement(stmt)?;
                 }
             }
         }
+        // Restore: the unwind is a compile-time projection for this exit
+        // path only; subsequent statements still sit inside the trys.
+        self.finally_stack.extend(unwound);
         Ok(())
     }
 
@@ -2079,16 +2142,25 @@ impl<'a> Compiler<'a> {
             .code
             .extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
 
-        // Track the finally block so break/continue can inline it.
+        // Track the finally block so break/continue/return can inline it.
+        // handler_active = true: early exits from the try block must also
+        // pop the runtime exception handler.
         let finally_rc = t.finalizer.as_ref().map(|f| std::rc::Rc::new(f.body.clone()));
-        self.finally_stack.push(finally_rc);
+        self.finally_stack.push((finally_rc, true));
 
         // Compile try block (no scope — var declarations should be global/function-scoped).
         for stmt in &t.block.body {
             self.compile_statement(stmt)?;
         }
 
-        self.finally_stack.pop();
+        // Entering the catch region: handle_throw pops the handler before
+        // jumping here, so early exits from the CATCH block must inline the
+        // finally but NOT pop a handler. The entry stays on the stack with
+        // the flag flipped so `return`/`break` inside catch still run the
+        // finalizer.
+        if let Some(entry) = self.finally_stack.last_mut() {
+            entry.1 = false;
+        }
 
         self.chunk.emit_op(OpCode::PopExcHandler, line);
         let skip_catch = self.chunk.emit_jump(OpCode::Jump, line);
@@ -2137,6 +2209,10 @@ impl<'a> Compiler<'a> {
             }
             self.end_scope();
         }
+
+        // Leaving try+catch: the finally region itself (below) and any code
+        // after must not re-inline this finalizer.
+        self.finally_stack.pop();
 
         self.chunk.patch_jump(skip_catch);
 
@@ -2936,6 +3012,10 @@ impl<'a> Compiler<'a> {
         let parent_upvalues = std::mem::take(&mut self.upvalues);
         let parent_depth = self.scope_depth;
         let parent_loops = std::mem::take(&mut self.loops);
+        let parent_predeclared_lex = std::mem::take(&mut self.predeclared_lex);
+        // Fresh per-function: a `return` must only unwind try handlers of
+        // ITS OWN function, never the enclosing one's.
+        let parent_finally_stack = std::mem::take(&mut self.finally_stack);
         self.enclosing_chain.push(EnclosingFrame {
             locals: parent_locals,
             upvalues: parent_upvalues,
@@ -3070,15 +3150,37 @@ impl<'a> Compiler<'a> {
         // or var binding (per spec, function declarations have higher precedence than
         // params/vars in function code).
         //
-        // Skip the hoist if the body has any top-level `let` / `const` — pre-compiling
-        // inner functions would resolve those bindings as missing upvalues since their
-        // slots are not yet allocated. The functions still work in execution order; only
-        // the rare param-shadowing pattern (`function f(x){ return x; function x(){} }`)
-        // depends on hoisting and that pattern doesn't typically include lexical decls.
+        // Top-level `let` / `const` complicate the hoist: pre-compiling inner
+        // functions would resolve those bindings as missing upvalues since
+        // their slots are not yet allocated. When every top-level lexical is a
+        // simple identifier, we reserve their slots (undefined) BEFORE the
+        // hoist so function bodies resolve them as locals/upvalues; the
+        // declaration statement later assigns into the reserved slot (tracked
+        // in `predeclared_lex`). DuckDuckGo's SSG script needs this — an IIFE
+        // opening with `let e = ...` calls memoized helpers declared after the
+        // call site; skipping the hoist left them undefined at the call.
+        //
+        // Destructuring lexicals (`let {a} = ...`) still skip the hoist —
+        // their binding path allocates slots mid-pattern and can't be
+        // pre-reserved without reworking it. Note TDZ is currently NOT
+        // enforced at runtime (InitLet is a no-op), so reserving as undefined
+        // does not change observable TDZ behavior.
         let has_top_level_lex = body.body.iter().any(|s| matches!(
             s,
             Statement::Variable(d) if matches!(d.kind, VarKind::Let | VarKind::Const)
         ));
+        let lex_all_simple = body.body.iter().all(|s| match s {
+            Statement::Variable(d) if matches!(d.kind, VarKind::Let | VarKind::Const) => d
+                .declarations
+                .iter()
+                .all(|dec| matches!(&dec.id, Pattern::Identifier(_))),
+            _ => true,
+        });
+        let has_fn_decls = body
+            .body
+            .iter()
+            .any(|s| matches!(s, Statement::Function(f) if f.id.is_some()));
+        let do_hoist = !has_top_level_lex || (lex_all_simple && has_fn_decls);
         let mut hoisted_fns: Vec<StringId> = Vec::new();
         // Function declaration named `arguments` shouldn't shadow the arguments
         // object when params have expressions (defaults/destructuring/rest), per
@@ -3088,7 +3190,27 @@ impl<'a> Compiler<'a> {
             Pattern::Assignment(_) | Pattern::Array(_) | Pattern::Object(_) | Pattern::Rest(_)
         ));
         let arguments_id = self.interner.intern("arguments");
-        if !has_top_level_lex {
+        if do_hoist {
+            // Reserve slots for top-level lexicals first (see comment above)
+            // so the hoisted function bodies can capture them.
+            if has_top_level_lex {
+                for stmt in &body.body {
+                    if let Statement::Variable(d) = stmt
+                        && matches!(d.kind, VarKind::Let | VarKind::Const)
+                    {
+                        for dec in &d.declarations {
+                            if let Pattern::Identifier(id) = &dec.id
+                                && self.resolve_local(id.name).is_none()
+                            {
+                                self.chunk.emit_op(OpCode::Undefined, dec.span.start);
+                                self.add_local(id.name);
+                                self.mark_initialized();
+                                self.predeclared_lex.push(id.name);
+                            }
+                        }
+                    }
+                }
+            }
             // Two-pass hoist so a function declaration is in scope *before* its
             // own body compiles — otherwise a nested function that references
             // the declaration (recursion, or a closure that calls back into a
@@ -3184,6 +3306,8 @@ impl<'a> Compiler<'a> {
         self.upvalues = parent_frame.upvalues;
         self.scope_depth = parent_depth;
         self.loops = parent_loops;
+        self.predeclared_lex = parent_predeclared_lex;
+        self.finally_stack = parent_finally_stack;
 
         Ok(compiled)
     }
@@ -3212,6 +3336,8 @@ impl<'a> Compiler<'a> {
         let parent_upvalues = std::mem::take(&mut self.upvalues);
         let parent_depth = self.scope_depth;
         let parent_loops = std::mem::take(&mut self.loops);
+        let parent_predeclared_lex = std::mem::take(&mut self.predeclared_lex);
+        let parent_finally_stack = std::mem::take(&mut self.finally_stack);
         // Push parent's scope onto the chain so the arrow body (and anything
         // nested in it) can capture transitively.
         self.enclosing_chain.push(EnclosingFrame {
@@ -3343,6 +3469,8 @@ impl<'a> Compiler<'a> {
         self.upvalues = parent_frame.upvalues;
         self.scope_depth = parent_depth;
         self.loops = parent_loops;
+        self.predeclared_lex = parent_predeclared_lex;
+        self.finally_stack = parent_finally_stack;
 
         Ok(compiled)
     }

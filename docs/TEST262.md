@@ -6,7 +6,7 @@ Run with: `cargo run --release --bin test262_runner`
 
 ## Results
 
-**90.1% pass rate** — 14,285 of 15,855 active tests pass (2,986 tests skipped).
+**89.8% pass rate** — 14,475 of 16,116 active tests pass (2,989 tests skipped).
 
 The pass rate dropped from 92.6% because earlier silent assertion no-ops
 (`assert.sameValue` / `assert.throws` weren't actually being called when invoked
@@ -105,6 +105,7 @@ Tests requiring these features are currently skipped (2,986 tests):
 | post-v0.4.0 c | 15,947  | 13,866  | 87.0% |
 | post-v0.4.0 d | 15,855  | 14,215  | 89.7% |
 | post-v0.4.0 e | 15,855  | 14,285  | 90.1% |
+| post-v0.4.0 f | 16,116  | 14,475  | 89.8% |
 
 The first post-v0.4.0 jump reflects unskipping features the engine already
 implemented (Symbol.asyncIterator, Symbol.matchAll, change-array-by-copy,
@@ -114,6 +115,15 @@ logical-assignment) and adding the `$DONE` async harness, `with`,
 The post-v0.4.0 e bump (+70) comes from switching the RegExp backend from
 the `regex` crate to `fancy-regex`, adding lookahead, lookbehind, and
 backreference support.
+
+The post-v0.4.0 f row is denominator honesty plus real fixes: `statements/try`
+and `expressions/yield` (261 tests) used to CRASH their runner subprocess —
+a `return` inside `try` leaked its exception handler, and a later unrelated
+throw jumped mid-instruction — so neither category was counted at all.
+With return/break/continue now unwinding handlers (and inlining `finally`
+bodies per spec), `statements/try` completes at 177/198 and the absolute
+pass count rises by 190; the rate dips because the recovered categories
+include hard yield* protocol tests that were never measured before.
 
 The second drop (92.6% → 83.7%) is honesty, not regression. Method dispatch on
 function values with user-set properties (`f.method = fn; f.method(args)`) was

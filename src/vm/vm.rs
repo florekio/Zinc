@@ -2061,7 +2061,32 @@ impl Vm {
             }
 
             let byte = self.read_byte();
-            // Safety: bytecode was compiled by our own compiler, all opcodes are valid
+            // Embedder-controlled trace: ZINC_TRACE_IP=1 dumps every
+            // (chunk, ip, opcode) step. Cached so the hot path pays one
+            // branch, not an env lookup per instruction.
+            {
+                static TRACE_IP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *TRACE_IP.get_or_init(|| std::env::var("ZINC_TRACE_IP").is_ok_and(|v| v == "1")) {
+                    let f = self.frames.last().unwrap();
+                    eprintln!("[ip] chunk {} ip {} op 0x{byte:02x}", f.chunk_idx, f.ip - 1);
+                }
+            }
+            if !OpCode::is_valid(byte) {
+                // A mid-instruction landing means corrupted control flow
+                // (e.g. a stale exception handler's catch target). Panic
+                // with enough context to localize it instead of letting
+                // the transmute below go undefined.
+                let f = self.frames.last().unwrap();
+                let c = &self.chunks[f.chunk_idx];
+                let name = self.interner.resolve(c.name);
+                let lo = (f.ip as usize).saturating_sub(20);
+                let hi = (f.ip as usize + 10).min(c.code.len());
+                panic!(
+                    "invalid opcode 0x{byte:02x} in chunk {} '{}' at ip {} (code len {}); bytes[{lo}..{hi}] = {:02x?}",
+                    f.chunk_idx, name, f.ip - 1, c.code.len(), &c.code[lo..hi]
+                );
+            }
+            // Safety: validated by the is_valid check above.
             let opcode = unsafe { std::mem::transmute::<u8, OpCode>(byte) };
 
             match opcode {

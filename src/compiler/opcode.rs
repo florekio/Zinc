@@ -375,7 +375,7 @@ impl OpCode {
         }
     }
 
-    fn is_valid(byte: u8) -> bool {
+    pub(crate) fn is_valid(byte: u8) -> bool {
         matches!(
             byte,
             0x00..=0x08
