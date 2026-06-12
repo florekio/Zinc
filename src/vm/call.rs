@@ -115,6 +115,16 @@ impl Vm {
             // Extracted Object.assign value
             return Ok(self.exec_object_assign(args));
         }
+        if packed == -751 {
+            // Extracted Array.isArray value
+            return Ok(self.exec_global_fn(-507, args));
+        }
+        if packed == -752 {
+            return Ok(self.exec_symbol_for(args));
+        }
+        if packed == -753 {
+            return Ok(self.exec_symbol_key_for(args));
+        }
         // Math method sentinels (-700 to -726)
         if (-726..=-700).contains(&packed) {
             return Ok(self.exec_math_sentinel(packed, args));

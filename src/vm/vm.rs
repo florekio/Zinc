@@ -258,6 +258,8 @@ pub struct Vm {
     pub(crate) json_oid: Option<ObjectId>,
     /// Symbol descriptions: index = symbol_id, value = optional description StringId
     pub(crate) symbol_descriptions: Vec<Option<StringId>>,
+    /// Global symbol registry backing `Symbol.for` / `Symbol.keyFor`.
+    pub(crate) symbol_registry: std::collections::HashMap<String, u32>,
     /// Next symbol ID to allocate
     pub(crate) next_symbol_id: u32,
     /// Well-known symbol IDs
@@ -679,6 +681,7 @@ impl Vm {
             math_oid: Some(math_oid),
             json_oid: Some(json_oid),
             symbol_descriptions: sym_descs,
+            symbol_registry: std::collections::HashMap::new(),
             next_symbol_id: 8, // 0-7 are well-known
             sym_iterator: 0,
             sym_has_instance: 1,
@@ -1558,6 +1561,8 @@ impl Vm {
                 _ => Value::undefined(),
             },
             -570 => match name_str.as_str() {
+                "for" => Value::function(-752),
+                "keyFor" => Value::function(-753),
                 "iterator" => Value::symbol(self.sym_iterator),
                 "hasInstance" => Value::symbol(self.sym_has_instance),
                 "toPrimitive" => Value::symbol(self.sym_to_primitive),
@@ -1586,6 +1591,8 @@ impl Vm {
                 "name" => { let id = self.interner.intern("Array"); Value::string(id) }
                 "length" => Value::int(1),
                 "call" | "apply" | "bind" => obj_val,
+                // Extractable static: `var isArray = Array.isArray;` (react-dom).
+                "isArray" => Value::function(-751),
                 // Constructors are functions; inherited methods
                 // (hasOwnProperty, isPrototypeOf, …) resolve through
                 // Function.prototype → Object.prototype. e.g.
@@ -3331,6 +3338,26 @@ impl Vm {
                             self.push(result);
                             continue;
                         }
+                        if sentinel == -752 || sentinel == -753 {
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
+                            let result = if sentinel == -752 {
+                                self.exec_symbol_for(&args)
+                            } else {
+                                self.exec_symbol_key_for(&args)
+                            };
+                            self.truncate_stack(func_pos);
+                            self.push(result);
+                            continue;
+                        }
+                        if sentinel == -751 {
+                            // Extracted Array.isArray value (its dispatch id,
+                            // -507, doubles as the Array constructor).
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
+                            let result = self.exec_global_fn(-507, &args);
+                            self.truncate_stack(func_pos);
+                            self.push(result);
+                            continue;
+                        }
                         if (-726..=-700).contains(&sentinel) {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                             let result = self.exec_math_sentinel(sentinel, &args);
@@ -4389,6 +4416,8 @@ impl Vm {
                                 _ => Value::undefined(),
                             },
                             -570 => match name_str {
+                                "for" => Value::function(-752),
+                                "keyFor" => Value::function(-753),
                                 "iterator" => Value::symbol(self.sym_iterator),
                                 "hasInstance" => Value::symbol(self.sym_has_instance),
                                 "toPrimitive" => Value::symbol(self.sym_to_primitive),
@@ -4410,6 +4439,9 @@ impl Vm {
                             -507 => match name_str {
                                 // Array static properties
                                 "prototype" => Value::object_id(self.array_prototype),
+                                // Extractable static: `var isArray = Array.isArray;`
+                                // (react-dom's reconciler aliases it).
+                                "isArray" => Value::function(-751),
                                 // Inherited function methods (hasOwnProperty,
                                 // call, …) via Function.prototype → Object.prototype.
                                 _ => self.heap.get_property_chain(self.function_prototype, name_id)
@@ -6676,6 +6708,22 @@ impl Vm {
                             let id = self.interner.intern(&result);
                             self.truncate_stack(obj_pos);
                             self.push(Value::string(id));
+                            continue;
+                        }
+                    }
+
+                    // Symbol static methods (Symbol.for / Symbol.keyFor)
+                    if obj_val.is_function() && obj_val.as_function() == Some(-570) {
+                        let mn = self.interner.resolve(method_name).to_owned();
+                        if mn == "for" || mn == "keyFor" {
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            let result = if mn == "for" {
+                                self.exec_symbol_for(&args)
+                            } else {
+                                self.exec_symbol_key_for(&args)
+                            };
+                            self.truncate_stack(obj_pos);
+                            self.push(result);
                             continue;
                         }
                     }
@@ -9421,6 +9469,40 @@ impl Vm {
         let wrapper_fn = Value::function(base_idx as i32);
         let result = self.call_function(wrapper_fn, &[])?;
         Ok(result)
+    }
+
+    /// `Symbol.for(key)`: one shared symbol per key, registered globally.
+    pub(crate) fn exec_symbol_for(&mut self, args: &[Value]) -> Value {
+        let key = args
+            .first()
+            .map(|v| self.value_to_string(*v))
+            .unwrap_or_else(|| "undefined".to_string());
+        if let Some(&id) = self.symbol_registry.get(&key) {
+            return Value::symbol(id);
+        }
+        let id = self.next_symbol_id;
+        self.next_symbol_id += 1;
+        if id as usize >= self.symbol_descriptions.len() {
+            self.symbol_descriptions.resize(id as usize + 1, None);
+        }
+        let desc = self.interner.intern(&key);
+        self.symbol_descriptions[id as usize] = Some(desc);
+        self.symbol_registry.insert(key, id);
+        Value::symbol(id)
+    }
+
+    /// `Symbol.keyFor(sym)`: the registry key, or undefined.
+    pub(crate) fn exec_symbol_key_for(&mut self, args: &[Value]) -> Value {
+        let Some(sym) = args.first().and_then(|v| v.as_symbol_id()) else {
+            return Value::undefined();
+        };
+        for (k, &id) in &self.symbol_registry {
+            if id == sym {
+                let sid = self.interner.intern(k);
+                return Value::string(sid);
+            }
+        }
+        Value::undefined()
     }
 
     /// Object.assign(target, ...sources) — shared by the CallMethod
