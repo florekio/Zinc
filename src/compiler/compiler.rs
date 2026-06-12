@@ -225,6 +225,9 @@ impl<'a> Compiler<'a> {
         let line = self.current_line();
         self.chunk.emit_op(OpCode::Halt, line);
         self.chunk.local_count = self.locals.len() as u16;
+        if self.chunk.jump_overflow {
+            return Err("script too large: a jump offset exceeded the i16 encoding".to_string());
+        }
         Ok(self.chunk)
     }
 
@@ -2165,7 +2168,12 @@ impl<'a> Compiler<'a> {
         self.chunk.emit_op(OpCode::PopExcHandler, line);
         let skip_catch = self.chunk.emit_jump(OpCode::Jump, line);
 
-        // Patch the catch target.
+        // Patch the catch target. PushExcHandler encodes ABSOLUTE u16
+        // targets — past 64 KiB of bytecode they'd wrap and the handler
+        // would land mid-instruction; poison the chunk instead.
+        if self.chunk.len() > u16::MAX as usize {
+            self.chunk.jump_overflow = true;
+        }
         let catch_target = self.chunk.len() as u16;
         if t.handler.is_some() {
             self.chunk.code[catch_placeholder] = (catch_target >> 8) as u8;
@@ -2218,6 +2226,9 @@ impl<'a> Compiler<'a> {
 
         // Compile finally block.
         if let Some(finalizer) = &t.finalizer {
+            if self.chunk.len() > u16::MAX as usize {
+                self.chunk.jump_overflow = true;
+            }
             let finally_target = self.chunk.len() as u16;
             self.chunk.code[catch_placeholder + 2] = (finally_target >> 8) as u8;
             self.chunk.code[catch_placeholder + 3] = (finally_target & 0xFF) as u8;
@@ -3326,6 +3337,12 @@ impl<'a> Compiler<'a> {
         self.predeclared_lex = parent_predeclared_lex;
         self.finally_stack = parent_finally_stack;
 
+        if compiled.jump_overflow {
+            let name = self.interner.resolve(compiled.name).to_owned();
+            return Err(format!(
+                "function '{name}' too large: a jump offset exceeded the i16 encoding"
+            ));
+        }
         Ok(compiled)
     }
 
@@ -3500,6 +3517,12 @@ impl<'a> Compiler<'a> {
         self.predeclared_lex = parent_predeclared_lex;
         self.finally_stack = parent_finally_stack;
 
+        if compiled.jump_overflow {
+            let name = self.interner.resolve(compiled.name).to_owned();
+            return Err(format!(
+                "function '{name}' too large: a jump offset exceeded the i16 encoding"
+            ));
+        }
         Ok(compiled)
     }
 

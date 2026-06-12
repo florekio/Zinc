@@ -54,6 +54,12 @@ pub struct Chunk {
     pub property_ic: Vec<u8>,
     /// Number of IC slots allocated so far for this chunk.
     pub ic_slot_count: u16,
+    /// Set when a patched jump's offset exceeded the i16 encoding — the
+    /// bytecode is CORRUPT (the offset wrapped) and must not run. The
+    /// compiler turns this into a per-script compile error; the long-term
+    /// fix is 32-bit conditional jump variants. Huge minified bundles
+    /// (Google's ~200 KB main chunk) hit this.
+    pub jump_overflow: bool,
 }
 
 /// Describes how a closure captures one upvalue.
@@ -104,6 +110,7 @@ impl Chunk {
             children: Vec::new(),
             property_ic: Vec::new(),
             ic_slot_count: 0,
+            jump_overflow: false,
         }
     }
 
@@ -173,10 +180,12 @@ impl Chunk {
     pub fn patch_jump(&mut self, offset_pos: usize) {
         let jump_target = self.code.len();
         let offset = jump_target as i32 - offset_pos as i32 - 2; // -2 for the offset bytes themselves
-        debug_assert!(
-            offset >= i16::MIN as i32 && offset <= i16::MAX as i32,
-            "Jump offset {offset} out of i16 range"
-        );
+        if offset < i16::MIN as i32 || offset > i16::MAX as i32 {
+            // Truncating would corrupt control flow (the VM would land
+            // mid-instruction). Mark the chunk poisoned; the compiler
+            // reports it as a compile error after the body finishes.
+            self.jump_overflow = true;
+        }
         let offset = offset as i16;
         self.code[offset_pos] = (offset >> 8) as u8;
         self.code[offset_pos + 1] = (offset & 0xFF) as u8;
@@ -186,7 +195,9 @@ impl Chunk {
     pub fn emit_loop(&mut self, loop_start: usize, line: u32) {
         self.emit_byte(OpCode::Loop as u8, line);
         let offset = self.code.len() - loop_start + 2; // +2 for the offset bytes
-        debug_assert!(offset <= u16::MAX as usize, "Loop offset too large");
+        if offset > u16::MAX as usize {
+            self.jump_overflow = true;
+        }
         self.code.push((offset >> 8) as u8);
         self.code.push((offset & 0xFF) as u8);
         self.add_line(line);
