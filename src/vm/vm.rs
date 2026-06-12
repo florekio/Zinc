@@ -1660,6 +1660,19 @@ impl Vm {
 
     /// Returns true if val is a heap object of kind ConsString.
     #[inline(always)]
+    /// Embedder-facing: the string content of `val` when it IS a
+    /// string (flat/interned or a runtime-concatenation ConsString),
+    /// else None. DOM bindings read text arguments through this —
+    /// resolving only interned ids silently turned every
+    /// `'prefix' + variable` argument into "".
+    pub fn string_content(&self, val: Value) -> Option<String> {
+        if val.as_string_id().is_some() || self.is_cons_string(val) {
+            Some(self.value_to_string(val))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn is_cons_string(&self, val: Value) -> bool {
         if let Some(oid) = val.as_object_id()
             && let Some(obj) = self.heap.get(oid) {
