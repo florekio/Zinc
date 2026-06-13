@@ -727,3 +727,19 @@ fn test_define_property_on_array_index() {
         "0"
     );
 }
+
+#[test]
+fn test_native_uri_functions() {
+    // Native decodeURIComponent / encodeURIComponent / decodeURI / encodeURI —
+    // without these, pages install slow JS polyfills (DuckDuckGo's SERP bundle
+    // hammered one hard enough to blow the fuel limit).
+    assert_eq!(eval("decodeURIComponent('a%20b%2Fc%3D1')"), "a b/c=1");
+    assert_eq!(eval("encodeURIComponent('a b/c=1&x')"), "a%20b%2Fc%3D1%26x");
+    assert_eq!(eval("decodeURIComponent('%E2%9C%93')"), "\u{2713}"); // ✓
+    assert_eq!(eval("encodeURIComponent('\u{2713}')"), "%E2%9C%93");
+    // encodeURI keeps reserved chars; encodeURIComponent escapes them.
+    assert_eq!(eval("encodeURI('http://x.com/a b?q=1&y=2')"), "http://x.com/a%20b?q=1&y=2");
+    assert_eq!(eval("decodeURI('a%20b/c?x=1')"), "a b/c?x=1");
+    // Round-trip.
+    assert_eq!(eval("decodeURIComponent(encodeURIComponent('hello world/?&=#'))"), "hello world/?&=#");
+}

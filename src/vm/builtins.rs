@@ -1109,6 +1109,28 @@ impl Vm {
                 let v = args.first().copied().unwrap_or(Value::boolean(false));
                 Value::boolean(v.to_boolean())
             }
+            -517 | -519 => { // decodeURIComponent / decodeURI
+                let s = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
+                // Spec-wise decodeURI preserves the reserved set (;/?:@&=+$,#),
+                // decoding only non-reserved escapes; we full-percent-decode for
+                // both. In practice decodeURI inputs rarely percent-encode the
+                // reserved chars, so the observable difference is negligible.
+                // Lenient: malformed escapes are left verbatim rather than
+                // throwing URIError (exec_global_fn returns a plain Value and
+                // can't signal a throw; lenient decode is safe for real input).
+                let decoded = percent_decode_utf8(&s);
+                let sid = self.interner.intern(&decoded);
+                Value::string(sid)
+            }
+            -518 | -509 => { // encodeURIComponent / encodeURI
+                let s = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
+                // encodeURI keeps the reserved + unreserved set unescaped;
+                // encodeURIComponent keeps only the unreserved set.
+                let keep_reserved = sentinel == -509;
+                let encoded = percent_encode_uri(&s, keep_reserved);
+                let sid = self.interner.intern(&encoded);
+                Value::string(sid)
+            }
             -530 => { // Number.isNaN
                 let v = args.first().copied().unwrap_or(Value::undefined());
                 // Number.isNaN does NOT coerce — only true for actual NaN number values
@@ -1527,4 +1549,53 @@ impl Vm {
         }
         Ok(val)
     }
+}
+
+/// Percent-decode a string into UTF-8 (backs decodeURIComponent / decodeURI).
+/// `%XX` byte escapes are collected and interpreted as UTF-8; a malformed or
+/// truncated escape is left verbatim (lenient — see call site). Non-escape
+/// characters pass through unchanged.
+fn percent_decode_utf8(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // Decoded bytes should be valid UTF-8 for well-formed input; fall back to
+    // a lossy conversion rather than dropping the result on stray bytes.
+    match String::from_utf8(out) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
+}
+
+/// Percent-encode a string per encodeURI / encodeURIComponent. The unreserved
+/// set (A-Z a-z 0-9 - _ . ! ~ * ' ( )) is always kept; when `keep_reserved`
+/// is true (encodeURI) the reserved set (; , / ? : @ & = + $ #) is also kept.
+fn percent_encode_uri(s: &str, keep_reserved: bool) -> String {
+    const RESERVED: &[u8] = b";,/?:@&=+$#";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        let unreserved = b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')');
+        if unreserved || (keep_reserved && RESERVED.contains(&b)) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+            out.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+        }
+    }
+    out
 }

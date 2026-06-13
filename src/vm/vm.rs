@@ -557,6 +557,20 @@ impl Vm {
         let object_name = interner.intern("Object");
         globals.insert(object_name, Value::function(-508));
 
+        // URI handling. Without native versions, pages (and core-js) install
+        // slow JS polyfills that percent-decode/encode char-by-char in a loop;
+        // DuckDuckGo's SERP bundle hammered a decodeURIComponent polyfill hard
+        // enough to blow the execution-limit fuel before it could define
+        // DDG.Pages.SERP.
+        let decode_uri_component_name = interner.intern("decodeURIComponent");
+        globals.insert(decode_uri_component_name, Value::function(-517));
+        let encode_uri_component_name = interner.intern("encodeURIComponent");
+        globals.insert(encode_uri_component_name, Value::function(-518));
+        let decode_uri_name = interner.intern("decodeURI");
+        globals.insert(decode_uri_name, Value::function(-519));
+        let encode_uri_name = interner.intern("encodeURI");
+        globals.insert(encode_uri_name, Value::function(-509));
+
         // Promise constructor
         let promise_name = interner.intern("Promise");
         globals.insert(promise_name, Value::function(-520));
