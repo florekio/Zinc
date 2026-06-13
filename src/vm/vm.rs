@@ -2764,6 +2764,14 @@ impl Vm {
     /// is how the embedder runs multiple `<script>` tags on a single
     /// long-lived `Engine`.
     pub fn load_and_run(&mut self, chunk: Chunk) -> Result<Value, VmError> {
+        // Reset the fuel counter per top-level script run. `max_steps` is an
+        // infinite-loop guard for a SINGLE script execution, not a budget for
+        // the whole page — without this reset `steps` accumulated across every
+        // `<script>` on the page, so a heavy page (e.g. DuckDuckGo's SERP, with
+        // many large bundles) blew the total and every script after the
+        // tipping point died with "execution limit exceeded", leaving globals
+        // like `DDG.Pages.SERP` undefined.
+        self.steps = 0;
         // Flatten the new chunk tree onto the existing chunks vec; the new
         // top chunk lands at `top_idx`, and its sub-chunks follow.
         let top_idx = self.chunks.len();
@@ -10167,12 +10175,20 @@ impl Vm {
             if flags == Property::ALL
                 && let Some(idx) = canonical_array_index(&key_str)
             {
-                let is_array = self
-                    .heap
-                    .get(target_oid)
-                    .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
-                    .unwrap_or(false);
-                if is_array {
+                let arr_len = self.heap.get(target_oid).and_then(|o| {
+                    if let ObjectKind::Array(ref e) = o.kind { Some(e.len()) } else { None }
+                });
+                // Only handle in-bounds appends / overwrites (idx <= len):
+                // that's exactly the createProperty / Array.from pattern
+                // (idx == len each step, or overwriting an existing slot), so
+                // the Vec grows by at most one. A large *sparse* index would
+                // otherwise balloon the dense Vec to `idx` undefined slots and
+                // trip the VM's execution limit (this broke DuckDuckGo's SERP
+                // bundles). Out-of-bounds / sparse indices fall through to the
+                // property-map path — the original pre-fix behaviour.
+                if let Some(len) = arr_len
+                    && idx <= len
+                {
                     if let Some(obj) = self.heap.get_mut(target_oid)
                         && let ObjectKind::Array(ref mut elements) = obj.kind
                     {
