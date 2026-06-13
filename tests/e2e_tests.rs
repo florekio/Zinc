@@ -700,3 +700,23 @@ fn test_await_multiple() {
     );
     assert_eq!(output, vec!["30"]);
 }
+
+#[test]
+fn test_define_property_on_array_index() {
+    // Object.defineProperty on a canonical array index must write to the
+    // array's element storage (backing arr[i] and .length), not just the
+    // property map. core-js's createProperty / Array.from rely on this;
+    // without it Array.from yielded all-undefined arrays.
+    assert_eq!(
+        eval("var a=[]; Object.defineProperty(a,0,{value:42,writable:true,enumerable:true,configurable:true}); a[0]+','+a.length"),
+        "42,1"
+    );
+    // Array.from over an iterable and an array must preserve values.
+    assert_eq!(eval("Array.from([10,20,30]).join('-')"), "10-20-30");
+    assert_eq!(eval("Array.from(new Set([1,2,3])).join('-')"), "1-2-3");
+    // Partial-flag defines keep property-map semantics (descriptor fidelity).
+    assert_eq!(
+        eval("var a=[]; Object.defineProperty(a,'0',{value:1,writable:false,enumerable:false,configurable:false}); var d=Object.getOwnPropertyDescriptor(a,'0'); ''+d.writable+d.enumerable+d.configurable"),
+        "falsefalsefalse"
+    );
+}

@@ -10051,6 +10051,21 @@ impl Vm {
     /// extracted-as-Native-fn path (`var f = Object.defineProperty; f(...)`)
     /// share one implementation.
     pub(crate) fn object_define_property(&mut self, args: &[Value]) -> Value {
+        // A canonical array index per ECMAScript: the string is the decimal
+        // form of a non-negative integer < 2^32-1, with no leading zeros
+        // ("0" itself is fine). "01", "1.5", "-1", "4294967295" are not.
+        fn canonical_array_index(s: &str) -> Option<usize> {
+            if s == "0" {
+                return Some(0);
+            }
+            if s.is_empty() || s.as_bytes()[0] == b'0' || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            s.parse::<u64>()
+                .ok()
+                .filter(|&n| n < (u32::MAX as u64))
+                .map(|n| n as usize)
+        }
         let target = args.first().copied().unwrap_or(Value::undefined());
         let key_val = args.get(1).copied().unwrap_or(Value::undefined());
         let desc_val = args.get(2).copied().unwrap_or(Value::undefined());
@@ -10133,9 +10148,45 @@ impl Vm {
                 o.has_own_property(gk) || o.has_own_property(sk)
             })
             .unwrap_or(false);
-        if !has_accessor
-            && let Some(obj) = self.heap.get_mut(target_oid) {
+        if !has_accessor {
+            // Array-index defines must land in the array's element storage,
+            // not the property map. Arrays keep elements in a separate Vec
+            // (backing `arr[i]` and `.length`); a map-only define is invisible
+            // to indexed access and length. core-js's `createProperty` (used by
+            // Array.from, Array.of, spread, etc.) builds result arrays via
+            // `Object.defineProperty(arr, i, {value})`, so without this every
+            // such array came back all-`undefined` — which broke `Array.from`
+            // wholesale once core-js's polyfill loaded.
+            // Only route to element storage when the descriptor carries the
+            // full default flag set (writable+enumerable+configurable) — the
+            // shape of a normal array element. core-js's createProperty /
+            // Array.from build with exactly these flags. A partial-flag define
+            // (e.g. a non-writable index) keeps the property-map path so its
+            // descriptor flags are preserved; copper's Vec-backed elements
+            // can't carry per-element flags.
+            if flags == Property::ALL
+                && let Some(idx) = canonical_array_index(&key_str)
+            {
+                let is_array = self
+                    .heap
+                    .get(target_oid)
+                    .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
+                    .unwrap_or(false);
+                if is_array {
+                    if let Some(obj) = self.heap.get_mut(target_oid)
+                        && let ObjectKind::Array(ref mut elements) = obj.kind
+                    {
+                        while elements.len() <= idx {
+                            elements.push(Value::undefined());
+                        }
+                        elements[idx] = value;
+                    }
+                    return target;
+                }
+            }
+            if let Some(obj) = self.heap.get_mut(target_oid) {
                 obj.define_property(key_id, Property::with_flags(value, flags));
+            }
         }
         target
     }
