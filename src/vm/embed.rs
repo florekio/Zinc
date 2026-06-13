@@ -114,6 +114,27 @@ impl Vm {
         self.make_native_error("Error", message)
     }
 
+    /// Stringify a value for embedder-side logging. For Error instances
+    /// this yields `Name: message`; for everything else it's the normal
+    /// JS string coercion. Used to surface thrown values (e.g. an
+    /// exception escaping a timer callback) in the console.
+    pub fn describe_value(&mut self, val: Value) -> String {
+        if let Some(oid) = val.as_object_id() {
+            let name_key = self.interner.intern("name");
+            let msg_key = self.interner.intern("message");
+            let name = self.heap.get_property_chain(oid, name_key)
+                .filter(|v| !v.is_undefined())
+                .map(|v| self.value_to_string(v));
+            let msg = self.heap.get_property_chain(oid, msg_key)
+                .filter(|v| !v.is_undefined())
+                .map(|v| self.value_to_string(v));
+            if let (Some(n), Some(m)) = (&name, &msg) {
+                return format!("{n}: {m}");
+            }
+        }
+        self.value_to_string(val)
+    }
+
     /// Build a new `TypeError` instance with the given message.
     pub fn type_error(&mut self, message: &str) -> Value {
         self.make_native_error("TypeError", message)
