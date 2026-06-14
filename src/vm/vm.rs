@@ -286,6 +286,13 @@ pub struct Vm {
     pub(crate) steps: u64,
     /// Max instructions before returning an error. 0 = unlimited.
     pub(crate) max_steps: u64,
+    /// Private-method brand timing: instance oid → class-prototype oids whose
+    /// private methods/accessors are NOT yet installed (the instance is still
+    /// being constructed and `super()` for those derived levels hasn't returned).
+    /// Empty/absent ⇒ all private members accessible (the normal case), so this
+    /// never gates ordinary objects. Used only to make `this.#m()` throw when a
+    /// base constructor reaches a not-yet-constructed subclass's private member.
+    pub(crate) pending_private_brands: HashMap<ObjectId, Vec<ObjectId>>,
 }
 
 impl Vm {
@@ -845,6 +852,7 @@ impl Vm {
             sym_async_iterator: 6,
             sym_match_all: 7,
             fn_property_overrides: HashMap::new(),
+            pending_private_brands: HashMap::new(),
             computed_exclusions: Vec::new(),
             steps: 0,
             max_steps: 0,
@@ -4484,6 +4492,13 @@ impl Vm {
                     if !self.closure_upvalues.is_empty() {
                         self.close_upvalues_above(frame.base.saturating_sub(1));
                     }
+                    // A constructor returning means its (and the subclass levels it stood
+                    // in for) private elements are now installed — clear pending brands.
+                    if frame.is_constructor && !self.pending_private_brands.is_empty()
+                        && let Some(coid) = frame.this_value.as_object_id()
+                    {
+                        self.pending_private_brands.remove(&coid);
+                    }
                     // Derived-class constructor: per spec, if super() was never called
                     // and the return value isn't an object, throw ReferenceError.
                     if frame.is_derived_ctor && !frame.super_called
@@ -4540,6 +4555,11 @@ impl Vm {
 
                 OpCode::ReturnUndefined => {
                     let frame = self.frames.pop().unwrap();
+                    if frame.is_constructor && !self.pending_private_brands.is_empty()
+                        && let Some(coid) = frame.this_value.as_object_id()
+                    {
+                        self.pending_private_brands.remove(&coid);
+                    }
                     // Derived-class constructor without super() — throw ReferenceError.
                     if frame.is_derived_ctor && !frame.super_called {
                         self.frames.push(frame);
@@ -6130,9 +6150,19 @@ impl Vm {
                     let obj_val = self.pop()?;
                     if let Some(oid) = obj_val.as_object_id() {
                         let name_str = self.interner.resolve(name_id).to_owned();
+                        let getter_key = self.interner.intern(&format!("__get_{}__", name_str));
+                        let setter_key = self.interner.intern(&format!("__set_{}__", name_str));
+                        // Brand check: a private method/accessor of a subclass level whose
+                        // constructor hasn't run yet (super not returned) is not installed.
+                        // Private methods live on the prototype under `__priv_#name__`.
+                        let priv_method_key = self.interner.intern(&format!("__priv_{}__", name_str));
+                        if self.private_brand_not_installed(oid, getter_key, setter_key, priv_method_key) {
+                            self.throw_type_error(&format!(
+                                "Cannot read private member {name_str} from an object whose class did not declare it"
+                            ))?;
+                            continue;
+                        }
                         // Check for private getter (__get_#name__)
-                        let getter_key_str = format!("__get_{}__", name_str);
-                        let getter_key = self.interner.intern(&getter_key_str);
                         let getter_fn = self.heap.get_property_chain(oid, getter_key);
                         if let Some(gfn) = getter_fn && gfn.is_function() {
                             let result = self.call_function_this(gfn, obj_val, &[])?;
@@ -6140,8 +6170,6 @@ impl Vm {
                         } else {
                             // If a private setter exists but no getter, the field is an
                             // accessor without a getter — PrivateGet must throw TypeError.
-                            let setter_key_str = format!("__set_{}__", name_str);
-                            let setter_key = self.interner.intern(&setter_key_str);
                             let setter_fn = self.heap.get_property_chain(oid, setter_key);
                             if let Some(sfn) = setter_fn && sfn.is_function() {
                                 self.throw_type_error(&format!(
@@ -6170,9 +6198,17 @@ impl Vm {
                     let obj_val = self.pop()?;
                     if let Some(oid) = obj_val.as_object_id() {
                         let name_str = self.interner.resolve(name_id).to_owned();
+                        let setter_key = self.interner.intern(&format!("__set_{}__", name_str));
+                        let getter_key_for_brand = self.interner.intern(&format!("__get_{}__", name_str));
+                        let priv_method_key = self.interner.intern(&format!("__priv_{}__", name_str));
+                        // Brand check (see GetPrivate): subclass-level private not yet installed.
+                        if self.private_brand_not_installed(oid, getter_key_for_brand, setter_key, priv_method_key) {
+                            self.throw_type_error(&format!(
+                                "Cannot write private member {name_str} to an object whose class did not declare it"
+                            ))?;
+                            continue;
+                        }
                         // Check for private setter (__set_#name__)
-                        let setter_key_str = format!("__set_{}__", name_str);
-                        let setter_key = self.interner.intern(&setter_key_str);
                         let setter_fn = self.heap.get_property_chain(oid, setter_key);
                         if let Some(sfn) = setter_fn && sfn.is_function() {
                             let prev_protect = self.protect_throw_depth;
@@ -6286,6 +6322,29 @@ impl Vm {
                         let err = self.make_native_error("TypeError", &msg);
                         self.handle_throw(err)?;
                         continue;
+                    }
+                    // Private method calls (`this.#m()`) compile to CallMethod with a
+                    // `#`-prefixed name. Brand-check: a subclass-level private method
+                    // reached from a base constructor (super not yet returned) is not
+                    // installed and must throw — see private_brand_not_installed.
+                    if !self.pending_private_brands.is_empty()
+                        && let Some(moid) = obj_val.as_object_id()
+                    {
+                        let mname = self.interner.resolve(method_name).to_owned();
+                        if mname.starts_with('#') {
+                            let getter_key = self.interner.intern(&format!("__get_{}__", mname));
+                            let setter_key = self.interner.intern(&format!("__set_{}__", mname));
+                            let priv_key = self.interner.intern(&format!("__priv_{}__", mname));
+                            if self.private_brand_not_installed(moid, getter_key, setter_key, priv_key) {
+                                let nm = self.interner.resolve(method_name).to_owned();
+                                self.truncate_stack(obj_pos);
+                                let err = self.make_native_error("TypeError", &format!(
+                                    "Cannot read private member {nm} from an object whose class did not declare it"
+                                ));
+                                self.handle_throw(err)?;
+                                continue;
+                            }
+                        }
                     }
 
                     // Look up the method on the object (walking prototype chain)
@@ -7847,6 +7906,11 @@ impl Vm {
                         let mut ctor_val = self.heap.get(class_oid)
                             .and_then(|o| o.get_property(ctor_key))
                             .filter(|v| v.is_function());
+                        // No own constructor → we walk `__super__` and reuse an ancestor's.
+                        // Track that, plus which class owns the ctor we run, to decide
+                        // whether the implicit `super(...args)` forward is already satisfied.
+                        let used_default_ctor = ctor_val.is_none();
+                        let mut ctor_owner_oid = class_oid;
                         // Native-error super: when extending Error/TypeError/etc., ctor_val
                         // is the sentinel itself; we'll handle it specially below.
                         let mut native_super_sentinel: Option<i32> = None;
@@ -7870,6 +7934,7 @@ impl Vm {
                                     && cv.is_function()
                                 {
                                     ctor_val = Some(cv);
+                                    ctor_owner_oid = sid;
                                     break;
                                 }
                                 cur_val = obj.get_property(super_key);
@@ -7924,6 +7989,42 @@ impl Vm {
                         let is_derived = self.heap.get(class_oid)
                             .and_then(|o| o.get_property(super_key))
                             .is_some();
+                        // `class B extends A {}` with no own ctor has the implicit
+                        // `constructor(...args){ super(...args) }`. We run the reused
+                        // ancestor ctor directly; when that ancestor is a BASE class
+                        // (no `__super__`), the implicit super-forward is already done,
+                        // so seed `super_called` to avoid a spurious "Must call super
+                        // constructor" on return. (is_derived left intact.)
+                        let owner_is_base = self.heap.get(ctor_owner_oid)
+                            .and_then(|o| o.get_property(super_key))
+                            .is_none();
+                        let super_called_init = is_derived && used_default_ctor && owner_is_base;
+                        // Private-method brand timing: when we run a base ancestor's ctor
+                        // as the implicit constructor for a derived class with no own ctor,
+                        // the subclass levels' private methods/accessors are NOT installed
+                        // until that ctor (the super-equivalent) returns. Mark them pending
+                        // so `this.#subclassPrivate()` reached from the base ctor throws,
+                        // per spec. Walk class_oid's __super__ down to (excluding) the ctor
+                        // owner, collecting each level's prototype oid.
+                        if used_default_ctor && is_derived {
+                            let mut pending: Vec<ObjectId> = Vec::new();
+                            let mut cur = Some(class_oid);
+                            while let Some(c) = cur {
+                                if c == ctor_owner_oid { break; }
+                                if let Some(p) = self.heap.get(c)
+                                    .and_then(|o| o.get_property(proto_key))
+                                    .and_then(|v| v.as_object_id())
+                                {
+                                    pending.push(p);
+                                }
+                                cur = self.heap.get(c)
+                                    .and_then(|o| o.get_property(super_key))
+                                    .and_then(|v| v.as_object_id());
+                            }
+                            if !pending.is_empty() {
+                                self.pending_private_brands.insert(new_oid, pending);
+                            }
+                        }
                         if let Some(cv) = ctor_val
                             && cv.is_function() {
                                 // Replace func on stack with this, push ctor as the call target
@@ -7949,7 +8050,7 @@ impl Vm {
                                         upvalues, this_value: this_val, is_constructor: true,
                                         pending_super_call: false, generator_id: None, argc,
                                         saved_args, arguments_oid: None,
-                                        is_derived_ctor: is_derived, super_called: false,
+                                        is_derived_ctor: is_derived, super_called: super_called_init,
                                         new_target: func_val,
                                         await_super_result: false,
                                     });
@@ -10072,6 +10173,34 @@ impl Vm {
     /// the inline `Object.defineProperty(...)` CallMethod path and the
     /// extracted-as-Native-fn path (`var f = Object.defineProperty; f(...)`)
     /// share one implementation.
+    /// If `oid` is mid-construction with pending private brands and the private
+    /// member `name_str` resolves to a METHOD or ACCESSOR owned by a not-yet-installed
+    /// (pending) class prototype, return true (access must throw). Private FIELDS
+    /// (own `__priv_` on the instance) and fully-constructed objects return false.
+    fn private_brand_not_installed(
+        &self,
+        oid: ObjectId,
+        getter_key: StringId,
+        setter_key: StringId,
+        method_key: StringId,
+    ) -> bool {
+        let Some(pending) = self.pending_private_brands.get(&oid) else { return false };
+        if pending.is_empty() { return false; }
+        // Walk the prototype chain; find the prototype that owns the method/accessor.
+        let mut cur = self.heap.get(oid).and_then(|o| o.prototype);
+        while let Some(c) = cur {
+            let Some(o) = self.heap.get(c) else { break };
+            if o.has_own_property(getter_key)
+                || o.has_own_property(setter_key)
+                || o.has_own_property(method_key)
+            {
+                return pending.contains(&c);
+            }
+            cur = o.prototype;
+        }
+        false
+    }
+
     pub(crate) fn object_define_property(&mut self, args: &[Value]) -> Value {
         // A canonical array index per ECMAScript: the string is the decimal
         // form of a non-negative integer < 2^32-1, with no leading zeros

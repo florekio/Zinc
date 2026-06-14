@@ -743,3 +743,29 @@ fn test_native_uri_functions() {
     // Round-trip.
     assert_eq!(eval("decodeURIComponent(encodeURIComponent('hello world/?&=#'))"), "hello world/?&=#");
 }
+
+#[test]
+fn test_derived_class_default_constructor() {
+    // `class B extends A {}` with no explicit constructor must work: the
+    // implicit `constructor(...args){ super(...args) }` forwards to A. Was
+    // throwing a spurious "Must call super constructor".
+    assert_eq!(eval("class A{constructor(x){this.x=x}} class B extends A{} new B(7).x"), "7");
+    assert_eq!(eval("class A{m(){return 5}} class B extends A{} (new B()).m()"), "5");
+    assert_eq!(eval("class A{} class B extends A{} class C extends B{} (new C()) instanceof A"), "true");
+    // Base constructor returning an object is honored through the default ctor.
+    assert_eq!(eval("class R{constructor(){return {tag:9}}} class S extends R{} new S().tag"), "9");
+}
+
+#[test]
+fn test_private_method_brand_timing() {
+    // A subclass's private method is NOT installed until its (implicit) super
+    // returns; reaching it from the base constructor must throw TypeError.
+    assert_eq!(
+        eval("class C{constructor(){this.f()}} class D extends C{f(){this.#m()} #m(){return 1}} (function(){try{new D();return 'no throw'}catch(e){return e instanceof TypeError ? 'TypeError' : 'other'}})()"),
+        "TypeError"
+    );
+    // Normal private method use (after construction) still works.
+    assert_eq!(eval("class A{#m(){return 42} run(){return this.#m()}} new A().run()"), "42");
+    // Derived class accessing its OWN private after super() works.
+    assert_eq!(eval("class C{constructor(){}} class D extends C{#x=8; constructor(){super(); } get(){return this.#x}} new D().get()"), "8");
+}
