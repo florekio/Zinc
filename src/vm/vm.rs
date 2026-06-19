@@ -2409,7 +2409,9 @@ impl Vm {
                 "POSITIVE_INFINITY" => Value::number(f64::INFINITY),
                 "NEGATIVE_INFINITY" => Value::number(f64::NEG_INFINITY),
                 "MAX_VALUE" => Value::number(f64::MAX),
-                "MIN_VALUE" => Value::number(f64::MIN_POSITIVE),
+                // Smallest positive value: the smallest denormal (5e-324),
+                // i.e. the double with bit pattern 1 — not the smallest normal.
+                "MIN_VALUE" => Value::number(f64::from_bits(1)),
                 "MAX_SAFE_INTEGER" => Value::number(9007199254740991.0),
                 "MIN_SAFE_INTEGER" => Value::number(-9007199254740991.0),
                 "EPSILON" => Value::number(f64::EPSILON),
@@ -5377,7 +5379,8 @@ impl Vm {
                                 "POSITIVE_INFINITY" => Value::number(f64::INFINITY),
                                 "NEGATIVE_INFINITY" => Value::number(f64::NEG_INFINITY),
                                 "MAX_VALUE" => Value::number(f64::MAX),
-                                "MIN_VALUE" => Value::number(f64::MIN_POSITIVE),
+                                // Smallest positive denormal (5e-324), not the smallest normal.
+                                "MIN_VALUE" => Value::number(f64::from_bits(1)),
                                 "MAX_SAFE_INTEGER" => Value::number(9007199254740991.0),
                                 "MIN_SAFE_INTEGER" => Value::number(-9007199254740991.0),
                                 "EPSILON" => Value::number(f64::EPSILON),
@@ -6162,6 +6165,14 @@ impl Vm {
                             ))?;
                             continue;
                         }
+                        // PrivateBrandCheck: the object must actually carry this private
+                        // name. Reading #name off an unrelated object throws TypeError.
+                        if self.private_brand_missing(oid, &name_str) {
+                            self.throw_type_error(&format!(
+                                "Cannot read private member {name_str} from an object whose class did not declare it"
+                            ))?;
+                            continue;
+                        }
                         // Check for private getter (__get_#name__)
                         let getter_fn = self.heap.get_property_chain(oid, getter_key);
                         if let Some(gfn) = getter_fn && gfn.is_function() {
@@ -6203,6 +6214,13 @@ impl Vm {
                         let priv_method_key = self.interner.intern(&format!("__priv_{}__", name_str));
                         // Brand check (see GetPrivate): subclass-level private not yet installed.
                         if self.private_brand_not_installed(oid, getter_key_for_brand, setter_key, priv_method_key) {
+                            self.throw_type_error(&format!(
+                                "Cannot write private member {name_str} to an object whose class did not declare it"
+                            ))?;
+                            continue;
+                        }
+                        // PrivateBrandCheck: writing #name to an unrelated object throws.
+                        if self.private_brand_missing(oid, &name_str) {
                             self.throw_type_error(&format!(
                                 "Cannot write private member {name_str} to an object whose class did not declare it"
                             ))?;
@@ -7055,6 +7073,18 @@ impl Vm {
                     if let Some(oid) = obj_val.as_object_id() {
                         // For private names (#x), try mangled key first
                         let method_name_s = self.interner.resolve(method_name).to_owned();
+                        // PrivateBrandCheck: calling #m() on an object that does not
+                        // carry the brand throws TypeError (e.g. `c.access.call({})`).
+                        if method_name_s.starts_with('#')
+                            && self.private_brand_missing(oid, &method_name_s)
+                        {
+                            self.truncate_stack(obj_pos);
+                            let err = self.make_native_error("TypeError", &format!(
+                                "Cannot read private member {method_name_s} from an object whose class did not declare it"
+                            ));
+                            self.handle_throw(err)?;
+                            continue;
+                        }
                         let mut method_val = if method_name_s.starts_with('#') {
                             let mangled = self.interner.intern(&format!("__priv_{}__", method_name_s));
                             self.heap.get_property_chain(oid, mangled)
@@ -10199,6 +10229,20 @@ impl Vm {
             cur = o.prototype;
         }
         false
+    }
+
+    /// PrivateBrandCheck: returns true when `oid` does NOT carry the private name
+    /// `#name`, i.e. accessing it must throw TypeError. The object has the brand
+    /// when the private member is reachable as a field (own `__priv_#name__`),
+    /// a method (`__priv_#name__` on the prototype chain), or an accessor
+    /// (`__get_#name__` / `__set_#name__` on the chain).
+    fn private_brand_missing(&mut self, oid: ObjectId, name_str: &str) -> bool {
+        let priv_key = self.interner.intern(&format!("__priv_{name_str}__"));
+        let getter_key = self.interner.intern(&format!("__get_{name_str}__"));
+        let setter_key = self.interner.intern(&format!("__set_{name_str}__"));
+        self.heap.get_property_chain(oid, priv_key).is_none()
+            && self.heap.get_property_chain(oid, getter_key).is_none()
+            && self.heap.get_property_chain(oid, setter_key).is_none()
     }
 
     pub(crate) fn object_define_property(&mut self, args: &[Value]) -> Value {
