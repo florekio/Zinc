@@ -711,6 +711,9 @@ impl<'a> Compiler<'a> {
         // Loop completion starts at undefined (spec: V = undefined before the loop);
         // body iterations overwrite it, so zero iterations yield undefined.
         self.emit_completion_reset(line);
+        // Consume any enclosing label so `continue label` / `break label` target
+        // this loop's own continue point rather than the labeled-statement wrapper.
+        let label = self.pending_label.take();
         let loop_start = self.chunk.len();
 
         self.loops.push(LoopCtx {
@@ -718,7 +721,7 @@ impl<'a> Compiler<'a> {
             break_patches: Vec::new(),
             continue_patches: Vec::new(),
             scope_depth: self.scope_depth,
-            label: None,
+            label,
             has_deferred_continue: false,
             try_depth: self.finally_stack.len(),
         });
@@ -738,6 +741,9 @@ impl<'a> Compiler<'a> {
     fn compile_do_while(&mut self, d: &DoWhileStatement) -> Result<(), String> {
         let line = d.span.start;
         self.emit_completion_reset(line);
+        // Consume any enclosing label so `continue label` targets this loop's
+        // deferred continue point (the test), not the labeled-statement wrapper.
+        let label = self.pending_label.take();
         let loop_start = self.chunk.len();
 
         // Use deferred continue patching so `continue` jumps to the test, not
@@ -747,7 +753,7 @@ impl<'a> Compiler<'a> {
             break_patches: Vec::new(),
             continue_patches: Vec::new(),
             scope_depth: self.scope_depth,
-            label: None,
+            label,
             has_deferred_continue: true,
             try_depth: self.finally_stack.len(),
         });

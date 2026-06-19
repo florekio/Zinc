@@ -61,9 +61,11 @@ impl Vm {
             if n.is_nan() || n.is_infinite() { return "null".into(); }
             return format!("{n}");
         }
-        if val.is_string() {
-            let id = val.as_string_id().unwrap();
-            let s = self.interner.resolve(id);
+        // Strings (interned/flat or runtime-concatenation ConsString) serialize
+        // as quoted JSON strings — a ConsString is a heap object, so it must be
+        // handled before the generic object branch below.
+        if self.is_string_like(val) {
+            let s = self.value_to_string(val);
             return format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t"));
         }
         if let Some(oid) = val.as_object_id()
@@ -103,9 +105,8 @@ impl Vm {
             if n.is_nan() || n.is_infinite() { return "null".into(); }
             return format!("{n}");
         }
-        if val.is_string() {
-            let id = val.as_string_id().unwrap();
-            let s = self.interner.resolve(id);
+        if self.is_string_like(val) {
+            let s = self.value_to_string(val);
             return format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t"));
         }
         if let Some(oid) = val.as_object_id()
