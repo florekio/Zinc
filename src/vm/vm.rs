@@ -3574,6 +3574,18 @@ impl Vm {
                             let mut arr = JsObject::array(args);
                             // Per spec, arguments has Object.prototype (not Array.prototype).
                             arr.prototype = Some(self.object_prototype);
+                            // arguments[Symbol.iterator] is Array.prototype.values, so
+                            // `for (x of arguments)` and `[...arguments]` work. The object
+                            // is array-kind, so the array values iterator (-626) applies.
+                            let sym_iter_key = self.interner.intern(&format!("__sym_{}__", self.sym_iterator));
+                            arr.define_property(
+                                sym_iter_key,
+                                crate::runtime::object::Property::with_flags(
+                                    Value::function(-626),
+                                    crate::runtime::object::Property::WRITABLE
+                                        | crate::runtime::object::Property::CONFIGURABLE,
+                                ),
+                            );
                             if !is_strict {
                                 let callee_key = self.interner.intern("callee");
                                 arr.define_property(
@@ -8034,31 +8046,45 @@ impl Vm {
                             new_o.set_property(class_key, func_val);
                         }
 
-                        // Apply instance fields (stored as __ifield_{name}__ on the class)
+                        // Apply instance fields (stored as __ifield_{name}__ on the class).
+                        // A derived instance also receives its ancestors' instance fields,
+                        // so walk the whole __super__ chain and install base-class fields
+                        // first (matching the order in which each constructor's fields run).
                         let ifield_prefix = "__ifield_";
-                        let instance_fields: Vec<(String, Value)> = self.heap.get(class_oid)
-                            .map(|o| o.properties.iter()
-                                .filter_map(|(k, p)| {
-                                    let key_str = self.interner.resolve(*k);
-                                    if key_str.starts_with(ifield_prefix) && key_str.ends_with("__") {
-                                        let inner = &key_str[ifield_prefix.len()..key_str.len() - 2];
-                                        Some((inner.to_owned(), p.value))
-                                    } else { None }
-                                })
-                                .collect())
-                            .unwrap_or_default();
-                        for (field_name, field_val) in instance_fields {
-                            // Private fields (#name) are stored under __priv_#name__ to avoid
-                            // being visible via hasOwnProperty("#name").
-                            // Public fields (no #) keep their plain names.
-                            let store_name = if field_name.starts_with('#') {
-                                format!("__priv_{}__", field_name)
-                            } else {
-                                field_name.clone()
-                            };
-                            let real_key = self.interner.intern(&store_name);
-                            if let Some(new_o) = self.heap.get_mut(new_oid) {
-                                new_o.set_property(real_key, field_val);
+                        let mut field_class_chain: Vec<ObjectId> = Vec::new();
+                        let mut cur_field_class = Some(class_oid);
+                        while let Some(coid) = cur_field_class {
+                            if field_class_chain.contains(&coid) { break; }
+                            field_class_chain.push(coid);
+                            cur_field_class = self.heap.get(coid)
+                                .and_then(|o| o.get_property(super_key))
+                                .and_then(|v| v.as_object_id());
+                        }
+                        for &coid in field_class_chain.iter().rev() {
+                            let instance_fields: Vec<(String, Value)> = self.heap.get(coid)
+                                .map(|o| o.properties.iter()
+                                    .filter_map(|(k, p)| {
+                                        let key_str = self.interner.resolve(*k);
+                                        if key_str.starts_with(ifield_prefix) && key_str.ends_with("__") {
+                                            let inner = &key_str[ifield_prefix.len()..key_str.len() - 2];
+                                            Some((inner.to_owned(), p.value))
+                                        } else { None }
+                                    })
+                                    .collect())
+                                .unwrap_or_default();
+                            for (field_name, field_val) in instance_fields {
+                                // Private fields (#name) are stored under __priv_#name__ to avoid
+                                // being visible via hasOwnProperty("#name").
+                                // Public fields (no #) keep their plain names.
+                                let store_name = if field_name.starts_with('#') {
+                                    format!("__priv_{}__", field_name)
+                                } else {
+                                    field_name.clone()
+                                };
+                                let real_key = self.interner.intern(&store_name);
+                                if let Some(new_o) = self.heap.get_mut(new_oid) {
+                                    new_o.set_property(real_key, field_val);
+                                }
                             }
                         }
 
