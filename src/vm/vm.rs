@@ -208,6 +208,10 @@ pub struct Vm {
     pub(crate) host_roots: Vec<ObjectId>,
     /// Active `with`-scope objects (innermost last). Names resolve here before globals.
     pub(crate) with_stack: Vec<ObjectId>,
+    /// Completion value of the currently running script/eval. Value-producing
+    /// statements update it via SetCompletion; Halt returns it. Saved/restored
+    /// around nested `eval` so an inner eval can't corrupt the outer's value.
+    pub(crate) script_completion: Value,
     /// Upvalues for each closure, indexed by closure_id.
     pub(crate) closure_upvalues: Vec<Vec<Upvalue>>,
     /// Live `Open` upvalue cells keyed by absolute stack slot, so every
@@ -817,6 +821,7 @@ impl Vm {
             microtask_queue: Vec::new(),
             host_roots: Vec::new(),
             with_stack: Vec::new(),
+            script_completion: Value::undefined(),
             closure_upvalues: Vec::new(),
             open_upvalues: std::collections::HashMap::new(),
             #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
@@ -2796,6 +2801,8 @@ impl Vm {
         // tipping point died with "execution limit exceeded", leaving globals
         // like `DDG.Pages.SERP` undefined.
         self.steps = 0;
+        // Fresh completion value per top-level run; Halt returns this.
+        self.script_completion = Value::undefined();
         // Flatten the new chunk tree onto the existing chunks vec; the new
         // top chunk lands at `top_idx`, and its sub-chunks follow.
         let top_idx = self.chunks.len();
@@ -4109,7 +4116,14 @@ impl Vm {
                         let current_this = self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined());
                         let frames_before = self.frames.len();
                         let stack_before = self.stack.len();
-                        let result = self.call_function_this(eval_fn, current_this, &[])?;
+                        // The eval body's Halt returns ITS completion value; run it with
+                        // a fresh register and restore the caller's afterwards so a nested
+                        // eval can't clobber the enclosing script's completion value.
+                        let saved_completion = self.script_completion;
+                        self.script_completion = Value::undefined();
+                        let result = self.call_function_this(eval_fn, current_this, &[]);
+                        self.script_completion = saved_completion;
+                        let result = result?;
                         // Eval chunks end in Halt, which doesn't unwind the call frame.
                         // Clean up leftover frame and stack slots.
                         while self.frames.len() > frames_before { self.frames.pop(); }
@@ -4623,15 +4637,24 @@ impl Vm {
 
                 // ---- Miscellaneous ---------------------------------------
                 OpCode::Halt => {
-                    // Only pop a value that belongs to the current frame.
-                    // Eval/script chunks may end with no value on top of their own frame;
-                    // do not steal the function value sitting in the parent slot.
+                    // Script/eval chunks return the completion value recorded via
+                    // SetCompletion (declarations and empty/false branches leave it
+                    // untouched per UpdateEmpty). Other chunks (manually built ones,
+                    // internal helpers) keep the legacy "top of frame" behavior.
+                    let cur = self.cur_chunk();
+                    if self.chunks[cur].flags.contains(ChunkFlags::SCRIPT) {
+                        return Ok(self.script_completion);
+                    }
                     let frame_base = self.frames.last().map(|f| f.base).unwrap_or(0);
                     return Ok(if self.stack.len() > frame_base {
                         self.pop()?
                     } else {
                         Value::undefined()
                     });
+                }
+
+                OpCode::SetCompletion => {
+                    self.script_completion = self.pop()?;
                 }
 
                 OpCode::CollectRest => {

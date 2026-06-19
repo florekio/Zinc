@@ -14,6 +14,9 @@ bitflags::bitflags! {
         const ARROW     = 0b0001_0000;
         /// Concise method (object/class shorthand). Has no [[Construct]] slot.
         const METHOD    = 0b0010_0000;
+        /// Top-level script or eval code. Value-producing statements update the
+        /// VM completion register so `eval(...)` yields the spec completion value.
+        const SCRIPT    = 0b0100_0000;
     }
 }
 

@@ -360,6 +360,8 @@ pub enum OpCode {
     WithEnter = 0xF9,
     /// Exit with scope
     WithExit = 0xFA,
+    /// Pop TOS and store it as the script/eval completion value.
+    SetCompletion = 0xFD,
     /// Stop execution
     Halt = 0xFF,
 }
@@ -396,7 +398,7 @@ impl OpCode {
             | 0xD8..=0xDD
             | 0xE0..=0xE5
             | 0xE8..=0xEF
-            | 0xF0..=0xFC
+            | 0xF0..=0xFD
             | 0xFF
         )
     }
@@ -494,6 +496,7 @@ impl OpCode {
             | OpCode::ClassStaticFieldComputed
             | OpCode::PushComputedExclude
             | OpCode::ArrayAppend
+            | OpCode::SetCompletion
             | OpCode::Halt => 1,
 
             // 2 bytes (u8 operand)

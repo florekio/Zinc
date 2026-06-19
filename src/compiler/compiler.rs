@@ -152,6 +152,9 @@ impl<'a> Compiler<'a> {
     }
 
     pub fn compile_program(mut self, program: &Program) -> Result<Chunk, String> {
+        // Top-level script/eval: value-producing statements update the VM
+        // completion register so `eval(...)` returns the spec completion value.
+        self.chunk.flags |= ChunkFlags::SCRIPT;
         if program.source_type == SourceType::Module {
             self.chunk.flags |= ChunkFlags::MODULE;
             self.chunk.flags |= ChunkFlags::STRICT; // modules are always strict
@@ -210,17 +213,12 @@ impl<'a> Compiler<'a> {
             {
                 continue;
             }
-            let is_last = i == len - 1;
-            if is_last {
-                // For the last statement, if it's an expression, keep value on stack for Halt
-                if let Statement::Expression(e) = stmt {
-                    self.compile_expr(&e.expression)?;
-                } else {
-                    self.compile_statement(stmt)?;
-                }
-            } else {
-                self.compile_statement(stmt)?;
-            }
+            let _ = i;
+            let _ = len;
+            // Every value-producing statement now routes its value into the
+            // completion register via SetCompletion (see compile_statement),
+            // and Halt returns that register — so no special last-statement case.
+            self.compile_statement(stmt)?;
         }
         let line = self.current_line();
         self.chunk.emit_op(OpCode::Halt, line);
@@ -457,6 +455,17 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// At script/eval level, reset the completion register to `undefined`.
+    /// Used by statements whose runtime semantics are `UpdateEmpty(value, undefined)`
+    /// (if / with): emitting this before the body means an empty body yields
+    /// `undefined`, while a body containing value statements overwrites it.
+    fn emit_completion_reset(&mut self, line: u32) {
+        if self.chunk.flags.contains(ChunkFlags::SCRIPT) {
+            self.chunk.emit_op(OpCode::Undefined, line);
+            self.chunk.emit_op(OpCode::SetCompletion, line);
+        }
+    }
+
     /// Emit bytecode that pops the current stack value and throws a runtime TypeError.
     fn emit_throw_type_error(&mut self, msg: &str, line: u32) {
         self.chunk.emit_op(OpCode::Pop, line);
@@ -478,7 +487,13 @@ impl<'a> Compiler<'a> {
         match stmt {
             Statement::Expression(e) => {
                 self.compile_expr(&e.expression)?;
-                self.chunk.emit_op(OpCode::Pop, self.current_line());
+                // At script/eval level the statement value becomes the program's
+                // completion value (consumed by Halt); inside functions it's discarded.
+                if self.chunk.flags.contains(ChunkFlags::SCRIPT) {
+                    self.chunk.emit_op(OpCode::SetCompletion, self.current_line());
+                } else {
+                    self.chunk.emit_op(OpCode::Pop, self.current_line());
+                }
                 Ok(())
             }
             Statement::Variable(decl) => self.compile_var_declaration(decl),
@@ -659,15 +674,29 @@ impl<'a> Compiler<'a> {
     // ---- if / else ----
 
     fn compile_if(&mut self, s: &IfStatement) -> Result<(), String> {
+        // IfStatement completion is UpdateEmpty(branch, undefined) for the taken
+        // branch, or undefined when the test is false and there is no else clause.
+        // Resetting the completion register to undefined before each branch body
+        // captures that: an empty body leaves undefined, a body with value
+        // statements overwrites it.
         let line = s.span.start;
+        let is_script = self.chunk.flags.contains(ChunkFlags::SCRIPT);
         self.compile_expr(&s.test)?;
         let then_jump = self.chunk.emit_jump(OpCode::JumpIfFalse, line);
+        self.emit_completion_reset(line);
         self.compile_statement(&s.consequent)?;
 
         if let Some(alt) = &s.alternate {
             let else_jump = self.chunk.emit_jump(OpCode::Jump, line);
             self.chunk.patch_jump(then_jump);
+            self.emit_completion_reset(line);
             self.compile_statement(alt)?;
+            self.chunk.patch_jump(else_jump);
+        } else if is_script {
+            // No else: the false path must still yield undefined.
+            let else_jump = self.chunk.emit_jump(OpCode::Jump, line);
+            self.chunk.patch_jump(then_jump);
+            self.emit_completion_reset(line);
             self.chunk.patch_jump(else_jump);
         } else {
             self.chunk.patch_jump(then_jump);
@@ -679,6 +708,9 @@ impl<'a> Compiler<'a> {
 
     fn compile_while(&mut self, w: &WhileStatement) -> Result<(), String> {
         let line = w.span.start;
+        // Loop completion starts at undefined (spec: V = undefined before the loop);
+        // body iterations overwrite it, so zero iterations yield undefined.
+        self.emit_completion_reset(line);
         let loop_start = self.chunk.len();
 
         self.loops.push(LoopCtx {
@@ -705,6 +737,7 @@ impl<'a> Compiler<'a> {
 
     fn compile_do_while(&mut self, d: &DoWhileStatement) -> Result<(), String> {
         let line = d.span.start;
+        self.emit_completion_reset(line);
         let loop_start = self.chunk.len();
 
         // Use deferred continue patching so `continue` jumps to the test, not
@@ -754,6 +787,7 @@ impl<'a> Compiler<'a> {
             }
         }
 
+        self.emit_completion_reset(line);
         let loop_start = self.chunk.len();
 
         // Push a loop context. For `for` loops with an update expression,
@@ -845,6 +879,7 @@ impl<'a> Compiler<'a> {
         self.compile_expr(&f.right)?;
         self.chunk.emit_op(OpCode::GetForInIterator, line);
 
+        self.emit_completion_reset(line);
         let loop_start = self.chunk.len();
 
         self.chunk.emit_op(OpCode::Dup, line);
@@ -981,6 +1016,7 @@ impl<'a> Compiler<'a> {
             self.mark_initialized();
         }
 
+        self.emit_completion_reset(line);
         let loop_start = self.chunk.len();
 
         // Call iterator.next()
@@ -1250,6 +1286,8 @@ impl<'a> Compiler<'a> {
 
     fn compile_switch(&mut self, s: &SwitchStatement) -> Result<(), String> {
         let line = s.span.start;
+        // Switch completion starts at undefined; matched case bodies overwrite it.
+        self.emit_completion_reset(line);
         self.compile_expr(&s.discriminant)?;
 
         // Phase 1: emit comparisons.
@@ -2534,6 +2572,8 @@ impl<'a> Compiler<'a> {
         let line = w.span.start;
         self.compile_expr(&w.object)?;
         self.chunk.emit_op(OpCode::WithEnter, line);
+        // WithStatement completion is UpdateEmpty(body, undefined).
+        self.emit_completion_reset(line);
         self.compile_statement(&w.body)?;
         self.chunk.emit_op(OpCode::WithExit, line);
         Ok(())
