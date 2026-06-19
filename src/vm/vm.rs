@@ -6220,7 +6220,12 @@ impl Vm {
                             self.push(val);
                         }
                     } else {
-                        self.push(Value::undefined());
+                        // PrivateFieldGet step 2: a non-object receiver throws TypeError.
+                        let name_str = self.interner.resolve(name_id).to_owned();
+                        self.throw_type_error(&format!(
+                            "Cannot read private member {name_str} from a non-object"
+                        ))?;
+                        continue;
                     }
                 }
 
@@ -6292,6 +6297,13 @@ impl Vm {
                                 obj.set_property(priv_key, value);
                             }
                         }
+                    } else {
+                        // PrivateFieldSet: a non-object receiver throws TypeError.
+                        let name_str = self.interner.resolve(name_id).to_owned();
+                        self.throw_type_error(&format!(
+                            "Cannot write private member {name_str} to a non-object"
+                        ))?;
+                        continue;
                     }
                     self.push(value);
                 }
@@ -6385,6 +6397,19 @@ impl Vm {
                                 self.handle_throw(err)?;
                                 continue;
                             }
+                        }
+                    }
+                    // Calling a private method (`o.#m()`) on a non-object receiver
+                    // is a PrivateFieldGet on a primitive — throws TypeError.
+                    if obj_val.as_object_id().is_none() {
+                        let mname = self.interner.resolve(method_name).to_owned();
+                        if mname.starts_with('#') {
+                            self.truncate_stack(obj_pos);
+                            let err = self.make_native_error("TypeError", &format!(
+                                "Cannot read private member {mname} from a non-object"
+                            ));
+                            self.handle_throw(err)?;
+                            continue;
                         }
                     }
 
