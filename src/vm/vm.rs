@@ -4093,17 +4093,34 @@ impl Vm {
                         let mut lexer = crate::lexer::lexer::Lexer::new(&code_str, &mut self.interner);
                         let tokens = lexer.tokenize();
                         let mut parser = crate::parser::parser::Parser::new(tokens, &code_str, &mut self.interner);
-                        let program = match parser.parse_program() {
+                        let parsed = parser.parse_program();
+                        // parse_program recovers from errors and returns Ok with a
+                        // partial AST, recording diagnostics in `errors`; a non-empty
+                        // list means the source is syntactically invalid. eval must
+                        // throw a catchable SyntaxError (not abort the VM).
+                        let parse_errors: Vec<String> =
+                            parser.errors.iter().map(|e| e.to_string()).collect();
+                        let program = match parsed {
                             Ok(p) => p,
                             Err(e) => {
-                                return Err(VmError::RuntimeError(format!("eval SyntaxError: {e}")));
+                                let err = self.make_native_error("SyntaxError", &e.to_string());
+                                self.handle_throw(err)?;
+                                continue;
                             }
                         };
+                        if !parse_errors.is_empty() {
+                            let msg = parse_errors.join("; ");
+                            let err = self.make_native_error("SyntaxError", &msg);
+                            self.handle_throw(err)?;
+                            continue;
+                        }
                         let compiler = crate::compiler::compiler::Compiler::new(&mut self.interner);
                         let chunk = match compiler.compile_program(&program) {
                             Ok(c) => c,
                             Err(e) => {
-                                return Err(VmError::RuntimeError(format!("eval CompileError: {e}")));
+                                let err = self.make_native_error("SyntaxError", &e);
+                                self.handle_throw(err)?;
+                                continue;
                             }
                         };
                         // Flatten and add chunks to VM. Adjust children indices to be absolute
