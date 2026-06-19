@@ -80,6 +80,9 @@ struct LoopCtx {
     has_deferred_continue: bool,
     /// Number of active try/finally handlers when this loop was entered.
     try_depth: usize,
+    /// Number of enclosing `with` blocks when this loop was entered, so a
+    /// `break`/`continue` can emit WithExit for each `with` it jumps out of.
+    with_depth: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +118,10 @@ pub struct Compiler<'a> {
     /// still active in that region (true inside the try block; false
     /// inside the catch block, where handle_throw already popped it).
     finally_stack: Vec<(Option<std::rc::Rc<Vec<Statement>>>, bool)>,
+    /// Number of lexically-enclosing `with` blocks. A `break`/`continue` out of
+    /// a `with` must emit WithExit for each scope it jumps past (the lexical
+    /// WithExit at the body's end is skipped by the jump).
+    with_depth: usize,
     /// Depth of nested class bodies. Class bodies (including method bodies)
     /// are implicitly strict per spec; tracking this lets
     /// compile_function_body_with_self set the STRICT flag for class methods.
@@ -146,6 +153,7 @@ impl<'a> Compiler<'a> {
             pending_label: None,
             pending_function_name: None,
             finally_stack: Vec::new(),
+            with_depth: 0,
             class_depth: 0,
             predeclared_lex: Vec::new(),
         }
@@ -724,6 +732,7 @@ impl<'a> Compiler<'a> {
             label,
             has_deferred_continue: false,
             try_depth: self.finally_stack.len(),
+            with_depth: self.with_depth,
         });
 
         self.compile_expr(&w.test)?;
@@ -756,6 +765,7 @@ impl<'a> Compiler<'a> {
             label,
             has_deferred_continue: true,
             try_depth: self.finally_stack.len(),
+            with_depth: self.with_depth,
         });
 
         self.compile_statement(&d.body)?;
@@ -808,6 +818,7 @@ impl<'a> Compiler<'a> {
             label,
             has_deferred_continue: has_update,
             try_depth: self.finally_stack.len(),
+            with_depth: self.with_depth,
         });
 
         // Condition.
@@ -927,6 +938,7 @@ impl<'a> Compiler<'a> {
             label: None,
             has_deferred_continue: false,
             try_depth: self.finally_stack.len(),
+            with_depth: self.with_depth,
         });
         self.compile_statement(&f.body)?;
         self.chunk.emit_loop(loop_start, line);
@@ -1259,6 +1271,7 @@ impl<'a> Compiler<'a> {
             label: None,
             has_deferred_continue: false,
             try_depth: self.finally_stack.len(),
+            with_depth: self.with_depth,
         });
 
         self.compile_statement(&f.body)?;
@@ -1332,6 +1345,7 @@ impl<'a> Compiler<'a> {
             label: None,
             has_deferred_continue: false,
             try_depth: self.finally_stack.len(),
+            with_depth: self.with_depth,
         });
 
         let mut body_starts: Vec<usize> = Vec::new();
@@ -1460,6 +1474,7 @@ impl<'a> Compiler<'a> {
         };
         let loop_depth = self.loops[target_idx].scope_depth;
         let target_try_depth = self.loops[target_idx].try_depth;
+        let target_with_depth = self.loops[target_idx].with_depth;
         let pop_n = self.locals_above_depth(loop_depth);
         if pop_n > 0 && pop_n <= u8::MAX as usize {
             self.chunk.emit_op_u8(OpCode::PopN, pop_n as u8, line);
@@ -1469,6 +1484,10 @@ impl<'a> Compiler<'a> {
             }
         }
         self.compile_inline_finallys(target_try_depth, line)?;
+        // Exit any `with` scopes between here and the target loop.
+        for _ in target_with_depth..self.with_depth {
+            self.chunk.emit_op(OpCode::WithExit, line);
+        }
         let patch = self.chunk.emit_jump(OpCode::Jump, line);
         self.loops[target_idx].break_patches.push(patch);
         Ok(())
@@ -1491,6 +1510,7 @@ impl<'a> Compiler<'a> {
         let target = self.loops[ctx_idx].continue_target;
         let loop_depth = self.loops[ctx_idx].scope_depth;
         let target_try_depth = self.loops[ctx_idx].try_depth;
+        let target_with_depth = self.loops[ctx_idx].with_depth;
         let deferred = self.loops[ctx_idx].has_deferred_continue;
 
         let pop_n = self.locals_above_depth(loop_depth);
@@ -1502,6 +1522,10 @@ impl<'a> Compiler<'a> {
             }
         }
         self.compile_inline_finallys(target_try_depth, line)?;
+        // Exit any `with` scopes between here and the target loop.
+        for _ in target_with_depth..self.with_depth {
+            self.chunk.emit_op(OpCode::WithExit, line);
+        }
         if deferred {
             // Emit a forward jump; it will be patched to the update position later
             let patch = self.chunk.emit_jump(OpCode::Jump, line);
@@ -2552,6 +2576,7 @@ impl<'a> Compiler<'a> {
                 label: Some(l.label),
                 has_deferred_continue: false,
                 try_depth: self.finally_stack.len(),
+                with_depth: self.with_depth,
             });
             self.compile_statement(&l.body)?;
             self.patch_loop_breaks();
@@ -2565,6 +2590,7 @@ impl<'a> Compiler<'a> {
                 label: Some(l.label),
                 has_deferred_continue: false,
                 try_depth: self.finally_stack.len(),
+                with_depth: self.with_depth,
             });
             self.compile_statement(&l.body)?;
             self.patch_loop_breaks();
@@ -2580,7 +2606,9 @@ impl<'a> Compiler<'a> {
         self.chunk.emit_op(OpCode::WithEnter, line);
         // WithStatement completion is UpdateEmpty(body, undefined).
         self.emit_completion_reset(line);
+        self.with_depth += 1;
         self.compile_statement(&w.body)?;
+        self.with_depth -= 1;
         self.chunk.emit_op(OpCode::WithExit, line);
         Ok(())
     }
@@ -3220,6 +3248,8 @@ impl<'a> Compiler<'a> {
         // Fresh per-function: a `return` must only unwind try handlers of
         // ITS OWN function, never the enclosing one's.
         let parent_finally_stack = std::mem::take(&mut self.finally_stack);
+        // `with` nesting does not cross function boundaries.
+        let parent_with_depth = std::mem::take(&mut self.with_depth);
         self.enclosing_chain.push(EnclosingFrame {
             locals: parent_locals,
             upvalues: parent_upvalues,
@@ -3382,6 +3412,7 @@ impl<'a> Compiler<'a> {
         self.loops = parent_loops;
         self.predeclared_lex = parent_predeclared_lex;
         self.finally_stack = parent_finally_stack;
+        self.with_depth = parent_with_depth;
 
         if compiled.jump_overflow {
             let name = self.interner.resolve(compiled.name).to_owned();
@@ -3418,6 +3449,8 @@ impl<'a> Compiler<'a> {
         let parent_loops = std::mem::take(&mut self.loops);
         let parent_predeclared_lex = std::mem::take(&mut self.predeclared_lex);
         let parent_finally_stack = std::mem::take(&mut self.finally_stack);
+        // `with` nesting does not cross function boundaries.
+        let parent_with_depth = std::mem::take(&mut self.with_depth);
         // Push parent's scope onto the chain so the arrow body (and anything
         // nested in it) can capture transitively.
         self.enclosing_chain.push(EnclosingFrame {
@@ -3562,6 +3595,7 @@ impl<'a> Compiler<'a> {
         self.loops = parent_loops;
         self.predeclared_lex = parent_predeclared_lex;
         self.finally_stack = parent_finally_stack;
+        self.with_depth = parent_with_depth;
 
         if compiled.jump_overflow {
             let name = self.interner.resolve(compiled.name).to_owned();

@@ -153,6 +153,7 @@ impl Vm {
                     arguments_oid: None, is_derived_ctor: false, super_called: false,
                     new_target: Value::undefined(),
                     await_super_result: false,
+                    with_base: self.with_stack.len(),
                 });
 
                 // For SuspendedYield, the input becomes the result of the yield expression

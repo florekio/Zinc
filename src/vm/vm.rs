@@ -150,6 +150,10 @@ pub(crate) struct CallFrame {
     /// parent constructor returns and yields an object, the child constructor
     /// must rebind its `this` to that object (per spec BindThisValue).
     pub(crate) await_super_result: bool,
+    /// `with_stack` length when this frame was entered. On return the stack is
+    /// truncated back to this depth, so a `return` out of a `with` block pops
+    /// its scope (the lexical WithExit at the body's end is skipped by the jump).
+    pub(crate) with_base: usize,
 }
 
 /// An active exception handler (pushed by PushExcHandler).
@@ -807,7 +811,7 @@ impl Vm {
 
         Self {
             chunks,
-            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::object_id(global_this_oid), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0, saved_args: Vec::new(), arguments_oid: None, is_derived_ctor: false, super_called: false, new_target: Value::undefined(), await_super_result: false }],
+            frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::object_id(global_this_oid), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0, saved_args: Vec::new(), arguments_oid: None, is_derived_ctor: false, super_called: false, new_target: Value::undefined(), await_super_result: false, with_base: 0 }],
             stack: Vec::with_capacity(256),
             globals,
             interner,
@@ -2853,6 +2857,7 @@ impl Vm {
             super_called: false,
             new_target: Value::undefined(),
             await_super_result: false,
+            with_base: self.with_stack.len(),
         });
         let result = match self.run_until(stop_depth) {
             Ok(v) => v,
@@ -3945,6 +3950,7 @@ impl Vm {
                                 saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
                                 new_target,
                                 await_super_result: false,
+                                with_base: self.with_stack.len(),
                             });
                             continue;
                         }
@@ -4517,6 +4523,11 @@ impl Vm {
                 OpCode::Return => {
                     let mut result = self.pop()?;
                     let frame = self.frames.pop().unwrap();
+                    // Returning out of any `with` blocks opened in this frame: drop
+                    // their scope objects (the lexical WithExit was jumped over).
+                    if self.with_stack.len() > frame.with_base {
+                        self.with_stack.truncate(frame.with_base);
+                    }
                     if !self.closure_upvalues.is_empty() {
                         self.close_upvalues_above(frame.base.saturating_sub(1));
                     }
@@ -4583,6 +4594,9 @@ impl Vm {
 
                 OpCode::ReturnUndefined => {
                     let frame = self.frames.pop().unwrap();
+                    if self.with_stack.len() > frame.with_base {
+                        self.with_stack.truncate(frame.with_base);
+                    }
                     if frame.is_constructor && !self.pending_private_brands.is_empty()
                         && let Some(coid) = frame.this_value.as_object_id()
                     {
@@ -7209,6 +7223,7 @@ impl Vm {
                                         saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
                                         new_target: Value::undefined(),
                                         await_super_result: false,
+                                        with_base: self.with_stack.len(),
                                     });
                                     continue;
                                 }
@@ -8157,6 +8172,7 @@ impl Vm {
                                         is_derived_ctor: is_derived, super_called: super_called_init,
                                         new_target: func_val,
                                         await_super_result: false,
+                                        with_base: self.with_stack.len(),
                                     });
                                     continue;
                                 }
@@ -8291,6 +8307,7 @@ impl Vm {
                                 saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
                                 new_target: func_val,
                                 await_super_result: false,
+                                with_base: self.with_stack.len(),
                             });
                             continue;
                         }
