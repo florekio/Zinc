@@ -224,6 +224,9 @@ pub struct Vm {
     /// statements update it via SetCompletion; Halt returns it. Saved/restored
     /// around nested `eval` so an inner eval can't corrupt the outer's value.
     pub(crate) script_completion: Value,
+    /// Nesting depth of parameter-default evaluation. While > 0, a direct eval
+    /// runs in the parameter scope and its var/function declarations may collide.
+    pub(crate) param_scope_depth: usize,
     /// Upvalues for each closure, indexed by closure_id.
     pub(crate) closure_upvalues: Vec<Vec<Upvalue>>,
     /// Live `Open` upvalue cells keyed by absolute stack slot, so every
@@ -838,6 +841,7 @@ impl Vm {
             host_roots: Vec::new(),
             with_stack: Vec::new(),
             script_completion: Value::undefined(),
+            param_scope_depth: 0,
             closure_upvalues: Vec::new(),
             open_upvalues: std::collections::HashMap::new(),
             #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
@@ -4446,6 +4450,25 @@ impl Vm {
                             self.handle_throw(err)?;
                             continue;
                         }
+                        // EvalDeclarationInstantiation early error: a direct eval
+                        // running in a parameter default may not declare a var or
+                        // function whose name collides with a parameter / body
+                        // lexical / the parameter-scoped `arguments` binding.
+                        if self.param_scope_depth > 0
+                            && let Some(frame) = self.frames.last()
+                        {
+                            let cidx = frame.chunk_idx;
+                            let declared = collect_eval_hoisted_names(&program);
+                            let collides = declared.iter().any(|n|
+                                self.chunks[cidx].param_names.contains(n)
+                                || self.chunks[cidx].lexical_names.contains(n));
+                            if collides {
+                                let err = self.make_native_error("SyntaxError",
+                                    "Identifier in eval declaration conflicts with a binding in the enclosing scope");
+                                self.handle_throw(err)?;
+                                continue;
+                            }
+                        }
                         let compiler = crate::compiler::compiler::Compiler::new(&mut self.interner);
                         let chunk = match compiler.compile_program(&program) {
                             Ok(c) => c,
@@ -5039,6 +5062,9 @@ impl Vm {
                 OpCode::SetCompletion => {
                     self.script_completion = self.pop()?;
                 }
+
+                OpCode::BeginParamExpr => { self.param_scope_depth += 1; }
+                OpCode::EndParamExpr => { self.param_scope_depth = self.param_scope_depth.saturating_sub(1); }
 
                 OpCode::CollectRest => {
                     let start_idx = self.read_byte() as usize;
@@ -11190,6 +11216,22 @@ pub(crate) fn bigint_cmp_f64(big: &num_bigint::BigInt, f: f64) -> Option<std::cm
         }
         other => Some(other),
     }
+}
+
+/// Top-level `var` and function-declaration names of an eval program — the
+/// names EvalDeclarationInstantiation would install in the variable environment.
+pub(crate) fn collect_eval_hoisted_names(program: &crate::ast::node::Program) -> Vec<crate::util::interner::StringId> {
+    use crate::ast::node::Statement;
+    let mut out = Vec::new();
+    crate::compiler::compiler::collect_program_var_names(&program.body, &mut out);
+    for stmt in &program.body {
+        if let Statement::Function(f) = stmt
+            && let Some(name) = f.id
+        {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// ECMAScript ToInt32 on an f64.

@@ -41,6 +41,11 @@ pub struct Chunk {
     pub formal_length: u16,
     /// Function name (for stack traces).
     pub name: StringId,
+    /// Parameter binding names (simple identifiers). Used by direct eval running
+    /// in a parameter default to detect var/function-declaration collisions.
+    pub param_names: Vec<StringId>,
+    /// Body-level lexical (let/const/class) binding names, same purpose.
+    pub lexical_names: Vec<StringId>,
     /// Chunk flags (strict, generator, async, etc.)
     pub flags: ChunkFlags,
     /// Upvalue descriptors for this closure.
@@ -106,6 +111,8 @@ impl Chunk {
             param_count: 0,
             formal_length: 0,
             name,
+            param_names: Vec::new(),
+            lexical_names: Vec::new(),
             flags: ChunkFlags::empty(),
             upvalue_descriptors: Vec::new(),
             exception_handlers: Vec::new(),

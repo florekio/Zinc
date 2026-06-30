@@ -30,6 +30,10 @@ pub enum OpCode {
     /// ToNumeric on TOS: coerce to a Number, or keep a BigInt unchanged.
     /// Used by postfix ++/-- to produce the old value's numeric form.
     ToNumeric = 0x09,
+    /// Enter/exit parameter-default evaluation. While active, a direct eval is
+    /// in the parameter scope, so its var/function declarations may early-error.
+    BeginParamExpr = 0x0A,
+    EndParamExpr = 0x0B,
 
     // ---- Stack Manipulation ----
     /// Discard top of stack
@@ -385,7 +389,7 @@ impl OpCode {
     pub(crate) fn is_valid(byte: u8) -> bool {
         matches!(
             byte,
-            0x00..=0x09
+            0x00..=0x0B
             | 0x10..=0x15
             | 0x20..=0x29
             | 0x30..=0x36
@@ -420,6 +424,8 @@ impl OpCode {
             | OpCode::Zero
             | OpCode::One
             | OpCode::ToNumeric
+            | OpCode::BeginParamExpr
+            | OpCode::EndParamExpr
             | OpCode::Pop
             | OpCode::Dup
             | OpCode::Dup2

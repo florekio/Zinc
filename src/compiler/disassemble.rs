@@ -45,7 +45,9 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
     match op {
         // No operands
         OpCode::Nop | OpCode::Undefined | OpCode::Null | OpCode::True | OpCode::False
-        | OpCode::Zero | OpCode::One | OpCode::ToNumeric | OpCode::Pop | OpCode::Dup | OpCode::Dup2
+        | OpCode::Zero | OpCode::One | OpCode::ToNumeric
+        | OpCode::BeginParamExpr | OpCode::EndParamExpr
+        | OpCode::Pop | OpCode::Dup | OpCode::Dup2
         | OpCode::Swap | OpCode::Rot3
         | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Rem
         | OpCode::Exp | OpCode::Neg | OpCode::Pos | OpCode::Inc | OpCode::Dec

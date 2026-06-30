@@ -3264,6 +3264,19 @@ impl<'a> Compiler<'a> {
         }
         child_chunk.flags = flags;
 
+        // Record binding names for direct-eval-in-parameter early errors.
+        let mut pnames: Vec<StringId> = Vec::new();
+        for p in params { collect_pattern_names(p, &mut pnames); }
+        let has_param_exprs = params.iter().any(|p| matches!(p,
+            Pattern::Assignment(_) | Pattern::Array(_) | Pattern::Object(_) | Pattern::Rest(_)));
+        if has_param_exprs {
+            // Non-arrow functions bind `arguments` in the parameter scope, so a
+            // direct eval in a parameter default cannot redeclare it.
+            pnames.push(self.interner.intern("arguments"));
+        }
+        child_chunk.param_names = pnames;
+        child_chunk.lexical_names = collect_body_lexical_names(&body.body);
+
         // Swap compiler state -- push parent's locals + upvalues onto the
         // enclosing chain so nested functions can capture them transitively.
         let parent_chunk = std::mem::replace(&mut self.chunk, child_chunk);
@@ -3338,8 +3351,11 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::JumpIfTrue, line);
                 self.chunk.code.push(0);
                 self.chunk.code.push(0);
-                // Default value expression
+                // Default value expression (a direct eval here is in the
+                // parameter scope — mark it so var/function decls early-error).
+                self.chunk.emit_op(OpCode::BeginParamExpr, line);
                 self.compile_expr(&a.right)?;
+                self.chunk.emit_op(OpCode::EndParamExpr, line);
                 // Set the local
                 self.chunk.emit_op(OpCode::SetLocal, line);
                 self.chunk.code.push(i as u8);
@@ -3468,6 +3484,14 @@ impl<'a> Compiler<'a> {
         if is_async {
             child_chunk.flags |= ChunkFlags::ASYNC;
         }
+        // Binding names for direct-eval-in-parameter early errors. Arrows have no
+        // implicit `arguments`, so only explicit params / body lexicals collide.
+        let mut pnames: Vec<StringId> = Vec::new();
+        for p in params { collect_pattern_names(p, &mut pnames); }
+        child_chunk.param_names = pnames;
+        if let ArrowBody::Block(b) = body {
+            child_chunk.lexical_names = collect_body_lexical_names(&b.body);
+        }
 
         let parent_chunk = std::mem::replace(&mut self.chunk, child_chunk);
         let parent_locals = std::mem::take(&mut self.locals);
@@ -3539,7 +3563,9 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::JumpIfTrue, line);
                 self.chunk.code.push(0);
                 self.chunk.code.push(0);
+                self.chunk.emit_op(OpCode::BeginParamExpr, line);
                 self.compile_expr(&a.right)?;
+                self.chunk.emit_op(OpCode::EndParamExpr, line);
                 self.chunk.emit_op(OpCode::SetLocal, line);
                 self.chunk.code.push(i as u8);
                 self.chunk.emit_op(OpCode::Pop, line);
@@ -5500,6 +5526,50 @@ fn collect_binding_names_into(pat: &Pattern, out: &mut Vec<StringId>) {
 }
 
 /// Collect all `var` declaration names from a statement tree (for hoisting).
+/// Collect the identifier names bound by a parameter pattern (including
+/// destructuring and defaults), for direct-eval-in-parameter collision checks.
+fn collect_pattern_names(pat: &Pattern, out: &mut Vec<StringId>) {
+    match pat {
+        Pattern::Identifier(id) => out.push(id.name),
+        Pattern::Assignment(a) => collect_pattern_names(&a.left, out),
+        Pattern::Rest(r) => collect_pattern_names(&r.argument, out),
+        Pattern::Array(arr) => {
+            for el in arr.elements.iter().flatten() { collect_pattern_names(el, out); }
+        }
+        Pattern::Object(obj) => {
+            for prop in &obj.properties {
+                match prop {
+                    ObjectPatternProperty::Property { value, .. } => collect_pattern_names(value, out),
+                    ObjectPatternProperty::Rest(r) => collect_pattern_names(&r.argument, out),
+                }
+            }
+        }
+        Pattern::Member(_) => {}
+    }
+}
+
+/// Collect the top-level lexical (let/const/class) binding names of a function
+/// body — names a direct eval's var/function declaration may not redeclare.
+fn collect_body_lexical_names(body: &[Statement]) -> Vec<StringId> {
+    let mut out = Vec::new();
+    for stmt in body {
+        match stmt {
+            Statement::Variable(d) if matches!(d.kind, VarKind::Let | VarKind::Const) => {
+                for dec in &d.declarations { collect_pattern_names(&dec.id, &mut out); }
+            }
+            Statement::Class(c) => { if let Some(name) = c.id { out.push(name); } }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Collect all `var`-declared names in a statement list (recursing into nested
+/// statements but not into nested functions). Used for eval var-hoisting.
+pub(crate) fn collect_program_var_names(body: &[Statement], out: &mut Vec<StringId>) {
+    for stmt in body { collect_var_declarations(stmt, out); }
+}
+
 fn collect_var_declarations(stmt: &Statement, out: &mut Vec<StringId>) {
     match stmt {
         Statement::Variable(decl) if decl.kind == VarKind::Var => {
