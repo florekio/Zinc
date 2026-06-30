@@ -186,6 +186,34 @@ pub(crate) enum Microtask {
     },
 }
 
+/// Global opcode-execution histogram for profiling (ZINC_OPCODE_HIST=1).
+/// Indexed by opcode byte; aggregates across every VM instance in the process.
+pub static OPCODE_HIST: [std::sync::atomic::AtomicU64; 256] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 256];
+
+/// Dump the opcode histogram (most-executed first) to stderr. Call once at
+/// program end. Prints each opcode's count and share of total dispatched
+/// instructions, plus the grand total — the basis for instructions/sec.
+pub fn dump_opcode_histogram() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut rows: Vec<(u8, u64)> = (0..=255u8)
+        .map(|b| (b, OPCODE_HIST[b as usize].load(Relaxed)))
+        .filter(|&(_, c)| c > 0)
+        .collect();
+    let total: u64 = rows.iter().map(|&(_, c)| c).sum();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("=== opcode histogram (total dispatched: {total}) ===");
+    for (b, c) in rows {
+        let name = if crate::compiler::opcode::OpCode::is_valid(b) {
+            format!("{:?}", unsafe { std::mem::transmute::<u8, crate::compiler::opcode::OpCode>(b) })
+        } else {
+            format!("0x{b:02x}")
+        };
+        let pct = 100.0 * c as f64 / total as f64;
+        eprintln!("{c:>14}  {pct:5.1}%  {name}");
+    }
+}
+
 /// Inline cache entry for GetGlobal: (name_id, cached_value).
 /// Keyed by (chunk_idx, bytecode_offset).
 pub(crate) type GlobalIC = HashMap<(usize, usize), (StringId, Value)>;
@@ -3183,6 +3211,18 @@ impl Vm {
                 if *TRACE_IP.get_or_init(|| std::env::var("ZINC_TRACE_IP").is_ok_and(|v| v == "1")) {
                     let f = self.frames.last().unwrap();
                     eprintln!("[ip] chunk {} ip {} op 0x{byte:02x}", f.chunk_idx, f.ip - 1);
+                }
+            }
+            // Profiling: ZINC_OPCODE_HIST=1 tallies executed opcodes into a
+            // global histogram (dumped by the embedder via dump_opcode_histogram).
+            // One cached branch on the hot path when disabled.
+            {
+                static HIST_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *HIST_ON.get_or_init(|| {
+                    std::env::var("ZINC_OPCODE_HIST").is_ok_and(|v| v == "1")
+                        || std::env::var("ZINC_TIME").is_ok_and(|v| v == "1")
+                }) {
+                    OPCODE_HIST[byte as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             if !OpCode::is_valid(byte) {
