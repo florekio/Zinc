@@ -1128,7 +1128,23 @@ pub(crate) fn parse_object_pattern(p: &mut Parser) -> ParseResult<Pattern> {
             continue;
         }
 
-        let key_name = p.intern_current();
+        // A BigInt key in a destructuring pattern (`{ 1n: a }`) uses the BigInt's
+        // decimal string ("1"), not the raw token text ("1n").
+        let key_name = if p.at(TokenKind::BigInt) {
+            let text = p.current_text();
+            let stripped: String = text.trim_end_matches('n').chars().filter(|&c| c != '_').collect();
+            let (radix, digits) = match stripped.get(0..2) {
+                Some("0x") | Some("0X") => (16, &stripped[2..]),
+                Some("0o") | Some("0O") => (8, &stripped[2..]),
+                Some("0b") | Some("0B") => (2, &stripped[2..]),
+                _ => (10, stripped.as_str()),
+            };
+            let decimal = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)
+                .map(|b| b.to_string()).unwrap_or_else(|| stripped.clone());
+            p.interner.intern(&decimal)
+        } else {
+            p.intern_current()
+        };
         let key_span = p.current().span;
         p.advance(); // consume identifier (or keyword used as property)
 
