@@ -200,6 +200,14 @@ fn trace_calls_enabled() -> bool {
     *TRACE_CALLS.get_or_init(|| std::env::var("ZINC_TRACE_CALLS").is_ok())
 }
 
+/// Whether `ZINC_FUEL_TRACE` is set: enables the fuel-checkpoint sampling
+/// profiler that pinpoints a runaway loop when the step limit is hit.
+#[inline]
+fn fuel_trace_enabled() -> bool {
+    static FUEL_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FUEL_TRACE.get_or_init(|| std::env::var("ZINC_FUEL_TRACE").is_ok())
+}
+
 /// Dump the opcode histogram (most-executed first) to stderr. Call once at
 /// program end. Prints each opcode's count and share of total dispatched
 /// instructions, plus the grand total — the basis for instructions/sec.
@@ -342,6 +350,11 @@ pub struct Vm {
     pub(crate) steps: u64,
     /// Max instructions before returning an error. 0 = unlimited.
     pub(crate) max_steps: u64,
+    /// Sampling profiler for diagnosing runaway loops (ZINC_FUEL_TRACE=1): at
+    /// each fuel checkpoint (every 1024 instructions) the current (chunk_idx,
+    /// source line) is tallied. On fuel exhaustion the hottest sites are dumped
+    /// — they point straight at the spinning loop. Empty/unused when off.
+    pub(crate) fuel_samples: HashMap<(u32, u32), u64>,
     /// Private-method brand timing: instance oid → class-prototype oids whose
     /// private methods/accessors are NOT yet installed (the instance is still
     /// being constructed and `super()` for those derived levels hasn't returned).
@@ -918,6 +931,7 @@ impl Vm {
             computed_exclusions: Vec::new(),
             steps: 0,
             max_steps: 0,
+            fuel_samples: HashMap::new(),
         };
         vm.init_typed_arrays();
         vm
@@ -3128,6 +3142,32 @@ impl Vm {
         s.parse::<f64>().ok()
     }
 
+    /// Dump diagnostics when the fuel limit is hit (ZINC_FUEL_TRACE=1): the
+    /// current call-stack backtrace plus the hottest (chunk, line) sites from
+    /// the sampling profiler — the runaway loop is whatever sits at the top.
+    fn dump_fuel_trace(&self) {
+        eprintln!("=== fuel exhausted ({} steps); call stack (innermost last) ===", self.steps);
+        for (depth, f) in self.frames.iter().enumerate() {
+            let chunk = &self.chunks[f.chunk_idx];
+            let name = self.interner.resolve(chunk.name);
+            let line = chunk.get_line(f.ip as u32);
+            let name = if name.is_empty() { "<anonymous>" } else { name };
+            eprintln!("  #{depth:<2} chunk '{name}' (idx {}) line {line} ip {}", f.chunk_idx, f.ip);
+        }
+        let mut hot: Vec<_> = self.fuel_samples.iter().collect();
+        hot.sort_by(|a, b| b.1.cmp(a.1));
+        let total: u64 = self.fuel_samples.values().sum();
+        eprintln!("=== hottest sites (chunk idx : source line — sample share of {total} checkpoints) ===");
+        for entry in hot.iter().take(20) {
+            let (chunk_idx, line) = *entry.0;
+            let count = *entry.1;
+            let name = self.interner.resolve(self.chunks[chunk_idx as usize].name);
+            let name = if name.is_empty() { "<anonymous>" } else { name };
+            let pct = 100.0 * count as f64 / total.max(1) as f64;
+            eprintln!("  {count:>8} ({pct:4.1}%)  chunk {chunk_idx} '{name}' line {line}");
+        }
+    }
+
     // ---- Main execution loop ----------------------------------------------
 
     pub fn run(&mut self) -> Result<Value, VmError> {
@@ -3169,6 +3209,9 @@ impl Vm {
         // tipping point died with "execution limit exceeded", leaving globals
         // like `DDG.Pages.SERP` undefined.
         self.steps = 0;
+        if !self.fuel_samples.is_empty() {
+            self.fuel_samples.clear();
+        }
         // Fresh completion value per top-level run; Halt returns this.
         self.script_completion = Value::undefined();
         // Flatten the new chunk tree onto the existing chunks vec; the new
@@ -3306,9 +3349,21 @@ impl Vm {
             gc_counter = gc_counter.wrapping_add(1);
             if gc_counter & 0x3FF == 0 {
                 if self.heap.needs_gc() { self.collect_gc(); }
+                // Sampling profiler (ZINC_FUEL_TRACE=1): tally where we are at
+                // each checkpoint so a runaway loop can be located on exhaustion.
+                if fuel_trace_enabled() {
+                    if let Some(f) = self.frames.last() {
+                        let (ci, ip) = (f.chunk_idx, f.ip);
+                        let line = self.chunks[ci].get_line(ip as u32);
+                        *self.fuel_samples.entry((ci as u32, line)).or_insert(0) += 1;
+                    }
+                }
                 if self.max_steps > 0 {
                     self.steps += 1024;
                     if self.steps > self.max_steps {
+                        if fuel_trace_enabled() {
+                            self.dump_fuel_trace();
+                        }
                         return Err(VmError::RuntimeError("execution limit exceeded".into()));
                     }
                 }
