@@ -217,25 +217,45 @@ impl Vm {
         let (re, global) = self.regex_cache.get_or_compile(&pattern, &flags).ok()?;
 
         match method {
-            "replace" => {
-                let replacement = args
-                    .get(1)
-                    .map(|v| self.value_to_string(*v))
-                    .unwrap_or_default();
-                let result = if global {
+            "replace" | "replaceAll" => {
+                let repl = args.get(1).copied().unwrap_or(Value::undefined());
+                let do_all = global || method == "replaceAll";
+                if repl.is_function() {
+                    // Function replacement: call fn(match, p1..pN, offset, string)
+                    // per match and substitute the returned string.
+                    let mut out = String::new();
+                    let mut last_end = 0usize;
+                    for caps in re.captures_iter(s) {
+                        let caps = match caps { Ok(c) => c, Err(_) => break };
+                        let m0 = match caps.get(0) { Some(m) => m, None => continue };
+                        out.push_str(&s[last_end..m0.start()]);
+                        let mut cb_args: Vec<Value> = Vec::with_capacity(caps.len() + 2);
+                        for i in 0..caps.len() {
+                            cb_args.push(match caps.get(i) {
+                                Some(m) => Value::string(self.interner.intern(m.as_str())),
+                                None => Value::undefined(),
+                            });
+                        }
+                        cb_args.push(Value::int(m0.start() as i32));
+                        cb_args.push(Value::string(self.interner.intern(s)));
+                        let r = self
+                            .call_function_this(repl, Value::undefined(), &cb_args)
+                            .unwrap_or(Value::undefined());
+                        let rs = self.value_to_string(r);
+                        out.push_str(&rs);
+                        last_end = m0.end();
+                        if !do_all { break; }
+                    }
+                    out.push_str(&s[last_end..]);
+                    let id = self.interner.intern(&out);
+                    return Some(Value::string(id));
+                }
+                let replacement = self.value_to_string(repl);
+                let result = if do_all {
                     re.replace_all(s, replacement.as_str()).to_string()
                 } else {
                     re.replace(s, replacement.as_str()).to_string()
                 };
-                let id = self.interner.intern(&result);
-                Some(Value::string(id))
-            }
-            "replaceAll" => {
-                let replacement = args
-                    .get(1)
-                    .map(|v| self.value_to_string(*v))
-                    .unwrap_or_default();
-                let result = re.replace_all(s, replacement.as_str()).to_string();
                 let id = self.interner.intern(&result);
                 Some(Value::string(id))
             }
@@ -253,9 +273,7 @@ impl Vm {
                     if matches.is_empty() {
                         Some(Value::null())
                     } else {
-                        let arr = JsObject::array(matches);
-                        let oid = self.heap.allocate(arr);
-                        Some(Value::object_id(oid))
+                        Some(self.alloc_array(matches))
                     }
                 } else {
                     // Return single match result (like exec)
@@ -270,9 +288,7 @@ impl Vm {
                                     elements.push(Value::undefined());
                                 }
                             }
-                            let arr = JsObject::array(elements);
-                            let oid = self.heap.allocate(arr);
-                            Some(Value::object_id(oid))
+                            Some(self.alloc_array(elements))
                         }
                         None => Some(Value::null()),
                     }
@@ -293,9 +309,33 @@ impl Vm {
                         Value::string(id)
                     })
                     .collect();
-                let arr = JsObject::array(parts);
-                let oid = self.heap.allocate(arr);
-                Some(Value::object_id(oid))
+                Some(self.alloc_array(parts))
+            }
+            "matchAll" => {
+                // Return an array of match-result arrays (iterable via for-of).
+                // Spec returns an iterator; an array covers the common usage.
+                let mut results: Vec<Value> = Vec::new();
+                for caps in re.captures_iter(s) {
+                    let caps = match caps { Ok(c) => c, Err(_) => break };
+                    let mut elements = Vec::new();
+                    for i in 0..caps.len() {
+                        elements.push(match caps.get(i) {
+                            Some(m) => Value::string(self.interner.intern(m.as_str())),
+                            None => Value::undefined(),
+                        });
+                    }
+                    let mut arr = JsObject::array(elements);
+                    arr.prototype = Some(self.array_prototype);
+                    if let Some(m) = caps.get(0) {
+                        let idx_key = self.interner.intern("index");
+                        arr.set_property(idx_key, Value::int(m.start() as i32));
+                    }
+                    let input_key = self.interner.intern("input");
+                    let input_id = self.interner.intern(s);
+                    arr.set_property(input_key, Value::string(input_id));
+                    results.push(Value::object_id(self.heap.allocate(arr)));
+                }
+                Some(self.alloc_array(results))
             }
             _ => None,
         }

@@ -17,11 +17,13 @@ impl Vm {
         Value::string(self.interner.intern(s))
     }
 
-    /// Allocate a JS array from a `Vec<Value>`.
+    /// Allocate a JS array from a `Vec<Value>`. `Array.prototype` is linked so
+    /// the result is a proper array — `for…of` (which resolves `@@iterator`
+    /// through the prototype chain), spread, and the Array methods all work.
     pub fn alloc_array(&mut self, items: Vec<Value>) -> Value {
         let obj = JsObject {
             properties: Vec::new(),
-            prototype: None,
+            prototype: Some(self.array_prototype),
             kind: ObjectKind::Array(items),
             marked: false,
             extensible: true,

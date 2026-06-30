@@ -288,6 +288,13 @@ impl Vm {
                 }
                 Value::null()
             }
+            "matchAll" => {
+                if let Some(result) = self.exec_string_regex_method(s, &name, args) {
+                    return result;
+                }
+                // Non-regex / no matches: an empty (iterable) array.
+                self.alloc_array(vec![])
+            }
             "repeat" => {
                 let count = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
                 let result = s.repeat(count);
