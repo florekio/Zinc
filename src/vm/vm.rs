@@ -476,6 +476,9 @@ impl Vm {
         error_proto.define_property(message_key_ep, Property::with_flags(Value::string(empty_str_ep), Property::WRITABLE | Property::CONFIGURABLE));
         let constructor_key_ep = interner.intern("constructor");
         error_proto.define_property(constructor_key_ep, Property::with_flags(Value::function(-510), Property::WRITABLE | Property::CONFIGURABLE));
+        // Error.prototype.toString — `${name}: ${message}` (sentinel -598).
+        let err_tostr_key = interner.intern("toString");
+        error_proto.define_property(err_tostr_key, Property::with_flags(Value::function(-598), Property::WRITABLE | Property::CONFIGURABLE));
         let error_prototype_oid = heap.allocate(error_proto);
         func_prototypes.insert(-510i32, error_prototype_oid);
 
@@ -7041,19 +7044,32 @@ impl Vm {
                                 continue;
                             }
                             "toString" => {
-                                // Check for Error-like object: has `name` and `message` → "Name: message"
-                                let error_str = if let Some(o) = self.heap.get(oid) {
+                                // Error.prototype.toString: when the receiver inherits from
+                                // Error.prototype, return `${name}: ${message}` reading both
+                                // via the prototype chain (name defaults to "Error"). `name`
+                                // lives on Error.prototype, so an own-property check misses it.
+                                let is_error = self.func_prototypes.get(&-510).copied()
+                                    .map(|ep| {
+                                        let mut cur = self.heap.get(oid).and_then(|o| o.prototype);
+                                        while let Some(c) = cur {
+                                            if c == ep { return true; }
+                                            cur = self.heap.get(c).and_then(|o| o.prototype);
+                                        }
+                                        false
+                                    })
+                                    .unwrap_or(false);
+                                let error_str = if is_error {
                                     let name_key = self.interner.intern("name");
                                     let msg_key = self.interner.intern("message");
-                                    let name_v = o.get_property(name_key);
-                                    let msg_v = o.get_property(msg_key);
-                                    if let (Some(nv), Some(mv)) = (name_v, msg_v) {
-                                        let name_s = self.value_to_string(nv);
-                                        let msg_s = self.value_to_string(mv);
-                                        if !name_s.is_empty() {
-                                            Some(if msg_s.is_empty() { name_s } else { format!("{name_s}: {msg_s}") })
-                                        } else { None }
-                                    } else { None }
+                                    let name_s = self.heap.get_property_chain(oid, name_key)
+                                        .map(|v| self.value_to_string(v))
+                                        .unwrap_or_else(|| "Error".to_string());
+                                    let msg_s = self.heap.get_property_chain(oid, msg_key)
+                                        .map(|v| self.value_to_string(v))
+                                        .unwrap_or_default();
+                                    Some(if msg_s.is_empty() { name_s }
+                                         else if name_s.is_empty() { msg_s }
+                                         else { format!("{name_s}: {msg_s}") })
                                 } else { None };
                                 if let Some(s) = error_str {
                                     let id = self.interner.intern(&s);

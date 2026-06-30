@@ -1330,6 +1330,24 @@ impl Vm {
                 let s = self.interner.intern("[object Object]");
                 Value::string(s)
             }
+            -598 => { // Error.prototype.toString — `${name}: ${message}`
+                if let Some(oid) = this_val.as_object_id() {
+                    let name_key = self.interner.intern("name");
+                    let msg_key = self.interner.intern("message");
+                    let name_s = self.heap.get_property_chain(oid, name_key)
+                        .map(|v| self.value_to_string(v))
+                        .unwrap_or_else(|| "Error".to_string());
+                    let msg_s = self.heap.get_property_chain(oid, msg_key)
+                        .map(|v| self.value_to_string(v))
+                        .unwrap_or_default();
+                    let s = if msg_s.is_empty() { name_s }
+                            else if name_s.is_empty() { msg_s }
+                            else { format!("{name_s}: {msg_s}") };
+                    Value::string(self.interner.intern(&s))
+                } else {
+                    Value::string(self.interner.intern("Error"))
+                }
+            }
             -593 => { // Object.prototype.valueOf
                 this_val
             }
