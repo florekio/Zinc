@@ -6572,6 +6572,27 @@ impl Vm {
                         obj_val
                     };
 
+                    // Symbol primitive methods: Symbol.prototype.valueOf returns the
+                    // symbol (so `s == s.valueOf()`), toString returns "Symbol(desc)".
+                    if effective_val.is_symbol() {
+                        let mn = self.interner.resolve(method_name).to_owned();
+                        match mn.as_str() {
+                            "valueOf" => {
+                                self.truncate_stack(obj_pos);
+                                self.push(effective_val);
+                                continue;
+                            }
+                            "toString" => {
+                                let s = self.value_to_string(effective_val);
+                                let id = self.interner.intern(&s);
+                                self.truncate_stack(obj_pos);
+                                self.push(Value::string(id));
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // Check if the obj is a string (or ConsString) and dispatch string method
                     let string_for_method = if effective_val.is_string() {
                         let sid = effective_val.as_string_id().unwrap();

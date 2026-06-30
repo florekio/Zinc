@@ -1307,7 +1307,17 @@ impl<'a> Compiler<'a> {
         let line = s.span.start;
         // Switch completion starts at undefined; matched case bodies overwrite it.
         self.emit_completion_reset(line);
+        let outer_depth = self.scope_depth;
         self.compile_expr(&s.discriminant)?;
+        // The CaseBlock is its own lexical scope (let/const/class declared in a
+        // case are block-scoped to the switch, not leaked to the enclosing scope).
+        // The discriminant stays on the stack through the case bodies, so reserve a
+        // slot for it as an anonymous local — otherwise the first declared local
+        // would alias the discriminant's stack slot.
+        self.begin_scope();
+        let disc_slot_name = self.interner.intern("(switch discriminant)");
+        self.add_local(disc_slot_name);
+        self.mark_initialized();
 
         // Phase 1: emit comparisons.
         // For each non-default case, dup the discriminant, compile the test,
@@ -1341,7 +1351,9 @@ impl<'a> Compiler<'a> {
             continue_target: 0, // unused for switch
             break_patches: Vec::new(),
             continue_patches: Vec::new(),
-            scope_depth: self.scope_depth,
+            // `break` must pop the case-block locals AND the discriminant slot,
+            // so target the depth outside the switch's lexical scope.
+            scope_depth: outer_depth,
             label: None,
             has_deferred_continue: false,
             try_depth: self.finally_stack.len(),
@@ -1395,8 +1407,9 @@ impl<'a> Compiler<'a> {
             self.chunk.patch_jump(end_of_compare);
         }
 
-        // Pop the discriminant after all case bodies.
-        self.chunk.emit_op(OpCode::Pop, line);
+        // End the case-block scope: pops all case-declared locals and the
+        // discriminant slot reserved above (fall-through / no-match path).
+        self.end_scope();
 
         self.patch_loop_breaks();
         Ok(())
