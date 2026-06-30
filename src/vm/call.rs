@@ -50,8 +50,6 @@ impl Vm {
         self.call_function_this(func_val, this_value, args)
     }
 
-    /// Call a closure with a specific `this` binding.
-
     /// Build a bound-function object over `target` (a function value —
     /// sentinel, packed bytecode closure, or function object), per
     /// Function.prototype.bind. Shared by the named `.bind(...)` method

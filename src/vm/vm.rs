@@ -695,8 +695,8 @@ impl Vm {
                         // it reads .source / .flags off any receiver —
                         // core-js feature-tests exactly this with a plain
                         // {source, flags} object.
-                        if name == "toString" {
-                            if let Some(roid) = this.as_object_id() {
+                        if name == "toString"
+                            && let Some(roid) = this.as_object_id() {
                                 let source_key = vm.interner.intern("source");
                                 let flags_key = vm.interner.intern("flags");
                                 let src = vm.heap.get_property_chain(roid, source_key)
@@ -708,7 +708,6 @@ impl Vm {
                                 let s = format!("/{src}/{flg}");
                                 return Ok(Value::string(vm.interner.intern(&s)));
                             }
-                        }
                         let repr = vm.value_to_string(this);
                         let msg = format!("RegExp.prototype.{name} called on incompatible receiver ({repr})");
                         return Err(vm.make_native_error("TypeError", &msg));
@@ -1927,7 +1926,7 @@ impl Vm {
                     Value::object_id(self.heap.allocate(arr))
                 } else { Value::undefined() }
             }
-            "assign" => self.exec_object_assign(&args),
+            "assign" => self.exec_object_assign(args),
             "create" => {
                 let proto = args.first().copied().unwrap_or(Value::null());
                 let mut obj = JsObject::ordinary();
@@ -1950,7 +1949,7 @@ impl Vm {
                 }
                 Value::object_id(self.heap.allocate(obj))
             }
-            "defineProperty" => self.object_define_property(&args),
+            "defineProperty" => self.object_define_property(args),
             "defineProperties" => {
                 // Simplified: treat like Object.assign for now
                 args.first().copied().unwrap_or(Value::undefined())
@@ -2980,8 +2979,8 @@ impl Vm {
                 let f = self.frames.last().unwrap();
                 let c = &self.chunks[f.chunk_idx];
                 let name = self.interner.resolve(c.name);
-                let lo = (f.ip as usize).saturating_sub(20);
-                let hi = (f.ip as usize + 10).min(c.code.len());
+                let lo = f.ip.saturating_sub(20);
+                let hi = (f.ip + 10).min(c.code.len());
                 panic!(
                     "invalid opcode 0x{byte:02x} in chunk {} '{}' at ip {} (code len {}); bytes[{lo}..{hi}] = {:02x?}",
                     f.chunk_idx, name, f.ip - 1, c.code.len(), &c.code[lo..hi]
@@ -5391,11 +5390,10 @@ impl Vm {
                         // `globalThis.Array` / `global[name]` resolve the
                         // engine builtins — core-js reads every primordial
                         // this way (`i[t].prototype[e]`).
-                        if val.is_undefined() && oid == self.global_this_oid {
-                            if let Some(&g) = self.globals.get(&name_id) {
+                        if val.is_undefined() && oid == self.global_this_oid
+                            && let Some(&g) = self.globals.get(&name_id) {
                                 val = g;
                             }
-                        }
                         self.push(val);
                     } else if obj_val.is_string() {
                         // String property/method access
@@ -5951,11 +5949,10 @@ impl Vm {
                             // globalThis proxies misses to the globals map
                             // (same as the dot-access path) — core-js reads
                             // primordials as `global[name]`.
-                            if val.is_undefined() && oid == self.global_this_oid {
-                                if let Some(&g) = self.globals.get(&name_id) {
+                            if val.is_undefined() && oid == self.global_this_oid
+                                && let Some(&g) = self.globals.get(&name_id) {
                                     val = g;
                                 }
-                            }
                             self.push(val);
                             continue;
                         }
