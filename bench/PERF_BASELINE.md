@@ -87,3 +87,34 @@ errors (`$ undefined`, etc.). So Phase 1 (~2–3×) helps but won't render the
 SERP by itself; the function-JIT (Phase 3) is required for the lighthouse.
 Phase 1+2 are still worth doing first: broad wins for every page, lower risk,
 and they de-risk the JIT work.
+
+## Phase 1 results (interpreter tuning) — recalibrated
+
+Measurement-driven. A CPU sample (macOS `sample`) of `strings.js` showed the
+time is **spread across the inlined opcode handlers inside `run_until`** (one
+mega-function), with non-inlined leaves (`malloc`/`free`/`memmove`,
+`Interner::intern`, SipHash `Hasher::write`) only ~5–15% combined — i.e. the
+cost is fundamental per-op work + allocation churn, not one hot call.
+
+Applied (safe, zero-risk, kept):
+- **FxHash interner** (was SipHash): the interner is on the hot path of every
+  string op; FxHash is the right choice for a non-adversarial engine map.
+- **Hoisted the per-instruction debug/profiling `OnceLock` loads** out of the
+  dispatch loop (resolved once at `run_until` entry).
+
+Measured delta: only **~2–4%** combined (decode 0.83→0.81s, strings 6.82→6.67s,
+numeric 3.22→3.13s). Investigated but **not** pursued (poor risk/reward):
+- Removing the per-op `ip >= code.len()` implicit-return check — would save a
+  few lookups/op but relies on a guaranteed trailing terminator; `get_unchecked`
+  makes a missing one UB. Not worth it.
+- `Add`/string concat already uses deferred `ConsString` (not O(n²)); its cost
+  is one heap allocation per `+` (10M+ for the string loop) — a string-builder /
+  small-string optimization would help but is a real representation change.
+
+**Conclusion / plan recalibration:** the interpreter is already well-tuned
+(unchecked reads, GetProperty inline cache, deferred ConsString). Safe
+interpreter micro-opts top out around **1.2–1.5×**, not the 2–3× originally
+hoped. Combined with the dormant-JIT finding, the real lever is **Phase 3
+(extend the JIT to hot functions)**. Recommendation: bank these small wins and
+move effort to Phase 3; the decode lighthouse needs JIT-level throughput to run
+in budget.

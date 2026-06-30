@@ -1,22 +1,65 @@
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 /// An interned string identifier. Comparison is O(1).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct StringId(pub u32);
+
+/// FxHash — the fast, non-cryptographic hash rustc itself uses. The default
+/// `HashMap` hasher is SipHash (DoS-resistant but slow); the interner is on the
+/// hot path of *every* string operation (each string value is interned), and
+/// has no adversarial-input concern, so a fast hash is a large win. ~5–10×
+/// faster than SipHash for the short keys the interner sees.
+#[derive(Default)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        while bytes.len() >= 8 {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[..8]);
+            self.add(u64::from_le_bytes(buf));
+            bytes = &bytes[8..];
+        }
+        if !bytes.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            self.add(u64::from_le_bytes(buf));
+        }
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 /// String interner: maps strings to unique `StringId` values.
 /// All identifier names, property keys, and string literals go through here.
 ///
 /// StringId(0) is always the empty string "".
 pub struct Interner {
-    map: HashMap<String, StringId>,
+    map: HashMap<Box<str>, StringId, FxBuildHasher>,
     strings: Vec<String>,
 }
 
 impl Interner {
     pub fn new() -> Self {
         let mut interner = Self {
-            map: HashMap::new(),
+            map: HashMap::default(),
             strings: Vec::new(),
         };
         // Reserve id 0 for empty string (falsy in JS)
@@ -32,7 +75,7 @@ impl Interner {
         }
         let id = StringId(self.strings.len() as u32);
         self.strings.push(s.to_owned());
-        self.map.insert(s.to_owned(), id);
+        self.map.insert(Box::from(s), id);
         id
     }
 

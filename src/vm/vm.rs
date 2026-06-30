@@ -3164,6 +3164,20 @@ impl Vm {
     /// Used by `call_function_this` to execute callbacks using the full dispatch loop.
     pub(crate) fn run_until(&mut self, stop_depth: usize) -> Result<Value, VmError> {
         let mut gc_counter: u32 = 0;
+        // Resolve the per-instruction debug/profiling switches ONCE here rather
+        // than doing an atomic OnceLock load on every dispatched opcode — these
+        // are off in normal runs and were measurable per-op overhead.
+        let trace_ip = {
+            static TRACE_IP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *TRACE_IP.get_or_init(|| std::env::var("ZINC_TRACE_IP").is_ok_and(|v| v == "1"))
+        };
+        let hist_on = {
+            static HIST_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *HIST_ON.get_or_init(|| {
+                std::env::var("ZINC_OPCODE_HIST").is_ok_and(|v| v == "1")
+                    || std::env::var("ZINC_TIME").is_ok_and(|v| v == "1")
+            })
+        };
         loop {
             // GC safepoint + fuel check (every 1024 instructions)
             gc_counter = gc_counter.wrapping_add(1);
@@ -3203,27 +3217,13 @@ impl Vm {
             }
 
             let byte = self.read_byte();
-            // Embedder-controlled trace: ZINC_TRACE_IP=1 dumps every
-            // (chunk, ip, opcode) step. Cached so the hot path pays one
-            // branch, not an env lookup per instruction.
-            {
-                static TRACE_IP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *TRACE_IP.get_or_init(|| std::env::var("ZINC_TRACE_IP").is_ok_and(|v| v == "1")) {
-                    let f = self.frames.last().unwrap();
-                    eprintln!("[ip] chunk {} ip {} op 0x{byte:02x}", f.chunk_idx, f.ip - 1);
-                }
+            // Debug/profiling, gated by switches resolved once at loop entry.
+            if trace_ip {
+                let f = self.frames.last().unwrap();
+                eprintln!("[ip] chunk {} ip {} op 0x{byte:02x}", f.chunk_idx, f.ip - 1);
             }
-            // Profiling: ZINC_OPCODE_HIST=1 tallies executed opcodes into a
-            // global histogram (dumped by the embedder via dump_opcode_histogram).
-            // One cached branch on the hot path when disabled.
-            {
-                static HIST_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *HIST_ON.get_or_init(|| {
-                    std::env::var("ZINC_OPCODE_HIST").is_ok_and(|v| v == "1")
-                        || std::env::var("ZINC_TIME").is_ok_and(|v| v == "1")
-                }) {
-                    OPCODE_HIST[byte as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+            if hist_on {
+                OPCODE_HIST[byte as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if !OpCode::is_valid(byte) {
                 // A mid-instruction landing means corrupted control flow
