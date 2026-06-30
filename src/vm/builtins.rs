@@ -30,6 +30,69 @@ impl Vm {
         Value::object_id(oid)
     }
 
+    /// Fast path for cheap indexing methods (`charAt`/`charCodeAt`/`substr`) on
+    /// an **interned ASCII** receiver. The generic dispatch clones the whole
+    /// receiver into an owned `String` (a borrow-checker workaround so the
+    /// method body can call `&mut self`); here we instead read only the small
+    /// *result* out of the borrowed `&str`, drop the borrow, then materialize
+    /// it — so a `charAt` on an 88-char string no longer copies 88 bytes.
+    ///
+    /// Returns `None` (fall through to the generic path) for any other method
+    /// or a non-ASCII receiver. Semantics mirror `exec_string_method` exactly.
+    #[inline]
+    pub(crate) fn try_fast_string_index_method(
+        &mut self,
+        rid: StringId,
+        method_name: StringId,
+        arg0: Option<f64>,
+        arg1: Option<f64>,
+    ) -> Option<Value> {
+        if !self.interner.is_ascii(rid) {
+            return None;
+        }
+        let kind = match self.interner.resolve(method_name) {
+            "charAt" => 1u8,
+            "charCodeAt" => 2,
+            "substr" => 3,
+            _ => return None,
+        };
+        enum R {
+            Num(f64),
+            Str(String),
+        }
+        // Borrow ends with this block; only the (small) result escapes.
+        let r = {
+            let s = self.interner.resolve(rid);
+            let b = s.as_bytes();
+            let n = b.len();
+            match kind {
+                1 => {
+                    let i = arg0.unwrap_or(0.0) as usize;
+                    R::Str(if i < n { s[i..i + 1].to_owned() } else { String::new() })
+                }
+                2 => {
+                    let i = arg0.unwrap_or(0.0) as usize;
+                    R::Num(if i < n { b[i] as f64 } else { f64::NAN })
+                }
+                _ => {
+                    let len = n as i32;
+                    let mut start = arg0.unwrap_or(0.0) as i32;
+                    if start < 0 {
+                        start = (start + len).max(0);
+                    }
+                    let start = start.min(len) as usize;
+                    let length = arg1.map(|x| x as i32).unwrap_or(len - start as i32).max(0) as usize;
+                    let end = (start + length).min(n);
+                    R::Str(s[start..end].to_owned())
+                }
+            }
+        };
+        Some(match r {
+            R::Num(x) => Value::number(x),
+            R::Str(st) => self.new_str(&st),
+        })
+    }
+
     // ---- String method dispatch ----
     pub(crate) fn exec_string_method(&mut self, s: &str, method_name: StringId, args: &[Value], ascii: bool) -> Value {
         let name = self.interner.resolve(method_name).to_owned();

@@ -7204,6 +7204,17 @@ impl Vm {
                         }
                     }
 
+                    // Fast path: charAt/charCodeAt/substr on an interned ASCII
+                    // receiver, avoiding the full-receiver clone below.
+                    if let Some(rid) = effective_val.as_string_id() {
+                        let arg0 = (argc >= 1).then(|| self.stack[obj_pos + 1].as_number()).flatten();
+                        let arg1 = (argc >= 2).then(|| self.stack[obj_pos + 2].as_number()).flatten();
+                        if let Some(result) = self.try_fast_string_index_method(rid, method_name, arg0, arg1) {
+                            self.truncate_stack(obj_pos);
+                            self.push(result);
+                            continue;
+                        }
+                    }
                     // Check if the obj is a string (or ConsString) and dispatch string method
                     let string_for_method = if self.is_string_like(effective_val) {
                         Some(self.value_to_string(effective_val))
