@@ -3898,11 +3898,24 @@ impl<'a> Compiler<'a> {
                         }
                     }
                     MemberProperty::Expression(key) => {
-                        self.compile_expr(key)?;
-                        self.chunk.emit_op(OpCode::Dup2, line);
-                        self.chunk.emit_op(OpCode::GetElement, line);
-                        self.chunk.emit_op(inc_op, line);
-                        self.chunk.emit_op(OpCode::SetElement, line);
+                        self.compile_expr(key)?;              // [obj, key]
+                        if u.prefix {
+                            self.chunk.emit_op(OpCode::Dup2, line);       // [obj, key, obj, key]
+                            self.chunk.emit_op(OpCode::GetElement, line); // [obj, key, old]
+                            self.chunk.emit_op(inc_op, line);             // [obj, key, new]
+                            self.chunk.emit_op(OpCode::SetElement, line); // [new]
+                        } else {
+                            // postfix: result is ToNumeric(old); store old±1.
+                            self.chunk.emit_op(OpCode::Dup2, line);       // [obj, key, obj, key]
+                            self.chunk.emit_op(OpCode::GetElement, line); // [obj, key, old]
+                            self.chunk.emit_op(OpCode::ToNumeric, line);  // [obj, key, n]
+                            self.chunk.emit_op(OpCode::Rot3, line);       // [n, obj, key]
+                            self.chunk.emit_op(OpCode::Dup2, line);       // [n, obj, key, obj, key]
+                            self.chunk.emit_op(OpCode::GetElement, line); // [n, obj, key, old]
+                            self.chunk.emit_op(inc_op, line);             // [n, obj, key, new]
+                            self.chunk.emit_op(OpCode::SetElement, line); // [n, new]
+                            self.chunk.emit_op(OpCode::Pop, line);        // [n]
+                        }
                     }
                     _ => {
                         self.chunk.emit_op(OpCode::Undefined, line);

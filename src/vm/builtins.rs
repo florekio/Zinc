@@ -1224,13 +1224,20 @@ impl Vm {
                     let prim_key = self.interner.intern("__primitive__");
                     obj.set_property(prim_key, arg);
                 }
-                // Symbol wrappers chain to Symbol.prototype so
-                // `Object(sym) instanceof Symbol` holds — part of
-                // core-js's NATIVE_SYMBOL detection; failing it swaps in
-                // the full Symbol shim (which replaces defineProperty
-                // globally and cascades).
-                if arg.is_symbol() {
-                    obj.prototype = Some(self.symbol_prototype_oid());
+                // Chain the wrapper to its primitive's prototype so the inherited
+                // valueOf/toString unwrap it (`Object(1) + 0` === 1) and
+                // `Object(x) instanceof Ctor` holds.
+                let proto_sentinel = if arg.as_bool().is_some() { Some(-506) }
+                    else if arg.is_int() || arg.is_number() { Some(-505) }
+                    else if arg.is_string() || self.is_cons_string(arg) { Some(-504) }
+                    else if arg.is_symbol() { Some(-570) }
+                    else { None };
+                if let Some(s) = proto_sentinel {
+                    let proto = match s {
+                        -570 => self.symbol_prototype_oid(),
+                        _ => self.func_prototypes.get(&s).copied().unwrap_or(self.object_prototype),
+                    };
+                    obj.prototype = Some(proto);
                 }
                 Value::object_id(self.heap.allocate(obj))
             }
@@ -1421,17 +1428,8 @@ impl Vm {
             }
             // Boolean.prototype.toString / valueOf — unwrap a Boolean primitive or wrapper.
             -630 | -631 => {
-                let inner = if this_val.is_boolean() {
-                    this_val
-                } else if let Some(oid) = this_val.as_object_id()
-                    && let Some(obj) = self.heap.get(oid)
-                    && let ObjectKind::Wrapper(v) = &obj.kind
-                    && v.is_boolean()
-                {
-                    *v
-                } else {
-                    return Value::undefined();
-                };
+                let inner = self.unwrap_wrapper_primitive(this_val, |v| v.is_boolean());
+                let Some(inner) = inner else { return Value::undefined(); };
                 if sentinel == -630 {
                     let s = if inner.to_boolean() { "true" } else { "false" };
                     Value::string(self.interner.intern(s))
@@ -1441,17 +1439,8 @@ impl Vm {
             }
             // Number.prototype.toString / valueOf — unwrap a Number primitive or wrapper.
             -632 | -633 => {
-                let inner = if this_val.is_int() || this_val.is_number() {
-                    this_val
-                } else if let Some(oid) = this_val.as_object_id()
-                    && let Some(obj) = self.heap.get(oid)
-                    && let ObjectKind::Wrapper(v) = &obj.kind
-                    && (v.is_int() || v.is_number())
-                {
-                    *v
-                } else {
-                    return Value::undefined();
-                };
+                let inner = self.unwrap_wrapper_primitive(this_val, |v| v.is_int() || v.is_number());
+                let Some(inner) = inner else { return Value::undefined(); };
                 if sentinel == -632 {
                     let s = self.value_to_string(inner);
                     Value::string(self.interner.intern(&s))
@@ -1461,17 +1450,8 @@ impl Vm {
             }
             // String.prototype.toString / valueOf — unwrap a String primitive or wrapper.
             -634 | -635 => {
-                if this_val.is_string() {
-                    this_val
-                } else if let Some(oid) = this_val.as_object_id()
-                    && let Some(obj) = self.heap.get(oid)
-                    && let ObjectKind::Wrapper(v) = &obj.kind
-                    && v.is_string()
-                {
-                    *v
-                } else {
-                    Value::undefined()
-                }
+                self.unwrap_wrapper_primitive(this_val, |v| v.is_string())
+                    .unwrap_or(Value::undefined())
             }
             // Array.prototype methods: dispatch via exec_array_method using this_val as array
             sentinel if (-629..=-600).contains(&sentinel) => {
@@ -1499,6 +1479,22 @@ impl Vm {
     }
 
     /// Check if a value is a String wrapper object.
+    /// Unwrap a primitive-wrapper receiver to its inner primitive when it
+    /// matches `want`. Handles both the `Wrapper` kind (`new Number(1)`) and the
+    /// legacy `__primitive__`-property form (`Object(1)`); a bare matching
+    /// primitive is returned as-is.
+    pub(crate) fn unwrap_wrapper_primitive(&mut self, this_val: Value, want: fn(Value) -> bool) -> Option<Value> {
+        if want(this_val) { return Some(this_val); }
+        let oid = this_val.as_object_id()?;
+        if let Some(obj) = self.heap.get(oid)
+            && let ObjectKind::Wrapper(v) = &obj.kind
+        {
+            return if want(*v) { Some(*v) } else { None };
+        }
+        let prim_key = self.interner.intern("__primitive__");
+        self.heap.get(oid).and_then(|o| o.get_property(prim_key)).filter(|v| want(*v))
+    }
+
     pub(crate) fn is_string_wrapper(&self, val: Value) -> bool {
         if let Some(oid) = val.as_object_id()
             && let Some(obj) = self.heap.get(oid)
@@ -1566,7 +1562,7 @@ impl Vm {
             {
                 let hint = self.interner.intern(hint_str);
                 let result = self.call_function_this(tp_fn, val, &[Value::string(hint)])?;
-                if !result.is_object() { return Ok(result); }
+                if !result.is_object() || self.is_bigint(result) { return Ok(result); }
                 // @@toPrimitive returning an object always throws.
                 let err = self.make_native_error("TypeError", "Cannot convert object to primitive value");
                 return Err(super::vm::VmError::Throw(err));
@@ -1583,7 +1579,7 @@ impl Vm {
             {
                 tried_method = true;
                 let result = self.call_function_this(fn1, val, &[])?;
-                if !result.is_object() { return Ok(result); }
+                if !result.is_object() || self.is_bigint(result) { return Ok(result); }
             }
             let second_key = self.interner.intern(try_second);
             if let Some(fn2) = self.heap.get_property_chain(oid, second_key)
@@ -1591,7 +1587,7 @@ impl Vm {
             {
                 tried_method = true;
                 let result = self.call_function_this(fn2, val, &[])?;
-                if !result.is_object() { return Ok(result); }
+                if !result.is_object() || self.is_bigint(result) { return Ok(result); }
             }
             // Both methods returned objects (or weren't callable in a way that produced
             // a primitive) — per spec, OrdinaryToPrimitive throws TypeError.

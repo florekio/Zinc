@@ -1638,6 +1638,11 @@ impl Vm {
             let sb = self.flatten_cons_to_string(b);
             return Ok(str_cmp(&sa, &sb));
         }
+        // A Symbol operand has no relational ordering — ToNumeric throws.
+        if a.is_symbol() || b.is_symbol() {
+            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+            return Err(VmError::Throw(err));
+        }
         // BigInt relational comparison (mathematical, mixes with Number/String).
         // An unparseable BigInt-vs-String or a NaN operand makes the result false.
         if self.is_bigint(a) || self.is_bigint(b) {
@@ -3622,6 +3627,12 @@ impl Vm {
                     } else { b_val };
                     if b_val.is_symbol() {
                         let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+                        self.handle_throw(err)?;
+                        continue;
+                    }
+                    // BigInts have no unsigned right shift; any BigInt operand throws.
+                    if self.is_bigint(a_val) || self.is_bigint(b_val) {
+                        let err = self.make_native_error("TypeError", "BigInts have no unsigned right shift, use >> instead");
                         self.handle_throw(err)?;
                         continue;
                     }
@@ -11028,7 +11039,9 @@ pub(crate) fn string_to_bigint(s: &str) -> Option<num_bigint::BigInt> {
         b'+' => (false, &t[1..]),
         _ => (false, t),
     };
-    // A sign is not allowed together with a radix prefix.
+    // Only one sign is permitted; the remaining body must be plain digits
+    // (parse_bytes would otherwise accept a second leading sign like "++0").
+    if body.starts_with(['+', '-']) { return None; }
     let v = parse_bigint_literal(body)?;
     Some(if neg { -v } else { v })
 }
