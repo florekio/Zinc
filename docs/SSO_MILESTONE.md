@@ -61,3 +61,26 @@ risk is the ~30 `as_string_id().unwrap()` sites. They fall into two classes:
 
 `bench/decode.js` throughput up (target: beat the 0.78s interned baseline) with
 test262 net ≥ 0. Interner growth on decode drops toward zero.
+
+## Results (all phases shipped)
+
+- **test262 unchanged at 14982** across A/B/C — net zero, as required.
+- **decode.js: 0.78s → 0.75s, ~49M → ~54M ops/sec** (~8%). Modest because the
+  *dominant* decode cost is `charAt`/`substr` on the long receiver string
+  (O(n) per access), which SSO does not touch — that needs O(1) string
+  indexing, a separate milestone. SSO removed the per-result allocations.
+- **Interner growth on decode halved (40k → 20k).** The residual 20k is
+  `String(consArg)` interning the unique per-iteration argument once so the
+  loop's repeated `charAt` resolves in O(1) — a deliberate trade, not waste.
+
+## Lesson: the embedder string-reading surface
+
+test262 exercises the **language**, not the **embedder API**. A regression hid
+in `Vm::string_content` (the DOM bindings' `read_str`): it gated on
+`as_string_id().is_some()`, which is false for inline strings, so it returned
+`None` and `__addEventListener` silently dropped React's `"click"` listener
+(the event name is derived via `slice(2).toLowerCase()` → a 5-byte inline
+string). test262 stayed green; the **React smoke caught it**. When changing the
+`Value` representation, audit the public `Vm` methods embedders call (and
+`as_string_id().is_some()/.is_none()`, not just `.unwrap()`), and run the
+real-page smokes — they cover what test262 structurally cannot.
