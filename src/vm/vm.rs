@@ -2789,6 +2789,21 @@ impl Vm {
         val.is_string() || self.is_cons_string(val) || self.is_flat_string(val)
     }
 
+    /// Whether a string value's content is all-ASCII, enabling O(1) byte-indexed
+    /// codepoint access in string methods. Interned strings use the cached flag;
+    /// inline strings check their (≤5) bytes; ConsStrings conservatively return
+    /// false (the slow char-walk path stays correct).
+    #[inline]
+    pub(crate) fn string_is_ascii(&self, val: Value) -> bool {
+        if let Some(inl) = val.as_inline_string() {
+            inl.as_str().is_ascii()
+        } else if let Some(id) = val.as_string_id() {
+            self.interner.is_ascii(id)
+        } else {
+            false
+        }
+    }
+
     /// True if `val` is a non-interned flat heap string (ObjectKind::FlatString).
     pub(crate) fn is_flat_string(&self, val: Value) -> bool {
         val.as_object_id()
@@ -2821,7 +2836,7 @@ impl Vm {
         if let Some(inl) = val.as_inline_string() {
             inl.as_str().chars().count() as u32
         } else if let Some(id) = val.as_string_id() {
-            self.interner.resolve(id).chars().count() as u32
+            self.interner.char_len(id)
         } else if let Some(oid) = val.as_object_id()
             && let Some(obj) = self.heap.get(oid) {
             match &obj.kind {
@@ -6537,27 +6552,35 @@ impl Vm {
                         Some(self.value_to_string(obj_val))
                     } else { None };
                     if let Some(s) = string_val_opt {
+                        let ascii = self.string_is_ascii(obj_val);
                         if let Some(i) = key.as_int() {
-                            if i >= 0
-                                && let Some(ch) = s.chars().nth(i as usize) {
+                            if i >= 0 {
+                                let i = i as usize;
+                                if ascii {
+                                    if i < s.len() { let v = self.new_str(&s[i..i + 1]); self.push(v); continue; }
+                                } else if let Some(ch) = s.chars().nth(i) {
                                     let mut buf = [0u8; 4];
                                     let v = self.new_str(ch.encode_utf8(&mut buf));
                                     self.push(v);
                                     continue;
                                 }
+                            }
                         } else if let Some(idx) = key.as_number() {
                             let i = idx as usize;
-                            if idx >= 0.0 && idx.fract() == 0.0
-                                && let Some(ch) = s.chars().nth(i) {
+                            if idx >= 0.0 && idx.fract() == 0.0 {
+                                if ascii {
+                                    if i < s.len() { let v = self.new_str(&s[i..i + 1]); self.push(v); continue; }
+                                } else if let Some(ch) = s.chars().nth(i) {
                                     let mut buf = [0u8; 4];
                                     let v = self.new_str(ch.encode_utf8(&mut buf));
                                     self.push(v);
                                     continue;
                                 }
+                            }
                         } else if let Some(name_id) = key.as_string_id() {
                             let name = self.interner.resolve(name_id);
                             if name == "length" {
-                                self.push(Value::int(s.chars().count() as i32));
+                                self.push(Value::int(self.string_char_len(obj_val) as i32));
                                 continue;
                             }
                         }
@@ -7179,8 +7202,9 @@ impl Vm {
                         None
                     };
                     if let Some(s) = string_for_method {
+                        let ascii = self.string_is_ascii(effective_val);
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                        let result = self.exec_string_method(&s, method_name, &args);
+                        let result = self.exec_string_method(&s, method_name, &args, ascii);
                         self.truncate_stack(obj_pos);
                         self.push(result);
                         continue;

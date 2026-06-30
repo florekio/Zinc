@@ -51,9 +51,19 @@ type FxBuildHasher = BuildHasherDefault<FxHasher>;
 /// All identifier names, property keys, and string literals go through here.
 ///
 /// StringId(0) is always the empty string "".
+/// Per-string metadata computed once at intern time. `is_ascii` enables O(1)
+/// codepoint indexing (`charAt`/`charCodeAt`/`substr`) since for an all-ASCII
+/// string byte index == char index; `char_len` makes `.length` O(1).
+#[derive(Clone, Copy)]
+struct StrInfo {
+    char_len: u32,
+    is_ascii: bool,
+}
+
 pub struct Interner {
     map: HashMap<Box<str>, StringId, FxBuildHasher>,
     strings: Vec<String>,
+    info: Vec<StrInfo>,
 }
 
 impl Interner {
@@ -61,6 +71,7 @@ impl Interner {
         let mut interner = Self {
             map: HashMap::default(),
             strings: Vec::new(),
+            info: Vec::new(),
         };
         // Reserve id 0 for empty string (falsy in JS)
         interner.intern("");
@@ -74,7 +85,10 @@ impl Interner {
             return id;
         }
         let id = StringId(self.strings.len() as u32);
+        let is_ascii = s.is_ascii();
+        let char_len = if is_ascii { s.len() } else { s.chars().count() } as u32;
         self.strings.push(s.to_owned());
+        self.info.push(StrInfo { char_len, is_ascii });
         self.map.insert(Box::from(s), id);
         id
     }
@@ -82,6 +96,19 @@ impl Interner {
     /// Resolve a StringId back to its string.
     pub fn resolve(&self, id: StringId) -> &str {
         &self.strings[id.0 as usize]
+    }
+
+    /// Codepoint length of an interned string, O(1) (cached at intern time).
+    #[inline]
+    pub fn char_len(&self, id: StringId) -> u32 {
+        self.info[id.0 as usize].char_len
+    }
+
+    /// Whether an interned string is all-ASCII, O(1). Enables byte-indexed
+    /// codepoint access.
+    #[inline]
+    pub fn is_ascii(&self, id: StringId) -> bool {
+        self.info[id.0 as usize].is_ascii
     }
 
     /// Number of interned strings.

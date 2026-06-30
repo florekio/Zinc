@@ -31,16 +31,23 @@ impl Vm {
     }
 
     // ---- String method dispatch ----
-    pub(crate) fn exec_string_method(&mut self, s: &str, method_name: StringId, args: &[Value]) -> Value {
+    pub(crate) fn exec_string_method(&mut self, s: &str, method_name: StringId, args: &[Value], ascii: bool) -> Value {
         let name = self.interner.resolve(method_name).to_owned();
         match name.as_str() {
             "charAt" => {
                 let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                if ascii {
+                    // byte index == char index for ASCII → O(1), no chars() walk
+                    return if idx < s.len() { self.new_str(&s[idx..idx + 1]) } else { self.new_str("") };
+                }
                 let ch = s.chars().nth(idx).map(|c| c.to_string()).unwrap_or_default();
                 self.new_str(&ch)
             }
             "charCodeAt" => {
                 let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                if ascii {
+                    return if idx < s.len() { Value::number(s.as_bytes()[idx] as f64) } else { Value::number(f64::NAN) };
+                }
                 let code = s.chars().nth(idx).map(|c| c as u32 as f64).unwrap_or(f64::NAN);
                 Value::number(code)
             }
@@ -49,6 +56,10 @@ impl Vm {
                 let from = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0).max(0.0) as usize;
                 if from >= s.len() {
                     return Value::int(if search.is_empty() { s.len() as i32 } else { -1 });
+                }
+                if ascii {
+                    // char index == byte index → slice directly, no chars() walk
+                    return Value::int(s[from..].find(&search).map(|i| (from + i) as i32).unwrap_or(-1));
                 }
                 let sub: String = s.chars().skip(from).collect();
                 let pos = sub.find(&search).map(|i| {
@@ -66,18 +77,26 @@ impl Vm {
                 let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
                 let from = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0).max(0.0) as usize;
                 if from >= s.len() { return Value::boolean(search.is_empty()); }
+                if ascii { return Value::boolean(s[from..].contains(&search)); }
                 let sub: String = s.chars().skip(from).collect();
                 Value::boolean(sub.contains(&search))
             }
             "startsWith" => {
                 let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
                 let from = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0).max(0.0) as usize;
+                if ascii {
+                    return Value::boolean(from <= s.len() && s[from..].starts_with(&search));
+                }
                 let sub: String = s.chars().skip(from).collect();
                 Value::boolean(sub.starts_with(&search))
             }
             "endsWith" => {
                 let search = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
                 let end_pos = args.get(1).and_then(|v| v.as_number()).map(|n| n as usize).unwrap_or(s.chars().count());
+                if ascii {
+                    let end = end_pos.min(s.len());
+                    return Value::boolean(s[..end].ends_with(&search));
+                }
                 let sub: String = s.chars().take(end_pos).collect();
                 Value::boolean(sub.ends_with(&search))
             }
@@ -240,6 +259,9 @@ impl Vm {
             }
             "codePointAt" => {
                 let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                if ascii {
+                    return if idx < s.len() { Value::number(s.as_bytes()[idx] as f64) } else { Value::undefined() };
+                }
                 match s.chars().nth(idx) {
                     Some(c) => Value::number(c as u32 as f64),
                     None => Value::undefined(),
@@ -247,9 +269,13 @@ impl Vm {
             }
             "at" => {
                 let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                let len = s.chars().count() as i32;
+                let len = if ascii { s.len() as i32 } else { s.chars().count() as i32 };
                 let actual = if idx < 0 { len + idx } else { idx };
                 if actual >= 0 && (actual as usize) < len as usize {
+                    if ascii {
+                        let a = actual as usize;
+                        return self.new_str(&s[a..a + 1]);
+                    }
                     let ch = s.chars().nth(actual as usize).unwrap().to_string();
                     self.new_str(&ch)
                 } else {
