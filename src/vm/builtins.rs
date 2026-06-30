@@ -1558,8 +1558,14 @@ impl Vm {
                 self.heap.get_property_chain(oid, sym_key)
             };
             if let Some(tp_fn) = tp_fn
-                && tp_fn.is_function()
+                && !tp_fn.is_nullish()
             {
+                // GetMethod(@@toPrimitive): a present-but-not-callable value is a
+                // TypeError (e.g. `{[Symbol.toPrimitive]: 1}`).
+                if !tp_fn.is_function() {
+                    let err = self.make_native_error("TypeError", "object[Symbol.toPrimitive] is not a function");
+                    return Err(super::vm::VmError::Throw(err));
+                }
                 let hint = self.interner.intern(hint_str);
                 let result = self.call_function_this(tp_fn, val, &[Value::string(hint)])?;
                 if !result.is_object() || self.is_bigint(result) { return Ok(result); }

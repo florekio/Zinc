@@ -1302,12 +1302,22 @@ fn parse_property_key(p: &mut Parser) -> ParseResult<(PropertyKey, bool)> {
             Ok((PropertyKey::NumberLiteral(value), false))
         }
         TokenKind::BigInt => {
-            // BigInt literal as property key: strip the trailing `n`, parse as number
+            // A BigInt property key is its exact decimal string (e.g. 1n → "1"),
+            // which must stay precise for values beyond f64 range.
             let text = p.current_text().to_owned();
             p.advance();
-            let without_n = &text[..text.len() - 1];
-            let value = p.parse_number(without_n);
-            Ok((PropertyKey::NumberLiteral(value), false))
+            let stripped: String = text.trim_end_matches('n').chars().filter(|&c| c != '_').collect();
+            let (radix, digits) = match stripped.get(0..2) {
+                Some("0x") | Some("0X") => (16, &stripped[2..]),
+                Some("0o") | Some("0O") => (8, &stripped[2..]),
+                Some("0b") | Some("0B") => (2, &stripped[2..]),
+                _ => (10, stripped.as_str()),
+            };
+            let decimal = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)
+                .map(|b| b.to_string())
+                .unwrap_or(stripped.clone());
+            let id = p.interner.intern(&decimal);
+            Ok((PropertyKey::StringLiteral(id), false))
         }
         TokenKind::LBracket => {
             p.advance(); // [
