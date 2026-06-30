@@ -118,3 +118,34 @@ hoped. Combined with the dormant-JIT finding, the real lever is **Phase 3
 (extend the JIT to hot functions)**. Recommendation: bank these small wins and
 move effort to Phase 3; the decode lighthouse needs JIT-level throughput to run
 in budget.
+
+## Phase 2 exploration (intrinsics / allocation) — same ceiling
+
+A CPU sample of `decode.js` (the SERP path) shows its called-leaf cost is
+**string-content allocation** (`malloc`/`free`/`memmove` for charAt/substr/
+fromCharCode results + ConsString nodes) and **`Interner::intern`**. Tried:
+- Single-allocation interner (`Arc<str>` shared between the map key and the
+  value table, vs two `to_owned()`/`Box::from` allocs per miss): **no
+  measurable gain** — the cost is the string *content* allocations, not the
+  interner's bookkeeping. Reverted.
+
+So intrinsic/allocation micro-opts hit the same ~0–3% ceiling as Phase 1.
+
+### The two real levers (both major, not micro-opts)
+
+1. **Stop interning transient string values.** copper interns *every* string
+   value (each charAt/substr/fromCharCode/concat result). This costs an alloc +
+   hash per value AND grows the interner unboundedly — a long page like the
+   SERP (millions of decoded strings → millions of interner entries) likely
+   pays a compounding memory + cache-thrash penalty on top of raw throughput.
+   Fix: a heap-string value kind for transient strings (ConsString already
+   proves the pattern), interning only when a string is used as a property key
+   / identifier. Contained to string handling; addresses speed **and** the
+   memory-growth correctness issue. **Highest-leverage single change.**
+2. **Function JIT (Phase 3).** Native-compile hot *functions* (the existing JIT
+   only does top-level numeric loops and bails on globals/calls/strings). The
+   decode lighthouse is a function with all three.
+
+**Bottom line:** the interpreter is near its easy ceiling (~1.2–1.5×). Rendering
+the SERP needs one of the two major efforts above, with the string-representation
+change being the more tractable and higher-leverage starting point.
