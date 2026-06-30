@@ -83,6 +83,9 @@ struct LoopCtx {
     /// Number of enclosing `with` blocks when this loop was entered, so a
     /// `break`/`continue` can emit WithExit for each `with` it jumps out of.
     with_depth: usize,
+    /// True for a `switch` context, which accepts `break` but is NOT a valid
+    /// `continue` target — `continue` must skip it to the enclosing loop.
+    is_switch: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +736,7 @@ impl<'a> Compiler<'a> {
             has_deferred_continue: false,
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
+            is_switch: false,
         });
 
         self.compile_expr(&w.test)?;
@@ -766,6 +770,7 @@ impl<'a> Compiler<'a> {
             has_deferred_continue: true,
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
+            is_switch: false,
         });
 
         self.compile_statement(&d.body)?;
@@ -819,6 +824,7 @@ impl<'a> Compiler<'a> {
             has_deferred_continue: has_update,
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
+            is_switch: false,
         });
 
         // Condition.
@@ -939,6 +945,7 @@ impl<'a> Compiler<'a> {
             has_deferred_continue: false,
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
+            is_switch: false,
         });
         self.compile_statement(&f.body)?;
         self.chunk.emit_loop(loop_start, line);
@@ -1272,6 +1279,7 @@ impl<'a> Compiler<'a> {
             has_deferred_continue: false,
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
+            is_switch: false,
         });
 
         self.compile_statement(&f.body)?;
@@ -1358,6 +1366,7 @@ impl<'a> Compiler<'a> {
             has_deferred_continue: false,
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
+            is_switch: true,
         });
 
         let mut body_starts: Vec<usize> = Vec::new();
@@ -1513,12 +1522,15 @@ impl<'a> Compiler<'a> {
         if self.loops.is_empty() {
             return Err(format!("'continue' outside of loop at offset {line}"));
         }
-        // Find the matching loop context (labeled or innermost)
+        // Find the matching loop context. `continue` targets an iteration
+        // statement only — never a `switch` (which is break-only), so skip
+        // switch contexts when resolving both labeled and unlabeled forms.
         let ctx_idx = if let Some(label) = c.label {
-            self.loops.iter().rposition(|ctx| ctx.label == Some(label))
+            self.loops.iter().rposition(|ctx| ctx.label == Some(label) && !ctx.is_switch)
                 .ok_or_else(|| format!("label not found at offset {line}"))?
         } else {
-            self.loops.len() - 1
+            self.loops.iter().rposition(|ctx| !ctx.is_switch)
+                .ok_or_else(|| format!("'continue' outside of loop at offset {line}"))?
         };
         let target = self.loops[ctx_idx].continue_target;
         let loop_depth = self.loops[ctx_idx].scope_depth;
@@ -2590,6 +2602,7 @@ impl<'a> Compiler<'a> {
                 has_deferred_continue: false,
                 try_depth: self.finally_stack.len(),
                 with_depth: self.with_depth,
+                is_switch: false,
             });
             self.compile_statement(&l.body)?;
             self.patch_loop_breaks();
@@ -2604,6 +2617,7 @@ impl<'a> Compiler<'a> {
                 has_deferred_continue: false,
                 try_depth: self.finally_stack.len(),
                 with_depth: self.with_depth,
+                is_switch: false,
             });
             self.compile_statement(&l.body)?;
             self.patch_loop_breaks();
