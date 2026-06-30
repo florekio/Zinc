@@ -97,9 +97,43 @@ impl Vm {
                     .first()
                     .map(|v| self.value_to_string(*v))
                     .unwrap_or_default();
-                let (re, _global) = self.regex_cache.get_or_compile(&pattern, &flags)
+                let (re, global) = self.regex_cache.get_or_compile(&pattern, &flags)
                     .map_err(VmError::RuntimeError)?;
-                match re.captures(&input).ok().flatten() {
+                // Global and sticky regexes are stateful: matching resumes from
+                // `lastIndex` and advances it, so `while ((m = re.exec(s)))`
+                // walks the string and terminates. Without this it always
+                // re-matched from 0 → an infinite loop.
+                let sticky = flags.contains('y');
+                let stateful = global || sticky;
+                let li_key = self.interner.intern("lastIndex");
+                let start = if stateful {
+                    self.heap.get_property_chain(oid, li_key)
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0)
+                        .max(0.0) as usize
+                } else {
+                    0
+                };
+                let caps_opt = if start > input.len() {
+                    None
+                } else {
+                    re.captures_from_pos(&input, start).ok().flatten()
+                };
+                // Sticky requires the match to begin exactly at lastIndex.
+                let caps_opt = match caps_opt {
+                    Some(c) if sticky && c.get(0).map(|m| m.start()) != Some(start) => None,
+                    other => other,
+                };
+                if stateful {
+                    let next = match &caps_opt {
+                        Some(c) => c.get(0).map(|m| m.end()).unwrap_or(start) as i32,
+                        None => 0,
+                    };
+                    if let Some(o) = self.heap.get_mut(oid) {
+                        o.set_property(li_key, Value::int(next));
+                    }
+                }
+                match caps_opt {
                     Some(caps) => {
                         // Build result array: [full_match, ...groups]
                         let mut elements = Vec::new();

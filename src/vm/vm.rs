@@ -355,6 +355,15 @@ pub struct Vm {
     /// source line) is tallied. On fuel exhaustion the hottest sites are dumped
     /// — they point straight at the spinning loop. Empty/unused when off.
     pub(crate) fuel_samples: HashMap<(u32, u32), u64>,
+    /// Diagnostic (ZINC_FUEL_TRACE): receiver-kind tally for CallMethod string
+    /// dispatch — [interned-ASCII, interned-non-ASCII, inline, cons/flat].
+    /// Reveals whether a hot string-method loop is hitting the O(1) fast path
+    /// or the O(n) fallback (e.g. a ConsString receiver).
+    pub(crate) string_recv_kinds: [u64; 4],
+    /// Diagnostic (ZINC_FUEL_TRACE): per-chunk function-entry counts, to tell a
+    /// runaway *caller* (one chunk entered millions of times) from one call
+    /// over a huge input. Keyed by chunk_idx.
+    pub(crate) fuel_call_counts: HashMap<u32, u64>,
     /// Private-method brand timing: instance oid → class-prototype oids whose
     /// private methods/accessors are NOT yet installed (the instance is still
     /// being constructed and `super()` for those derived levels hasn't returned).
@@ -932,6 +941,8 @@ impl Vm {
             steps: 0,
             max_steps: 0,
             fuel_samples: HashMap::new(),
+            string_recv_kinds: [0; 4],
+            fuel_call_counts: HashMap::new(),
         };
         vm.init_typed_arrays();
         vm
@@ -3166,6 +3177,21 @@ impl Vm {
             let pct = 100.0 * count as f64 / total.max(1) as f64;
             eprintln!("  {count:>8} ({pct:4.1}%)  chunk {chunk_idx} '{name}' line {line}");
         }
+        let k = self.string_recv_kinds;
+        eprintln!(
+            "=== string-method receiver kinds: interned-ASCII={} interned-nonASCII={} inline={} cons/flat={} ===",
+            k[0], k[1], k[2], k[3]
+        );
+        let mut calls: Vec<_> = self.fuel_call_counts.iter().collect();
+        calls.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("=== most-entered chunks (sampled every 1024 instr; relative magnitude) ===");
+        for entry in calls.iter().take(12) {
+            let chunk_idx = *entry.0;
+            let count = *entry.1;
+            let name = self.interner.resolve(self.chunks[chunk_idx as usize].name);
+            let name = if name.is_empty() { "<anonymous>" } else { name };
+            eprintln!("  {count:>8}  chunk {chunk_idx} '{name}'");
+        }
     }
 
     // ---- Main execution loop ----------------------------------------------
@@ -3211,6 +3237,8 @@ impl Vm {
         self.steps = 0;
         if !self.fuel_samples.is_empty() {
             self.fuel_samples.clear();
+            self.string_recv_kinds = [0; 4];
+            self.fuel_call_counts.clear();
         }
         // Fresh completion value per top-level run; Halt returns this.
         self.script_completion = Value::undefined();
@@ -3330,6 +3358,7 @@ impl Vm {
     /// Used by `call_function_this` to execute callbacks using the full dispatch loop.
     pub(crate) fn run_until(&mut self, stop_depth: usize) -> Result<Value, VmError> {
         let mut gc_counter: u32 = 0;
+        let mut fuel_prev_depth = self.frames.len();
         // Resolve the per-instruction debug/profiling switches ONCE here rather
         // than doing an atomic OnceLock load on every dispatched opcode — these
         // are off in normal runs and were measurable per-op overhead.
@@ -3357,6 +3386,14 @@ impl Vm {
                         let line = self.chunks[ci].get_line(ip as u32);
                         *self.fuel_samples.entry((ci as u32, line)).or_insert(0) += 1;
                     }
+                    // Count distinct function entries (frame-depth increases) to
+                    // distinguish a runaway caller from one huge call.
+                    let depth = self.frames.len();
+                    if depth > fuel_prev_depth
+                        && let Some(f) = self.frames.last() {
+                            *self.fuel_call_counts.entry(f.chunk_idx as u32).or_insert(0) += 1;
+                        }
+                    fuel_prev_depth = depth;
                 }
                 if self.max_steps > 0 {
                     self.steps += 1024;
@@ -5978,7 +6015,10 @@ impl Vm {
                                 "dotAll" => Value::boolean(flags.contains('s')),
                                 "unicode" => Value::boolean(flags.contains('u')),
                                 "sticky" => Value::boolean(flags.contains('y')),
-                                "lastIndex" => Value::int(0),
+                                // lastIndex is mutable state (advanced by a global/sticky
+                                // exec, settable from JS): read the stored property,
+                                // defaulting to 0 when never set.
+                                "lastIndex" => self.heap.get_property_chain(oid, name_id).unwrap_or(Value::int(0)),
                                 // Unknown names walk the chain: RegExp.prototype
                                 // holds extractable test/exec/toString NativeFns.
                                 _ => self.heap.get_property_chain(oid, name_id)
@@ -7259,6 +7299,12 @@ impl Vm {
                         }
                     }
 
+                    if fuel_trace_enabled() && self.is_string_like(effective_val) {
+                        let bucket = if let Some(id) = effective_val.as_string_id() {
+                            if self.interner.is_ascii(id) { 0 } else { 1 }
+                        } else if effective_val.is_inline_string() { 2 } else { 3 };
+                        self.string_recv_kinds[bucket] += 1;
+                    }
                     // Fast path: charAt/charCodeAt/substr on an interned ASCII
                     // receiver, avoiding the full-receiver clone below.
                     if let Some(rid) = effective_val.as_string_id() {
