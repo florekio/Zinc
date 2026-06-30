@@ -2795,27 +2795,23 @@ impl Vm {
             .unwrap_or(false)
     }
 
-    /// Allocate a non-interned flat string value. String-producing operations
-    /// use this instead of `Value::string(self.interner.intern(&s))` so that
-    /// transient strings don't grow the interner. Interned on demand only when
-    /// used as a property key (`flatten_to_string_id`).
-    pub(crate) fn new_string_value(&mut self, s: String) -> Value {
-        // The empty string stays the interned singleton StringId(0): a FlatString
-        // is a heap object (truthy by default), so an empty FlatString would
-        // wrongly be truthy. Empty is also the common case for which interning
-        // is free (already present).
+    /// Create a string Value from a `&str`, preferring an inline (small-string)
+    /// encoding so transient short strings cost no heap allocation and no
+    /// interner growth. String-producing operations use this instead of
+    /// `Value::string(self.interner.intern(s))`.
+    ///
+    /// - empty           -> the interned StringId(0) singleton
+    /// - <= 5 UTF-8 bytes -> inline (NaN-box payload; no allocation)
+    /// - longer          -> interned (deduplicated and GC-free; the FlatString
+    ///   heap path measured slower than interning on the decode benchmark)
+    pub(crate) fn new_str(&mut self, s: &str) -> Value {
         if s.is_empty() {
             return Value::string(crate::util::interner::StringId(0));
         }
-        let char_len = s.chars().count() as u32;
-        let obj = JsObject {
-            properties: Vec::new(),
-            prototype: None,
-            kind: ObjectKind::FlatString { data: s.into_boxed_str(), char_len },
-            marked: false,
-            extensible: false,
-        };
-        Value::object_id(self.heap.allocate(obj))
+        if let Some(v) = Value::inline_string(s) {
+            return v;
+        }
+        Value::string(self.interner.intern(s))
     }
 
     /// Returns the character length of a string-like value in O(1) for ConsString.
@@ -3468,15 +3464,13 @@ impl Vm {
                             a_prim
                         } else {
                             let s = self.value_to_string(a_prim);
-                            let id = self.interner.intern(&s);
-                            Value::string(id)
+                            self.new_str(&s)
                         };
                         let right_val = if self.is_string_like(b_prim) {
                             b_prim
                         } else {
                             let s = self.value_to_string(b_prim);
-                            let id = self.interner.intern(&s);
-                            Value::string(id)
+                            self.new_str(&s)
                         };
                         let left_len = self.string_char_len(left_val);
                         let right_len = self.string_char_len(right_val);
@@ -6544,16 +6538,18 @@ impl Vm {
                         if let Some(i) = key.as_int() {
                             if i >= 0
                                 && let Some(ch) = s.chars().nth(i as usize) {
-                                    let ch_id = self.interner.intern(&ch.to_string());
-                                    self.push(Value::string(ch_id));
+                                    let mut buf = [0u8; 4];
+                                    let v = self.new_str(ch.encode_utf8(&mut buf));
+                                    self.push(v);
                                     continue;
                                 }
                         } else if let Some(idx) = key.as_number() {
                             let i = idx as usize;
                             if idx >= 0.0 && idx.fract() == 0.0
                                 && let Some(ch) = s.chars().nth(i) {
-                                    let ch_id = self.interner.intern(&ch.to_string());
-                                    self.push(Value::string(ch_id));
+                                    let mut buf = [0u8; 4];
+                                    let v = self.new_str(ch.encode_utf8(&mut buf));
+                                    self.push(v);
                                     continue;
                                 }
                         } else if let Some(name_id) = key.as_string_id() {
@@ -11459,27 +11455,27 @@ mod tests {
     }
 
     #[test]
-    fn test_flatstring_infrastructure() {
-        // Phase A: a FlatString value behaves as a string across the
-        // polymorphic helpers, without being interned.
+    fn test_inline_string_producer() {
+        // SSO: new_str packs short strings inline (no interning) and they behave
+        // as strings across the polymorphic helpers.
         let (chunk, interner) = make_env();
         let mut vm = Vm::new(chunk, interner);
         let before = vm.interner.len();
 
-        let v = vm.new_string_value("abc".to_string());
+        let v = vm.new_str("abc");
         assert!(vm.is_string_like(v));
-        assert!(vm.is_flat_string(v));
+        assert!(v.is_inline_string());
         assert_eq!(vm.string_char_len(v), 3);
         assert_eq!(vm.value_to_string(v), "abc");
         assert_eq!(vm.type_of_value(v), "string");
-        // Producing the value did NOT intern it.
-        assert_eq!(vm.interner.len(), before, "FlatString must not be interned on creation");
+        // Producing a short value did NOT intern it.
+        assert_eq!(vm.interner.len(), before, "inline string must not be interned on creation");
 
-        // Strict equality vs an interned copy (content compare).
+        // Strict equality vs an interned copy (content compare, no allocation).
         let interned = Value::string(vm.interner.intern("abc"));
         assert!(vm.strict_eq(v, interned));
         assert!(vm.strict_eq(interned, v));
-        let other = vm.new_string_value("abd".to_string());
+        let other = vm.new_str("abd");
         assert!(!vm.strict_eq(v, other));
 
         // Interns on demand (property-key path) and round-trips.
@@ -11487,14 +11483,21 @@ mod tests {
         assert_eq!(vm.interner.resolve(id), "abc");
 
         // Empty stays the interned singleton (avoids a truthy empty string).
-        let e = vm.new_string_value(String::new());
-        assert!(!vm.is_flat_string(e));
+        let e = vm.new_str("");
+        assert!(!e.is_inline_string());
         assert_eq!(vm.value_to_string(e), "");
 
-        // Unicode scalar count, not byte length.
-        let u = vm.new_string_value("a\u{2713}b".to_string());
+        // 5 bytes (Unicode): still inline; char count, not byte length.
+        let u = vm.new_str("a\u{2713}b");
+        assert!(u.is_inline_string());
         assert_eq!(vm.string_char_len(u), 3);
         assert_eq!(vm.value_to_string(u), "a\u{2713}b");
+
+        // > 5 bytes: falls back to interning.
+        let long = vm.new_str("abcdef");
+        assert!(!long.is_inline_string());
+        assert!(long.is_interned_string());
+        assert_eq!(vm.value_to_string(long), "abcdef");
     }
 
     fn emit_const_number(chunk: &mut Chunk, n: f64) {

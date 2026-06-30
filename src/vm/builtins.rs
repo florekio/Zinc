@@ -37,8 +37,7 @@ impl Vm {
             "charAt" => {
                 let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
                 let ch = s.chars().nth(idx).map(|c| c.to_string()).unwrap_or_default();
-                let id = self.interner.intern(&ch);
-                Value::string(id)
+                self.new_str(&ch)
             }
             "charCodeAt" => {
                 let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
@@ -89,8 +88,7 @@ impl Vm {
                 let start = if start < 0 { (len + start).max(0) as usize } else { start.min(len) as usize };
                 let end = if end < 0 { (len + end).max(0) as usize } else { end.min(len) as usize };
                 let result = if start <= end { &s[start..end] } else { "" };
-                let id = self.interner.intern(result);
-                Value::string(id)
+                self.new_str(result)
             }
             "substring" => {
                 let len = s.len() as i32;
@@ -100,8 +98,7 @@ impl Vm {
                 end = end.max(0).min(len);
                 if start > end { std::mem::swap(&mut start, &mut end); }
                 let result = &s[start as usize..end as usize];
-                let id = self.interner.intern(result);
-                Value::string(id)
+                self.new_str(result)
             }
             "substr" => {
                 let len = s.len() as i32;
@@ -115,35 +112,28 @@ impl Vm {
                     .max(0) as usize;
                 let end = (start + length).min(s.len());
                 let result = &s[start..end];
-                let id = self.interner.intern(result);
-                Value::string(id)
+                self.new_str(result)
             }
             "toUpperCase" => {
                 let result = s.to_uppercase();
-                let id = self.interner.intern(&result);
-                Value::string(id)
+                self.new_str(&result)
             }
             "toLowerCase" => {
                 let result = s.to_lowercase();
-                let id = self.interner.intern(&result);
-                Value::string(id)
+                self.new_str(&result)
             }
             "trim" => {
-                let id = self.interner.intern(s.trim());
-                Value::string(id)
+                self.new_str(s.trim())
             }
             "trimStart" => {
-                let id = self.interner.intern(s.trim_start());
-                Value::string(id)
+                self.new_str(s.trim_start())
             }
             "trimEnd" => {
-                let id = self.interner.intern(s.trim_end());
-                Value::string(id)
+                self.new_str(s.trim_end())
             }
             "normalize" => {
                 // No Unicode normalization library: return as-is (sufficient for ASCII)
-                let id = self.interner.intern(s);
-                Value::string(id)
+                self.new_str(s)
             }
             "split" => {
                 // Check if separator is a RegExp
@@ -155,8 +145,8 @@ impl Vm {
                 let mut parts: Vec<Value> = Vec::new();
                 for part in s.split(&sep) {
                     if let Some(lim) = limit && parts.len() >= lim { break; }
-                    let id = self.interner.intern(part);
-                    parts.push(Value::string(id));
+                    let v = self.new_str(part);
+                    parts.push(v);
                 }
                 let arr = JsObject::array(parts);
                 let oid = self.heap.allocate(arr);
@@ -208,8 +198,7 @@ impl Vm {
                         s.replacen(&search, &replacement, 1)
                     }
                 };
-                let id = self.interner.intern(&result);
-                Value::string(id)
+                self.new_str(&result)
             }
             "match" | "search" => {
                 if let Some(result) = self.exec_string_regex_method(s, &name, args) {
@@ -220,8 +209,7 @@ impl Vm {
             "repeat" => {
                 let count = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
                 let result = s.repeat(count);
-                let id = self.interner.intern(&result);
-                Value::string(id)
+                self.new_str(&result)
             }
             "padStart" => {
                 let target_len = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
@@ -231,8 +219,7 @@ impl Vm {
                     result.insert_str(0, &pad);
                 }
                 if result.len() > target_len { result.truncate(target_len); }
-                let id = self.interner.intern(&result);
-                Value::string(id)
+                self.new_str(&result)
             }
             "padEnd" => {
                 let target_len = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
@@ -242,16 +229,14 @@ impl Vm {
                     result.push_str(&pad);
                 }
                 if result.len() > target_len { result.truncate(target_len); }
-                let id = self.interner.intern(&result);
-                Value::string(id)
+                self.new_str(&result)
             }
             "concat" => {
                 let mut result = s.to_string();
                 for arg in args {
                     result.push_str(&self.value_to_string(*arg));
                 }
-                let id = self.interner.intern(&result);
-                Value::string(id)
+                self.new_str(&result)
             }
             "codePointAt" => {
                 let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
@@ -266,15 +251,13 @@ impl Vm {
                 let actual = if idx < 0 { len + idx } else { idx };
                 if actual >= 0 && (actual as usize) < len as usize {
                     let ch = s.chars().nth(actual as usize).unwrap().to_string();
-                    let id = self.interner.intern(&ch);
-                    Value::string(id)
+                    self.new_str(&ch)
                 } else {
                     Value::undefined()
                 }
             }
             "toString" | "valueOf" => {
-                let id = self.interner.intern(s);
-                Value::string(id)
+                self.new_str(s)
             }
             _ => Value::undefined(),
         }
@@ -1089,9 +1072,21 @@ impl Vm {
                 Value::boolean(n.is_finite())
             }
             -504 => { // String()
-                let s = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let id = self.interner.intern(&s);
-                Value::string(id)
+                match args.first().copied() {
+                    None => Value::string(crate::util::interner::StringId(0)),
+                    Some(v) if v.is_interned_string() || v.is_inline_string() => v,
+                    Some(v) if self.is_string_like(v) => {
+                        // ConsString/FlatString: flatten once and intern, so that
+                        // repeated charAt/substr in a loop resolve in O(1) rather
+                        // than re-flattening the cons tree on every access.
+                        let s = self.value_to_string(v);
+                        Value::string(self.interner.intern(&s))
+                    }
+                    Some(v) => {
+                        let s = self.value_to_string(v);
+                        self.new_str(&s)
+                    }
+                }
             }
             -505 => { // Number()
                 let v = args.first().copied().unwrap_or(Value::int(0));
@@ -1165,8 +1160,7 @@ impl Vm {
                         result.push(c);
                     }
                 }
-                let id = self.interner.intern(&result);
-                Value::string(id)
+                self.new_str(&result)
             }
             -536 => { // String.raw
                 let template = args.first().copied().unwrap_or(Value::undefined());
@@ -1186,8 +1180,7 @@ impl Vm {
                         result.push_str(&self.value_to_string(args[i + 1]));
                     }
                 }
-                let id = self.interner.intern(&result);
-                Value::string(id)
+                self.new_str(&result)
             }
             -507 => { // Array.isArray
                 let v = args.first().copied().unwrap_or(Value::undefined());
