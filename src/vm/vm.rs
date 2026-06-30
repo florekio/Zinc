@@ -191,6 +191,15 @@ pub(crate) enum Microtask {
 pub static OPCODE_HIST: [std::sync::atomic::AtomicU64; 256] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 256];
 
+/// Whether `ZINC_TRACE_CALLS` is set, cached after the first read. The Call and
+/// CallMethod opcodes consult this on *every* call, so reading the env var each
+/// time (a lock + syscall) was a measurable hot-path cost on call-heavy code.
+#[inline]
+fn trace_calls_enabled() -> bool {
+    static TRACE_CALLS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE_CALLS.get_or_init(|| std::env::var("ZINC_TRACE_CALLS").is_ok())
+}
+
 /// Dump the opcode histogram (most-executed first) to stderr. Call once at
 /// program end. Prints each opcode's count and share of total dispatched
 /// instructions, plus the grand total — the basis for instructions/sec.
@@ -4252,7 +4261,7 @@ impl Vm {
                     // bytecode position. Bulky output — turn off in
                     // production. Built behind an env-var check so
                     // the hot path is unaffected when not tracing.
-                    if std::env::var("ZINC_TRACE_CALLS").is_ok() {
+                    if trace_calls_enabled() {
                         let (line, pc) = if let Some(f) = self.frames.last() {
                             (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip)
                         } else { (0, 0) };
@@ -6964,7 +6973,7 @@ impl Vm {
                     // Stack layout: [..., obj, arg0, ..., argN]
                     let obj_pos = self.stack.len() - 1 - argc;
                     let obj_val = self.stack[obj_pos];
-                    if std::env::var("ZINC_TRACE_CALLS").is_ok() {
+                    if trace_calls_enabled() {
                         let (line, pc) = if let Some(f) = self.frames.last() {
                             (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip)
                         } else { (0, 0) };
