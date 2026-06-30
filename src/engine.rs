@@ -250,8 +250,7 @@ impl Engine {
                 format!("{n}")
             }
         } else if value.is_string() {
-            let id = value.as_string_id().unwrap();
-            self.vm.interner.resolve(id).to_string()
+            self.vm.value_to_string(*value)
         } else if value.is_object() {
             "[object Object]".to_string()
         } else {

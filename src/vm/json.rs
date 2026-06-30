@@ -23,10 +23,8 @@ impl Vm {
                     if let Some(n) = v.as_number() {
                         " ".repeat((n as usize).min(10))
                     } else if v.is_string() {
-                        let id = v.as_string_id().unwrap();
-                        let s = self.interner.resolve(id);
                         // Limit to 10 chars
-                        s.chars().take(10).collect()
+                        self.value_to_string(*v).chars().take(10).collect()
                     } else {
                         String::new()
                     }

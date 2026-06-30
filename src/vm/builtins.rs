@@ -1305,12 +1305,10 @@ impl Vm {
                     Value::boolean(has)
                 } else if this_val.is_string() {
                     // String primitives: numeric indices and "length" are own properties.
-                    let s_id = this_val.as_string_id().unwrap();
-                    let s = self.interner.resolve(s_id);
                     let has = if key == "length" {
                         true
                     } else if let Ok(idx) = key.parse::<usize>() {
-                        idx < s.chars().count()
+                        idx < self.string_char_len(this_val) as usize
                     } else { false };
                     Value::boolean(has)
                 } else { Value::boolean(false) }

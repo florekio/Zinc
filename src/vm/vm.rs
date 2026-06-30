@@ -1295,8 +1295,13 @@ impl Vm {
         if val.is_null() { return 0.0; }
         if val.is_undefined() { return f64::NAN; }
         if val.is_string() {
-            let id = val.as_string_id().unwrap();
-            let s = self.interner.resolve(id).trim();
+            let inl = val.as_inline_string();
+            let raw = if let Some(ref i) = inl {
+                i.as_str()
+            } else {
+                self.interner.resolve(val.as_string_id().unwrap())
+            };
+            let s = raw.trim();
             if s.is_empty() { return 0.0; }
             // Handle hex literals: 0x, 0X
             if s.starts_with("0x") || s.starts_with("0X") {
@@ -1420,7 +1425,9 @@ impl Vm {
     /// Convert a Value to its string representation, using the interner for
     /// string values.
     pub(crate) fn value_to_string(&self, val: Value) -> String {
-        if let Some(id) = val.as_string_id() {
+        if let Some(inl) = val.as_inline_string() {
+            inl.as_str().to_owned()
+        } else if let Some(id) = val.as_string_id() {
             self.interner.resolve(id).to_owned()
         } else if val.is_undefined() {
             "undefined".into()
@@ -2813,7 +2820,9 @@ impl Vm {
 
     /// Returns the character length of a string-like value in O(1) for ConsString.
     pub(crate) fn string_char_len(&self, val: Value) -> u32 {
-        if let Some(id) = val.as_string_id() {
+        if let Some(inl) = val.as_inline_string() {
+            inl.as_str().chars().count() as u32
+        } else if let Some(id) = val.as_string_id() {
             self.interner.resolve(id).chars().count() as u32
         } else if let Some(oid) = val.as_object_id()
             && let Some(obj) = self.heap.get(oid) {
@@ -2830,6 +2839,9 @@ impl Vm {
     /// Flatten a ConsString (or regular string) to a plain String without interning.
     /// Uses an iterative traversal to avoid stack overflow on deep trees.
     pub(crate) fn flatten_cons_to_string(&self, val: Value) -> String {
+        if let Some(inl) = val.as_inline_string() {
+            return inl.as_str().to_owned();
+        }
         if let Some(id) = val.as_string_id() {
             return self.interner.resolve(id).to_owned();
         }
@@ -2838,7 +2850,9 @@ impl Vm {
         let mut stack = Vec::new();
         stack.push(val);
         while let Some(cur) = stack.pop() {
-            if let Some(id) = cur.as_string_id() {
+            if let Some(inl) = cur.as_inline_string() {
+                result.push_str(inl.as_str());
+            } else if let Some(id) = cur.as_string_id() {
                 result.push_str(self.interner.resolve(id));
             } else if let Some(oid) = cur.as_object_id()
                 && let Some(obj) = self.heap.get(oid) {
@@ -2904,7 +2918,7 @@ impl Vm {
 
         // Both strings (including ConsString)
         if self.is_string_like(a) && self.is_string_like(b) {
-            return Ok(self.flatten_cons_to_string(a) == self.flatten_cons_to_string(b));
+            return Ok(self.str_eq(a, b));
         }
 
         // Both booleans
@@ -2981,6 +2995,47 @@ impl Vm {
     }
 
     /// Strict equality (===).
+    /// Content equality for two string-like values, avoiding allocation on the
+    /// hot path. Both args MUST be string-like (caller checks `is_string_like`).
+    ///
+    /// The decode loop's dominant comparison is `charAt(i) === '%'`: an *inline*
+    /// string vs an *interned* literal. Their NaN-box bits differ, so the
+    /// fast identity check misses — but we can still compare the inline bytes
+    /// against the interned `&str` directly, with no `String` allocation.
+    pub(crate) fn str_eq(&self, a: Value, b: Value) -> bool {
+        // Identical encoding: inline==inline (same bytes) or interned==interned
+        // (interning dedupes, so equal content => equal id => equal bits).
+        if a.raw() == b.raw() {
+            return true;
+        }
+        match (a.as_inline_string(), b.as_inline_string()) {
+            (Some(x), Some(y)) => x.as_str() == y.as_str(),
+            (Some(x), None) => self.value_eq_str(b, x.as_str()),
+            (None, Some(y)) => self.value_eq_str(a, y.as_str()),
+            (None, None) => {
+                // Neither is inline. Two distinct interned ids => distinct content
+                // (dedup guarantee; identical bits already handled above). Anything
+                // involving a ConsString needs a flattening compare.
+                if let (Some(ia), Some(ib)) = (a.as_string_id(), b.as_string_id()) {
+                    return ia == ib;
+                }
+                self.flatten_cons_to_string(a) == self.flatten_cons_to_string(b)
+            }
+        }
+    }
+
+    /// Compare a string-like value against a known `&str` without allocating
+    /// when `val` is interned; flattens only for ConsString.
+    fn value_eq_str(&self, val: Value, s: &str) -> bool {
+        if let Some(id) = val.as_string_id() {
+            self.interner.resolve(id) == s
+        } else if self.is_cons_string(val) || self.is_flat_string(val) {
+            self.flatten_cons_to_string(val) == s
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn strict_eq(&self, a: Value, b: Value) -> bool {
         if a.raw() == b.raw() {
             if a.is_float() {
@@ -3004,15 +3059,21 @@ impl Vm {
         let a_str = self.is_string_like(a);
         let b_str = self.is_string_like(b);
         if a_str && b_str {
-            return self.flatten_cons_to_string(a) == self.flatten_cons_to_string(b);
+            return self.str_eq(a, b);
         }
         false
     }
 
     /// Try to parse a string value as a number (for == coercion).
     pub(crate) fn string_to_number(&self, val: Value) -> Option<f64> {
-        let id = val.as_string_id()?;
-        let s = self.interner.resolve(id).trim();
+        let inl = val.as_inline_string();
+        let raw = if let Some(ref i) = inl {
+            i.as_str()
+        } else {
+            let id = val.as_string_id()?;
+            self.interner.resolve(id)
+        };
+        let s = raw.trim();
         if s.is_empty() {
             return Some(0.0);
         }
@@ -4501,10 +4562,7 @@ impl Vm {
                             self.push(code);
                             continue;
                         }
-                        let code_str = {
-                            let sid = code.as_string_id().unwrap();
-                            self.interner.resolve(sid).to_owned()
-                        };
+                        let code_str = self.value_to_string(code);
                         // Lex, parse, compile
                         let mut lexer = crate::lexer::lexer::Lexer::new(&code_str, &mut self.interner);
                         let tokens = lexer.tokenize();
@@ -4908,8 +4966,7 @@ impl Vm {
                         let type_name = if func_val.is_null() { "null".to_owned() }
                             else if let Some(b) = func_val.as_bool() { b.to_string() }
                             else if func_val.is_string() {
-                                let sid = func_val.as_string_id().unwrap();
-                                format!("\"{}\"", self.interner.resolve(sid))
+                                format!("\"{}\"", self.value_to_string(func_val))
                             } else { self.value_to_string(func_val) };
                         // Annotate with source line + chunk-byte
                         // offset so the embedder can correlate
@@ -5878,11 +5935,9 @@ impl Vm {
                             }
                         self.push(val);
                     } else if obj_val.is_string() {
-                        // String property/method access
-                        let sid = obj_val.as_string_id().unwrap();
-                        let s = self.interner.resolve(sid);
+                        // String property/method access (interned or inline).
                         match name_str {
-                            "length" => self.push(Value::int(s.chars().count() as i32)),
+                            "length" => self.push(Value::int(self.string_char_len(obj_val) as i32)),
                             // String methods return sentinels for CallMethod dispatch
                             "charAt" | "charCodeAt" | "indexOf" | "lastIndexOf"
                             | "includes" | "startsWith" | "endsWith"
@@ -6416,9 +6471,10 @@ impl Vm {
                                 }
                             }
                         }
-                        // String property lookup — check getter first, then plain property
-                        // Flatten ConsString and numeric keys to strings before lookup.
-                        let key = if self.is_cons_string(key) {
+                        // String property lookup — check getter first, then plain property.
+                        // Inline/ConsString/numeric keys have no StringId, so intern them
+                        // (intern-on-demand: a transient string used as a property key).
+                        let key = if key.is_inline_string() || self.is_cons_string(key) || self.is_flat_string(key) {
                             let flat = self.flatten_cons_to_string(key);
                             Value::string(self.interner.intern(&flat))
                         } else if key.as_number().is_some() && key.as_string_id().is_none() {
@@ -6480,12 +6536,9 @@ impl Vm {
                             continue;
                         }
                     }
-                    // String bracket index access: "hello"[0] → "h" (also handles ConsString)
-                    let string_val_opt: Option<String> = if obj_val.is_string() {
-                        let sid = obj_val.as_string_id().unwrap();
-                        Some(self.interner.resolve(sid).to_owned())
-                    } else if self.is_cons_string(obj_val) {
-                        Some(self.flatten_cons_to_string(obj_val))
+                    // String bracket index access: "hello"[0] → "h" (interned, inline, or ConsString)
+                    let string_val_opt: Option<String> = if self.is_string_like(obj_val) {
+                        Some(self.value_to_string(obj_val))
                     } else { None };
                     if let Some(s) = string_val_opt {
                         if let Some(i) = key.as_int() {
@@ -6610,8 +6663,12 @@ impl Vm {
                                 continue;
                             }
                         }
-                        // Numeric non-array-index keys become string-keyed properties.
-                        let key = if key.as_number().is_some() && key.as_string_id().is_none() {
+                        // Numeric non-array-index keys, and inline/flat strings (which
+                        // have no StringId), become interned string-keyed properties.
+                        let key = if key.is_inline_string() || self.is_flat_string(key) {
+                            let flat = self.flatten_cons_to_string(key);
+                            Value::string(self.interner.intern(&flat))
+                        } else if key.as_number().is_some() && key.as_string_id().is_none() {
                             let s = self.value_to_string(key);
                             Value::string(self.interner.intern(&s))
                         } else { key };
@@ -7118,11 +7175,8 @@ impl Vm {
                     }
 
                     // Check if the obj is a string (or ConsString) and dispatch string method
-                    let string_for_method = if effective_val.is_string() {
-                        let sid = effective_val.as_string_id().unwrap();
-                        Some(self.interner.resolve(sid).to_owned())
-                    } else if self.is_cons_string(effective_val) {
-                        Some(self.flatten_cons_to_string(effective_val))
+                    let string_for_method = if self.is_string_like(effective_val) {
+                        Some(self.value_to_string(effective_val))
                     } else {
                         None
                     };
@@ -7940,8 +7994,7 @@ impl Vm {
                                         }
                                     } else { vec![] }
                                 } else if source.is_string() {
-                                    let sid = source.as_string_id().unwrap();
-                                    let s = self.interner.resolve(sid).to_owned();
+                                    let s = self.value_to_string(source);
                                     s.chars().map(|c| {
                                         let id = self.interner.intern(&c.to_string());
                                         Value::string(id)
@@ -9197,8 +9250,7 @@ impl Vm {
                             None => vec![],
                         }
                     } else if source.is_string() {
-                        let sid = source.as_string_id().unwrap();
-                        let s = self.interner.resolve(sid).to_owned();
+                        let s = self.value_to_string(source);
                         s.chars().map(|c| {
                             let id = self.interner.intern(&c.to_string());
                             Value::string(id)
@@ -10088,8 +10140,7 @@ impl Vm {
                         }
                     } else if val.is_string() {
                         // String iterator: iterate over characters
-                        let sid = val.as_string_id().unwrap();
-                        let s = self.interner.resolve(sid).to_owned();
+                        let s = self.value_to_string(val);
                         let chars: Vec<Value> = s.chars().map(|c| {
                             let id = self.interner.intern(&c.to_string());
                             Value::string(id)
@@ -10556,12 +10607,8 @@ impl Vm {
                     let source = self.pop()?;
                     let mut rest = JsObject::ordinary();
                     // Spread string characters as indexed properties
-                    if source.is_string() || self.is_cons_string(source) {
-                        let s = if source.is_string() {
-                            self.interner.resolve(source.as_string_id().unwrap()).to_owned()
-                        } else {
-                            self.flatten_cons_to_string(source)
-                        };
+                    if self.is_string_like(source) {
+                        let s = self.value_to_string(source);
                         for (i, ch) in s.chars().enumerate() {
                             let key = self.interner.intern(&i.to_string());
                             if excluded.contains(&key) { continue; }
