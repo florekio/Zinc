@@ -2765,7 +2765,9 @@ impl Vm {
     /// resolving only interned ids silently turned every
     /// `'prefix' + variable` argument into "".
     pub fn string_content(&self, val: Value) -> Option<String> {
-        if val.as_string_id().is_some() || self.is_cons_string(val) {
+        if self.is_string_like(val) {
+            // is_string_like covers interned, inline (SSO), ConsString and
+            // FlatString; value_to_string decodes each correctly.
             Some(self.value_to_string(val))
         } else {
             None
@@ -4944,7 +4946,7 @@ impl Vm {
                         || func_val.as_bool().is_some()
                         || func_val.is_number()
                         || func_val.is_int()
-                        || (func_val.is_string() && func_val.as_string_id().is_some())
+                        || func_val.is_string()
                         || (func_val.is_object() && !func_val.is_function() && {
                             // Treat object as non-callable when its kind isn't Function
                             // and it doesn't have a __constructor__ marker (class).
