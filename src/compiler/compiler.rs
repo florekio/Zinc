@@ -3640,6 +3640,13 @@ impl<'a> Compiler<'a> {
     fn compile_expr(&mut self, expr: &Expression) -> Result<(), String> {
         match expr {
             Expression::NumberLiteral(n) => self.compile_number(n),
+            Expression::BigIntLiteral(b) => {
+                // Store the digit string as a constant; LoadBigInt parses it
+                // into a heap BigInt at runtime (Value can't hold one directly).
+                let idx = self.chunk.add_constant(Value::string(b.raw));
+                self.chunk.emit_op_u16(OpCode::LoadBigInt, idx, b.span.start);
+                Ok(())
+            }
             Expression::StringLiteral(s) => self.compile_string_lit(s),
             Expression::BooleanLiteral(b) => {
                 let op = if b.value { OpCode::True } else { OpCode::False };
@@ -3864,8 +3871,8 @@ impl<'a> Compiler<'a> {
                     self.chunk.emit_op(inc_op, line);
                     self.compile_set_variable(id.name, line)?;
                 } else {
-                    // postfix: apply ToNumber to old value, then inc/dec the copy
-                    self.chunk.emit_op(OpCode::Pos, line); // ToNumber on original
+                    // postfix: apply ToNumeric to old value, then inc/dec the copy
+                    self.chunk.emit_op(OpCode::ToNumeric, line); // keeps BigInt; coerces else
                     self.chunk.emit_op(OpCode::Dup, line);
                     self.chunk.emit_op(inc_op, line);
                     self.compile_set_variable(id.name, line)?;

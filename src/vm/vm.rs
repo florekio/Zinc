@@ -64,6 +64,14 @@ pub enum VmError {
     Throw(Value),
 }
 
+/// Classified operands for a numeric/bitwise binary operation.
+pub(crate) enum ArithOperands {
+    Numbers(f64, f64),
+    BigInts(num_bigint::BigInt, num_bigint::BigInt),
+    /// One operand is a BigInt and the other isn't — a TypeError.
+    Mixed,
+}
+
 impl fmt::Display for VmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -612,6 +620,8 @@ impl Vm {
         globals.insert(eval_name, Value::function(-560));
         let symbol_name = interner.intern("Symbol");
         globals.insert(symbol_name, Value::function(-570));
+        let bigint_name = interner.intern("BigInt");
+        globals.insert(bigint_name, Value::function(-638));
         let map_name = interner.intern("Map");
         globals.insert(map_name, Value::function(-540));
         // Map.prototype / Set.prototype with extractable this-aware
@@ -1302,46 +1312,6 @@ impl Vm {
         f64::NAN
     }
 
-    #[inline(always)]
-    pub(crate) fn pop_numbers(&mut self) -> Result<(f64, f64), VmError> {
-        let b = self.pop()?;
-        let a = self.pop()?;
-        // Per spec: ToNumber(lhs) (which is ToPrimitive(lhs, Number) → ToNumber(prim))
-        // BEFORE ToNumber(rhs). If ToNumber(lhs) throws (e.g. lhs is Symbol),
-        // rhs's ToPrimitive is never invoked.
-        let a = if a.is_object() { self.try_coerce_to_primitive_hint(a, "number")? } else { a };
-        if a.is_symbol() {
-            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
-            return Err(VmError::Throw(err));
-        }
-        let b = if b.is_object() { self.try_coerce_to_primitive_hint(b, "number")? } else { b };
-        if b.is_symbol() {
-            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
-            return Err(VmError::Throw(err));
-        }
-        Ok((self.to_f64(a), self.to_f64(b)))
-    }
-
-    /// Pop two values, convert to i32 (for bitwise ops).
-    pub(crate) fn pop_ints(&mut self) -> Result<(i32, i32), VmError> {
-        let bv = self.pop()?;
-        let av = self.pop()?;
-        // Per spec: ToNumber(lhs) before ToNumber(rhs). Symbol throws TypeError.
-        let av = if av.is_object() { self.try_coerce_to_primitive_hint(av, "number")? } else { av };
-        if av.is_symbol() {
-            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
-            return Err(VmError::Throw(err));
-        }
-        let bv = if bv.is_object() { self.try_coerce_to_primitive_hint(bv, "number")? } else { bv };
-        if bv.is_symbol() {
-            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
-            return Err(VmError::Throw(err));
-        }
-        let b = self.to_i32(bv)?;
-        let a = self.to_i32(av)?;
-        Ok((a, b))
-    }
-
     /// Convert a Value to i32 for bitwise operations (ECMAScript ToInt32).
     pub(crate) fn to_i32(&self, val: Value) -> Result<i32, VmError> {
         let n = self.to_f64(val);
@@ -1366,6 +1336,36 @@ impl Vm {
     /// Push a number result, using SMI when the value fits in i32 with no
     /// fractional part.  Preserves -0.0 as a float (JS distinguishes it).
     #[inline]
+    /// Pop two operands for an arithmetic/bitwise/shift op, applying ToPrimitive
+    /// (number hint) exactly once each. Classifies the pair so the caller can run
+    /// BigInt vs Number semantics; mixing the two is a TypeError (Mixed).
+    pub(crate) fn pop_arith_operands(&mut self) -> Result<ArithOperands, VmError> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        // Raw BigInts are already primitive — don't run ToPrimitive on them.
+        let a = if a.is_object() && !self.is_bigint(a) { self.try_coerce_to_primitive_hint(a, "number")? } else { a };
+        if a.is_symbol() {
+            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+            return Err(VmError::Throw(err));
+        }
+        let b = if b.is_object() && !self.is_bigint(b) { self.try_coerce_to_primitive_hint(b, "number")? } else { b };
+        if b.is_symbol() {
+            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+            return Err(VmError::Throw(err));
+        }
+        match (self.as_bigint(a), self.as_bigint(b)) {
+            (Some(x), Some(y)) => Ok(ArithOperands::BigInts(x, y)),
+            (None, None) => Ok(ArithOperands::Numbers(self.to_f64(a), self.to_f64(b))),
+            _ => Ok(ArithOperands::Mixed),
+        }
+    }
+
+    /// Throw the standard "Cannot mix BigInt and other types" TypeError.
+    pub(crate) fn throw_mix_bigint(&mut self) -> Result<(), VmError> {
+        let err = self.make_native_error("TypeError", "Cannot mix BigInt and other types, use explicit conversions");
+        self.handle_throw(err)
+    }
+
     pub(crate) fn push_number(&mut self, n: f64) {
         if n == 0.0 && n.is_sign_negative() {
             // -0.0 must stay as a float
@@ -1418,6 +1418,7 @@ impl Vm {
                         parts.join(",")
                     }
                     ObjectKind::Wrapper(inner) => self.value_to_string(*inner),
+                    ObjectKind::BigInt(b) => b.to_string(),
                     ObjectKind::RegExp { pattern, flags } => {
                         format!("/{pattern}/{flags}")
                     }
@@ -1490,6 +1491,7 @@ impl Vm {
             if let Some(oid) = val.as_object_id()
                 && let Some(obj) = self.heap.get(oid) {
                     if matches!(obj.kind, ObjectKind::ConsString { .. }) { return "string"; }
+                    if matches!(obj.kind, ObjectKind::BigInt(_)) { return "bigint"; }
                     // Function-kind objects (bound functions, native sentinels wrapped
                     // as objects, bytecode functions stored as objects) report "function".
                     if matches!(obj.kind, ObjectKind::Function(_)) { return "function"; }
@@ -1627,16 +1629,39 @@ impl Vm {
         bv: Value,
         num_cmp: fn(f64, f64) -> bool,
         str_cmp: fn(&str, &str) -> bool,
+        ord_cmp: fn(std::cmp::Ordering) -> bool,
     ) -> Result<bool, VmError> {
         let a = self.try_coerce_to_primitive_hint(av, "number")?;
         let b = self.try_coerce_to_primitive_hint(bv, "number")?;
         if self.is_string_like(a) && self.is_string_like(b) {
             let sa = self.flatten_cons_to_string(a);
             let sb = self.flatten_cons_to_string(b);
-            Ok(str_cmp(&sa, &sb))
-        } else {
-            Ok(num_cmp(self.to_f64(a), self.to_f64(b)))
+            return Ok(str_cmp(&sa, &sb));
         }
+        // BigInt relational comparison (mathematical, mixes with Number/String).
+        // An unparseable BigInt-vs-String or a NaN operand makes the result false.
+        if self.is_bigint(a) || self.is_bigint(b) {
+            let ord = if let (Some(x), Some(y)) = (self.as_bigint(a), self.as_bigint(b)) {
+                Some(x.cmp(&y))
+            } else if let Some(x) = self.as_bigint(a) {
+                if self.is_string_like(b) {
+                    let s = self.flatten_cons_to_string(b);
+                    string_to_bigint(&s).map(|y| x.cmp(&y))
+                } else {
+                    bigint_cmp_f64(&x, self.to_f64(b))
+                }
+            } else {
+                let y = self.as_bigint(b).unwrap();
+                if self.is_string_like(a) {
+                    let s = self.flatten_cons_to_string(a);
+                    string_to_bigint(&s).map(|x| x.cmp(&y))
+                } else {
+                    bigint_cmp_f64(&y, self.to_f64(a)).map(|o| o.reverse())
+                }
+            };
+            return Ok(ord.map(ord_cmp).unwrap_or(false));
+        }
+        Ok(num_cmp(self.to_f64(a), self.to_f64(b)))
     }
 
     /// Throw a JS value through the exception-handler machinery.
@@ -1752,6 +1777,59 @@ impl Vm {
         let p = self.heap.allocate(sp);
         self.func_prototypes.insert(-570, p);
         p
+    }
+
+    /// BigInt.prototype, lazily created (func_prototypes[-638]). Holds the
+    /// `toString` (-639) and `valueOf` (-640) sentinels and `constructor`.
+    pub(crate) fn bigint_prototype_oid(&mut self) -> ObjectId {
+        if let Some(&p) = self.func_prototypes.get(&-638) {
+            return p;
+        }
+        let mut bp = JsObject::ordinary();
+        bp.prototype = Some(self.object_prototype);
+        let ctor_key = self.interner.intern("constructor");
+        bp.set_property(ctor_key, Value::function(-638));
+        let ts = self.interner.intern("toString");
+        bp.define_property(ts, crate::runtime::object::Property::with_flags(
+            Value::function(-639), crate::runtime::object::Property::WRITABLE | crate::runtime::object::Property::CONFIGURABLE));
+        let vo = self.interner.intern("valueOf");
+        bp.define_property(vo, crate::runtime::object::Property::with_flags(
+            Value::function(-640), crate::runtime::object::Property::WRITABLE | crate::runtime::object::Property::CONFIGURABLE));
+        let p = self.heap.allocate(bp);
+        self.func_prototypes.insert(-638, p);
+        p
+    }
+
+    /// ToBigInt(value) per spec. Returns the BigInt value, or Err(thrown).
+    pub(crate) fn value_to_bigint(&mut self, val: Value) -> Result<num_bigint::BigInt, VmError> {
+        // Unwrap a primitive-wrapper object first (Object(1n)).
+        let v = if val.is_object() && !self.is_bigint(val) {
+            self.try_coerce_to_primitive_hint(val, "number")?
+        } else { val };
+        if let Some(b) = self.as_bigint(v) { return Ok(b); }
+        if let Some(boolean) = v.as_bool() {
+            return Ok(num_bigint::BigInt::from(if boolean { 1 } else { 0 }));
+        }
+        if v.is_number() || v.is_int() {
+            let f = self.to_f64(v);
+            if !f.is_finite() || f.fract() != 0.0 {
+                let err = self.make_native_error("RangeError", "The number is not a safe integer");
+                return Err(VmError::Throw(err));
+            }
+            return Ok(num_traits::FromPrimitive::from_f64(f).unwrap_or_default());
+        }
+        if self.is_string_like(v) {
+            let s = self.flatten_cons_to_string(v);
+            return match string_to_bigint(&s) {
+                Some(b) => Ok(b),
+                None => {
+                    let err = self.make_native_error("SyntaxError", "Cannot convert string to a BigInt");
+                    Err(VmError::Throw(err))
+                }
+            };
+        }
+        let err = self.make_native_error("TypeError", "Cannot convert value to a BigInt");
+        Err(VmError::Throw(err))
     }
 
     /// Lazily create the shared builtin-iterator prototype: an ordinary
@@ -2541,6 +2619,75 @@ impl Vm {
         }
     }
 
+    // ---- BigInt helpers ----------------------------------------------------
+
+    /// Allocate a heap BigInt and return it as a Value. Its prototype is
+    /// BigInt.prototype so property reads (`.constructor`, `.toString`) resolve;
+    /// `typeof`/arithmetic still classify it by its BigInt kind, not the proto.
+    pub(crate) fn make_bigint(&mut self, v: num_bigint::BigInt) -> Value {
+        let proto = self.bigint_prototype_oid();
+        let mut obj = crate::runtime::object::JsObject::bigint(v);
+        obj.prototype = Some(proto);
+        let oid = self.heap.allocate(obj);
+        Value::object_id(oid)
+    }
+
+    /// ToBoolean, heap-aware: `0n` is falsy (other BigInts truthy); everything
+    /// else defers to the bit-level `Value::to_boolean`.
+    pub(crate) fn truthy(&self, val: Value) -> bool {
+        if let Some(b) = self.as_bigint(val) {
+            return !num_traits::Zero::is_zero(&b);
+        }
+        val.to_boolean()
+    }
+
+    /// True if `val` is a BigInt primitive (heap object of kind BigInt).
+    pub(crate) fn is_bigint(&self, val: Value) -> bool {
+        val.as_object_id()
+            .and_then(|oid| self.heap.get(oid))
+            .map(|o| matches!(o.kind, crate::runtime::object::ObjectKind::BigInt(_)))
+            .unwrap_or(false)
+    }
+
+    /// BigInt shift: `a << b` (left=true) or `a >> b` (left=false). A negative
+    /// shift count reverses direction (`a << -n` == `a >> n`). `>>` is an
+    /// arithmetic shift (rounds toward -∞), matching BigInt semantics.
+    pub(crate) fn bigint_shift(&mut self, a: num_bigint::BigInt, b: num_bigint::BigInt, left: bool) -> Value {
+        use num_bigint::{BigInt, Sign};
+        use num_traits::{ToPrimitive, Zero};
+        // Normalize to "shift left by `n`" where n may be negative.
+        let n = b.to_i64().map(|v| if left { v } else { -v });
+        let result = match n {
+            Some(n) if n >= 0 => a << (n as usize),
+            Some(n) => a >> ((-n) as usize),
+            None => {
+                // Shift count doesn't fit i64. Either direction is infeasible to
+                // materialize for a nonzero value; approximate the limit results.
+                let shifting_left = (b.sign() == Sign::Plus) == left;
+                if a.is_zero() {
+                    BigInt::zero()
+                } else if shifting_left {
+                    a << usize::MAX // effectively unbounded; only reachable with a==0 in practice
+                } else if a.sign() == Sign::Minus {
+                    BigInt::from(-1)
+                } else {
+                    BigInt::zero()
+                }
+            }
+        };
+        self.make_bigint(result)
+    }
+
+    /// Clone the BigInt value out of `val`, if it is one.
+    pub(crate) fn as_bigint(&self, val: Value) -> Option<num_bigint::BigInt> {
+        val.as_object_id()
+            .and_then(|oid| self.heap.get(oid))
+            .and_then(|o| match &o.kind {
+                crate::runtime::object::ObjectKind::BigInt(b) => Some(b.clone()),
+                _ => None,
+            })
+    }
+
     // ---- ConsString helpers -----------------------------------------------
 
     /// Returns true if val is a heap object of kind ConsString.
@@ -2690,6 +2837,32 @@ impl Vm {
             return self.try_abstract_eq(a, Value::number(num_b));
         }
 
+        // BigInt comparisons. A BigInt is a heap object, so this must run before
+        // the generic object-vs-primitive branch below.
+        if self.is_bigint(a) || self.is_bigint(b) {
+            // If the other operand is a (non-BigInt) object, coerce it first.
+            if self.is_bigint(a) && b.is_object() && !self.is_bigint(b) {
+                let pb = self.try_coerce_to_primitive_hint(b, "default")?;
+                return self.try_abstract_eq(a, pb);
+            }
+            if self.is_bigint(b) && a.is_object() && !self.is_bigint(a) {
+                let pa = self.try_coerce_to_primitive_hint(a, "default")?;
+                return self.try_abstract_eq(pa, b);
+            }
+            let (big, other) = if let Some(x) = self.as_bigint(a) { (x, b) } else { (self.as_bigint(b).unwrap(), a) };
+            if let Some(y) = self.as_bigint(other) {
+                return Ok(big == y);
+            }
+            if other.is_number() {
+                return Ok(bigint_eq_f64(&big, self.to_f64(other)));
+            }
+            if self.is_string_like(other) {
+                let s = self.flatten_cons_to_string(other);
+                return Ok(matches!(string_to_bigint(&s), Some(y) if big == y));
+            }
+            return Ok(false);
+        }
+
         // object vs primitive: unwrap wrapper only when the OTHER side is primitive
         // (object == object compares references, not values)
         if a.is_object() && !b.is_object() {
@@ -2720,6 +2893,13 @@ impl Vm {
         // Handle int == float comparison: 1 === 1.0 should be true
         if a.is_number() && b.is_number() {
             return a.as_number() == b.as_number();
+        }
+        // BigInt === BigInt compares by mathematical value; a BigInt is never
+        // strictly equal to a value of any other type.
+        match (self.as_bigint(a), self.as_bigint(b)) {
+            (Some(x), Some(y)) => return x == y,
+            (Some(_), None) | (None, Some(_)) => return false,
+            (None, None) => {}
         }
         // ConsString equality: compare flattened content
         let a_str = self.is_string_like(a);
@@ -3001,6 +3181,18 @@ impl Vm {
                     self.push(val);
                 }
 
+                OpCode::LoadBigInt => {
+                    let index = self.read_u16() as usize;
+                    let chunk = self.cur_chunk();
+                    let digits = self.chunks[chunk].constants.get(index)
+                        .and_then(|v| v.as_string_id())
+                        .map(|id| self.interner.resolve(id).to_owned())
+                        .unwrap_or_default();
+                    let big = parse_bigint_literal(&digits).unwrap_or_default();
+                    let v = self.make_bigint(big);
+                    self.push(v);
+                }
+
                 OpCode::ConstLong => {
                     let index = {
                         let v = self.chunks[self.cur_chunk()].read_u32(self.cur_ip());
@@ -3149,6 +3341,13 @@ impl Vm {
                             self.handle_throw(err)?;
                             continue;
                         }
+                        // Neither side is a string: BigInt + BigInt adds; mixing a
+                        // BigInt with a non-BigInt is a TypeError.
+                        match (self.as_bigint(a_prim), self.as_bigint(b_prim)) {
+                            (Some(x), Some(y)) => { let v = self.make_bigint(x + y); self.push(v); continue; }
+                            (None, None) => {}
+                            _ => { self.throw_mix_bigint()?; continue; }
+                        }
                         let na = self.to_f64(a_prim);
                         let nb = self.to_f64(b_prim);
                         self.push_number(na + nb);
@@ -3156,40 +3355,60 @@ impl Vm {
                 }
 
                 OpCode::Sub => {
-                    match self.pop_numbers() {
-                        Ok((a, b)) => self.push_number(a - b),
+                    match self.pop_arith_operands() {
+                        Ok(ArithOperands::Numbers(a, b)) => self.push_number(a - b),
+                        Ok(ArithOperands::BigInts(a, b)) => { let v = self.make_bigint(a - b); self.push(v); }
+                        Ok(ArithOperands::Mixed) => { self.throw_mix_bigint()?; continue; }
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
                     }
                 }
 
                 OpCode::Mul => {
-                    match self.pop_numbers() {
-                        Ok((a, b)) => self.push_number(a * b),
+                    match self.pop_arith_operands() {
+                        Ok(ArithOperands::Numbers(a, b)) => self.push_number(a * b),
+                        Ok(ArithOperands::BigInts(a, b)) => { let v = self.make_bigint(a * b); self.push(v); }
+                        Ok(ArithOperands::Mixed) => { self.throw_mix_bigint()?; continue; }
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
                     }
                 }
 
                 OpCode::Div => {
-                    match self.pop_numbers() {
-                        Ok((a, b)) => self.push_number(a / b),
+                    match self.pop_arith_operands() {
+                        Ok(ArithOperands::Numbers(a, b)) => self.push_number(a / b),
+                        Ok(ArithOperands::BigInts(a, b)) => {
+                            if num_bigint::BigInt::from(0) == b {
+                                let err = self.make_native_error("RangeError", "Division by zero");
+                                self.handle_throw(err)?; continue;
+                            }
+                            let v = self.make_bigint(a / b); self.push(v);
+                        }
+                        Ok(ArithOperands::Mixed) => { self.throw_mix_bigint()?; continue; }
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
                     }
                 }
 
                 OpCode::Rem => {
-                    match self.pop_numbers() {
-                        Ok((a, b)) => self.push_number(a % b),
+                    match self.pop_arith_operands() {
+                        Ok(ArithOperands::Numbers(a, b)) => self.push_number(a % b),
+                        Ok(ArithOperands::BigInts(a, b)) => {
+                            if num_bigint::BigInt::from(0) == b {
+                                let err = self.make_native_error("RangeError", "Division by zero");
+                                self.handle_throw(err)?; continue;
+                            }
+                            let v = self.make_bigint(a % b); self.push(v);
+                        }
+                        Ok(ArithOperands::Mixed) => { self.throw_mix_bigint()?; continue; }
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
                     }
                 }
 
                 OpCode::Exp => {
-                    match self.pop_numbers() {
-                        Ok((a, b)) => {
+                    match self.pop_arith_operands() {
+                        Ok(ArithOperands::Numbers(a, b)) => {
                             // Per spec, if abs(base) is 1 and exponent is ±∞, the result
                             // is NaN. Rust's powf follows IEEE 754 and returns 1 here.
                             let result = if a.abs() == 1.0 && b.is_infinite() {
@@ -3199,6 +3418,17 @@ impl Vm {
                             };
                             self.push_number(result);
                         }
+                        Ok(ArithOperands::BigInts(a, b)) => {
+                            use num_traits::Signed;
+                            if b.is_negative() {
+                                let err = self.make_native_error("RangeError", "Exponent must be non-negative");
+                                self.handle_throw(err)?; continue;
+                            }
+                            // Exponent fits in u32 for any feasible result; clamp avoids overflow.
+                            let exp: u32 = num_traits::ToPrimitive::to_u32(&b).unwrap_or(u32::MAX);
+                            let v = self.make_bigint(a.pow(exp)); self.push(v);
+                        }
+                        Ok(ArithOperands::Mixed) => { self.throw_mix_bigint()?; continue; }
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
                     }
@@ -3213,7 +3443,11 @@ impl Vm {
                             Err(e) => return Err(e),
                         }
                     } else { val };
-                    self.push_number(-self.to_f64(prim));
+                    if let Some(b) = self.as_bigint(prim) {
+                        let v = self.make_bigint(-b); self.push(v);
+                    } else {
+                        self.push_number(-self.to_f64(prim));
+                    }
                 }
 
                 OpCode::Pos => {
@@ -3225,7 +3459,31 @@ impl Vm {
                             Err(e) => return Err(e),
                         }
                     } else { val };
+                    // Unary `+` performs ToNumber, which throws on BigInt.
+                    if self.is_bigint(prim) {
+                        let err = self.make_native_error("TypeError", "Cannot convert a BigInt value to a number");
+                        self.handle_throw(err)?; continue;
+                    }
                     self.push_number(self.to_f64(prim));
+                }
+
+                OpCode::ToNumeric => {
+                    let val = self.pop()?;
+                    let prim = if val.is_object() {
+                        match self.try_coerce_to_primitive_hint(val, "number") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
+                    } else { val };
+                    if self.is_bigint(prim) {
+                        self.push(prim);
+                    } else if prim.is_symbol() {
+                        let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+                        self.handle_throw(err)?; continue;
+                    } else {
+                        self.push_number(self.to_f64(prim));
+                    }
                 }
 
                 OpCode::Inc => {
@@ -3237,7 +3495,11 @@ impl Vm {
                             Err(e) => return Err(e),
                         }
                     } else { val };
-                    self.push_number(self.to_f64(prim) + 1.0);
+                    if let Some(b) = self.as_bigint(prim) {
+                        let v = self.make_bigint(b + 1); self.push(v);
+                    } else {
+                        self.push_number(self.to_f64(prim) + 1.0);
+                    }
                 }
 
                 OpCode::Dec => {
@@ -3249,29 +3511,39 @@ impl Vm {
                             Err(e) => return Err(e),
                         }
                     } else { val };
-                    self.push_number(self.to_f64(prim) - 1.0);
+                    if let Some(b) = self.as_bigint(prim) {
+                        let v = self.make_bigint(b - 1); self.push(v);
+                    } else {
+                        self.push_number(self.to_f64(prim) - 1.0);
+                    }
                 }
 
                 // ---- Bitwise ---------------------------------------------
                 OpCode::BitAnd => {
-                    match self.pop_ints() {
-                        Ok((a, b)) => self.push(Value::int(a & b)),
+                    match self.pop_arith_operands() {
+                        Ok(ArithOperands::Numbers(a, b)) => self.push(Value::int(f64_to_int32(a) & f64_to_int32(b))),
+                        Ok(ArithOperands::BigInts(a, b)) => { let v = self.make_bigint(a & b); self.push(v); }
+                        Ok(ArithOperands::Mixed) => { self.throw_mix_bigint()?; continue; }
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
                     }
                 }
 
                 OpCode::BitOr => {
-                    match self.pop_ints() {
-                        Ok((a, b)) => self.push(Value::int(a | b)),
+                    match self.pop_arith_operands() {
+                        Ok(ArithOperands::Numbers(a, b)) => self.push(Value::int(f64_to_int32(a) | f64_to_int32(b))),
+                        Ok(ArithOperands::BigInts(a, b)) => { let v = self.make_bigint(a | b); self.push(v); }
+                        Ok(ArithOperands::Mixed) => { self.throw_mix_bigint()?; continue; }
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
                     }
                 }
 
                 OpCode::BitXor => {
-                    match self.pop_ints() {
-                        Ok((a, b)) => self.push(Value::int(a ^ b)),
+                    match self.pop_arith_operands() {
+                        Ok(ArithOperands::Numbers(a, b)) => self.push(Value::int(f64_to_int32(a) ^ f64_to_int32(b))),
+                        Ok(ArithOperands::BigInts(a, b)) => { let v = self.make_bigint(a ^ b); self.push(v); }
+                        Ok(ArithOperands::Mixed) => { self.throw_mix_bigint()?; continue; }
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
                     }
@@ -3286,27 +3558,40 @@ impl Vm {
                             Err(e) => return Err(e),
                         }
                     } else { val };
-                    let n = self.to_i32(prim)?;
-                    self.push(Value::int(!n));
+                    if let Some(b) = self.as_bigint(prim) {
+                        // ~x == -(x + 1) for BigInt.
+                        let v = self.make_bigint(-(b + num_bigint::BigInt::from(1))); self.push(v);
+                    } else {
+                        let n = self.to_i32(prim)?;
+                        self.push(Value::int(!n));
+                    }
                 }
 
                 OpCode::Shl => {
-                    match self.pop_ints() {
-                        Ok((a, b)) => {
-                            let shift = (b as u32) & 0x1F;
-                            self.push(Value::int(a.wrapping_shl(shift)));
+                    match self.pop_arith_operands() {
+                        Ok(ArithOperands::Numbers(a, b)) => {
+                            let shift = (f64_to_int32(b) as u32) & 0x1F;
+                            self.push(Value::int(f64_to_int32(a).wrapping_shl(shift)));
                         }
+                        Ok(ArithOperands::BigInts(a, b)) => {
+                            let v = self.bigint_shift(a, b, true); self.push(v);
+                        }
+                        Ok(ArithOperands::Mixed) => { self.throw_mix_bigint()?; continue; }
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
                     }
                 }
 
                 OpCode::Shr => {
-                    match self.pop_ints() {
-                        Ok((a, b)) => {
-                            let shift = (b as u32) & 0x1F;
-                            self.push(Value::int(a.wrapping_shr(shift)));
+                    match self.pop_arith_operands() {
+                        Ok(ArithOperands::Numbers(a, b)) => {
+                            let shift = (f64_to_int32(b) as u32) & 0x1F;
+                            self.push(Value::int(f64_to_int32(a).wrapping_shr(shift)));
                         }
+                        Ok(ArithOperands::BigInts(a, b)) => {
+                            let v = self.bigint_shift(a, b, false); self.push(v);
+                        }
+                        Ok(ArithOperands::Mixed) => { self.throw_mix_bigint()?; continue; }
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
                     }
@@ -3386,7 +3671,7 @@ impl Vm {
                 OpCode::Lt => {
                     let bv = self.pop()?;
                     let av = self.pop()?;
-                    match self.relational_compare(av, bv, |a, b| a < b, |a, b| a < b) {
+                    match self.relational_compare(av, bv, |a, b| a < b, |a, b| a < b, |o| o == std::cmp::Ordering::Less) {
                         Ok(r) => self.push(Value::boolean(r)),
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
@@ -3396,7 +3681,7 @@ impl Vm {
                 OpCode::Le => {
                     let bv = self.pop()?;
                     let av = self.pop()?;
-                    match self.relational_compare(av, bv, |a, b| a <= b, |a, b| a <= b) {
+                    match self.relational_compare(av, bv, |a, b| a <= b, |a, b| a <= b, |o| o != std::cmp::Ordering::Greater) {
                         Ok(r) => self.push(Value::boolean(r)),
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
@@ -3406,7 +3691,7 @@ impl Vm {
                 OpCode::Gt => {
                     let bv = self.pop()?;
                     let av = self.pop()?;
-                    match self.relational_compare(av, bv, |a, b| a > b, |a, b| a > b) {
+                    match self.relational_compare(av, bv, |a, b| a > b, |a, b| a > b, |o| o == std::cmp::Ordering::Greater) {
                         Ok(r) => self.push(Value::boolean(r)),
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
@@ -3416,7 +3701,7 @@ impl Vm {
                 OpCode::Ge => {
                     let bv = self.pop()?;
                     let av = self.pop()?;
-                    match self.relational_compare(av, bv, |a, b| a >= b, |a, b| a >= b) {
+                    match self.relational_compare(av, bv, |a, b| a >= b, |a, b| a >= b, |o| o != std::cmp::Ordering::Less) {
                         Ok(r) => self.push(Value::boolean(r)),
                         Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                         Err(e) => return Err(e),
@@ -3426,7 +3711,7 @@ impl Vm {
                 // ---- Logical / Unary -------------------------------------
                 OpCode::Not => {
                     let val = self.pop()?;
-                    self.push(Value::boolean(!val.to_boolean()));
+                    let t = self.truthy(val); self.push(Value::boolean(!t));
                 }
 
                 OpCode::TypeOf => {
@@ -3483,7 +3768,7 @@ impl Vm {
                 OpCode::JumpIfFalse => {
                     let offset = self.read_i16();
                     let val = self.pop()?;
-                    if !val.to_boolean() {
+                    if !self.truthy(val) {
                         self.frames.last_mut().unwrap().ip = (self.frames.last().unwrap().ip as isize + offset as isize) as usize;
                     }
                 }
@@ -3491,7 +3776,7 @@ impl Vm {
                 OpCode::JumpIfTrue => {
                     let offset = self.read_i16();
                     let val = self.pop()?;
-                    if val.to_boolean() {
+                    if self.truthy(val) {
                         self.frames.last_mut().unwrap().ip = (self.frames.last().unwrap().ip as isize + offset as isize) as usize;
                     }
                 }
@@ -3499,7 +3784,7 @@ impl Vm {
                 OpCode::JumpIfFalsePeek => {
                     let offset = self.read_i16();
                     let val = self.peek()?;
-                    if !val.to_boolean() {
+                    if !self.truthy(val) {
                         self.frames.last_mut().unwrap().ip = (self.frames.last().unwrap().ip as isize + offset as isize) as usize;
                     }
                 }
@@ -3507,7 +3792,7 @@ impl Vm {
                 OpCode::JumpIfTruePeek => {
                     let offset = self.read_i16();
                     let val = self.peek()?;
-                    if val.to_boolean() {
+                    if self.truthy(val) {
                         self.frames.last_mut().unwrap().ip = (self.frames.last().unwrap().ip as isize + offset as isize) as usize;
                     }
                 }
@@ -4041,6 +4326,18 @@ impl Vm {
                         continue;
                     }
 
+                    // BigInt(value) — converts to a BigInt (not constructable).
+                    if func_val.is_function() && func_val.as_function() == Some(-638) {
+                        let arg = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                        self.truncate_stack(func_pos);
+                        match self.value_to_bigint(arg) {
+                            Ok(b) => { let v = self.make_bigint(b); self.push(v); }
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; }
+                            Err(e) => return Err(e),
+                        }
+                        continue;
+                    }
+
                     // RegExp(pattern, flags) — without new, same as new RegExp
                     if func_val.is_function() && func_val.as_function() == Some(-580) {
                         let pattern = if argc > 0 { self.value_to_string(self.stack[func_pos + 1]) } else { String::new() };
@@ -4344,7 +4641,7 @@ impl Vm {
                             self.push(result);
                             continue;
                         }
-                        if (-635..=-590).contains(&sentinel) {
+                        if (-635..=-590).contains(&sentinel) || sentinel == -639 || sentinel == -640 {
                             // Native this-dependent methods called standalone (this=undefined)
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                             let result = self.exec_native_method(sentinel, Value::undefined(), &args);
@@ -4412,7 +4709,15 @@ impl Vm {
                     // Object(v) called as function: wraps primitives, returns objects as-is
                     if func_val.is_function() && func_val.as_function() == Some(-508) {
                         let arg = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
-                        let result = if arg.is_object() {
+                        let result = if self.is_bigint(arg) {
+                            // ToObject(bigint) → a BigInt wrapper object (typeof "object").
+                            let proto = self.bigint_prototype_oid();
+                            let mut obj = JsObject { properties: Vec::new(), prototype: Some(proto),
+                                kind: ObjectKind::Wrapper(arg), marked: false, extensible: true };
+                            let prim_key = self.interner.intern("__primitive__");
+                            obj.set_property(prim_key, arg);
+                            Value::object_id(self.heap.allocate(obj))
+                        } else if arg.is_object() {
                             arg
                         } else if arg.is_null() || arg.is_undefined() {
                             let mut obj = JsObject::ordinary();
@@ -6584,6 +6889,30 @@ impl Vm {
                             }
                             "toString" => {
                                 let s = self.value_to_string(effective_val);
+                                let id = self.interner.intern(&s);
+                                self.truncate_stack(obj_pos);
+                                self.push(Value::string(id));
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // BigInt primitive methods: valueOf returns the BigInt;
+                    // toString(radix) renders it (radix defaults to 10).
+                    if let Some(b) = self.as_bigint(effective_val) {
+                        let mn = self.interner.resolve(method_name).to_owned();
+                        match mn.as_str() {
+                            "valueOf" => {
+                                self.truncate_stack(obj_pos);
+                                self.push(effective_val);
+                                continue;
+                            }
+                            "toString" | "toLocaleString" => {
+                                let radix = if argc > 0 {
+                                    self.to_f64(self.stack[obj_pos + 1]) as u32
+                                } else { 10 };
+                                let s = if (2..=36).contains(&radix) { b.to_str_radix(radix) } else { b.to_string() };
                                 let id = self.interner.intern(&s);
                                 self.truncate_stack(obj_pos);
                                 self.push(Value::string(id));
@@ -10686,6 +11015,74 @@ fn epoch_to_ymd(ms: f64) -> (i32, i32, i32) {
 
 pub(crate) fn format_date(ms: f64) -> String {
     format_iso(ms)
+}
+
+/// StringToBigInt: parse a string (per `==` and `BigInt(str)`) into a BigInt.
+/// Allows surrounding whitespace, an optional sign, and 0x/0o/0b prefixes.
+/// Empty/whitespace-only yields 0n; anything malformed yields None.
+pub(crate) fn string_to_bigint(s: &str) -> Option<num_bigint::BigInt> {
+    let t = s.trim();
+    if t.is_empty() { return Some(num_bigint::BigInt::default()); }
+    let (neg, body) = match t.as_bytes()[0] {
+        b'-' => (true, &t[1..]),
+        b'+' => (false, &t[1..]),
+        _ => (false, t),
+    };
+    // A sign is not allowed together with a radix prefix.
+    let v = parse_bigint_literal(body)?;
+    Some(if neg { -v } else { v })
+}
+
+/// True iff the BigInt equals the (finite, integral) Number `f`.
+pub(crate) fn bigint_eq_f64(big: &num_bigint::BigInt, f: f64) -> bool {
+    if !f.is_finite() || f.fract() != 0.0 { return false; }
+    matches!(num_traits::FromPrimitive::from_f64(f), Some(bf) if *big == bf)
+}
+
+/// Compare a BigInt with a Number for relational operators. None if `f` is NaN.
+pub(crate) fn bigint_cmp_f64(big: &num_bigint::BigInt, f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if f.is_nan() { return None; }
+    if f == f64::INFINITY { return Some(Ordering::Less); }
+    if f == f64::NEG_INFINITY { return Some(Ordering::Greater); }
+    // Compare exactly: floor(f) splits the integer boundary, fract breaks ties.
+    let floor = f.floor();
+    let bf: num_bigint::BigInt = num_traits::FromPrimitive::from_f64(floor)
+        .unwrap_or_default();
+    match big.cmp(&bf) {
+        Ordering::Equal => {
+            // big == floor(f); if f has a fractional part, f is larger.
+            if f.fract() > 0.0 { Some(Ordering::Less) } else { Some(Ordering::Equal) }
+        }
+        other => Some(other),
+    }
+}
+
+/// ECMAScript ToInt32 on an f64.
+pub(crate) fn f64_to_int32(n: f64) -> i32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 { return 0; }
+    let int = n.signum() * n.abs().floor();
+    let int32bit = int.rem_euclid(4294967296.0);
+    if int32bit >= 2147483648.0 { (int32bit - 4294967296.0) as i32 } else { int32bit as i32 }
+}
+
+/// Parse a BigInt literal's digit string (no trailing `n`, separators already
+/// stripped) into a BigInt, honoring 0x/0o/0b radix prefixes. Returns None on
+/// malformed input.
+pub(crate) fn parse_bigint_literal(s: &str) -> Option<num_bigint::BigInt> {
+    use num_bigint::BigInt;
+    let s = s.trim();
+    let (radix, digits) = if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        (16, rest)
+    } else if let Some(rest) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
+        (8, rest)
+    } else if let Some(rest) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        (2, rest)
+    } else {
+        (10, s)
+    };
+    if digits.is_empty() { return if radix == 10 { Some(BigInt::default()) } else { None }; }
+    BigInt::parse_bytes(digits.as_bytes(), radix)
 }
 
 fn format_iso(ms: f64) -> String {

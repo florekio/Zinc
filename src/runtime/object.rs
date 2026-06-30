@@ -153,6 +153,10 @@ pub enum ObjectKind {
     },
     /// Date: milliseconds since UNIX epoch
     Date(f64),
+    /// BigInt: arbitrary-precision integer. A `typeof === "bigint"` primitive,
+    /// stored on the heap because the NaN-boxed Value tag space is full. These
+    /// objects are immutable and compared by mathematical value, not identity.
+    BigInt(num_bigint::BigInt),
     /// Lazy concatenated string. Left and right are either TAG_STRING (StringId)
     /// or another ConsString ObjectId. `len` caches the total char count for O(1) .length.
     ConsString { left: Value, right: Value, len: u32 },
@@ -399,6 +403,7 @@ impl ObjectHeap {
             | ObjectKind::KeyIterator(_, _)
             | ObjectKind::RegExp { .. }
             | ObjectKind::Host { .. }
+            | ObjectKind::BigInt(_)
             | ObjectKind::Date(_) => {}
         }
 
@@ -478,6 +483,16 @@ impl JsObject {
             kind: ObjectKind::Array(elements),
             marked: false,
             extensible: true,
+        }
+    }
+
+    pub fn bigint(value: num_bigint::BigInt) -> Self {
+        Self {
+            properties: Vec::new(),
+            prototype: None,
+            kind: ObjectKind::BigInt(value),
+            marked: false,
+            extensible: false,
         }
     }
 

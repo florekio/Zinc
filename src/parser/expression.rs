@@ -363,13 +363,14 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
             Ok(Expression::NumberLiteral(NumberLiteral { value, span }))
         }
         TokenKind::BigInt => {
-            // Treat BigInt as a regular number (strip 'n' suffix)
             let text = p.current_text().to_owned();
             let span = p.current().span;
             p.advance();
-            let stripped = text.trim_end_matches('n');
-            let value = p.parse_number(stripped);
-            Ok(Expression::NumberLiteral(NumberLiteral { value, span }))
+            // Keep the digits (and any 0x/0o/0b prefix); drop the `n` and any
+            // numeric separators. The compiler parses this into a BigInt.
+            let stripped: String = text.trim_end_matches('n').chars().filter(|&c| c != '_').collect();
+            let raw = p.interner.intern(&stripped);
+            Ok(Expression::BigIntLiteral(BigIntLiteral { raw, span }))
         }
         TokenKind::String => {
             let text = p.current_text().to_owned();
@@ -1532,6 +1533,7 @@ fn arrow_body_end(body: &ArrowBody) -> u32 {
 pub fn expr_span(expr: &Expression) -> Span {
     match expr {
         Expression::NumberLiteral(n) => n.span,
+        Expression::BigIntLiteral(b) => b.span,
         Expression::StringLiteral(s) => s.span,
         Expression::BooleanLiteral(b) => b.span,
         Expression::NullLiteral(s) => *s,

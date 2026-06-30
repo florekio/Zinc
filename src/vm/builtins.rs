@@ -1095,7 +1095,11 @@ impl Vm {
             }
             -505 => { // Number()
                 let v = args.first().copied().unwrap_or(Value::int(0));
-                if let Some(n) = v.as_number() { Value::number(n) }
+                if let Some(b) = self.as_bigint(v) {
+                    // Number(bigint) is an explicit, allowed conversion (unlike ToNumber).
+                    Value::number(num_traits::ToPrimitive::to_f64(&b).unwrap_or(f64::INFINITY))
+                }
+                else if let Some(n) = v.as_number() { Value::number(n) }
                 else if v.is_boolean() { Value::number(if v.as_bool().unwrap() { 1.0 } else { 0.0 }) }
                 else if v.is_null() { Value::number(0.0) }
                 else if v.is_undefined() { Value::number(f64::NAN) }
@@ -1107,7 +1111,7 @@ impl Vm {
             }
             -506 => { // Boolean()
                 let v = args.first().copied().unwrap_or(Value::boolean(false));
-                Value::boolean(v.to_boolean())
+                Value::boolean(self.truthy(v))
             }
             -517 | -519 => { // decodeURIComponent / decodeURI
                 let s = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
@@ -1195,6 +1199,17 @@ impl Vm {
             }
             -508 => { // Object(v) — coerce to object
                 let arg = args.first().copied().unwrap_or(Value::undefined());
+                // A raw BigInt is a primitive (despite living on the heap):
+                // ToObject wraps it in a BigInt wrapper object (typeof "object").
+                if self.is_bigint(arg) {
+                    let proto = self.bigint_prototype_oid();
+                    let prim_key = self.interner.intern("__primitive__");
+                    let mut obj = crate::runtime::object::JsObject {
+                        properties: Vec::new(), prototype: Some(proto),
+                        kind: ObjectKind::Wrapper(arg), marked: false, extensible: true };
+                    obj.set_property(prim_key, arg);
+                    return Value::object_id(self.heap.allocate(obj));
+                }
                 // ToObject of an object — and functions ARE objects —
                 // returns the value unchanged. core-js's toIndexedObject
                 // runs every descriptor target through Object(t); minting
@@ -1351,6 +1366,26 @@ impl Vm {
             -593 => { // Object.prototype.valueOf
                 this_val
             }
+            -639 => { // BigInt.prototype.toString(radix)
+                let b = self.as_bigint(this_val)
+                    .or_else(|| this_val.as_object_id()
+                        .and_then(|o| self.heap.get(o))
+                        .and_then(|o| if let ObjectKind::Wrapper(inner) = &o.kind { self.as_bigint(*inner) } else { None }));
+                if let Some(b) = b {
+                    let radix = if let Some(r) = args.first() { self.to_f64(*r) as u32 } else { 10 };
+                    let s = if (2..=36).contains(&radix) { b.to_str_radix(radix) } else { b.to_string() };
+                    Value::string(self.interner.intern(&s))
+                } else {
+                    Value::string(self.interner.intern("0"))
+                }
+            }
+            -640 => { // BigInt.prototype.valueOf
+                self.as_bigint(this_val).map(|b| self.make_bigint(b))
+                    .or_else(|| this_val.as_object_id()
+                        .and_then(|o| self.heap.get(o))
+                        .and_then(|o| if let ObjectKind::Wrapper(inner) = &o.kind { Some(*inner) } else { None }))
+                    .unwrap_or(this_val)
+            }
             -594 => { // Object.prototype.isPrototypeOf
                 let target = args.first().copied().unwrap_or(Value::undefined());
                 if let Some(proto_oid) = this_val.as_object_id() {
@@ -1485,6 +1520,11 @@ impl Vm {
     }
 
     fn try_coerce_to_primitive_hint_inner(&mut self, val: Value, hint_str: &str) -> Result<Value, super::vm::VmError> {
+        // A raw BigInt is already a primitive (it lives on the heap only because
+        // the Value tag space is full) — ToPrimitive returns it unchanged.
+        if self.is_bigint(val) {
+            return Ok(val);
+        }
         // Function values are tagged primitives in the VM but spec-wise are
         // ordinary objects. Coerce them to a string via the canonical
         // toString form so they participate in '+' / '<' / '==' correctly.

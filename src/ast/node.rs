@@ -278,6 +278,7 @@ pub struct ClassProperty {
 pub enum Expression {
     // Literals
     NumberLiteral(NumberLiteral),
+    BigIntLiteral(BigIntLiteral),
     StringLiteral(StringLiteral),
     BooleanLiteral(BooleanLiteral),
     NullLiteral(Span),
@@ -323,6 +324,14 @@ pub enum Expression {
 #[derive(Debug, Clone)]
 pub struct NumberLiteral {
     pub value: f64,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct BigIntLiteral {
+    /// The literal digits without the trailing `n`, including any `0x`/`0o`/`0b`
+    /// radix prefix (e.g. "123", "0xFF"). Parsed to a BigInt at compile time.
+    pub raw: StringId,
     pub span: Span,
 }
 

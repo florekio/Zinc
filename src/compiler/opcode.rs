@@ -27,6 +27,9 @@ pub enum OpCode {
     Zero = 0x07,
     /// Push 1 (as SMI)
     One = 0x08,
+    /// ToNumeric on TOS: coerce to a Number, or keep a BigInt unchanged.
+    /// Used by postfix ++/-- to produce the old value's numeric form.
+    ToNumeric = 0x09,
 
     // ---- Stack Manipulation ----
     /// Discard top of stack
@@ -362,6 +365,8 @@ pub enum OpCode {
     WithExit = 0xFA,
     /// Pop TOS and store it as the script/eval completion value.
     SetCompletion = 0xFD,
+    /// Parse the digit-string constant (u16 index) into a BigInt and push it.
+    LoadBigInt = 0xFE,
     /// Stop execution
     Halt = 0xFF,
 }
@@ -380,7 +385,7 @@ impl OpCode {
     pub(crate) fn is_valid(byte: u8) -> bool {
         matches!(
             byte,
-            0x00..=0x08
+            0x00..=0x09
             | 0x10..=0x15
             | 0x20..=0x29
             | 0x30..=0x36
@@ -398,7 +403,7 @@ impl OpCode {
             | 0xD8..=0xDD
             | 0xE0..=0xE5
             | 0xE8..=0xEF
-            | 0xF0..=0xFD
+            | 0xF0..=0xFE
             | 0xFF
         )
     }
@@ -414,6 +419,7 @@ impl OpCode {
             | OpCode::False
             | OpCode::Zero
             | OpCode::One
+            | OpCode::ToNumeric
             | OpCode::Pop
             | OpCode::Dup
             | OpCode::Dup2
@@ -519,6 +525,7 @@ impl OpCode {
 
             // 3 bytes (u16 or i16 operand)
             OpCode::Const
+            | OpCode::LoadBigInt
             | OpCode::TypeOfGlobal
             | OpCode::DeleteGlobal
             | OpCode::Jump

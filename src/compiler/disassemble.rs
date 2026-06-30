@@ -45,7 +45,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
     match op {
         // No operands
         OpCode::Nop | OpCode::Undefined | OpCode::Null | OpCode::True | OpCode::False
-        | OpCode::Zero | OpCode::One | OpCode::Pop | OpCode::Dup | OpCode::Dup2
+        | OpCode::Zero | OpCode::One | OpCode::ToNumeric | OpCode::Pop | OpCode::Dup | OpCode::Dup2
         | OpCode::Swap | OpCode::Rot3
         | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Rem
         | OpCode::Exp | OpCode::Neg | OpCode::Pos | OpCode::Inc | OpCode::Dec
@@ -105,7 +105,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         }
 
         // u16 operand (constant index or name)
-        OpCode::Const => {
+        OpCode::Const | OpCode::LoadBigInt => {
             let idx = chunk.read_u16(offset + 1);
             let val = &chunk.constants[idx as usize];
             out.push_str(&format!("{op:<20} [{idx}] = {val:?}\n"));
