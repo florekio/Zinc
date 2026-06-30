@@ -46,6 +46,45 @@ const TAG_STRING: u64 = NANBOX | (0b101 << 48);
 const TAG_SYMBOL: u64 = NANBOX | (0b110 << 48);
 const TAG_FUNCTION: u64 = NANBOX | (0b111 << 48);
 
+// ---- Inline (small) strings ----
+//
+// The 3-bit tag space is full, so short strings share TAG_STRING and are
+// distinguished by a sub-flag in the 48-bit payload (interned ids only ever
+// occupy the low 32 bits, so the high payload bits are free):
+//
+//   bit 47        : INLINE flag. 0 => interned StringId in low 32 bits (legacy);
+//                                1 => inline string, encoded as below.
+//   bits 44..=46  : byte length (0..=5).
+//   bits 0..=39   : up to 5 raw UTF-8 bytes, byte k in bits (8k..8k+8).
+//
+// Because a string of <=5 bytes is always a complete prefix-free slice, the
+// stored bytes are always valid UTF-8 (we never split a multibyte char).
+/// Payload bit marking a TAG_STRING value as inline rather than an interned id.
+const STR_INLINE_FLAG: u64 = 1 << 47;
+const STR_INLINE_LEN_SHIFT: u64 = 44;
+const STR_INLINE_LEN_MASK: u64 = 0b111 << 44;
+/// Maximum number of UTF-8 bytes that fit in an inline string.
+pub const INLINE_STRING_MAX: usize = 5;
+
+/// An inline string's bytes, materialized on the stack for `&str` access.
+pub struct InlineStr {
+    buf: [u8; INLINE_STRING_MAX],
+    len: u8,
+}
+
+impl InlineStr {
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        // Safe: only constructed from <=5-byte complete &str slices (valid UTF-8).
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len as usize]) }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+}
+
 /// A JavaScript value packed into 64 bits via NaN-boxing.
 #[derive(Clone, Copy, PartialEq)]
 #[repr(transparent)]
@@ -88,6 +127,23 @@ impl Value {
     #[inline]
     pub fn string(id: StringId) -> Self {
         Self(TAG_STRING | id.0 as u64)
+    }
+
+    /// Try to pack a short string inline (no interning, no heap allocation).
+    /// Returns `None` if `s` exceeds [`INLINE_STRING_MAX`] bytes; the caller
+    /// should fall back to interning or a heap string in that case.
+    #[inline]
+    pub fn inline_string(s: &str) -> Option<Self> {
+        let bytes = s.as_bytes();
+        let len = bytes.len();
+        if len > INLINE_STRING_MAX {
+            return None;
+        }
+        let mut payload: u64 = STR_INLINE_FLAG | ((len as u64) << STR_INLINE_LEN_SHIFT);
+        for (k, &b) in bytes.iter().enumerate() {
+            payload |= (b as u64) << (8 * k);
+        }
+        Some(Self(TAG_STRING | payload))
     }
 
     #[inline]
@@ -161,9 +217,36 @@ impl Value {
         self.is_null() || self.is_undefined()
     }
 
+    /// Any string: interned id *or* inline. Both share TAG_STRING.
     #[inline]
     pub fn is_string(&self) -> bool {
         (self.0 & NANBOX_MASK) == TAG_STRING
+    }
+
+    /// True only for inline (small) strings.
+    #[inline]
+    pub fn is_inline_string(&self) -> bool {
+        (self.0 & NANBOX_MASK) == TAG_STRING && (self.0 & STR_INLINE_FLAG) != 0
+    }
+
+    /// True only for interned strings (have a real StringId).
+    #[inline]
+    pub fn is_interned_string(&self) -> bool {
+        (self.0 & NANBOX_MASK) == TAG_STRING && (self.0 & STR_INLINE_FLAG) == 0
+    }
+
+    /// Decode an inline string's bytes onto the stack. `None` if not inline.
+    #[inline]
+    pub fn as_inline_string(&self) -> Option<InlineStr> {
+        if !self.is_inline_string() {
+            return None;
+        }
+        let len = ((self.0 & STR_INLINE_LEN_MASK) >> STR_INLINE_LEN_SHIFT) as u8;
+        let mut buf = [0u8; INLINE_STRING_MAX];
+        for (k, slot) in buf.iter_mut().enumerate() {
+            *slot = ((self.0 >> (8 * k)) & 0xFF) as u8;
+        }
+        Some(InlineStr { buf, len })
     }
 
     #[inline]
@@ -223,9 +306,11 @@ impl Value {
         }
     }
 
+    /// Returns the interned StringId, or `None` for inline strings (which have
+    /// no id). Callers that need an id for an inline string must intern it.
     #[inline]
     pub fn as_string_id(&self) -> Option<StringId> {
-        if self.is_string() {
+        if self.is_interned_string() {
             Some(StringId((self.0 & 0xFFFF_FFFF) as u32))
         } else {
             None
@@ -289,6 +374,9 @@ impl Value {
             (self.0 & 1) != 0
         } else if self.is_null() || self.is_undefined() {
             false
+        } else if self.is_inline_string() {
+            // Inline strings are never empty (empty is the interned StringId(0)).
+            true
         } else if self.is_string() {
             // Empty string is falsy -- we'll need interner context for this.
             // For now, all strings are truthy (refined in runtime with interner).
@@ -321,6 +409,8 @@ impl fmt::Debug for Value {
             write!(f, "fn#{}", self.as_function().unwrap())
         } else if self.is_float() {
             write!(f, "{}", f64::from_bits(self.0))
+        } else if let Some(inl) = self.as_inline_string() {
+            write!(f, "str~{:?}", inl.as_str())
         } else if self.is_string() {
             write!(f, "str#{}", self.as_string_id().unwrap().0)
         } else if self.is_symbol() {
@@ -354,6 +444,8 @@ impl fmt::Display for Value {
             } else {
                 write!(f, "{n}")
             }
+        } else if let Some(inl) = self.as_inline_string() {
+            write!(f, "{}", inl.as_str())
         } else if self.is_string() {
             write!(f, "<string#{}>", self.as_string_id().unwrap().0)
         } else if self.is_symbol() {
@@ -369,6 +461,43 @@ impl fmt::Display for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_inline_string() {
+        // Round-trip a range of short strings.
+        for s in ["", "a", "ab", "abc", "abcd", "abcde", "%", "20", "é", "✓"] {
+            match Value::inline_string(s) {
+                Some(v) => {
+                    assert!(v.is_string(), "{s:?} should report is_string");
+                    assert!(v.is_inline_string(), "{s:?} should be inline");
+                    assert!(!v.is_interned_string(), "{s:?} should not be interned");
+                    assert_eq!(v.as_string_id(), None, "{s:?} has no id");
+                    assert_eq!(v.as_inline_string().unwrap().as_str(), s);
+                    // Non-empty inline strings are truthy; empty is still inline-encodable
+                    // but producers route "" to the interned StringId(0).
+                    if !s.is_empty() {
+                        assert!(v.to_boolean());
+                    }
+                }
+                None => panic!("{s:?} ({} bytes) should fit inline", s.len()),
+            }
+        }
+        // Too long -> None (caller falls back to interning).
+        assert_eq!(Value::inline_string("abcdef"), None);
+        assert_eq!(Value::inline_string("hello world"), None);
+        // A 2-byte char plus padding still fits if <=5 bytes total.
+        assert_eq!(Value::inline_string("éé").unwrap().as_inline_string().unwrap().as_str(), "éé");
+    }
+
+    #[test]
+    fn test_interned_string_still_works() {
+        let v = Value::string(StringId(12345));
+        assert!(v.is_string());
+        assert!(v.is_interned_string());
+        assert!(!v.is_inline_string());
+        assert_eq!(v.as_string_id(), Some(StringId(12345)));
+        assert_eq!(v.as_inline_string().is_none(), true);
+    }
 
     #[test]
     fn test_undefined() {

@@ -51,6 +51,7 @@ fn main() {
                     (total as f64 / secs) / 1e6
                 );
             }
+            eprintln!("    interner size: {}", engine.interner().len());
         }
         if want_hist { zinc::vm::vm::dump_opcode_histogram(); }
     } else {
