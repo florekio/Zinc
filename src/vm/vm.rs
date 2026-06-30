@@ -1447,6 +1447,7 @@ impl Vm {
                     ObjectKind::ConsString { .. } => {
                         self.flatten_cons_to_string(val)
                     }
+                    ObjectKind::FlatString { data, .. } => data.to_string(),
                     ObjectKind::Array(elements) => {
                         let parts: Vec<String> = elements.iter().map(|v| self.value_to_string(*v)).collect();
                         parts.join(",")
@@ -1524,7 +1525,7 @@ impl Vm {
         } else if val.is_object() {
             if let Some(oid) = val.as_object_id()
                 && let Some(obj) = self.heap.get(oid) {
-                    if matches!(obj.kind, ObjectKind::ConsString { .. }) { return "string"; }
+                    if matches!(obj.kind, ObjectKind::ConsString { .. } | ObjectKind::FlatString { .. }) { return "string"; }
                     if matches!(obj.kind, ObjectKind::BigInt(_)) { return "bigint"; }
                     // Function-kind objects (bound functions, native sentinels wrapped
                     // as objects, bytecode functions stored as objects) report "function".
@@ -2776,7 +2777,38 @@ impl Vm {
     /// Returns true if val is string-like: either a TAG_STRING or a ConsString object.
     #[inline(always)]
     pub(crate) fn is_string_like(&self, val: Value) -> bool {
-        val.is_string() || self.is_cons_string(val)
+        val.is_string() || self.is_cons_string(val) || self.is_flat_string(val)
+    }
+
+    /// True if `val` is a non-interned flat heap string (ObjectKind::FlatString).
+    pub(crate) fn is_flat_string(&self, val: Value) -> bool {
+        val.as_object_id()
+            .and_then(|oid| self.heap.get(oid))
+            .map(|o| matches!(o.kind, ObjectKind::FlatString { .. }))
+            .unwrap_or(false)
+    }
+
+    /// Allocate a non-interned flat string value. String-producing operations
+    /// use this instead of `Value::string(self.interner.intern(&s))` so that
+    /// transient strings don't grow the interner. Interned on demand only when
+    /// used as a property key (`flatten_to_string_id`).
+    pub(crate) fn new_string_value(&mut self, s: String) -> Value {
+        // The empty string stays the interned singleton StringId(0): a FlatString
+        // is a heap object (truthy by default), so an empty FlatString would
+        // wrongly be truthy. Empty is also the common case for which interning
+        // is free (already present).
+        if s.is_empty() {
+            return Value::string(crate::util::interner::StringId(0));
+        }
+        let char_len = s.chars().count() as u32;
+        let obj = JsObject {
+            properties: Vec::new(),
+            prototype: None,
+            kind: ObjectKind::FlatString { data: s.into_boxed_str(), char_len },
+            marked: false,
+            extensible: false,
+        };
+        Value::object_id(self.heap.allocate(obj))
     }
 
     /// Returns the character length of a string-like value in O(1) for ConsString.
@@ -2784,9 +2816,12 @@ impl Vm {
         if let Some(id) = val.as_string_id() {
             self.interner.resolve(id).chars().count() as u32
         } else if let Some(oid) = val.as_object_id()
-            && let Some(obj) = self.heap.get(oid)
-            && let ObjectKind::ConsString { len, .. } = obj.kind {
-            len
+            && let Some(obj) = self.heap.get(oid) {
+            match &obj.kind {
+                ObjectKind::ConsString { len, .. } => *len,
+                ObjectKind::FlatString { char_len, .. } => *char_len,
+                _ => 0,
+            }
         } else {
             0
         }
@@ -2806,11 +2841,16 @@ impl Vm {
             if let Some(id) = cur.as_string_id() {
                 result.push_str(self.interner.resolve(id));
             } else if let Some(oid) = cur.as_object_id()
-                && let Some(obj) = self.heap.get(oid)
-                && let ObjectKind::ConsString { left, right, .. } = obj.kind {
-                // Push right first so left is processed first (LIFO)
-                stack.push(right);
-                stack.push(left);
+                && let Some(obj) = self.heap.get(oid) {
+                match &obj.kind {
+                    ObjectKind::ConsString { left, right, .. } => {
+                        // Push right first so left is processed first (LIFO)
+                        stack.push(*right);
+                        stack.push(*left);
+                    }
+                    ObjectKind::FlatString { data, .. } => result.push_str(data),
+                    _ => {}
+                }
             }
         }
         result
@@ -11369,6 +11409,45 @@ mod tests {
 
     fn emit_op(chunk: &mut Chunk, op: OpCode) {
         chunk.emit_op(op, 1);
+    }
+
+    #[test]
+    fn test_flatstring_infrastructure() {
+        // Phase A: a FlatString value behaves as a string across the
+        // polymorphic helpers, without being interned.
+        let (chunk, interner) = make_env();
+        let mut vm = Vm::new(chunk, interner);
+        let before = vm.interner.len();
+
+        let v = vm.new_string_value("abc".to_string());
+        assert!(vm.is_string_like(v));
+        assert!(vm.is_flat_string(v));
+        assert_eq!(vm.string_char_len(v), 3);
+        assert_eq!(vm.value_to_string(v), "abc");
+        assert_eq!(vm.type_of_value(v), "string");
+        // Producing the value did NOT intern it.
+        assert_eq!(vm.interner.len(), before, "FlatString must not be interned on creation");
+
+        // Strict equality vs an interned copy (content compare).
+        let interned = Value::string(vm.interner.intern("abc"));
+        assert!(vm.strict_eq(v, interned));
+        assert!(vm.strict_eq(interned, v));
+        let other = vm.new_string_value("abd".to_string());
+        assert!(!vm.strict_eq(v, other));
+
+        // Interns on demand (property-key path) and round-trips.
+        let id = vm.flatten_to_string_id(v);
+        assert_eq!(vm.interner.resolve(id), "abc");
+
+        // Empty stays the interned singleton (avoids a truthy empty string).
+        let e = vm.new_string_value(String::new());
+        assert!(!vm.is_flat_string(e));
+        assert_eq!(vm.value_to_string(e), "");
+
+        // Unicode scalar count, not byte length.
+        let u = vm.new_string_value("a\u{2713}b".to_string());
+        assert_eq!(vm.string_char_len(u), 3);
+        assert_eq!(vm.value_to_string(u), "a\u{2713}b");
     }
 
     fn emit_const_number(chunk: &mut Chunk, n: f64) {

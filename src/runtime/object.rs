@@ -228,6 +228,12 @@ pub enum ObjectKind {
     /// Lazy concatenated string. Left and right are either TAG_STRING (StringId)
     /// or another ConsString ObjectId. `len` caches the total char count for O(1) .length.
     ConsString { left: Value, right: Value, len: u32 },
+    /// A flat, owned string value that is NOT interned. Produced by string
+    /// operations (charAt, substr, fromCharCode, concat flattening, …) so that
+    /// transient string values don't pollute (and unboundedly grow) the
+    /// interner. `char_len` caches the Unicode scalar count for O(1) `.length`.
+    /// Interned only on demand, when used as a property key (flatten_to_string_id).
+    FlatString { data: Box<str>, char_len: u32 },
     /// Host-owned object: tag identifies the host class (assigned by the
     /// embedder via `Engine::register_host_class`); payload is an opaque
     /// 64-bit handle the host uses to find the backing data (typically an
@@ -475,6 +481,7 @@ impl ObjectHeap {
             | ObjectKind::RegExp { .. }
             | ObjectKind::Host { .. }
             | ObjectKind::BigInt(_)
+            | ObjectKind::FlatString { .. }
             | ObjectKind::Date(_) => {}
         }
 
