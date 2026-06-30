@@ -84,6 +84,66 @@ pub struct PromiseReaction {
     pub promise: ObjectId, // child promise returned by .then()
 }
 
+/// The element type of a typed array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedArrayKind {
+    Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32, Uint32, Float32, Float64,
+    BigInt64, BigUint64,
+}
+
+impl TypedArrayKind {
+    pub fn bytes_per_element(self) -> usize {
+        match self {
+            TypedArrayKind::Int8 | TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped => 1,
+            TypedArrayKind::Int16 | TypedArrayKind::Uint16 => 2,
+            TypedArrayKind::Int32 | TypedArrayKind::Uint32 | TypedArrayKind::Float32 => 4,
+            TypedArrayKind::Float64 | TypedArrayKind::BigInt64 | TypedArrayKind::BigUint64 => 8,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TypedArrayKind::Int8 => "Int8Array",
+            TypedArrayKind::Uint8 => "Uint8Array",
+            TypedArrayKind::Uint8Clamped => "Uint8ClampedArray",
+            TypedArrayKind::Int16 => "Int16Array",
+            TypedArrayKind::Uint16 => "Uint16Array",
+            TypedArrayKind::Int32 => "Int32Array",
+            TypedArrayKind::Uint32 => "Uint32Array",
+            TypedArrayKind::Float32 => "Float32Array",
+            TypedArrayKind::Float64 => "Float64Array",
+            TypedArrayKind::BigInt64 => "BigInt64Array",
+            TypedArrayKind::BigUint64 => "BigUint64Array",
+        }
+    }
+
+    pub fn is_bigint(self) -> bool {
+        matches!(self, TypedArrayKind::BigInt64 | TypedArrayKind::BigUint64)
+    }
+
+    /// Coerce a numeric value to this element type's stored representation
+    /// (integer wrap / clamp / float rounding), matching the spec's conversions.
+    pub fn coerce(self, n: f64) -> f64 {
+        fn to_int(n: f64) -> f64 { if n.is_finite() { n.trunc() } else { 0.0 } }
+        match self {
+            TypedArrayKind::Float32 => (n as f32) as f64,
+            TypedArrayKind::Float64 => n,
+            TypedArrayKind::Uint8Clamped => {
+                if n.is_nan() { 0.0 } else { n.round_ties_even().clamp(0.0, 255.0) }
+            }
+            TypedArrayKind::Int8 => (to_int(n) as i64 as u8) as i8 as f64,
+            TypedArrayKind::Uint8 => (to_int(n) as i64 as u8) as f64,
+            TypedArrayKind::Int16 => (to_int(n) as i64 as u16) as i16 as f64,
+            TypedArrayKind::Uint16 => (to_int(n) as i64 as u16) as f64,
+            TypedArrayKind::Int32 => (to_int(n) as i64 as u32) as i32 as f64,
+            TypedArrayKind::Uint32 => (to_int(n) as i64 as u32) as f64,
+            // BigInt-backed kinds store the (already 64-bit-wrapped) value as f64
+            // only for non-bigint paths; real values flow through the BigInt store.
+            TypedArrayKind::BigInt64 | TypedArrayKind::BigUint64 => to_int(n),
+        }
+    }
+}
+
 pub enum ObjectKind {
     Ordinary,
     Array(Vec<Value>),
@@ -157,6 +217,14 @@ pub enum ObjectKind {
     /// stored on the heap because the NaN-boxed Value tag space is full. These
     /// objects are immutable and compared by mathematical value, not identity.
     BigInt(num_bigint::BigInt),
+    /// ArrayBuffer: a raw byte store backing typed-array / DataView views.
+    ArrayBuffer(Vec<u8>),
+    /// Typed array view. Elements are kept pre-coerced as f64 (BigInt kinds use
+    /// the BigInt value range); `kind` drives element coercion and BYTES_PER_ELEMENT.
+    /// `buffer` is the associated ArrayBuffer (kept in sync on writes).
+    TypedArray { kind: TypedArrayKind, elements: Vec<f64>, buffer: ObjectId },
+    /// DataView over an ArrayBuffer.
+    DataView { buffer: ObjectId, byte_offset: usize, byte_length: usize },
     /// Lazy concatenated string. Left and right are either TAG_STRING (StringId)
     /// or another ConsString ObjectId. `len` caches the total char count for O(1) .length.
     ConsString { left: Value, right: Value, len: u32 },
@@ -399,7 +467,10 @@ impl ObjectHeap {
                 if let Some(oid) = trace_value(*left) { refs.push(oid); }
                 if let Some(oid) = trace_value(*right) { refs.push(oid); }
             }
-            ObjectKind::Ordinary
+            ObjectKind::TypedArray { buffer, .. } => refs.push(*buffer),
+            ObjectKind::DataView { buffer, .. } => refs.push(*buffer),
+            ObjectKind::ArrayBuffer(_)
+            | ObjectKind::Ordinary
             | ObjectKind::KeyIterator(_, _)
             | ObjectKind::RegExp { .. }
             | ObjectKind::Host { .. }

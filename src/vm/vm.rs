@@ -821,7 +821,7 @@ impl Vm {
         };
 
 
-        Self {
+        let mut vm = Self {
             chunks,
             frames: vec![CallFrame { chunk_idx: 0, ip: 0, base: 0, upvalues: Vec::new(), this_value: Value::object_id(global_this_oid), is_constructor: false, pending_super_call: false, generator_id: None, argc: 0, saved_args: Vec::new(), arguments_oid: None, is_derived_ctor: false, super_called: false, new_target: Value::undefined(), await_super_result: false, with_base: 0 }],
             stack: Vec::with_capacity(256),
@@ -877,7 +877,9 @@ impl Vm {
             computed_exclusions: Vec::new(),
             steps: 0,
             max_steps: 0,
-        }
+        };
+        vm.init_typed_arrays();
+        vm
     }
 
     pub(crate) fn flatten_chunk(mut chunk: Chunk, out: &mut Vec<Chunk>) {
@@ -1578,6 +1580,26 @@ impl Vm {
                     if let ObjectKind::Set { ref entries } = o.kind { entries.get(idx).copied() } else { None }
                 });
                 if let Some(v) = elem { (v, false) } else { (Value::undefined(), true) }
+            } else if let Some(ta_len) = self.typed_array_len(src_oid) {
+                // Typed array iterator.
+                let kind_key = self.interner.intern("__iter_kind__");
+                let kind_str = self.heap.get(iter_oid)
+                    .and_then(|o| o.get_property(kind_key))
+                    .and_then(|v| v.as_string_id())
+                    .map(|sid| self.interner.resolve(sid).to_owned());
+                if idx >= ta_len {
+                    (Value::undefined(), true)
+                } else {
+                    let elem = self.typed_array_get(src_oid, idx).unwrap_or(Value::undefined());
+                    match kind_str.as_deref() {
+                        Some("keys") => (Value::int(idx as i32), false),
+                        Some("entries") => {
+                            let pair = JsObject::array(vec![Value::int(idx as i32), elem]);
+                            (Value::object_id(self.heap.allocate(pair)), false)
+                        }
+                        _ => (elem, false),
+                    }
+                }
             } else {
                 // Array iterator. Honor the optional `__iter_kind__` tag for keys/entries.
                 let elem = self.heap.get(src_oid).and_then(|o| {
@@ -5624,6 +5646,41 @@ impl Vm {
                             self.push(Value::function(sentinel));
                             continue;
                         }
+                        // TypedArray / ArrayBuffer / DataView properties.
+                        if let Some(obj) = self.heap.get(oid) {
+                            match &obj.kind {
+                                ObjectKind::TypedArray { kind, elements, buffer } => {
+                                    let kind = *kind; let len = elements.len(); let buffer = *buffer;
+                                    let bpe = kind.bytes_per_element();
+                                    match name_str {
+                                        "length" => { self.push(Value::int(len as i32)); continue; }
+                                        "byteLength" => { self.push(Value::int((len * bpe) as i32)); continue; }
+                                        "byteOffset" => { self.push(Value::int(0)); continue; }
+                                        "BYTES_PER_ELEMENT" => { self.push(Value::int(bpe as i32)); continue; }
+                                        "buffer" => { self.push(Value::object_id(buffer)); continue; }
+                                        "constructor" => { self.push(Value::function(crate::vm::typedarray::sentinel_for_kind(kind))); continue; }
+                                        _ => {
+                                            if let Ok(i) = name_str.parse::<usize>() {
+                                                let v = self.typed_array_get(oid, i).unwrap_or(Value::undefined());
+                                                self.push(v); continue;
+                                            }
+                                        }
+                                    }
+                                }
+                                ObjectKind::ArrayBuffer(b) => {
+                                    if name_str == "byteLength" { self.push(Value::int(b.len() as i32)); continue; }
+                                }
+                                ObjectKind::DataView { buffer, byte_offset, byte_length } => {
+                                    match name_str {
+                                        "byteLength" => { self.push(Value::int(*byte_length as i32)); continue; }
+                                        "byteOffset" => { self.push(Value::int(*byte_offset as i32)); continue; }
+                                        "buffer" => { self.push(Value::object_id(*buffer)); continue; }
+                                        _ => {}
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         // Check for array-specific properties
                         if let Some(obj) = self.heap.get(oid)
                             && let ObjectKind::Array(ref elements) = obj.kind {
@@ -6203,6 +6260,16 @@ impl Vm {
                             Value::string(self.interner.intern(&s))
                         } else { key }
                     } else { key };
+                    // Typed array: an integer (canonical-index) key reads the element;
+                    // non-index keys ("length", methods) fall through to the property path.
+                    if let Some(oid) = obj_val.as_object_id()
+                        && self.typed_array_len(oid).is_some()
+                        && let Some(i) = self.canonical_index(key)
+                    {
+                        let v = self.typed_array_get(oid, i).unwrap_or(Value::undefined());
+                        self.push(v);
+                        continue;
+                    }
                     if let Some(oid) = obj_val.as_object_id()
                         && let Some(obj) = self.heap.get(oid)
                     {
@@ -6392,6 +6459,17 @@ impl Vm {
                             Value::string(self.interner.intern(&s))
                         }
                     } else { key };
+                    // Typed array indexed write: coerce + store (out-of-range is a no-op).
+                    if let Some(oid) = obj_val.as_object_id()
+                        && self.typed_array_len(oid).is_some()
+                        && let Some(i) = self.canonical_index(key)
+                    {
+                        match self.typed_array_set(oid, i, val) {
+                            Ok(_) => { self.push(val); continue; }
+                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
+                            Err(e) => return Err(e),
+                        }
+                    }
                     if let Some(oid) = obj_val.as_object_id()
                         && let Some(obj) = self.heap.get_mut(oid)
                     {
@@ -7983,6 +8061,43 @@ impl Vm {
                     // Handle Map/Set/WeakMap/WeakSet constructors
                     if func_val.is_function() {
                         let sentinel = func_val.as_function().unwrap();
+                        // ArrayBuffer / DataView / TypedArray constructors.
+                        if sentinel == crate::vm::typedarray::SENT_ARRAYBUFFER {
+                            let n = if argc > 0 { self.to_f64(self.stack[func_pos + 1]) } else { 0.0 };
+                            let len = if n.is_finite() && n >= 0.0 { n as usize } else { 0 };
+                            let oid = self.make_array_buffer(len);
+                            self.truncate_stack(func_pos);
+                            self.push(Value::object_id(oid));
+                            continue;
+                        }
+                        if sentinel == crate::vm::typedarray::SENT_DATAVIEW {
+                            let buf = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                            let buf_oid = buf.as_object_id().filter(|o| matches!(self.heap.get(*o).map(|x| &x.kind), Some(ObjectKind::ArrayBuffer(_))));
+                            let Some(buf_oid) = buf_oid else {
+                                let e = self.make_native_error("TypeError", "First argument to DataView constructor must be an ArrayBuffer");
+                                self.truncate_stack(func_pos); self.handle_throw(e)?; continue;
+                            };
+                            let blen = if let Some(ObjectKind::ArrayBuffer(b)) = self.heap.get(buf_oid).map(|o| &o.kind) { b.len() } else { 0 };
+                            let off = if argc > 1 { self.to_f64(self.stack[func_pos + 2]) as usize } else { 0 };
+                            let len = if argc > 2 && !self.stack[func_pos + 3].is_undefined() { self.to_f64(self.stack[func_pos + 3]) as usize } else { blen.saturating_sub(off) };
+                            let proto = self.func_prototypes.get(&crate::vm::typedarray::SENT_DATAVIEW).copied();
+                            let obj = JsObject { properties: Vec::new(), prototype: proto,
+                                kind: ObjectKind::DataView { buffer: buf_oid, byte_offset: off, byte_length: len }, marked: false, extensible: true };
+                            let oid = self.heap.allocate(obj);
+                            self.truncate_stack(func_pos);
+                            self.push(Value::object_id(oid));
+                            continue;
+                        }
+                        if let Some(kind) = crate::vm::typedarray::kind_for_sentinel(sentinel) {
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
+                            self.truncate_stack(func_pos);
+                            match self.construct_typed_array(kind, &args, None) {
+                                Ok(v) => self.push(v),
+                                Err(VmError::Throw(v)) => { self.handle_throw(v)?; }
+                                Err(e) => return Err(e),
+                            }
+                            continue;
+                        }
                         match sentinel {
                             -540 => { // new Map()
                                 let mut entries = Vec::new();
@@ -9513,6 +9628,7 @@ impl Vm {
                                 let has_default = (-516..=-510).contains(&sentinel)
                                     || matches!(sentinel, -504 | -505 | -506 | -507 | -508 | -520 | -551
                                         | -540 | -541 | -542 | -543 | -550 | -570 | -580)
+                                    || (-672..=-660).contains(&sentinel) // ArrayBuffer/DataView/TypedArrays
                                     || sentinel >= 0; // user-defined functions auto-allocate
                                 if has_default {
                                     None // resolution happens later; treat as "object"
@@ -10003,6 +10119,11 @@ impl Vm {
                                             (Value::undefined(), true)
                                         }
                                     } else { (Value::undefined(), true) }
+                                } else { (Value::undefined(), true) }
+                            } else if let Some(ta_len) = self.typed_array_len(src_oid) {
+                                // Typed array iterator (values).
+                                if idx < ta_len {
+                                    (self.typed_array_get(src_oid, idx).unwrap_or(Value::undefined()), false)
                                 } else { (Value::undefined(), true) }
                             } else {
                                 // Array iterator

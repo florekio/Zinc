@@ -8,5 +8,6 @@ mod promise;
 mod generator;
 mod regexp;
 mod map;
+mod typedarray;
 
 pub use vm::{Vm, VmError};
