@@ -387,7 +387,21 @@ impl Vm {
                     .unwrap_or_else(|| ",".into());
                 if let Some(obj) = self.heap.get(oid)
                     && let ObjectKind::Array(ref elements) = obj.kind {
-                        let parts: Vec<String> = elements.iter().map(|v| self.value_to_string(*v)).collect();
+                        // Per spec (Array.prototype.join step 7c): undefined,
+                        // null, and holes stringify to the empty string — NOT
+                        // "undefined"/"null". `Array(n).join(x)` relies on this
+                        // to produce a run of separators (a common zero-pad
+                        // idiom); rendering holes as "undefined" corrupted it.
+                        let parts: Vec<String> = elements
+                            .iter()
+                            .map(|v| {
+                                if v.is_undefined() || v.is_null() {
+                                    String::new()
+                                } else {
+                                    self.value_to_string(*v)
+                                }
+                            })
+                            .collect();
                         let result = parts.join(&sep);
                         let id = self.interner.intern(&result);
                         return Ok(Value::string(id));
