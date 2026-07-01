@@ -9142,6 +9142,20 @@ impl Vm {
                             // Replace the function slot with `this` so local slot -1 is this
                             self.stack[func_pos] = this_val;
 
+                            // Pad missing arguments with undefined so the callee's
+                            // declared param slots are materialized on the stack.
+                            // Without this, `new Ctor()` with fewer args than params
+                            // leaves the prologue's local-init writing into a param
+                            // slot, so the real locals alias stack temps and get
+                            // clobbered by the first method call (Handlebars'
+                            // `new HandlebarsEnvironment` hit exactly this).
+                            let mut argc = argc;
+                            let expected = self.chunks[chunk_idx].param_count as usize;
+                            while argc < expected {
+                                self.push(Value::undefined());
+                                argc += 1;
+                            }
+
                             let saved_args: Vec<Value> = (0..argc)
                                 .map(|i| self.stack.get(func_pos + 1 + i).copied().unwrap_or(Value::undefined()))
                                 .collect();
