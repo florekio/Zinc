@@ -218,7 +218,7 @@ pub fn dump_opcode_histogram() {
         .filter(|&(_, c)| c > 0)
         .collect();
     let total: u64 = rows.iter().map(|&(_, c)| c).sum();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     eprintln!("=== opcode histogram (total dispatched: {total}) ===");
     for (b, c) in rows {
         let name = if crate::compiler::opcode::OpCode::is_valid(b) {
@@ -3166,7 +3166,7 @@ impl Vm {
             eprintln!("  #{depth:<2} chunk '{name}' (idx {}) line {line} ip {}", f.chunk_idx, f.ip);
         }
         let mut hot: Vec<_> = self.fuel_samples.iter().collect();
-        hot.sort_by(|a, b| b.1.cmp(a.1));
+        hot.sort_by_key(|e| std::cmp::Reverse(*e.1));
         let total: u64 = self.fuel_samples.values().sum();
         eprintln!("=== hottest sites (chunk idx : source line — sample share of {total} checkpoints) ===");
         for entry in hot.iter().take(20) {
@@ -3183,7 +3183,7 @@ impl Vm {
             k[0], k[1], k[2], k[3]
         );
         let mut calls: Vec<_> = self.fuel_call_counts.iter().collect();
-        calls.sort_by(|a, b| b.1.cmp(a.1));
+        calls.sort_by_key(|e| std::cmp::Reverse(*e.1));
         eprintln!("=== most-entered chunks (sampled every 1024 instr; relative magnitude) ===");
         for entry in calls.iter().take(12) {
             let chunk_idx = *entry.0;
