@@ -871,6 +871,9 @@ impl<'a> Compiler<'a> {
         // Only scope for let/const
         let is_var = matches!(&f.left, ForInOfLeft::Variable(decl) if decl.kind == VarKind::Var);
         let is_const = matches!(&f.left, ForInOfLeft::Variable(decl) if decl.kind == VarKind::Const);
+        // A bare-identifier loop head (`for (e in o)`, no declaration) assigns to
+        // an existing binding, like `var` — it must not get a fresh local either.
+        let is_bare = matches!(&f.left, ForInOfLeft::Pattern(Pattern::Identifier(_)));
         if !is_var { self.begin_scope(); }
 
         // Declare the loop variable
@@ -886,14 +889,15 @@ impl<'a> Compiler<'a> {
         let mut local_slot: Option<u8> = None;
         let mut is_global = false;
         if let Some(name) = var_name {
-            if is_var && self.scope_depth > 1 {
-                // A `var` loop variable is already hoisted to the enclosing
-                // function scope (collect_var_declarations covers for-in), so it
-                // has a slot. Adding a fresh local here created a *duplicate*
-                // whose slot index equalled the stack position of the on-stack
-                // for-in iterator — a nested for-in's SetLocal then clobbered the
-                // outer iterator (→ "not an iterator"). Store into the hoisted
-                // binding via compile_set_variable instead (below).
+            if (is_var || is_bare) && self.scope_depth > 1 {
+                // `var` (hoisted) and bare-identifier loop heads assign to an
+                // existing binding, so no fresh local is needed. Adding a
+                // duplicate local here gave it a slot index equal to the stack
+                // position of the on-stack for-in iterator — a nested for-in's
+                // SetLocal then clobbered the outer iterator (→ "not an
+                // iterator"). Store into the existing binding via
+                // compile_set_variable instead (below). Only let/const need a
+                // fresh scoped local.
             } else {
                 self.chunk.emit_op(OpCode::Undefined, line);
                 if self.scope_depth <= 1 {
@@ -912,10 +916,30 @@ impl<'a> Compiler<'a> {
         self.compile_expr(&f.right)?;
         self.chunk.emit_op(OpCode::GetForInIterator, line);
 
+        // When the loop head declares a fresh block-scoped local (let/const),
+        // reserve a scoped local for the iterator and address it via GetLocal
+        // rather than assuming it stays at the top of the stack (Dup). A nested
+        // let/const for-in adds its own loop-var local whose Undefined lands on
+        // the stack above the outer iterator, which would corrupt the Dup scheme
+        // (→ "not an iterator"). A fixed slot is immune; end_scope reclaims it.
+        let iter_slot = if local_slot.is_some() {
+            let s = self.locals.len() as u8;
+            let anon = self.interner.intern("(for-in-iter)");
+            self.add_local(anon);
+            self.mark_initialized();
+            Some(s)
+        } else {
+            None
+        };
+
         self.emit_completion_reset(line);
         let loop_start = self.chunk.len();
 
-        self.chunk.emit_op(OpCode::Dup, line);
+        if let Some(s) = iter_slot {
+            self.chunk.emit_op_u8(OpCode::GetLocal, s, line);
+        } else {
+            self.chunk.emit_op(OpCode::Dup, line);
+        }
         self.chunk.emit_op(OpCode::IteratorNext, line);
         self.chunk.emit_op(OpCode::Dup, line);
         self.chunk.emit_op(OpCode::IteratorDone, line);
@@ -962,7 +986,12 @@ impl<'a> Compiler<'a> {
 
         self.chunk.patch_jump(exit_jump);
         self.chunk.emit_op(OpCode::Pop, line); // pop result
-        self.chunk.emit_op(OpCode::Pop, line); // pop iterator
+        if iter_slot.is_none() {
+            // Dup path: the iterator is a stack temp at TOS — pop it. In the
+            // reserved-slot path the iterator lives in a scoped local and is
+            // reclaimed by end_scope below.
+            self.chunk.emit_op(OpCode::Pop, line);
+        }
 
         self.patch_loop_breaks();
         if !is_var { self.end_scope(); }
