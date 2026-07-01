@@ -10505,7 +10505,11 @@ impl Vm {
                         self.push(Value::object_id(result_id));
                         } // close non-generator else
                     } else {
-                        let err = self.make_native_error("TypeError", "not an iterator");
+                        let (line, pc, cn) = if let Some(f) = self.frames.last() {
+                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip,
+                             self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned())
+                        } else { (0, 0, String::new()) };
+                        let err = self.make_native_error("TypeError", &format!("not an iterator (at line {line}, pc {pc}, chunk '{cn}')"));
                         self.handle_throw(err)?;
                         continue;
                     }

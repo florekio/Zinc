@@ -886,15 +886,25 @@ impl<'a> Compiler<'a> {
         let mut local_slot: Option<u8> = None;
         let mut is_global = false;
         if let Some(name) = var_name {
-            self.chunk.emit_op(OpCode::Undefined, line);
-            if self.scope_depth <= 1 {
-                let idx = self.make_string_constant(name);
-                self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
-                is_global = true;
+            if is_var && self.scope_depth > 1 {
+                // A `var` loop variable is already hoisted to the enclosing
+                // function scope (collect_var_declarations covers for-in), so it
+                // has a slot. Adding a fresh local here created a *duplicate*
+                // whose slot index equalled the stack position of the on-stack
+                // for-in iterator — a nested for-in's SetLocal then clobbered the
+                // outer iterator (→ "not an iterator"). Store into the hoisted
+                // binding via compile_set_variable instead (below).
             } else {
-                self.add_local(name);
-                self.mark_initialized();
-                local_slot = Some((self.locals.len() - 1) as u8);
+                self.chunk.emit_op(OpCode::Undefined, line);
+                if self.scope_depth <= 1 {
+                    let idx = self.make_string_constant(name);
+                    self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
+                    is_global = true;
+                } else {
+                    self.add_local(name);
+                    self.mark_initialized();
+                    local_slot = Some((self.locals.len() - 1) as u8);
+                }
             }
         }
 
