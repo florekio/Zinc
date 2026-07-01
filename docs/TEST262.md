@@ -6,17 +6,18 @@ Run with: `cargo run --release --bin test262_runner`
 
 ## Results
 
-**90.0% pass rate** — 14,504 of 16,116 active tests pass (2,989 tests skipped).
+**93.0% pass rate** — 14,982 of 16,116 active tests pass (2,989 tests skipped).
 
-The pass rate dropped from 92.6% because earlier silent assertion no-ops
-(`assert.sameValue` / `assert.throws` weren't actually being called when invoked
-on a function value with user-set properties, so tests "passed" by inaction)
-were fixed in this round. The underlying engine is materially more conformant —
-we now report against thousands of tests whose latent bugs had been hidden.
-Many of the resulting failures are themselves now-fixed (strict-mode property
-writes / deletes, derived-class missing-super, eager generator parameters,
-iterator-close protocol, computed-key class methods, `__proto__: val` literals,
-etc.). Remaining failures are concentrated in eval-time strict early errors,
+An earlier round had briefly dropped to 90.0% when silent assertion no-ops
+were fixed (`assert.sameValue` / `assert.throws` weren't actually invoked on a
+function value with user-set properties, so tests "passed" by inaction),
+exposing thousands of previously-hidden latent bugs. Those have since been
+worked through — strict-mode property writes / deletes, derived-class
+missing-super, eager generator parameters, iterator-close protocol,
+computed-key class methods, `__proto__: val` literals, global/sticky
+`RegExp.exec` `lastIndex`, computed property writes onto function values
+(`fn[k] = v`), and nested `for-in` iterator aliasing — bringing the rate to
+93.0%. Remaining failures are concentrated in eval-time strict early errors,
 private-field brand checks, completion-value semantics, and TDZ for params.
 
 ### Perfect Scores (100%)
@@ -108,6 +109,7 @@ Tests requiring these features are currently skipped (2,986 tests):
 | post-v0.4.0 f | 16,116  | 14,491  | 89.9% |
 | post-v0.4.0 g | 16,116  | 14,503  | 90.0% |
 | post-v0.4.0 h | 16,116  | 14,504  | 90.0% |
+| post-v0.4.0 i | 16,116  | 14,982  | 93.0% |
 
 The first post-v0.4.0 jump reflects unskipping features the engine already
 implemented (Symbol.asyncIterator, Symbol.matchAll, change-array-by-copy,

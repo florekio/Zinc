@@ -4,7 +4,7 @@ A JavaScript engine written from scratch in Rust with an **experimental JIT comp
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**90.0% [Test262](docs/TEST262.md) conformance (14,504 / 16,116 active tests)** | **90 tests** | **~22,500 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
+**93.0% [Test262](docs/TEST262.md) conformance (14,982 / 16,116 active tests)** | **94 tests** | **~35,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
 
 ![Zinc Playground](web/screenshot.png)
 
@@ -132,7 +132,7 @@ bash bench/sunspider/run.sh    # SunSpider benchmarks
 
 ## Test262 Conformance
 
-**90.0%** of tested ECMAScript spec tests pass (14,504 / 16,116 active tests). See [TEST262.md](docs/TEST262.md).
+**93.0%** of tested ECMAScript spec tests pass (14,982 / 16,116 active tests). See [TEST262.md](docs/TEST262.md).
 
 23 categories at **100% pass rate** including: identifiers, expressions/assignmenttargettype, destructuring, future-reserved-words, reserved-words, keywords, expressions/conditional, expressions/logical-not/and/or, statements/block, statements/return, statements/throw, expressions/coalesce, expressions/grouping, expressions/this, expressions/comma, literals/boolean, literals/null, and more.
 
@@ -174,7 +174,7 @@ src/
   gc/                  Mark-and-sweep GC foundation
   util/                String interner
 
-tests/                 90 tests (unit + parser + e2e + JIT)
+tests/                 94 tests (unit + parser + e2e + JIT)
 bench/                 Micro benchmarks + SunSpider
 tools/                 Test262 conformance runner
 web/                   WASM playground (HTML + compiled WASM)
@@ -182,9 +182,9 @@ web/                   WASM playground (HTML + compiled WASM)
 
 ## Stats
 
-- **~22,500 lines** of Rust
-- **90 tests** passing
-- **90.0%** Test262 conformance (14,504 / 16,116 active tests)
+- **~35,000 lines** of Rust
+- **94 tests** passing
+- **93.0%** Test262 conformance (14,982 / 16,116 active tests)
 - **1.5 MB** WASM binary (includes regex engine)
 - **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation

@@ -1,5 +1,13 @@
 # Milestone: Stop interning transient string values
 
+> **Superseded by [SSO_MILESTONE.md](SSO_MILESTONE.md).** The FlatString
+> (heap-object) approach scoped here measured ~15% *slower* on decode (GC of
+> per-string heap objects cost more than the interner's leak). It was
+> abandoned in favour of inline small strings (SSO): strings ≤5 bytes packed
+> directly into the NaN-boxed `Value` — no heap, no GC, no interning. This
+> document is kept for the problem analysis and the measurement that ruled
+> the heap approach out.
+
 ## Problem
 
 copper interns **every** string value through `Interner` (`Value::string(id)`
