@@ -2016,8 +2016,7 @@ impl Vm {
                         .iter()
                         .map(|n| Value::string(self.interner.intern(n)))
                         .collect();
-                    let arr = JsObject::array(values);
-                    Value::object_id(self.heap.allocate(arr))
+                    self.alloc_array(values)
                 } else if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                     let is_array = self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Array(_))).unwrap_or(false);
                     if is_array {
@@ -2026,8 +2025,7 @@ impl Vm {
                             let s = self.interner.intern(&i.to_string());
                             Value::string(s)
                         }).collect();
-                        let arr = JsObject::array(keys);
-                        Value::object_id(self.heap.allocate(arr))
+                        self.alloc_array(keys)
                     } else {
                         let props: Vec<(StringId, bool)> = self.heap.get(oid)
                             .map(|o| o.properties.iter().map(|&(k, ref p)| (k, p.is_enumerable())).collect())
@@ -2068,8 +2066,7 @@ impl Vm {
                         numeric.sort_by_key(|&(n, _)| n);
                         let mut keys: Vec<Value> = numeric.into_iter().map(|(_, k)| Value::string(k)).collect();
                         keys.extend(string.into_iter().map(Value::string));
-                        let arr = JsObject::array(keys);
-                        Value::object_id(self.heap.allocate(arr))
+                        self.alloc_array(keys)
                     }
                 } else { Value::undefined() }
             }
@@ -2087,8 +2084,7 @@ impl Vm {
                             }
                         })
                         .unwrap_or_default();
-                    let arr = JsObject::array(vals);
-                    Value::object_id(self.heap.allocate(arr))
+                    self.alloc_array(vals)
                 } else { Value::undefined() }
             }
             "entries" => {
@@ -2101,11 +2097,10 @@ impl Vm {
                         .unwrap_or_default();
                     let mut entries = Vec::new();
                     for (k, v) in pairs {
-                        let pair = JsObject::array(vec![k, v]);
-                        entries.push(Value::object_id(self.heap.allocate(pair)));
+                        let pair = self.alloc_array(vec![k, v]);
+                        entries.push(pair);
                     }
-                    let arr = JsObject::array(entries);
-                    Value::object_id(self.heap.allocate(arr))
+                    self.alloc_array(entries)
                 } else { Value::undefined() }
             }
             "assign" => self.exec_object_assign(args),
@@ -2296,9 +2291,7 @@ impl Vm {
                         let id = self.interner.intern(n);
                         names.push(Value::string(id));
                     }
-                    let arr = JsObject::array(names);
-                    let arr_oid = self.heap.allocate(arr);
-                    Value::object_id(arr_oid)
+                    self.alloc_array(names)
                 } else if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                     let mut seen = std::collections::HashSet::new();
                     let mut names: Vec<Value> = Vec::new();
@@ -2359,8 +2352,7 @@ impl Vm {
                         let id = self.interner.intern(&s);
                         names.push(Value::string(id));
                     }
-                    let arr = JsObject::array(names);
-                    Value::object_id(self.heap.allocate(arr))
+                    self.alloc_array(names)
                 } else { Value::undefined() }
             }
             "getOwnPropertyDescriptors" => {
