@@ -8078,6 +8078,10 @@ impl Vm {
                                     let saved_args: Vec<Value> = (0..argc)
                                         .map(|i| self.stack.get(obj_pos + 1 + i).copied().unwrap_or(Value::undefined()))
                                         .collect();
+                                    // Drop args beyond declared params so method locals don't
+                                    // alias extra arguments (a method passed as a callback gets
+                                    // element/index/array).
+                                    self.stack.truncate(obj_pos + 1 + expected);
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: obj_pos + 1,
                                         upvalues, this_value: obj_val, is_constructor: false,
@@ -9069,6 +9073,12 @@ impl Vm {
                                     let saved_args: Vec<Value> = (0..argc)
                                         .map(|i| self.stack.get(func_pos + 1 + i).copied().unwrap_or(Value::undefined()))
                                         .collect();
+                                    // Drop args beyond declared params so the constructor's
+                                    // locals (incl. a named-function self-binding at slot
+                                    // param_count) don't alias extra arguments — e.g.
+                                    // `new C(a,b,c)` on a 2-param ctor made its self-name `e`
+                                    // in `_classCallCheck(this,e)` read the 3rd arg.
+                                    self.stack.truncate(func_pos + 1 + expected);
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: func_pos + 1,
                                         upvalues, this_value: this_val, is_constructor: true,
@@ -9222,6 +9232,9 @@ impl Vm {
                             let saved_args: Vec<Value> = (0..argc)
                                 .map(|i| self.stack.get(func_pos + 1 + i).copied().unwrap_or(Value::undefined()))
                                 .collect();
+                            // Drop args beyond declared params (see the class-ctor path):
+                            // extra args must not occupy the constructor's local slots.
+                            self.stack.truncate(func_pos + 1 + expected);
                             self.frames.push(CallFrame {
                                 chunk_idx,
                                 ip: 0,
