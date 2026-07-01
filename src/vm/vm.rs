@@ -3194,6 +3194,59 @@ impl Vm {
         }
     }
 
+    /// Write `val` to function-value property `name_id`, honoring read-only
+    /// builtins and strict/arrow restricted properties. Shared by SetProperty
+    /// (dot) and SetElement (computed) so both behave identically. Returns
+    /// `Some(msg)` if the caller should throw a TypeError, else `None`
+    /// (stored, or a silent non-strict no-op).
+    fn write_fn_property(
+        &mut self,
+        sentinel: i32,
+        name_id: StringId,
+        val: Value,
+        in_strict: bool,
+    ) -> Option<String> {
+        let name_str = self.interner.resolve(name_id).to_owned();
+        let is_readonly = matches!((sentinel, name_str.as_str()),
+            (-505, "NaN") | (-505, "POSITIVE_INFINITY") | (-505, "NEGATIVE_INFINITY")
+            | (-505, "MAX_VALUE") | (-505, "MIN_VALUE")
+            | (-505, "MAX_SAFE_INTEGER") | (-505, "MIN_SAFE_INTEGER")
+            | (-505, "EPSILON")
+            | (-570, "iterator") | (-570, "hasInstance") | (-570, "toPrimitive")
+            | (-570, "toStringTag") | (-570, "species") | (-570, "unscopables")
+            | (-570, "asyncIterator") | (-570, "matchAll")
+            | (-507, "prototype") | (-508, "prototype") | (-551, "prototype")
+        )
+        // Every function's own `length` and `name` are non-writable (writable:
+        // false, configurable: true) per spec — assignment no-ops/throws; only
+        // defineProperty (a different path) can change them.
+        || name_str == "length" || name_str == "name";
+        if is_readonly {
+            if in_strict {
+                return Some(format!("Cannot assign to read only property '{name_str}'"));
+            }
+            return None; // non-strict: silent no-op
+        }
+        if matches!(name_str.as_str(), "caller" | "arguments") && sentinel >= 0 {
+            let chunk_idx = (sentinel & 0xFFFF) as usize;
+            let is_restricted = chunk_idx < self.chunks.len()
+                && (self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW)
+                    || self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT));
+            if is_restricted {
+                return Some(format!("'{name_str}' may not be set on strict mode functions"));
+            }
+        }
+        self.fn_property_overrides.insert((sentinel, name_id), Some(val));
+        // Keep func_prototypes in sync so `obj instanceof F` reads the
+        // user-set prototype, not the auto-generated one.
+        if name_str == "prototype"
+            && let Some(proto_oid) = val.as_object_id()
+        {
+            self.func_prototypes.insert(sentinel, proto_oid);
+        }
+        None
+    }
+
     // ---- Main execution loop ----------------------------------------------
 
     pub fn run(&mut self) -> Result<Value, VmError> {
@@ -6317,69 +6370,27 @@ impl Vm {
                     if obj_val.is_null() || obj_val.is_undefined() {
                         let kind = if obj_val.is_null() { "null" } else { "undefined" };
                         let name_s = self.interner.resolve(name_id).to_owned();
+                        let (line, pc, cn) = if let Some(f) = self.frames.last() {
+                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip,
+                             self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned())
+                        } else { (0, 0, String::new()) };
                         let err = self.make_native_error(
                             "TypeError",
-                            &format!("Cannot set properties of {kind} (setting '{name_s}')"),
+                            &format!("Cannot set properties of {kind} (setting '{name_s}') (at line {line}, pc {pc}, chunk '{cn}')"),
                         );
                         self.handle_throw(err)?;
                         continue;
                     }
                     if obj_val.is_function() {
                         let sentinel = obj_val.as_function().unwrap();
-                        // Built-in read-only properties on native sentinels (Number.MAX_VALUE,
-                        // Symbol.iterator, Array.prototype, etc.) — strict-mode writes throw,
-                        // non-strict writes silently fail.
                         let in_strict = self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT);
-                        let name_str = self.interner.resolve(name_id);
-                        let is_readonly = matches!((sentinel, name_str),
-                            (-505, "NaN") | (-505, "POSITIVE_INFINITY") | (-505, "NEGATIVE_INFINITY")
-                            | (-505, "MAX_VALUE") | (-505, "MIN_VALUE")
-                            | (-505, "MAX_SAFE_INTEGER") | (-505, "MIN_SAFE_INTEGER")
-                            | (-505, "EPSILON")
-                            | (-570, "iterator") | (-570, "hasInstance") | (-570, "toPrimitive")
-                            | (-570, "toStringTag") | (-570, "species") | (-570, "unscopables")
-                            | (-570, "asyncIterator") | (-570, "matchAll")
-                            | (-507, "prototype") | (-508, "prototype") | (-551, "prototype")
-                        )
-                        // Constructor `length` and `name` are non-writable per spec.
-                        || ((-636..=-500).contains(&sentinel) && (name_str == "length" || name_str == "name"));
-                        if is_readonly {
-                            if in_strict {
-                                let prop = name_str.to_owned();
-                                let msg = format!("Cannot assign to read only property '{prop}'");
-                                let err = self.make_native_error("TypeError", &msg);
-                                self.handle_throw(err)?;
-                                continue;
-                            }
-                            // Non-strict: silently no-op.
-                            self.push(val);
+                        if let Some(msg) = self.write_fn_property(sentinel, name_id, val, in_strict) {
+                            let err = self.make_native_error("TypeError", &msg);
+                            self.handle_throw(err)?;
                             continue;
                         }
-                        // Restricted-properties poison pill: arrow functions and
-                        // strict-mode functions throw TypeError on caller/arguments
-                        // assignment regardless of caller strictness.
-                        if matches!(name_str, "caller" | "arguments") && sentinel >= 0 {
-                            let chunk_idx = (sentinel & 0xFFFF) as usize;
-                            let is_restricted = chunk_idx < self.chunks.len()
-                                && (self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW)
-                                    || self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT));
-                            if is_restricted {
-                                let err = self.make_native_error(
-                                    "TypeError",
-                                    &format!("'{name_str}' may not be set on strict mode functions"),
-                                );
-                                self.handle_throw(err)?;
-                                continue;
-                            }
-                        }
-                        self.fn_property_overrides.insert((sentinel, name_id), Some(val));
-                        // Keep func_prototypes in sync so `obj instanceof F` reads
-                        // the user-set prototype, not the auto-generated one.
-                        if name_str == "prototype"
-                            && let Some(proto_oid) = val.as_object_id()
-                        {
-                            self.func_prototypes.insert(sentinel, proto_oid);
-                        }
+                        self.push(val);
+                        continue;
                     } else if let Some(oid) = obj_val.as_object_id() {
                         // Check for setter
                         let name_str = self.interner.resolve(name_id).to_owned();
@@ -6753,6 +6764,38 @@ impl Vm {
                             Err(VmError::Throw(v)) => { self.handle_throw(v)?; continue; }
                             Err(e) => return Err(e),
                         }
+                    }
+                    // Computed write onto a function value (functions have no
+                    // object_id, so they'd otherwise be dropped by the object
+                    // branch below). jQuery.extend copies its statics via
+                    // `target[name] = copy` onto the jQuery *function*, so this
+                    // is load-bearing. Mirrors the dot-path SetProperty store.
+                    // Computed write onto a *user* function (positive sentinel):
+                    // store like the dot path so `fn[key] = v` works — jQuery.extend
+                    // copies its statics this way onto the jQuery function. Builtin
+                    // functions (negative sentinels) keep their prior behavior below
+                    // (the object/tail path), since test262 relies on it.
+                    if obj_val.is_function()
+                        && let Some(sentinel) = obj_val.as_function()
+                    {
+                        let name_id = if let Some(id) = key.as_string_id() {
+                            id
+                        } else if let Some(inl) = key.as_inline_string() {
+                            self.interner.intern(inl.as_str())
+                        } else if let Some(sid) = key.as_symbol_id() {
+                            self.interner.intern(&format!("__sym_{sid}__"))
+                        } else {
+                            let s = self.value_to_string(key);
+                            self.interner.intern(&s)
+                        };
+                        let in_strict = self.chunks[self.cur_chunk()].flags.contains(ChunkFlags::STRICT);
+                        if let Some(msg) = self.write_fn_property(sentinel, name_id, val, in_strict) {
+                            let err = self.make_native_error("TypeError", &msg);
+                            self.handle_throw(err)?;
+                            continue;
+                        }
+                        self.push(val);
+                        continue;
                     }
                     if let Some(oid) = obj_val.as_object_id()
                         && let Some(obj) = self.heap.get_mut(oid)
