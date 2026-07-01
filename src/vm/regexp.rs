@@ -7,6 +7,42 @@ use crate::util::interner::StringId;
 
 use super::vm::{Vm, VmError};
 
+/// Translate a JS regex source into one the Rust regex engine accepts, for the
+/// dialect differences the engine is strict about. Currently: an unescaped `[`
+/// inside a character class is a literal in JS (`[^()[\]]`) but the Rust engine
+/// treats `[` as a nested-class / set operator and errors ("Invalid character
+/// class") — Sizzle's selector regexes hit this. Escape it to `\[`.
+pub(crate) fn translate_js_regex(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut chars = pattern.chars().peekable();
+    let mut in_class = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                // Copy the escape and its target verbatim.
+                out.push('\\');
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            '[' if !in_class => {
+                in_class = true;
+                out.push('[');
+            }
+            '[' if in_class => {
+                // Literal `[` inside a class — escape for the Rust engine.
+                out.push_str("\\[");
+            }
+            ']' if in_class => {
+                in_class = false;
+                out.push(']');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Cache for compiled regexes, keyed by (pattern, flags).
 pub struct RegexCache {
     cache: HashMap<(String, String), Regex>,
@@ -33,8 +69,13 @@ impl RegexCache {
                 _ => return Err(format!("Invalid regex flag: {ch}")),
             }
         }
-        let rust_pattern = format!("{prefix}{pattern}");
-        let re = Regex::new(&rust_pattern).map_err(|e| format!("Invalid regex: {e}"))?;
+        let rust_pattern = format!("{prefix}{}", translate_js_regex(pattern));
+        let re = Regex::new(&rust_pattern).map_err(|e| {
+            if std::env::var("ZINC_REGEX_TRACE").is_ok() {
+                eprintln!("[regex] compile failed: {e}\n  pattern: {rust_pattern}");
+            }
+            format!("Invalid regex: {e}")
+        })?;
         self.cache.insert(key, re.clone());
         Ok((re, global))
     }
@@ -56,8 +97,13 @@ pub fn compile_js_regex(pattern: &str, flags: &str) -> Result<(Regex, bool), Str
             _ => return Err(format!("Invalid regex flag: {ch}")),
         }
     }
-    let rust_pattern = format!("{prefix}{pattern}");
-    let re = Regex::new(&rust_pattern).map_err(|e| format!("Invalid regex: {e}"))?;
+    let rust_pattern = format!("{prefix}{}", translate_js_regex(pattern));
+    let re = Regex::new(&rust_pattern).map_err(|e| {
+        if std::env::var("ZINC_REGEX_TRACE").is_ok() {
+            eprintln!("[regex] compile failed: {e}\n  pattern: {rust_pattern}");
+        }
+        format!("Invalid regex: {e}")
+    })?;
     Ok((re, global))
 }
 
