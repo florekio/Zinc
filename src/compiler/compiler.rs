@@ -3861,10 +3861,19 @@ impl<'a> Compiler<'a> {
     fn compile_unary(&mut self, u: &UnaryExpression) -> Result<(), String> {
         let line = u.span.start;
 
-        // typeof <identifier> must not throw ReferenceError on undeclared globals.
+        // typeof <identifier> must not throw ReferenceError on undeclared
+        // globals — but only genuinely global/undeclared names go through
+        // TypeOfGlobal. A name that resolves to a local *or an upvalue* must
+        // read that binding normally; otherwise `typeof <captured-var>` looked
+        // the name up as a (missing) global and wrongly returned "undefined"
+        // (e.g. Babel's `typeof SomeClass === "function"` checks on a closed-
+        // over class, which then took a fallback branch and left the class
+        // undefined downstream). resolve_upvalue is deduplicated, so calling
+        // it here and again during the normal compile below is safe.
         if u.operator == UnaryOperator::TypeOf
             && let Expression::Identifier(id) = &u.argument
-                && self.resolve_local(id.name).is_none() {
+                && self.resolve_local(id.name).is_none()
+                && self.resolve_upvalue(id.name).is_none() {
                     let idx = self.make_string_constant(id.name);
                     self.chunk.emit_op_u16(OpCode::TypeOfGlobal, idx, line);
                     return Ok(());
