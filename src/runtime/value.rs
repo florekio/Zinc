@@ -83,6 +83,11 @@ impl InlineStr {
     pub fn len(&self) -> usize {
         self.len as usize
     }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 /// A JavaScript value packed into 64 bits via NaN-boxing.
@@ -496,7 +501,7 @@ mod tests {
         assert!(v.is_interned_string());
         assert!(!v.is_inline_string());
         assert_eq!(v.as_string_id(), Some(StringId(12345)));
-        assert_eq!(v.as_inline_string().is_none(), true);
+        assert!(v.as_inline_string().is_none());
     }
 
     #[test]
