@@ -4552,6 +4552,14 @@ impl Vm {
                             let saved_args: Vec<Value> = (0..actual_argc)
                                 .map(|i| self.stack.get(func_pos + 1 + i).copied().unwrap_or(Value::undefined()))
                                 .collect();
+                            // Drop any arguments beyond the declared parameters. The
+                            // compiler lays out locals starting at slot = param_count,
+                            // assuming the stack holds exactly the params at body entry;
+                            // extra args (e.g. the index/array a `.map` callback receives
+                            // but doesn't declare) would otherwise occupy those local
+                            // slots, so a `let` inside the callback aliased the index.
+                            // `arguments` still sees them via `saved_args` above.
+                            self.stack.truncate(func_pos + 1 + expected_params);
                             // Arrow functions inherit new.target from the enclosing
                             // scope; ordinary calls (not via `new`) have new.target = undefined.
                             let new_target = if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {

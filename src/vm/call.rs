@@ -346,6 +346,12 @@ impl Vm {
             self.push(Value::undefined());
             argc += 1;
         }
+        // Drop args beyond the declared params so the callee's locals (which the
+        // compiler places at slot = param_count) don't alias extra arguments —
+        // e.g. a `.map` callback that declares one param but is handed
+        // (element, index, array). `arguments` still sees them via saved_args
+        // below (built from the `args` slice, not the stack).
+        self.stack.truncate(func_pos + 1 + expected);
 
         let upvalues = if closure_id < self.closure_upvalues.len() {
             self.closure_upvalues[closure_id].clone()
