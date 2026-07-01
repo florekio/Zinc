@@ -1426,17 +1426,50 @@ impl Vm {
                 } else { Value::boolean(false) }
             }
             -592 => { // Object.prototype.toString
-                if let Some(oid) = this_val.as_object_id()
-                    && let Some(obj) = self.heap.get(oid) {
-                        let tag = match &obj.kind {
-                            ObjectKind::Array(_) => "Array",
-                            ObjectKind::Function(_) => "Function",
-                            _ => "Object",
-                        };
-                        let s = self.interner.intern(&format!("[object {tag}]"));
-                        return Value::string(s);
+                // Per spec, the tag comes from the receiver's type — the classic
+                // `Object.prototype.toString.call(x)` type-detection idiom relies
+                // on this (Handlebars, jQuery, lodash, …). Previously every
+                // primitive returned "[object Object]".
+                let tag = if this_val.is_undefined() {
+                    "Undefined"
+                } else if this_val.is_null() {
+                    "Null"
+                } else if this_val.is_boolean() {
+                    "Boolean"
+                } else if this_val.is_number() || this_val.is_int() {
+                    "Number"
+                } else if this_val.is_string() {
+                    "String"
+                } else if this_val.is_symbol() {
+                    "Symbol"
+                } else if this_val.is_function() {
+                    "Function"
+                } else if let Some(oid) = this_val.as_object_id() {
+                    match self.heap.get(oid).map(|o| &o.kind) {
+                        Some(ObjectKind::Array(_)) => "Array",
+                        Some(ObjectKind::Function(_)) => "Function",
+                        Some(ObjectKind::RegExp { .. }) => "RegExp",
+                        Some(ObjectKind::Promise { .. }) => "Promise",
+                        Some(ObjectKind::Map { .. }) => "Map",
+                        Some(ObjectKind::Set { .. }) => "Set",
+                        Some(ObjectKind::WeakMap { .. }) => "WeakMap",
+                        Some(ObjectKind::WeakSet { .. }) => "WeakSet",
+                        Some(ObjectKind::ConsString { .. } | ObjectKind::FlatString { .. }) => "String",
+                        Some(ObjectKind::BigInt(_)) => "BigInt",
+                        Some(ObjectKind::Wrapper(inner)) => {
+                            // Boxed primitive (new String/Number/Boolean).
+                            let inner = *inner;
+                            if inner.is_boolean() { "Boolean" }
+                            else if inner.is_number() || inner.is_int() { "Number" }
+                            else if inner.is_string() { "String" }
+                            else { "Object" }
+                        }
+                        _ => "Object",
                     }
-                let s = self.interner.intern("[object Object]");
+                } else {
+                    "Object"
+                };
+                let s = self.interner.intern(&format!("[object {tag}]"));
                 Value::string(s)
             }
             -598 => { // Error.prototype.toString — `${name}: ${message}`
