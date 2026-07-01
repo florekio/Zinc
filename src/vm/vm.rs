@@ -5648,7 +5648,11 @@ impl Vm {
                             })
                             .unwrap_or(false);
                     if !constructor_callable {
-                        let err = self.make_native_error("TypeError", "Right-hand side of 'instanceof' is not callable");
+                        let (line, pc, cn) = if let Some(f) = self.frames.last() {
+                            (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip,
+                             self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned())
+                        } else { (0, 0, String::new()) };
+                        let err = self.make_native_error("TypeError", &format!("Right-hand side of 'instanceof' is not callable (at line {line}, pc {pc}, chunk '{cn}')"));
                         self.handle_throw(err)?;
                         continue;
                     }
