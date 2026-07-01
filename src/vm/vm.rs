@@ -5652,6 +5652,49 @@ impl Vm {
                             (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip,
                              self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned())
                         } else { (0, 0, String::new()) };
+                        if std::env::var("ZINC_INSTANCEOF_TRACE").is_ok() {
+                            let mut d = String::new();
+                            if constructor.is_undefined() {
+                                d.push_str("undefined");
+                            } else if constructor.is_null() {
+                                d.push_str("null");
+                            } else if let Some(oid) = constructor.as_object_id() {
+                                if let Some(o) = self.heap.get(oid) {
+                                    let kind = match &o.kind {
+                                        ObjectKind::Ordinary => "Ordinary",
+                                        ObjectKind::Function(_) => "Function",
+                                        ObjectKind::Array(_) => "Array",
+                                        ObjectKind::Wrapper(_) => "Wrapper",
+                                        _ => "Other",
+                                    };
+                                    let keys: Vec<String> = o.properties.iter().take(16)
+                                        .map(|(k, _)| self.interner.resolve(*k).to_owned()).collect();
+                                    d.push_str(&format!("object kind={kind} keys=[{}]", keys.join(",")));
+                                    if let Some(pid) = o.prototype {
+                                        if let Some(p) = self.heap.get(pid) {
+                                            let pk: Vec<String> = p.properties.iter().take(16)
+                                                .map(|(k, _)| self.interner.resolve(*k).to_owned()).collect();
+                                            d.push_str(&format!(" proto.keys=[{}]", pk.join(",")));
+                                        }
+                                    }
+                                }
+                            } else {
+                                d.push_str(&format!("primitive {:?}", constructor));
+                            }
+                            let bt: Vec<String> = self.frames.iter().rev().take(8)
+                                .map(|f| self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned())
+                                .collect();
+                            let lhs = if obj.is_undefined() { "undefined".to_string() }
+                                else if obj.is_null() { "null".to_string() }
+                                else if let Some(oid) = obj.as_object_id() {
+                                    self.heap.get(oid).map(|o| {
+                                        let keys: Vec<String> = o.properties.iter().take(8)
+                                            .map(|(k,_)| self.interner.resolve(*k).to_owned()).collect();
+                                        format!("object keys=[{}]", keys.join(","))
+                                    }).unwrap_or_default()
+                                } else { format!("{obj:?}") };
+                            eprintln!("[instanceof] RHS not callable @ chunk '{cn}' pc {pc}: RHS={d}\n  LHS={lhs}\n  backtrace={bt:?}");
+                        }
                         let err = self.make_native_error("TypeError", &format!("Right-hand side of 'instanceof' is not callable (at line {line}, pc {pc}, chunk '{cn}')"));
                         self.handle_throw(err)?;
                         continue;
@@ -9001,8 +9044,15 @@ impl Vm {
                         }
                         if let Some(cv) = ctor_val
                             && cv.is_function() {
-                                // Replace func on stack with this, push ctor as the call target
-                                self.stack[func_pos] = this_val;
+                                // Put the constructor function in the callee slot
+                                // (stack[base-1]) so LoadCallee — and thus a named
+                                // function expression's self-reference inside the
+                                // constructor body — resolves to the function, not
+                                // `this`. `this` comes from frame.this_value, so it
+                                // needn't live in this slot. (See the sibling
+                                // plain-function path for the _classCallCheck bug
+                                // this avoids.)
+                                self.stack[func_pos] = cv;
                                 let packed = cv.as_function().unwrap();
                                 let closure_id = ((packed as u32) >> 16) as usize;
                                 let chunk_idx = (packed & 0xFFFF) as usize;
@@ -9143,8 +9193,17 @@ impl Vm {
                                 Vec::new()
                             };
 
-                            // Replace the function slot with `this` so local slot -1 is this
-                            self.stack[func_pos] = this_val;
+                            // Leave the function value in the callee slot
+                            // (stack[base-1]) so a named function expression's
+                            // self-reference — compiled to LoadCallee, which reads
+                            // stack[base-1] — resolves to the function itself, not
+                            // to `this`. `this` is read separately via
+                            // frame.this_value (the `__this__` global), so this
+                            // slot need not hold it. Previously this was
+                            // overwritten with `this_val`, which made `function
+                            // e(){ this instanceof e }` see `e === this` under
+                            // `new` and throw "RHS of instanceof is not callable"
+                            // (Babel's _classCallCheck hit exactly this).
 
                             // Pad missing arguments with undefined so the callee's
                             // declared param slots are materialized on the stack.
