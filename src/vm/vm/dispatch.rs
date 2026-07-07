@@ -792,52 +792,26 @@ impl Vm {
                     } else if name_str == "arguments" && self.frames.len() > 1 {
                         // Arrow functions don't have their own `arguments` — walk up
                         // to the nearest non-arrow frame.
-                        let mut frame_idx = self.frames.len() - 1;
-                        while frame_idx > 0
-                            && self.chunks[self.frames[frame_idx].chunk_idx].flags.contains(ChunkFlags::ARROW)
-                        {
-                            frame_idx -= 1;
-                        }
-                        // Reuse the cached arguments object so identity holds and
-                        // mutations (e.g. via `with`) persist across reads.
-                        let cached = self.frames[frame_idx].arguments_oid;
-                        let oid = if let Some(oid) = cached {
-                            oid
-                        } else {
-                            let args = self.frames[frame_idx].saved_args.clone();
-                            let chunk_idx = self.frames[frame_idx].chunk_idx;
-                            let is_strict = self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT);
-                            let mut arr = JsObject::array(args);
-                            // Per spec, arguments has Object.prototype (not Array.prototype).
-                            arr.prototype = Some(self.object_prototype);
-                            // arguments[Symbol.iterator] is Array.prototype.values, so
-                            // `for (x of arguments)` and `[...arguments]` work. The object
-                            // is array-kind, so the array values iterator (-626) applies.
-                            let sym_iter_key = self.interner.intern(&format!("__sym_{}__", self.sym_iterator));
-                            arr.define_property(
-                                sym_iter_key,
-                                crate::runtime::object::Property::with_flags(
-                                    Value::function(-626),
-                                    crate::runtime::object::Property::WRITABLE
-                                        | crate::runtime::object::Property::CONFIGURABLE,
-                                ),
-                            );
-                            if !is_strict {
-                                let callee_key = self.interner.intern("callee");
-                                arr.define_property(
-                                    callee_key,
-                                    crate::runtime::object::Property::with_flags(
-                                        Value::function(chunk_idx as i32),
-                                        crate::runtime::object::Property::WRITABLE
-                                            | crate::runtime::object::Property::CONFIGURABLE,
-                                    ),
-                                );
-                            }
-                            let oid = self.heap.allocate(arr);
-                            self.frames[frame_idx].arguments_oid = Some(oid);
-                            oid
+                        // An arrow that captured its defining scope's arguments
+                        // (see the Closure op) uses the captured object — the
+                        // frame walk below would see the CALLER's arguments once
+                        // the arrow escapes its parent.
+                        let captured = self.frames.last()
+                            .filter(|f| {
+                                f.base > 0
+                                    && self.chunks[f.chunk_idx].flags.contains(ChunkFlags::ARROW)
+                            })
+                            .and_then(|f| self.stack.get(f.base - 1))
+                            .and_then(|v| v.as_function())
+                            .filter(|p| *p >= 0)
+                            .map(|p| ((p as u32) >> 16) as usize)
+                            .filter(|cid| *cid != 0)
+                            .and_then(|cid| self.closure_arrow_args.get(&cid).copied());
+                        let v = match captured {
+                            Some(v) => v,
+                            None => self.materialize_enclosing_arguments(),
                         };
-                        self.push(Value::object_id(oid));
+                        self.push(v);
                     } else {
                         match self.globals.get(&name_id).copied() {
                             Some(val) => self.push(val),
@@ -1467,6 +1441,43 @@ impl Vm {
                                 let err = self.make_native_error("SyntaxError", msg);
                                 self.handle_throw(err)?;
                                 continue;
+                            }
+                            // Private names used at the eval's top level must be
+                            // declared by a class on the calling context's lexical
+                            // private-environment chain (direct eval only —
+                            // indirect eval runs as global code).
+                            if !r.private_names.is_empty() {
+                                let chain = if direct_eval {
+                                    self.frames.last()
+                                        .filter(|f| f.base > 0)
+                                        .and_then(|f| self.stack.get(f.base - 1))
+                                        .and_then(|v| v.as_function())
+                                        .filter(|p| *p >= 0)
+                                        .map(|p| ((p as u32) >> 16) as usize)
+                                        .filter(|cid| *cid != 0)
+                                        .and_then(|cid| self.closure_private_env.get(&cid).cloned())
+                                } else {
+                                    None
+                                };
+                                let mut invalid = false;
+                                for name in &r.private_names {
+                                    let declared = chain.as_ref().is_some_and(|env| {
+                                        env.iter().copied().collect::<Vec<_>>().into_iter()
+                                            .any(|c| self.class_declares_private(c, name))
+                                    });
+                                    if !declared {
+                                        invalid = true;
+                                        break;
+                                    }
+                                }
+                                if invalid {
+                                    let err = self.make_native_error(
+                                        "SyntaxError",
+                                        "Private field must be declared in an enclosing class",
+                                    );
+                                    self.handle_throw(err)?;
+                                    continue;
+                                }
                             }
                         }
                         // EvalDeclarationInstantiation early error: a direct eval
@@ -6612,6 +6623,12 @@ impl Vm {
                     {
                         self.closure_arrow_ctx
                             .insert(closure_id, (f.this_value, f.new_target));
+                        // Arrows referencing `arguments` see the defining
+                        // scope's object even after escaping it.
+                        if self.chunks[abs_idx].uses_arguments && self.frames.len() > 1 {
+                            let args_obj = self.materialize_enclosing_arguments();
+                            self.closure_arrow_args.insert(closure_id, args_obj);
+                        }
                     }
                     // Inherit the creating context's lexical private-name
                     // environment chain (class code creating nested closures —

@@ -65,6 +65,9 @@ pub struct Chunk {
     pub property_ic: Vec<u8>,
     /// Number of IC slots allocated so far for this chunk.
     pub ic_slot_count: u16,
+    /// The body references the `arguments` object (set for arrow chunks so
+    /// closure creation knows to capture the defining scope's arguments).
+    pub uses_arguments: bool,
     /// Set when a patched jump's offset exceeded the i16 encoding — the
     /// bytecode is CORRUPT (the offset wrapped) and must not run. The
     /// compiler turns this into a per-script compile error; the long-term
@@ -124,6 +127,7 @@ impl Chunk {
             property_ic: Vec::new(),
             ic_slot_count: 0,
             jump_overflow: false,
+            uses_arguments: false,
         }
     }
 

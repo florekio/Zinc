@@ -282,6 +282,10 @@ pub struct Vm {
     /// `this` — apply/call/bind and later calls from other contexts must not
     /// rebind it.
     pub(crate) closure_arrow_ctx: std::collections::HashMap<usize, (Value, Value)>,
+    /// The defining scope's `arguments` object, captured by arrows whose
+    /// body references `arguments` (chunk.uses_arguments). Keyed by
+    /// closure_id; only materialized when needed.
+    pub(crate) closure_arrow_args: std::collections::HashMap<usize, Value>,
     /// One-shot with_base override for the next frame pushed by
     /// call_function_this. Direct eval runs in the caller's scope, so its
     /// frame must inherit the caller's with-visibility instead of starting a

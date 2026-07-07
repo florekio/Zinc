@@ -493,12 +493,15 @@ pub(crate) fn radix_fmt(mut n: u64, radix: u32) -> String {
 /// Contextually-restricted constructs found in eval code. Whether each is a
 /// SyntaxError depends on where the eval was called from (EarlyErrors for
 /// eval via the direct-eval additional rules).
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub(crate) struct EvalRestrictions {
     pub super_call: bool,
     pub super_prop: bool,
     pub new_target: bool,
     pub arguments_ref: bool,
+    /// Private names (#x) referenced outside any class body in the eval
+    /// code: legal only when the calling context's class chain declares them.
+    pub private_names: Vec<String>,
 }
 
 /// Scan eval code for super() / super.prop / new.target / `arguments` in
@@ -600,8 +603,12 @@ pub(crate) fn scan_eval_restrictions(
         fn expr(&mut self, e: &Expression) {
             match e {
                 Expression::Identifier(id) => {
-                    if self.it.resolve(id.name) == "arguments" {
+                    let name = self.it.resolve(id.name);
+                    if name == "arguments" {
                         self.r.arguments_ref = true;
+                    } else if name.starts_with('#') {
+                        // `#x in o` parses the private name as an identifier.
+                        self.r.private_names.push(name.to_owned());
                     }
                 }
                 Expression::Call(c) => {
@@ -622,7 +629,13 @@ pub(crate) fn scan_eval_restrictions(
                     } else {
                         self.expr(&m.object);
                     }
-                    if let MemberProperty::Expression(k) = &m.property { self.expr(k); }
+                    match &m.property {
+                        MemberProperty::Expression(k) => self.expr(k),
+                        MemberProperty::PrivateIdentifier(sid) => {
+                            self.r.private_names.push(self.it.resolve(*sid).to_owned());
+                        }
+                        MemberProperty::Identifier(_) => {}
+                    }
                 }
                 Expression::MetaProperty(mp) => {
                     if self.it.resolve(mp.meta) == "new" && self.it.resolve(mp.property) == "target" {
@@ -998,5 +1011,59 @@ impl Vm {
             -543 => Some(ObjectKind::WeakSet { entries: Vec::new() }),
             _ => None,
         }
+    }
+}
+
+impl Vm {
+    /// Materialize (or reuse) the `arguments` object of the nearest
+    /// non-arrow frame, caching it on that frame so identity holds.
+    pub(crate) fn materialize_enclosing_arguments(&mut self) -> Value {
+        let mut frame_idx = self.frames.len() - 1;
+        while frame_idx > 0
+            && self.chunks[self.frames[frame_idx].chunk_idx]
+                .flags
+                .contains(crate::compiler::chunk::ChunkFlags::ARROW)
+        {
+            frame_idx -= 1;
+        }
+        let cached = self.frames[frame_idx].arguments_oid;
+        let oid = if let Some(oid) = cached {
+            oid
+        } else {
+            let args = self.frames[frame_idx].saved_args.clone();
+            let chunk_idx = self.frames[frame_idx].chunk_idx;
+            let is_strict = self.chunks[chunk_idx]
+                .flags
+                .contains(crate::compiler::chunk::ChunkFlags::STRICT);
+            let mut arr = JsObject::array(args);
+            // Per spec, arguments has Object.prototype (not Array.prototype).
+            arr.prototype = Some(self.object_prototype);
+            // arguments[Symbol.iterator] is Array.prototype.values, so
+            // `for (x of arguments)` and `[...arguments]` work.
+            let sym_iter_key = self.interner.intern(&format!("__sym_{}__", self.sym_iterator));
+            arr.define_property(
+                sym_iter_key,
+                crate::runtime::object::Property::with_flags(
+                    Value::function(-626),
+                    crate::runtime::object::Property::WRITABLE
+                        | crate::runtime::object::Property::CONFIGURABLE,
+                ),
+            );
+            if !is_strict {
+                let callee_key = self.interner.intern("callee");
+                arr.define_property(
+                    callee_key,
+                    crate::runtime::object::Property::with_flags(
+                        Value::function(chunk_idx as i32),
+                        crate::runtime::object::Property::WRITABLE
+                            | crate::runtime::object::Property::CONFIGURABLE,
+                    ),
+                );
+            }
+            let oid = self.heap.allocate(arr);
+            self.frames[frame_idx].arguments_oid = Some(oid);
+            oid
+        };
+        Value::object_id(oid)
     }
 }

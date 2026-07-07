@@ -269,6 +269,9 @@ impl<'a> Compiler<'a> {
             }
             if let Some(pos) = guard { self.chunk.patch_jump(pos); }
         } else {
+            if self.interner.resolve(name) == "arguments" {
+                self.chunk.uses_arguments = true;
+            }
             let idx = self.make_string_constant(name);
             self.chunk.emit_op_u16(OpCode::GetGlobal, idx, line);
         }
