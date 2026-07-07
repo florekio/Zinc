@@ -6228,7 +6228,7 @@ impl Vm {
                                         {
                                             let done_key = self.interner.intern("done");
                                             let value_key = self.interner.intern("value");
-                                            let is_done = obj.get_property(done_key).map(|v| v.to_boolean()).unwrap_or(true);
+                                            let is_done = obj.get_property(done_key).map(|v| v.to_boolean()).unwrap_or(false);
                                             if is_done { break; }
                                             let val = obj.get_property(value_key).unwrap_or(Value::undefined());
                                             result.push(val);
@@ -6279,6 +6279,7 @@ impl Vm {
                                     let iter_oid = iter_val.as_object_id().unwrap();
                                     let next_key = self.interner.intern("next");
                                     let mut result = Vec::new();
+                                    let mut protocol_threw = false;
                                     loop {
                                         let next_fn = self.heap.get_property_chain(iter_oid, next_key)
                                             .unwrap_or(Value::undefined());
@@ -6288,6 +6289,7 @@ impl Vm {
                                                 "iterator.next is not a function",
                                             );
                                             self.handle_throw(err)?;
+                                            protocol_threw = true;
                                             break;
                                         }
                                         let prev_protect = self.protect_throw_depth;
@@ -6296,7 +6298,7 @@ impl Vm {
                                         self.protect_throw_depth = prev_protect;
                                         let step = match step_call {
                                             Ok(v) => v,
-                                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; break; }
+                                            Err(VmError::Throw(v)) => { self.handle_throw(v)?; protocol_threw = true; break; }
                                             Err(e) => return Err(e),
                                         };
                                         if !step.is_object() {
@@ -6305,6 +6307,7 @@ impl Vm {
                                                 "Iterator result is not an object",
                                             );
                                             self.handle_throw(err)?;
+                                            protocol_threw = true;
                                             break;
                                         }
                                         let step_oid = step.as_object_id().unwrap();
@@ -6314,16 +6317,21 @@ impl Vm {
                                         let done_gfn = self.heap.get_property_chain(step_oid, done_getter_key)
                                             .filter(|v| v.is_function());
                                         let done = if let Some(gfn) = done_gfn {
-                                            match self.call_function_this(gfn, step, &[]) {
+                                            let prev_protect = self.protect_throw_depth;
+                                            self.protect_throw_depth = self.frames.len() + 1;
+                                            let r = self.call_function_this(gfn, step, &[]);
+                                            self.protect_throw_depth = prev_protect;
+                                            match r {
                                                 Ok(v) => v.to_boolean(),
-                                                Err(VmError::Throw(v)) => { self.handle_throw(v)?; break; }
+                                                Err(VmError::Throw(v)) => { self.handle_throw(v)?; protocol_threw = true; break; }
                                                 Err(e) => return Err(e),
                                             }
                                         } else {
+                                            // Absent `done` is undefined — falsy.
                                             self.heap.get(step_oid)
                                                 .and_then(|o| o.get_property(done_key))
                                                 .map(|v| v.to_boolean())
-                                                .unwrap_or(true)
+                                                .unwrap_or(false)
                                         };
                                         if done { break; }
                                         // Read `value` with getter support (IteratorValue)
@@ -6332,9 +6340,13 @@ impl Vm {
                                         let value_gfn = self.heap.get_property_chain(step_oid, value_getter_key)
                                             .filter(|v| v.is_function());
                                         let val = if let Some(gfn) = value_gfn {
-                                            match self.call_function_this(gfn, step, &[]) {
+                                            let prev_protect = self.protect_throw_depth;
+                                            self.protect_throw_depth = self.frames.len() + 1;
+                                            let r = self.call_function_this(gfn, step, &[]);
+                                            self.protect_throw_depth = prev_protect;
+                                            match r {
                                                 Ok(v) => v,
-                                                Err(VmError::Throw(v)) => { self.handle_throw(v)?; break; }
+                                                Err(VmError::Throw(v)) => { self.handle_throw(v)?; protocol_threw = true; break; }
                                                 Err(e) => return Err(e),
                                             }
                                         } else {
@@ -6344,6 +6356,12 @@ impl Vm {
                                         };
                                         result.push(val);
                                         if result.len() > 100_000 { break; }
+                                    }
+                                    // handle_throw already redirected execution to the
+                                    // catch handler — the rest of this arm must not run
+                                    // (its pushes would corrupt the unwound stack).
+                                    if protocol_threw {
+                                        continue;
                                     }
                                     result
                                 }
@@ -8211,6 +8229,22 @@ impl Vm {
                     } else {
                         key
                     };
+                    // OrdinaryToPrimitive found no coercion method: TypeError
+                    // per spec. Restricted to null-prototype ordinary objects —
+                    // engine builtins (generators, iterators, …) dispatch their
+                    // prototype methods natively and rely on the lenient
+                    // stringification fallback.
+                    let no_methods = prim.as_object_id()
+                        .and_then(|o| self.heap.get(o))
+                        .is_some_and(|o| {
+                            o.prototype.is_none()
+                                && matches!(o.kind, ObjectKind::Ordinary)
+                                && o.properties.is_empty()
+                        });
+                    if no_methods {
+                        self.throw_type_error("Cannot convert object to primitive value")?;
+                        continue;
+                    }
                     let result = if prim.is_symbol() || prim.is_string() {
                         prim
                     } else if self.is_cons_string(prim) {

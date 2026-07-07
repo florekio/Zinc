@@ -39,7 +39,7 @@ impl Vm {
             let done = self.heap.get(soid)
                 .and_then(|o| o.get_property(done_key))
                 .map(|v| v.to_boolean())
-                .unwrap_or(true);
+                .unwrap_or(false);
             if done {
                 break;
             }
@@ -89,7 +89,7 @@ impl Vm {
             let done = self.heap.get(soid)
                 .and_then(|o| o.get_property(done_key))
                 .map(|v| v.to_boolean())
-                .unwrap_or(true);
+                .unwrap_or(false);
             if done {
                 break;
             }
