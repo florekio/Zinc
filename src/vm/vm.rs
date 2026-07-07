@@ -265,6 +265,20 @@ pub struct Vm {
     pub(crate) host_roots: Vec<ObjectId>,
     /// Active `with`-scope objects (innermost last). Names resolve here before globals.
     pub(crate) with_stack: Vec<ObjectId>,
+    /// With-scope objects captured by closures created inside a `with` body,
+    /// keyed by closure_id. Re-pushed onto `with_stack` for the duration of a
+    /// call so the closure still sees its lexical with-scope after the block
+    /// exits (spec: the function's [[Environment]] includes the object env).
+    pub(crate) closure_withs: std::collections::HashMap<usize, std::rc::Rc<Vec<ObjectId>>>,
+    /// Names of top-level lexical bindings (let/const). They live in the
+    /// globals map but are NOT properties of globalThis, and SetGlobal must
+    /// not mirror them onto it.
+    pub(crate) lex_globals: std::collections::HashSet<crate::util::interner::StringId>,
+    /// One-shot with_base override for the next frame pushed by
+    /// call_function_this. Direct eval runs in the caller's scope, so its
+    /// frame must inherit the caller's with-visibility instead of starting a
+    /// fresh (empty) one.
+    pub(crate) eval_inherit_with_base: Option<usize>,
     /// Completion value of the currently running script/eval. Value-producing
     /// statements update it via SetCompletion; Halt returns it. Saved/restored
     /// around nested `eval` so an inner eval can't corrupt the outer's value.
@@ -899,9 +913,16 @@ impl Vm {
             microtask_queue: Vec::new(),
             host_roots: Vec::new(),
             with_stack: Vec::new(),
+            closure_withs: std::collections::HashMap::new(),
+            lex_globals: std::collections::HashSet::new(),
+            eval_inherit_with_base: None,
             script_completion: Value::undefined(),
             param_scope_depth: 0,
-            closure_upvalues: Vec::new(),
+            // Index 0 is a reserved dummy: plain chunk-index function values
+            // (eval bodies, arguments.callee, …) decode to closure_id 0, so the
+            // first real closure must not claim that id — otherwise its
+            // upvalues/captured with-scopes would leak into those calls.
+            closure_upvalues: vec![Vec::new()],
             open_upvalues: std::collections::HashMap::new(),
             #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
             call_counts: HashMap::new(),
@@ -1144,6 +1165,12 @@ impl Vm {
                     roots.push(oid);
                 }
             }
+        }
+
+        // Root 5b: active and closure-captured with-scope objects
+        roots.extend(self.with_stack.iter().copied());
+        for captured in self.closure_withs.values() {
+            roots.extend(captured.iter().copied());
         }
 
         // Root 6: microtask queue
@@ -2725,6 +2752,112 @@ impl Vm {
         Value::object_id(oid)
     }
 
+    /// HasBinding for a with-scope object: true when the object owns the
+    /// property (data or accessor) and it is not blocked by the object's
+    /// Symbol.unscopables.
+    pub(crate) fn with_scope_has_binding(
+        &mut self,
+        oid: ObjectId,
+        name_id: crate::util::interner::StringId,
+    ) -> bool {
+        let name_str = self.interner.resolve(name_id).to_owned();
+        let getter_key = self.interner.intern(&format!("__get_{name_str}__"));
+        let setter_key = self.interner.intern(&format!("__set_{name_str}__"));
+        let owns = self.heap.get(oid).is_some_and(|o| {
+            o.get_property(name_id).is_some()
+                || o.get_property(getter_key).is_some()
+                || o.get_property(setter_key).is_some()
+        });
+        if !owns {
+            return false;
+        }
+        let unscopables_key = self
+            .interner
+            .intern(&format!("__sym_{}__", self.sym_unscopables));
+        let blocked = self.heap.get(oid)
+            .and_then(|o| o.get_property(unscopables_key))
+            .and_then(|v| v.as_object_id())
+            .and_then(|uo| self.heap.get(uo))
+            .and_then(|uo| uo.get_property(name_id))
+            .map(|v| self.truthy(v))
+            .unwrap_or(false);
+        !blocked
+    }
+
+    /// Start of the with-stack slice visible to the current frame: entries
+    /// pushed within it plus its closure's captured chain (both sit at
+    /// `frame.with_base..`). Entries below belong to caller frames and are
+    /// not in this function's scope chain.
+    pub(crate) fn frame_with_base(&self) -> usize {
+        self.frames
+            .last()
+            .map(|f| f.with_base)
+            .unwrap_or(0)
+            .min(self.with_stack.len())
+    }
+
+    /// Innermost with-scope object (searching `with_stack[from..]`, innermost
+    /// first) that has a binding for `name_id`, honoring Symbol.unscopables.
+    pub(crate) fn with_scope_lookup(
+        &mut self,
+        from: usize,
+        name_id: crate::util::interner::StringId,
+    ) -> Option<ObjectId> {
+        for i in (from..self.with_stack.len()).rev() {
+            let oid = self.with_stack[i];
+            if self.with_scope_has_binding(oid, name_id) {
+                return Some(oid);
+            }
+        }
+        None
+    }
+
+    /// GetValue through a with-scope binding: run the getter if the property
+    /// is an accessor, else read the data property.
+    pub(crate) fn with_scope_get(
+        &mut self,
+        oid: ObjectId,
+        name_id: crate::util::interner::StringId,
+    ) -> Result<Value, VmError> {
+        let name_str = self.interner.resolve(name_id).to_owned();
+        let getter_key = self.interner.intern(&format!("__get_{name_str}__"));
+        if let Some(gfn) = self.heap.get(oid).and_then(|o| o.get_property(getter_key))
+            && gfn.is_function()
+        {
+            return self.call_function_this(gfn, Value::object_id(oid), &[]);
+        }
+        Ok(self.heap.get(oid)
+            .and_then(|o| o.get_property(name_id))
+            .unwrap_or(Value::undefined()))
+    }
+
+    /// PutValue through a with-scope binding: run the setter if the property
+    /// is an accessor (a getter-only property is silently ignored, non-strict
+    /// semantics), else write/recreate the data property.
+    pub(crate) fn with_scope_set(
+        &mut self,
+        oid: ObjectId,
+        name_id: crate::util::interner::StringId,
+        val: Value,
+    ) -> Result<(), VmError> {
+        let name_str = self.interner.resolve(name_id).to_owned();
+        let setter_key = self.interner.intern(&format!("__set_{name_str}__"));
+        if let Some(sfn) = self.heap.get(oid).and_then(|o| o.get_property(setter_key))
+            && sfn.is_function()
+        {
+            self.call_function_this(sfn, Value::object_id(oid), &[val])?;
+            return Ok(());
+        }
+        let getter_key = self.interner.intern(&format!("__get_{name_str}__"));
+        if self.heap.get(oid).and_then(|o| o.get_property(getter_key)).is_some() {
+            return Ok(());
+        }
+        if let Some(obj) = self.heap.get_mut(oid) {
+            obj.set_property(name_id, val);
+        }
+        Ok(())
+    }
+
     /// ToBoolean, heap-aware: `0n` is falsy (other BigInts truthy); everything
     /// else defers to the bit-level `Value::to_boolean`.
     pub(crate) fn truthy(&self, val: Value) -> bool {
@@ -4153,21 +4286,14 @@ impl Vm {
                         VmError::RuntimeError("expected string constant".into())
                     })?;
                     // `with` scope: innermost-first, look up the name as a property of
-                    // any active with-scope object before falling back to globals.
-                    if !self.with_stack.is_empty() {
-                        let mut found: Option<Value> = None;
-                        for &oid in self.with_stack.iter().rev() {
-                            if let Some(obj) = self.heap.get(oid)
-                                && let Some(v) = obj.get_property(name_id)
-                            {
-                                found = Some(v);
-                                break;
-                            }
-                        }
-                        if let Some(v) = found {
-                            self.push(v);
-                            continue;
-                        }
+                    // any with-scope object visible to this frame (entered in it or
+                    // captured by its closure) before falling back to globals.
+                    if !self.with_stack.is_empty()
+                        && let Some(oid) = self.with_scope_lookup(self.frame_with_base(), name_id)
+                    {
+                        let v = self.with_scope_get(oid, name_id)?;
+                        self.push(v);
+                        continue;
                     }
                     // Fast path: Vec-based lookup (O(1) instead of HashMap)
                     // null in the vec means "not present" (we never store null as a global)
@@ -4265,23 +4391,13 @@ impl Vm {
                         VmError::RuntimeError("expected string constant for variable name".into())
                     })?;
                     let val = self.peek()?;
-                    // `with` scope: if any active with-object owns this name, set it there.
-                    if !self.with_stack.is_empty() {
-                        let mut target_oid: Option<ObjectId> = None;
-                        for &oid in self.with_stack.iter().rev() {
-                            if let Some(obj) = self.heap.get(oid)
-                                && obj.get_property(name_id).is_some()
-                            {
-                                target_oid = Some(oid);
-                                break;
-                            }
-                        }
-                        if let Some(oid) = target_oid {
-                            if let Some(obj) = self.heap.get_mut(oid) {
-                                obj.set_property(name_id, val);
-                            }
-                            continue;
-                        }
+                    // `with` scope: if a with-object visible to this frame owns this
+                    // name, set it there.
+                    if !self.with_stack.is_empty()
+                        && let Some(oid) = self.with_scope_lookup(self.frame_with_base(), name_id)
+                    {
+                        self.with_scope_set(oid, name_id, val)?;
+                        continue;
                     }
                     // Strict-mode: assigning to an unresolvable reference (no binding
                     // exists anywhere in scope) throws ReferenceError per spec.
@@ -4306,6 +4422,11 @@ impl Vm {
                     if idx >= self.globals_vec.len() { self.globals_vec.resize(idx + 1, Value::null()); }
                     self.globals_vec[idx] = val;
                     self.global_version += 1;
+                    // Top-level lexical bindings are not globalThis properties;
+                    // never mirror them there.
+                    if self.lex_globals.contains(&name_id) {
+                        continue;
+                    }
                     // Mirror onto globalThis. Per spec, PutValue on an unresolvable
                     // reference in non-strict mode creates a writable/enumerable/
                     // configurable property on the global object; explicit `var`
@@ -4354,6 +4475,23 @@ impl Vm {
                             obj.set_property(name_id, val);
                         }
                     }
+                }
+
+                OpCode::DefineGlobalLex => {
+                    let name_index = self.read_u16() as usize;
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_index];
+                    let name_id = name_val.as_string_id().ok_or_else(|| {
+                        VmError::RuntimeError("expected string constant for variable name".into())
+                    })?;
+                    let val = self.pop()?;
+                    self.globals.insert(name_id, val);
+                    let idx = name_id.0 as usize;
+                    if idx >= self.globals_vec.len() { self.globals_vec.resize(idx + 1, Value::null()); }
+                    self.globals_vec[idx] = val;
+                    self.global_version += 1;
+                    // Lexical global (top-level let/const): lives in the global
+                    // environment but is NOT a property of globalThis.
+                    self.lex_globals.insert(name_id);
                 }
 
                 OpCode::GetLocal => {
@@ -4567,6 +4705,7 @@ impl Vm {
                             } else {
                                 Value::undefined()
                             };
+                            let with_base = self.with_base_for_call(closure_id);
                             self.frames.push(CallFrame {
                                 chunk_idx,
                                 ip: 0,
@@ -4580,7 +4719,7 @@ impl Vm {
                                 saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
                                 new_target,
                                 await_super_result: false,
-                                with_base: self.with_stack.len(),
+                                with_base,
                             });
                             continue;
                         }
@@ -4814,6 +4953,9 @@ impl Vm {
                         // eval can't clobber the enclosing script's completion value.
                         let saved_completion = self.script_completion;
                         self.script_completion = Value::undefined();
+                        // Direct eval runs in the caller's scope: its frame must see
+                        // the same with-scope chain the caller does.
+                        self.eval_inherit_with_base = Some(self.frame_with_base());
                         let result = self.call_function_this(eval_fn, current_this, &[]);
                         self.script_completion = saved_completion;
                         let result = result?;
@@ -5569,16 +5711,10 @@ impl Vm {
                     let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
                     let name_id = name_val.as_string_id().unwrap();
                     // `with` scope: if any active with-object owns this name, delete it there.
+                    // (DeleteBinding does not consult Symbol.unscopables, but HasBinding
+                    // during resolution does; keep the same lookup the other ops use.)
                     if !self.with_stack.is_empty() {
-                        let mut target_oid: Option<ObjectId> = None;
-                        for &oid in self.with_stack.iter().rev() {
-                            if let Some(obj) = self.heap.get(oid)
-                                && obj.get_property(name_id).is_some()
-                            {
-                                target_oid = Some(oid);
-                                break;
-                            }
-                        }
+                        let target_oid = self.with_scope_lookup(self.frame_with_base(), name_id);
                         if let Some(oid) = target_oid {
                             let removed = if let Some(obj) = self.heap.get_mut(oid) {
                                 obj.properties.iter().position(|(k, _)| *k == name_id)
@@ -5588,6 +5724,12 @@ impl Vm {
                             self.push(Value::boolean(removed));
                             continue;
                         }
+                    }
+                    // Lexical global bindings (top-level let/const) are not
+                    // deletable.
+                    if self.lex_globals.contains(&name_id) {
+                        self.push(Value::boolean(false));
+                        continue;
                     }
                     // Check whether the binding is non-configurable on globalThis
                     // (var/function decls are non-configurable per spec).
@@ -5670,12 +5812,12 @@ impl Vm {
                                     let keys: Vec<String> = o.properties.iter().take(16)
                                         .map(|(k, _)| self.interner.resolve(*k).to_owned()).collect();
                                     d.push_str(&format!("object kind={kind} keys=[{}]", keys.join(",")));
-                                    if let Some(pid) = o.prototype {
-                                        if let Some(p) = self.heap.get(pid) {
-                                            let pk: Vec<String> = p.properties.iter().take(16)
-                                                .map(|(k, _)| self.interner.resolve(*k).to_owned()).collect();
-                                            d.push_str(&format!(" proto.keys=[{}]", pk.join(",")));
-                                        }
+                                    if let Some(pid) = o.prototype
+                                        && let Some(p) = self.heap.get(pid)
+                                    {
+                                        let pk: Vec<String> = p.properties.iter().take(16)
+                                            .map(|(k, _)| self.interner.resolve(*k).to_owned()).collect();
+                                        d.push_str(&format!(" proto.keys=[{}]", pk.join(",")));
                                     }
                                 }
                             } else {
@@ -8082,6 +8224,7 @@ impl Vm {
                                     // alias extra arguments (a method passed as a callback gets
                                     // element/index/array).
                                     self.stack.truncate(obj_pos + 1 + expected);
+                                    let with_base = self.with_base_for_call(_closure_id);
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: obj_pos + 1,
                                         upvalues, this_value: obj_val, is_constructor: false,
@@ -8089,7 +8232,7 @@ impl Vm {
                                         saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
                                         new_target: Value::undefined(),
                                         await_super_result: false,
-                                        with_base: self.with_stack.len(),
+                                        with_base,
                                     });
                                     continue;
                                 }
@@ -9079,6 +9222,7 @@ impl Vm {
                                     // `new C(a,b,c)` on a 2-param ctor made its self-name `e`
                                     // in `_classCallCheck(this,e)` read the 3rd arg.
                                     self.stack.truncate(func_pos + 1 + expected);
+                                    let with_base = self.with_base_for_call(closure_id);
                                     self.frames.push(CallFrame {
                                         chunk_idx, ip: 0, base: func_pos + 1,
                                         upvalues, this_value: this_val, is_constructor: true,
@@ -9087,7 +9231,7 @@ impl Vm {
                                         is_derived_ctor: is_derived, super_called: super_called_init,
                                         new_target: func_val,
                                         await_super_result: false,
-                                        with_base: self.with_stack.len(),
+                                        with_base,
                                     });
                                     continue;
                                 }
@@ -9235,6 +9379,7 @@ impl Vm {
                             // Drop args beyond declared params (see the class-ctor path):
                             // extra args must not occupy the constructor's local slots.
                             self.stack.truncate(func_pos + 1 + expected);
+                            let with_base = self.with_base_for_call(closure_id);
                             self.frames.push(CallFrame {
                                 chunk_idx,
                                 ip: 0,
@@ -9248,7 +9393,7 @@ impl Vm {
                                 saved_args, arguments_oid: None, is_derived_ctor: false, super_called: false,
                                 new_target: func_val,
                                 await_super_result: false,
-                                with_base: self.with_stack.len(),
+                                with_base,
                             });
                             continue;
                         }
@@ -9790,6 +9935,18 @@ impl Vm {
                         }
                     }
                     self.closure_upvalues.push(upvalues);
+                    // If the closure is created inside a `with` body, capture the
+                    // with-scope chain visible to the creating frame. Calls to the
+                    // closure re-push it so names still resolve through the with
+                    // object after the block exits (the function's [[Environment]]
+                    // includes the object environment per spec).
+                    let with_base = self.frames.last().map(|f| f.with_base).unwrap_or(0);
+                    if let Some(visible) = self.with_stack.get(with_base..)
+                        && !visible.is_empty()
+                    {
+                        self.closure_withs
+                            .insert(closure_id, std::rc::Rc::new(visible.to_vec()));
+                    }
                     // Encode closure_id in high bits, chunk_idx in low bits
                     // Use a special encoding: negative int where abs value encodes both
                     // Actually let's use a simpler approach: store as two values
@@ -11228,6 +11385,101 @@ impl Vm {
 
                 OpCode::WithExit => {
                     self.with_stack.pop();
+                }
+
+                // Guard before a static local/upvalue access for a name that is
+                // lexically inside a `with` body: if a with-scope object visible
+                // to this frame owns the name, the with object wins and the
+                // fallback access is jumped over.
+                OpCode::WithGetCheck | OpCode::WithSetCheck => {
+                    let name_index = self.read_u16() as usize;
+                    let offset = self.read_i16();
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_index];
+                    let name_id = name_val.as_string_id().ok_or_else(|| {
+                        VmError::RuntimeError("expected string constant".into())
+                    })?;
+                    let target_oid = self.with_scope_lookup(self.frame_with_base(), name_id);
+                    if let Some(oid) = target_oid {
+                        if opcode == OpCode::WithGetCheck {
+                            let v = self.with_scope_get(oid, name_id)?;
+                            self.push(v);
+                        } else {
+                            // Like SetLocal, the assigned value stays on the stack
+                            // (assignment is an expression).
+                            let val = self.peek()?;
+                            self.with_scope_set(oid, name_id, val)?;
+                        }
+                        let f = self.frames.last_mut().unwrap();
+                        f.ip = (f.ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                // Resolve a with-scope assignment target BEFORE its RHS runs.
+                // Pushes the owning with object, or null when the assignment
+                // will fall back to the static local/upvalue binding.
+                OpCode::WithRefResolve => {
+                    let name_index = self.read_u16() as usize;
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_index];
+                    let name_id = name_val.as_string_id().ok_or_else(|| {
+                        VmError::RuntimeError("expected string constant".into())
+                    })?;
+                    let target = self.with_scope_lookup(self.frame_with_base(), name_id);
+                    self.push(target.map(Value::object_id).unwrap_or_else(Value::null));
+                }
+
+                // Store through a resolved with-reference. Stack [ref, value]:
+                // object ref → set ref[name] = value, leave [value], jump over
+                // the fallback; null ref → drop it and fall through.
+                // SetMutableBinding: if the binding was deleted after the
+                // reference was resolved (e.g. by a getter the read invoked),
+                // strict code throws ReferenceError; sloppy code recreates the
+                // property (per PutValue → Set).
+                OpCode::WithRefSet => {
+                    let name_index = self.read_u16() as usize;
+                    let offset = self.read_i16();
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_index];
+                    let name_id = name_val.as_string_id().ok_or_else(|| {
+                        VmError::RuntimeError("expected string constant".into())
+                    })?;
+                    let val = self.pop()?;
+                    let target = self.pop()?;
+                    self.push(val);
+                    if let Some(oid) = target.as_object_id() {
+                        let still_exists = self.with_scope_has_binding(oid, name_id);
+                        if !still_exists
+                            && self.chunks[self.cur_chunk()].flags.contains(ChunkFlags::STRICT)
+                        {
+                            let name = self.interner.resolve(name_id).to_owned();
+                            let err = self.make_native_error(
+                                "ReferenceError",
+                                &format!("{name} is not defined"),
+                            );
+                            self.handle_throw(err)?;
+                            continue;
+                        }
+                        self.with_scope_set(oid, name_id, val)?;
+                        let f = self.frames.last_mut().unwrap();
+                        f.ip = (f.ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                // Read through a resolved with-reference. Peeks the ref: object
+                // → push its value (running a getter) and jump; null → fall
+                // through to the static read, which pushes on top of the ref.
+                OpCode::WithRefGet => {
+                    let name_index = self.read_u16() as usize;
+                    let offset = self.read_i16();
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_index];
+                    let name_id = name_val.as_string_id().ok_or_else(|| {
+                        VmError::RuntimeError("expected string constant".into())
+                    })?;
+                    let target = self.peek()?;
+                    if let Some(oid) = target.as_object_id() {
+                        let v = self.with_scope_get(oid, name_id)?;
+                        self.push(v);
+                        let f = self.frames.last_mut().unwrap();
+                        f.ip = (f.ip as isize + offset as isize) as usize;
+                    }
                 }
             }
         }

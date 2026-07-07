@@ -186,6 +186,18 @@ impl Chunk {
         pos
     }
 
+    /// Emit a placeholder i16 jump offset that follows another operand (e.g.
+    /// the name index of WithGetCheck/WithSetCheck). Returns the position of
+    /// the offset bytes for later patching with `patch_jump`.
+    pub fn emit_offset_placeholder(&mut self, line: u32) -> usize {
+        let pos = self.code.len();
+        self.code.push(0xFF);
+        self.code.push(0xFF);
+        self.add_line(line);
+        self.add_line(line);
+        pos
+    }
+
     /// Patch a previously emitted jump to target the current position.
     pub fn patch_jump(&mut self, offset_pos: usize) {
         let jump_target = self.code.len();

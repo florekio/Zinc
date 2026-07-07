@@ -9,6 +9,20 @@ impl Vm {
         self.call_function_this(func_val, Value::undefined(), args)
     }
 
+    /// If the callee captured a with-scope chain at creation (closure created
+    /// inside a `with` body), push it onto the with-stack for the duration of
+    /// the call. Returns the with-stack length from *before* the push — the
+    /// value for the new frame's `with_base`, so the return-path truncation
+    /// pops the captured entries again.
+    pub(crate) fn with_base_for_call(&mut self, closure_id: usize) -> usize {
+        let base = self.with_stack.len();
+        if let Some(captured) = self.closure_withs.get(&closure_id) {
+            let captured = captured.clone();
+            self.with_stack.extend(captured.iter().copied());
+        }
+        base
+    }
+
     /// Like `call_function_this`, but if the target is an async function the
     /// body is invoked and its result/throw is wrapped into a fulfilled or
     /// rejected Promise (matching the regular call dispatch path).
@@ -388,6 +402,10 @@ impl Vm {
         } else {
             Value::undefined()
         };
+        // Direct eval: inherit the caller's with-visibility (the frame shares
+        // the caller's slice; it owns no entries of its own to pop on error).
+        let inherited_base = self.eval_inherit_with_base.take();
+        let with_base = inherited_base.unwrap_or_else(|| self.with_base_for_call(closure_id));
         self.frames.push(CallFrame {
             chunk_idx, ip: 0, base: func_pos + 1,
             upvalues, this_value: effective_this, is_constructor: false,
@@ -395,7 +413,7 @@ impl Vm {
             saved_args: args.to_vec(), arguments_oid: None, is_derived_ctor: false, super_called: false,
             new_target,
             await_super_result: false,
-            with_base: self.with_stack.len(),
+            with_base,
         });
 
         // Run using the full main dispatch loop, stopping when our frame returns.
@@ -407,6 +425,11 @@ impl Vm {
                 self.frames.pop();
             }
             self.truncate_stack(func_pos);
+            // Pop captured with-entries this call pushed — but not for an
+            // eval frame, whose with_base points into the caller's own slice.
+            if inherited_base.is_none() {
+                self.with_stack.truncate(with_base);
+            }
         }
         result
     }

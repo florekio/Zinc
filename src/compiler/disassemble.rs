@@ -114,7 +114,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
             offset + 3
         }
 
-        OpCode::GetGlobal | OpCode::SetGlobal | OpCode::DefineGlobal => {
+        OpCode::GetGlobal | OpCode::SetGlobal | OpCode::DefineGlobal | OpCode::DefineGlobalLex => {
             let idx = chunk.read_u16(offset + 1);
             let val = &chunk.constants[idx as usize];
             let name = if let Some(id) = val.as_string_id() {
@@ -133,13 +133,21 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
             offset + 5
         }
 
+        OpCode::WithGetCheck | OpCode::WithSetCheck | OpCode::WithRefSet | OpCode::WithRefGet => {
+            let idx = chunk.read_u16(offset + 1);
+            let jump = chunk.read_u16(offset + 3) as i16;
+            let target = (offset as i32) + 5 + jump as i32;
+            out.push_str(&format!("{op:<20} [{idx}] -> {target}\n"));
+            offset + 5
+        }
+
         OpCode::GetSuper
         | OpCode::GetPrivate | OpCode::SetPrivate | OpCode::HasPrivate
         | OpCode::DefineMethod | OpCode::Class
         | OpCode::ClassStaticMethod | OpCode::ClassMethod
         | OpCode::ClassField | OpCode::ClassStaticField | OpCode::ClassPrivateMethod
         | OpCode::SetFunctionName | OpCode::ImportModule | OpCode::ExportAllFrom | OpCode::CollectRest
-        | OpCode::TypeOfGlobal | OpCode::DeleteGlobal => {
+        | OpCode::TypeOfGlobal | OpCode::DeleteGlobal | OpCode::WithRefResolve => {
             let idx = chunk.read_u16(offset + 1);
             out.push_str(&format!("{op:<20} [{idx}]\n"));
             offset + 3

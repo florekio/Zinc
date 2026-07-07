@@ -135,6 +135,12 @@ pub struct Compiler<'a> {
     /// into the reserved slot instead of pushing a new local, consuming its
     /// entry here. Saved/restored around each nested function body.
     predeclared_lex: Vec<StringId>,
+    /// `locals.len()` at each enclosing `with` entry (innermost last). A local
+    /// declared before the innermost `with` may be shadowed by the with-scope
+    /// object at runtime and needs a WithGetCheck/WithSetCheck guard; one
+    /// declared inside the body (e.g. `let x`) is inner to the with scope and
+    /// never guarded.
+    with_local_floor: Vec<usize>,
 }
 
 impl<'a> Compiler<'a> {
@@ -159,6 +165,7 @@ impl<'a> Compiler<'a> {
             with_depth: 0,
             class_depth: 0,
             predeclared_lex: Vec::new(),
+            with_local_floor: Vec::new(),
         }
     }
 
@@ -412,13 +419,57 @@ impl<'a> Compiler<'a> {
 
     // ---- variable get / set ----
 
-    fn compile_get_variable(&mut self, name: StringId, line: u32) -> Result<(), String> {
+    /// Inside a `with` body, a name that statically resolves to a local or
+    /// upvalue may still be shadowed by the with-scope object at runtime.
+    /// Emit a WithGetCheck/WithSetCheck guard before the static access; the
+    /// guard handles the name via the with-object (and jumps over the
+    /// fallback) when the object owns the property. Returns the patch
+    /// position for the embedded jump offset.
+    fn emit_with_guard(&mut self, op: OpCode, name: StringId, line: u32) -> usize {
+        let idx = self.make_string_constant(name);
+        self.chunk.emit_op_u16(op, idx, line);
+        self.chunk.emit_offset_placeholder(line)
+    }
+
+    /// Whether a local in `slot` needs a with-scope guard: we must be inside a
+    /// `with` body, and the local must be declared *outside* the innermost
+    /// `with` (bindings created inside the body — e.g. `let x` — are inner to
+    /// the with scope and can never be shadowed by it).
+    fn local_needs_with_guard(&self, slot: usize) -> bool {
+        self.with_depth > 0
+            && self.with_local_floor.last().is_none_or(|&floor| slot < floor)
+    }
+
+    /// True when an identifier assignment target inside a `with` body must be
+    /// resolved as a reference before the RHS runs (spec: references resolve
+    /// before the right-hand side, and a compound assignment writes back
+    /// through the same reference). Applies to guarded locals, upvalues and
+    /// globals. Const bindings are excluded — compile_set_variable's static
+    /// TypeError path handles them.
+    fn ident_needs_with_ref(&mut self, name: StringId) -> bool {
+        if self.with_depth == 0 {
+            return false;
+        }
+        if let Some(slot) = self.resolve_local(name) {
+            !self.locals[slot].is_const && self.local_needs_with_guard(slot)
+        } else if self.resolve_upvalue(name).is_some() {
+            true
+        } else {
+            !self.const_globals.contains(&name)
+        }
+    }
+
+    /// Emit the read for a with-scope reference already resolved by
+    /// WithRefResolve (stack: [ref] → [ref, value]). WithRefGet peeks the
+    /// ref: it either reads through it and jumps, or falls through to the
+    /// plain (unguarded) local/upvalue read.
+    fn compile_get_variable_resolved(&mut self, name: StringId, line: u32) -> Result<(), String> {
+        let guard = self.emit_with_guard(OpCode::WithRefGet, name, line);
         if let Some(slot) = self.resolve_local(name) {
             if slot <= u8::MAX as usize {
                 self.chunk.emit_op_u8(OpCode::GetLocal, slot as u8, line);
             } else {
-                self.chunk
-                    .emit_op_u16(OpCode::GetLocalWide, slot as u16, line);
+                self.chunk.emit_op_u16(OpCode::GetLocalWide, slot as u16, line);
             }
         } else if let Some(uv_idx) = self.resolve_upvalue(name) {
             if uv_idx <= u8::MAX as u16 {
@@ -426,6 +477,60 @@ impl<'a> Compiler<'a> {
             } else {
                 self.chunk.emit_op_u16(OpCode::GetUpvalueWide, uv_idx, line);
             }
+        } else {
+            let idx = self.make_string_constant(name);
+            self.chunk.emit_op_u16(OpCode::GetGlobal, idx, line);
+        }
+        self.chunk.patch_jump(guard);
+        Ok(())
+    }
+
+    /// Emit the store for an assignment whose with-scope reference was already
+    /// resolved by WithRefResolve (stack: [ref, value]). WithRefSet consumes
+    /// the ref: it either stores through it and jumps, or falls through to the
+    /// plain (unguarded) local/upvalue set.
+    fn compile_set_variable_resolved(&mut self, name: StringId, line: u32) -> Result<(), String> {
+        let guard = self.emit_with_guard(OpCode::WithRefSet, name, line);
+        if let Some(slot) = self.resolve_local(name) {
+            if slot <= u8::MAX as usize {
+                self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
+            } else {
+                self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
+            }
+        } else if let Some(uv_idx) = self.resolve_upvalue(name) {
+            if uv_idx <= u8::MAX as u16 {
+                self.chunk.emit_op_u8(OpCode::SetUpvalue, uv_idx as u8, line);
+            } else {
+                self.chunk.emit_op_u16(OpCode::SetUpvalueWide, uv_idx, line);
+            }
+        } else {
+            let idx = self.make_string_constant(name);
+            self.chunk.emit_op_u16(OpCode::SetGlobal, idx, line);
+        }
+        self.chunk.patch_jump(guard);
+        Ok(())
+    }
+
+    fn compile_get_variable(&mut self, name: StringId, line: u32) -> Result<(), String> {
+        if let Some(slot) = self.resolve_local(name) {
+            let guard = self.local_needs_with_guard(slot)
+                .then(|| self.emit_with_guard(OpCode::WithGetCheck, name, line));
+            if slot <= u8::MAX as usize {
+                self.chunk.emit_op_u8(OpCode::GetLocal, slot as u8, line);
+            } else {
+                self.chunk
+                    .emit_op_u16(OpCode::GetLocalWide, slot as u16, line);
+            }
+            if let Some(pos) = guard { self.chunk.patch_jump(pos); }
+        } else if let Some(uv_idx) = self.resolve_upvalue(name) {
+            let guard = (self.with_depth > 0)
+                .then(|| self.emit_with_guard(OpCode::WithGetCheck, name, line));
+            if uv_idx <= u8::MAX as u16 {
+                self.chunk.emit_op_u8(OpCode::GetUpvalue, uv_idx as u8, line);
+            } else {
+                self.chunk.emit_op_u16(OpCode::GetUpvalueWide, uv_idx, line);
+            }
+            if let Some(pos) = guard { self.chunk.patch_jump(pos); }
         } else {
             let idx = self.make_string_constant(name);
             self.chunk.emit_op_u16(OpCode::GetGlobal, idx, line);
@@ -441,18 +546,24 @@ impl<'a> Compiler<'a> {
                     &format!("Assignment to constant variable '{var_name}'"), line);
                 return Ok(());
             }
+            let guard = self.local_needs_with_guard(slot)
+                .then(|| self.emit_with_guard(OpCode::WithSetCheck, name, line));
             if slot <= u8::MAX as usize {
                 self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
             } else {
                 self.chunk
                     .emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
             }
+            if let Some(pos) = guard { self.chunk.patch_jump(pos); }
         } else if let Some(uv_idx) = self.resolve_upvalue(name) {
+            let guard = (self.with_depth > 0)
+                .then(|| self.emit_with_guard(OpCode::WithSetCheck, name, line));
             if uv_idx <= u8::MAX as u16 {
                 self.chunk.emit_op_u8(OpCode::SetUpvalue, uv_idx as u8, line);
             } else {
                 self.chunk.emit_op_u16(OpCode::SetUpvalueWide, uv_idx, line);
             }
+            if let Some(pos) = guard { self.chunk.patch_jump(pos); }
         } else {
             if self.const_globals.contains(&name) {
                 let var_name = self.interner.resolve(name).to_owned();
@@ -570,21 +681,16 @@ impl<'a> Compiler<'a> {
                                 self.chunk.emit_op_u16(OpCode::SetGlobal, idx, line);
                                 self.chunk.emit_op(OpCode::Pop, line);
                             } else {
-                                self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
+                                // Top-level let/const are lexical bindings in the
+                                // global environment — NOT properties of globalThis.
+                                self.chunk.emit_op_u16(OpCode::DefineGlobalLex, idx, line);
                             }
                         } else if decl.kind == VarKind::Var {
-                            if let Some(slot) = self.resolve_local(name) {
-                                if slot <= u8::MAX as usize {
-                                    self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
-                                } else {
-                                    self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
-                                }
-                                self.chunk.emit_op(OpCode::Pop, line);
-                            } else {
-                                let idx = self.make_string_constant(name);
-                                self.chunk.emit_op_u16(OpCode::SetGlobal, idx, line);
-                                self.chunk.emit_op(OpCode::Pop, line);
-                            }
+                            // `var x = expr` initializes via an ordinary assignment,
+                            // which goes through the scope chain — including any
+                            // active `with` scope (compile_set_variable guards it).
+                            self.compile_set_variable(name, line)?;
+                            self.chunk.emit_op(OpCode::Pop, line);
                         } else if let Some(slot) = self.take_predeclared_lex(name) {
                             // Slot was reserved at function entry by the
                             // hoist pass — assign into it instead of pushing
@@ -2673,7 +2779,9 @@ impl<'a> Compiler<'a> {
         // WithStatement completion is UpdateEmpty(body, undefined).
         self.emit_completion_reset(line);
         self.with_depth += 1;
+        self.with_local_floor.push(self.locals.len());
         self.compile_statement(&w.body)?;
+        self.with_local_floor.pop();
         self.with_depth -= 1;
         self.chunk.emit_op(OpCode::WithExit, line);
         Ok(())
@@ -3329,6 +3437,7 @@ impl<'a> Compiler<'a> {
         let parent_finally_stack = std::mem::take(&mut self.finally_stack);
         // `with` nesting does not cross function boundaries.
         let parent_with_depth = std::mem::take(&mut self.with_depth);
+        let parent_with_local_floor = std::mem::take(&mut self.with_local_floor);
         self.enclosing_chain.push(EnclosingFrame {
             locals: parent_locals,
             upvalues: parent_upvalues,
@@ -3495,6 +3604,7 @@ impl<'a> Compiler<'a> {
         self.predeclared_lex = parent_predeclared_lex;
         self.finally_stack = parent_finally_stack;
         self.with_depth = parent_with_depth;
+        self.with_local_floor = parent_with_local_floor;
 
         if compiled.jump_overflow {
             let name = self.interner.resolve(compiled.name).to_owned();
@@ -3523,6 +3633,14 @@ impl<'a> Compiler<'a> {
         if is_async {
             child_chunk.flags |= ChunkFlags::ASYNC;
         }
+        // Inherit strict mode from the enclosing code (or detect the arrow's
+        // own "use strict" directive; class bodies are implicitly strict).
+        let arrow_strict = self.chunk.flags.contains(ChunkFlags::STRICT)
+            || self.class_depth > 0
+            || matches!(body, ArrowBody::Block(b) if self.has_use_strict_directive(&b.body));
+        if arrow_strict {
+            child_chunk.flags |= ChunkFlags::STRICT;
+        }
         // Binding names for direct-eval-in-parameter early errors. Arrows have no
         // implicit `arguments`, so only explicit params / body lexicals collide.
         let mut pnames: Vec<StringId> = Vec::new();
@@ -3541,6 +3659,7 @@ impl<'a> Compiler<'a> {
         let parent_finally_stack = std::mem::take(&mut self.finally_stack);
         // `with` nesting does not cross function boundaries.
         let parent_with_depth = std::mem::take(&mut self.with_depth);
+        let parent_with_local_floor = std::mem::take(&mut self.with_local_floor);
         // Push parent's scope onto the chain so the arrow body (and anything
         // nested in it) can capture transitively.
         self.enclosing_chain.push(EnclosingFrame {
@@ -3688,6 +3807,7 @@ impl<'a> Compiler<'a> {
         self.predeclared_lex = parent_predeclared_lex;
         self.finally_stack = parent_finally_stack;
         self.with_depth = parent_with_depth;
+        self.with_local_floor = parent_with_local_floor;
 
         if compiled.jump_overflow {
             let name = self.interner.resolve(compiled.name).to_owned();
@@ -3940,6 +4060,27 @@ impl<'a> Compiler<'a> {
 
         match &u.argument {
             Expression::Identifier(id) => {
+                // Inside a `with` body, ++/-- must resolve its reference once
+                // and write back through it (see compound assignment).
+                if self.ident_needs_with_ref(id.name) {
+                    let idx = self.make_string_constant(id.name);
+                    self.chunk.emit_op_u16(OpCode::WithRefResolve, idx, line); // [ref]
+                    self.compile_get_variable_resolved(id.name, line)?;       // [ref, old]
+                    if u.prefix {
+                        self.chunk.emit_op(inc_op, line);                      // [ref, new]
+                        self.compile_set_variable_resolved(id.name, line)?;    // [new]
+                    } else {
+                        self.chunk.emit_op(OpCode::ToNumeric, line);           // [ref, oldn]
+                        self.chunk.emit_op(OpCode::Dup, line);                 // [ref, oldn, oldn]
+                        self.chunk.emit_op(inc_op, line);                      // [ref, oldn, new]
+                        self.chunk.emit_op(OpCode::Rot3, line);                // [new, ref, oldn]
+                        self.chunk.emit_op(OpCode::Rot3, line);                // [oldn, new, ref]
+                        self.chunk.emit_op(OpCode::Swap, line);                // [oldn, ref, new]
+                        self.compile_set_variable_resolved(id.name, line)?;    // [oldn, new]
+                        self.chunk.emit_op(OpCode::Pop, line);                 // [oldn]
+                    }
+                    return Ok(());
+                }
                 self.compile_get_variable(id.name, line)?;
                 if u.prefix {
                     self.chunk.emit_op(inc_op, line);
@@ -4187,8 +4328,37 @@ impl<'a> Compiler<'a> {
                     if Self::is_anonymous_fn_def(&a.right) {
                         self.pending_function_name = Some(id.name);
                     }
+                    // Inside a `with` body, the target reference must be
+                    // resolved BEFORE the RHS runs: `x = (scope.x = 2, 1)`
+                    // must not see the with-object property the RHS creates.
+                    if self.ident_needs_with_ref(id.name) {
+                        let idx = self.make_string_constant(id.name);
+                        self.chunk.emit_op_u16(OpCode::WithRefResolve, idx, line);
+                        self.compile_expr(&a.right)?;
+                        self.compile_set_variable_resolved(id.name, line)?;
+                        return Ok(());
+                    }
                     self.compile_expr(&a.right)?;
                 } else {
+                    // Arithmetic compound assignment inside a `with` body:
+                    // resolve the reference ONCE, read and write through it.
+                    // (A getter that deletes the property must not make the
+                    // write-back fall through to the static binding.)
+                    let is_logical = matches!(
+                        a.operator,
+                        AssignmentOperator::AndAssign
+                            | AssignmentOperator::OrAssign
+                            | AssignmentOperator::NullishAssign
+                    );
+                    if !is_logical && self.ident_needs_with_ref(id.name) {
+                        let idx = self.make_string_constant(id.name);
+                        self.chunk.emit_op_u16(OpCode::WithRefResolve, idx, line); // [ref]
+                        self.compile_get_variable_resolved(id.name, line)?;       // [ref, old]
+                        self.compile_expr(&a.right)?;                             // [ref, old, rhs]
+                        self.emit_compound_arith(a.operator, line)?;              // [ref, result]
+                        self.compile_set_variable_resolved(id.name, line)?;       // [result]
+                        return Ok(());
+                    }
                     self.compile_get_variable(id.name, line)?;
 
                     // Logical assignment operators need short-circuit. Per spec,

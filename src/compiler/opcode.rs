@@ -171,6 +171,10 @@ pub enum OpCode {
     CheckTdz = 0x7C,
     /// Set captured upvalue (u16 index) -- wide
     SetUpvalueWide = 0x7D,
+    /// Define global *lexical* binding (u16 constant index). Like DefineGlobal
+    /// but does NOT mirror the binding onto the globalThis object — top-level
+    /// let/const live in the declarative global environment only.
+    DefineGlobalLex = 0x7E,
 
     // ---- Property Access ----
     /// obj.name -- replace obj with value (u16 name constant)
@@ -193,6 +197,31 @@ pub enum OpCode {
     SetPrivate = 0x88,
     /// `#name in obj` (u16 name): pops obj, pushes boolean
     HasPrivate = 0x89,
+    /// `with`-scope guard before a local/upvalue read (u16 name constant,
+    /// i16 jump offset). If an active with-scope object owns `name`, push its
+    /// value and jump over the fallback local/upvalue access.
+    WithGetCheck = 0x8A,
+    /// `with`-scope guard before a local/upvalue write (u16 name constant,
+    /// i16 jump offset). If an active with-scope object owns `name`, set it
+    /// there (leaving the value on the stack) and jump over the fallback.
+    WithSetCheck = 0x8B,
+    /// Resolve a with-scope reference NOW, before the RHS runs (u16 name
+    /// constant). Pushes the owning with-scope object, or null when no
+    /// visible with object owns the name (assignment falls back to the
+    /// static binding). Spec: an assignment target is resolved before the
+    /// right-hand side is evaluated.
+    WithRefResolve = 0x8C,
+    /// Store through a previously resolved with-reference (u16 name
+    /// constant, i16 jump offset). Stack [ref, value]: if ref is an object,
+    /// set ref[name] = value, leave [value], jump over the fallback; if ref
+    /// is null, just drop it (leaving [value]) and fall through.
+    WithRefSet = 0x8D,
+    /// Read through a previously resolved with-reference (u16 name constant,
+    /// i16 jump offset). Peeks the ref on top: if it is an object, push
+    /// ref[name] (running a getter if defined) and jump over the fallback;
+    /// if null, fall through to the static read (which pushes the value on
+    /// top of the null ref). Both paths end with [ref, value].
+    WithRefGet = 0x8E,
 
     // ---- Function Calls ----
     /// Call function (u8 argc): stack=[fn, arg0..argN]
@@ -396,8 +425,8 @@ impl OpCode {
             | 0x40..=0x49
             | 0x50..=0x55
             | 0x60..=0x67
-            | 0x70..=0x7D
-            | 0x80..=0x89
+            | 0x70..=0x7E
+            | 0x80..=0x8E
             | 0x90..=0x97
             | 0xA0..=0xAA
             | 0xB0..=0xB1
@@ -548,6 +577,7 @@ impl OpCode {
             | OpCode::GetGlobal
             | OpCode::SetGlobal
             | OpCode::DefineGlobal
+            | OpCode::DefineGlobalLex
             | OpCode::GetElement
             | OpCode::SetElement
             | OpCode::GetSuper
@@ -555,6 +585,7 @@ impl OpCode {
             | OpCode::GetPrivate
             | OpCode::SetPrivate
             | OpCode::HasPrivate
+            | OpCode::WithRefResolve
             | OpCode::CreateArray
             | OpCode::DefineMethod
             | OpCode::Closure
@@ -572,6 +603,9 @@ impl OpCode {
 
             // 5 bytes: opcode + u16 name_idx + u16 ic_slot
             OpCode::GetProperty | OpCode::SetProperty => 5,
+
+            // 5 bytes: opcode + u16 name_idx + i16 jump offset
+            OpCode::WithGetCheck | OpCode::WithSetCheck | OpCode::WithRefSet | OpCode::WithRefGet => 5,
 
             // 4 bytes (u16 + u16)
             OpCode::PushExcHandler | OpCode::GetModuleVar => 5,
