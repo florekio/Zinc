@@ -213,9 +213,14 @@ impl Vm {
                         let writable_key = self.interner.intern("writable");
                         let enumerable_key = self.interner.intern("enumerable");
                         let configurable_key = self.interner.intern("configurable");
+                        // `name`/`length` keep their spec flags (writable
+                        // false, enumerable false, configurable true) even
+                        // when the VALUE came from an override (e.g.
+                        // SetFunctionName on a symbol-keyed function).
+                        let spec_flags = intrinsic || key_str == "name" || key_str == "length";
                         desc.set_property(value_key, v);
-                        desc.set_property(writable_key, Value::boolean(!intrinsic));
-                        desc.set_property(enumerable_key, Value::boolean(!intrinsic));
+                        desc.set_property(writable_key, Value::boolean(!spec_flags));
+                        desc.set_property(enumerable_key, Value::boolean(!spec_flags));
                         desc.set_property(configurable_key, Value::boolean(true));
                         return Ok(Some(Value::object_id(self.heap.allocate(desc))));
                     }

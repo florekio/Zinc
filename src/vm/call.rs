@@ -373,9 +373,11 @@ impl Vm {
             Vec::new()
         };
 
-        // Arrow functions inherit `this` from the enclosing scope.
+        // Arrow functions use the `this` captured at creation (lexical).
         let effective_this = if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
-            self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined())
+            self.closure_arrow_ctx.get(&closure_id).map(|(t, _)| *t)
+                .or_else(|| self.frames.last().map(|f| f.this_value))
+                .unwrap_or(Value::undefined())
         } else if !self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT) {
             // Non-strict: coerce null/undefined to globalThis, and primitive
             // values (number/string/boolean) to their wrapper object.
@@ -398,7 +400,9 @@ impl Vm {
         // Arrow functions inherit new.target from the enclosing scope; ordinary
         // calls (not via `new`) have new.target = undefined.
         let new_target = if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
-            self.frames.last().map(|f| f.new_target).unwrap_or(Value::undefined())
+            self.closure_arrow_ctx.get(&closure_id).map(|(_, nt)| *nt)
+                .or_else(|| self.frames.last().map(|f| f.new_target))
+                .unwrap_or(Value::undefined())
         } else {
             Value::undefined()
         };

@@ -183,6 +183,12 @@ impl Vm {
             roots.extend(env.iter().copied());
         }
 
+        // Root 5d: arrow closures' captured `this` / new.target
+        for (t, nt) in self.closure_arrow_ctx.values() {
+            if let Some(oid) = trace_value(*t) { roots.push(oid); }
+            if let Some(oid) = trace_value(*nt) { roots.push(oid); }
+        }
+
         // Root 6: microtask queue
         for task in &self.microtask_queue {
             match task {

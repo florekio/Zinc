@@ -530,6 +530,7 @@ impl Vm {
             closure_withs: std::collections::HashMap::new(),
             lex_globals: std::collections::HashSet::new(),
             tdz_globals: std::collections::HashSet::new(),
+            closure_arrow_ctx: std::collections::HashMap::new(),
             eval_inherit_with_base: None,
             direct_eval_pending: false,
             closure_private_env: std::collections::HashMap::new(),

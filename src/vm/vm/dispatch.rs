@@ -1209,8 +1209,12 @@ impl Vm {
                                 }
                                 self.frames.last().unwrap().this_value
                             } else if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
-                                // Arrow functions inherit `this` from enclosing scope
-                                self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined())
+                                // Arrow functions use the `this` captured at creation
+                                // (lexical); fall back to the caller's for closures
+                                // without a recorded context.
+                                self.closure_arrow_ctx.get(&closure_id).map(|(t, _)| *t)
+                                    .or_else(|| self.frames.last().map(|f| f.this_value))
+                                    .unwrap_or(Value::undefined())
                             } else if self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT) {
                                 Value::undefined()
                             } else {
@@ -1233,7 +1237,9 @@ impl Vm {
                             // Arrow functions inherit new.target from the enclosing
                             // scope; ordinary calls (not via `new`) have new.target = undefined.
                             let new_target = if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
-                                self.frames.last().map(|f| f.new_target).unwrap_or(Value::undefined())
+                                self.closure_arrow_ctx.get(&closure_id).map(|(_, nt)| *nt)
+                                    .or_else(|| self.frames.last().map(|f| f.new_target))
+                                    .unwrap_or(Value::undefined())
                             } else {
                                 Value::undefined()
                             };
@@ -6652,6 +6658,15 @@ impl Vm {
                         }
                     }
                     self.closure_upvalues.push(upvalues);
+                    // Arrows capture their defining scope's `this` and
+                    // new.target at creation; later calls must not rebind them.
+                    if abs_idx < self.chunks.len()
+                        && self.chunks[abs_idx].flags.contains(ChunkFlags::ARROW)
+                        && let Some(f) = self.frames.last()
+                    {
+                        self.closure_arrow_ctx
+                            .insert(closure_id, (f.this_value, f.new_target));
+                    }
                     // Inherit the creating context's lexical private-name
                     // environment chain (class code creating nested closures —
                     // methods of inner classes, escaped arrows — keeps access

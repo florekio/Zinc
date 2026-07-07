@@ -277,6 +277,11 @@ pub struct Vm {
     /// Top-level lexical bindings whose declaration has not executed yet
     /// (script/eval-level TDZ): reads and writes throw ReferenceError.
     pub(crate) tdz_globals: std::collections::HashSet<crate::util::interner::StringId>,
+    /// Lexical (this, new.target) captured by each arrow-function closure at
+    /// creation, keyed by closure_id. Arrows must see their DEFINING scope's
+    /// `this` — apply/call/bind and later calls from other contexts must not
+    /// rebind it.
+    pub(crate) closure_arrow_ctx: std::collections::HashMap<usize, (Value, Value)>,
     /// One-shot with_base override for the next frame pushed by
     /// call_function_this. Direct eval runs in the caller's scope, so its
     /// frame must inherit the caller's with-visibility instead of starting a
