@@ -617,6 +617,7 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::LoadCallee, 0);
                 self.add_local(self_name);
                 self.mark_initialized();
+                self.locals.last_mut().unwrap().is_fn_self_name = true;
             }
         }
 

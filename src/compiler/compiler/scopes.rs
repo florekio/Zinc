@@ -40,6 +40,7 @@ impl<'a> Compiler<'a> {
             initialized: false,
             captured: false,
             is_const: false,
+            is_fn_self_name: false,
         });
     }
 
@@ -282,6 +283,17 @@ impl<'a> Compiler<'a> {
             return Ok(());
         }
         if let Some(slot) = self.resolve_local(name) {
+            // Named function expression self-binding is immutable: sloppy
+            // assignments are silently ignored (the RHS remains the
+            // expression's value); strict ones throw TypeError.
+            if self.locals[slot].is_fn_self_name {
+                if self.chunk.flags.contains(ChunkFlags::STRICT) {
+                    let var_name = self.interner.resolve(name).to_owned();
+                    self.emit_throw_type_error(
+                        &format!("Assignment to constant variable '{var_name}'"), line);
+                }
+                return Ok(());
+            }
             if self.locals[slot].is_const {
                 let var_name = self.interner.resolve(name).to_owned();
                 self.emit_throw_type_error(
@@ -298,6 +310,20 @@ impl<'a> Compiler<'a> {
             }
             if let Some(pos) = guard { self.chunk.patch_jump(pos); }
         } else if let Some(uv_idx) = self.resolve_upvalue(name) {
+            // The captured binding may be a named-function-expression
+            // self-binding in an enclosing function — same immutability
+            // rules as the local case above.
+            let captured_self_name = self.enclosing_chain.iter().rev().find_map(|frame| {
+                frame.locals.iter().rev().find(|l| l.name == name).map(|l| l.is_fn_self_name)
+            });
+            if captured_self_name == Some(true) {
+                if self.chunk.flags.contains(ChunkFlags::STRICT) {
+                    let var_name = self.interner.resolve(name).to_owned();
+                    self.emit_throw_type_error(
+                        &format!("Assignment to constant variable '{var_name}'"), line);
+                }
+                return Ok(());
+            }
             let guard = (self.with_depth > 0)
                 .then(|| self.emit_with_guard(OpCode::WithSetCheck, name, line));
             if uv_idx <= u8::MAX as u16 {

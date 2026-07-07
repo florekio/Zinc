@@ -39,6 +39,9 @@ struct Local {
     initialized: bool,
     captured: bool,
     is_const: bool,
+    /// Named function expression self-binding: immutable. Assignments are
+    /// silently ignored in sloppy mode and throw TypeError in strict mode.
+    is_fn_self_name: bool,
 }
 
 use crate::compiler::chunk::UpvalueDescriptor;

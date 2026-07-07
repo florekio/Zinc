@@ -7741,6 +7741,45 @@ impl Vm {
                             continue;
                         }
                     }
+                    // Generic thenable: an object with a callable `then` is
+                    // subscribed through a fresh promise and unwrapped.
+                    if let Some(oid) = awaited.as_object_id() {
+                        let then_name = self.interner.intern("then");
+                        let then_fn = self.heap.get_property_chain(oid, then_name);
+                        if let Some(tf) = then_fn
+                            && tf.is_function()
+                        {
+                            let pid = self.allocate_promise();
+                            let resolve_fn = Value::function(-600_000 - pid.0 as i32);
+                            let reject_fn = Value::function(-700_000 - pid.0 as i32);
+                            let prev_protect = self.protect_throw_depth;
+                            self.protect_throw_depth = self.frames.len() + 1;
+                            let r = self.call_function_this(tf, awaited, &[resolve_fn, reject_fn]);
+                            self.protect_throw_depth = prev_protect;
+                            match r {
+                                Ok(_) => {}
+                                Err(VmError::Throw(v)) => {
+                                    self.handle_throw(v)?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                            self.drain_microtasks()?;
+                            let settled = self.heap.get(pid).and_then(|o| {
+                                if let ObjectKind::Promise { state, result, .. } = &o.kind {
+                                    Some((*state, *result))
+                                } else { None }
+                            });
+                            match settled {
+                                Some((PromiseState::Fulfilled, v)) => { self.push(v); }
+                                Some((PromiseState::Rejected, v)) => {
+                                    self.handle_throw(v)?;
+                                }
+                                _ => { self.push(Value::undefined()); }
+                            }
+                            continue;
+                        }
+                    }
                     // Not a promise: push value directly (await on non-thenable resolves immediately)
                     self.push(awaited);
                 }
