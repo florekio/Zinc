@@ -70,6 +70,14 @@ pub enum GeneratorState {
     Completed,
 }
 
+/// A generator frame's exception handler, saved across suspension.
+#[derive(Debug, Clone, Copy)]
+pub struct SavedExcHandler {
+    pub catch_target: u16,
+    pub finally_target: u16,
+    pub rel_stack_depth: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PromiseState {
     Pending,
@@ -169,6 +177,11 @@ pub enum ObjectKind {
         /// Snapshot of the actual call arguments — used by `arguments` references
         /// inside the generator body across suspensions.
         saved_args: Vec<Value>,
+        /// Exception handlers belonging to the generator frame at suspension
+        /// (innermost last), with stack depth relative to the frame base.
+        /// Removed from the VM handler stack on suspend (they'd be stale) and
+        /// re-pushed with fresh absolute positions on resume.
+        saved_handlers: Vec<SavedExcHandler>,
     },
     /// Regular expression
     RegExp {

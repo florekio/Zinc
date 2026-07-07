@@ -41,25 +41,60 @@ impl Vm {
             }
             "return" => {
                 let val = args.first().copied().unwrap_or(Value::undefined());
-                if let Some(obj) = self.heap.get_mut(gen_oid)
-                    && let ObjectKind::Generator { state, .. } = &mut obj.kind
-                {
-                    *state = GeneratorState::Completed;
+                let suspended_mid_body = self.heap.get(gen_oid).is_some_and(|o| matches!(
+                    &o.kind,
+                    ObjectKind::Generator { state: GeneratorState::SuspendedYield, .. }
+                ));
+                if suspended_mid_body {
+                    // Resume with a return completion: unwind from the yield
+                    // point with a unique sentinel so try/finally blocks run;
+                    // when the sentinel escapes the frame, the close is done.
+                    let sentinel_oid = self.heap.allocate(JsObject::ordinary());
+                    match self.generator_abrupt_resume(
+                        gen_oid,
+                        Value::object_id(sentinel_oid),
+                        Some(sentinel_oid),
+                    )? {
+                        AbruptOutcome::SentinelEscaped => {
+                            let result = self.make_iter_result(val, true)?;
+                            Ok(GeneratorAction::Done(result))
+                        }
+                        AbruptOutcome::Threw(v) => Err(VmError::Throw(v)),
+                        AbruptOutcome::Completed(result) => Ok(GeneratorAction::Done(result)),
+                    }
+                } else {
+                    if let Some(obj) = self.heap.get_mut(gen_oid)
+                        && let ObjectKind::Generator { state, .. } = &mut obj.kind
+                    {
+                        *state = GeneratorState::Completed;
+                    }
+                    let result = self.make_iter_result(val, true)?;
+                    Ok(GeneratorAction::Done(result))
                 }
-                let result = self.make_iter_result(val, true)?;
-                Ok(GeneratorAction::Done(result))
             }
             "throw" => {
-                if let Some(obj) = self.heap.get_mut(gen_oid)
-                    && let ObjectKind::Generator { state, .. } = &mut obj.kind
-                {
-                    *state = GeneratorState::Completed;
+                let exc = args.first().copied().unwrap_or(Value::undefined());
+                let suspended_mid_body = self.heap.get(gen_oid).is_some_and(|o| matches!(
+                    &o.kind,
+                    ObjectKind::Generator { state: GeneratorState::SuspendedYield, .. }
+                ));
+                if suspended_mid_body {
+                    // Resume throwing `exc` at the yield point: catch blocks may
+                    // handle it (the generator continues to a yield/return), and
+                    // finallys run before it escapes.
+                    match self.generator_abrupt_resume(gen_oid, exc, None)? {
+                        AbruptOutcome::SentinelEscaped => Err(VmError::Throw(exc)),
+                        AbruptOutcome::Threw(v) => Err(VmError::Throw(v)),
+                        AbruptOutcome::Completed(result) => Ok(GeneratorAction::Done(result)),
+                    }
+                } else {
+                    if let Some(obj) = self.heap.get_mut(gen_oid)
+                        && let ObjectKind::Generator { state, .. } = &mut obj.kind
+                    {
+                        *state = GeneratorState::Completed;
+                    }
+                    Err(VmError::Throw(exc))
                 }
-                let msg = args
-                    .first()
-                    .map(|v| self.value_to_string(*v))
-                    .unwrap_or_else(|| "undefined".into());
-                Err(VmError::RuntimeError(msg))
             }
             _ => Ok(GeneratorAction::Done(Value::undefined())),
         }
@@ -86,6 +121,7 @@ impl Vm {
                     saved_upvalues,
                     this_value,
                     saved_args,
+                    saved_handlers,
                 } => Some((
                     *state,
                     *chunk_idx,
@@ -94,12 +130,13 @@ impl Vm {
                     saved_upvalues.clone(),
                     *this_value,
                     saved_args.clone(),
+                    saved_handlers.clone(),
                 )),
                 _ => None,
             }
         };
 
-        let (state, chunk_idx, ip, saved_stack, saved_upvalues, this_value, saved_args) =
+        let (state, chunk_idx, ip, saved_stack, saved_upvalues, this_value, saved_args, saved_handlers) =
             gen_data.ok_or_else(|| VmError::TypeError("not a generator".into()))?;
 
         match state {
@@ -156,6 +193,19 @@ impl Vm {
                     with_base: self.with_stack.len(),
                 });
 
+                // Re-attach the frame's exception handlers at their new
+                // absolute positions (detached at suspension — see Yield).
+                let fidx = self.frames.len() - 1;
+                for h in &saved_handlers {
+                    self.exc_handlers.push(crate::vm::vm::ExcHandler {
+                        catch_target: h.catch_target,
+                        finally_target: h.finally_target,
+                        stack_depth: base + h.rel_stack_depth,
+                        frame_idx: fidx,
+                        with_depth: self.with_stack.len(),
+                    });
+                }
+
                 // For SuspendedYield, the input becomes the result of the yield expression
                 if state == GeneratorState::SuspendedYield {
                     self.push(input);
@@ -165,4 +215,72 @@ impl Vm {
             }
         }
     }
+
+    /// Resume a suspended generator by throwing `exc` at the yield point and
+    /// running it to completion. Finallys (and catch blocks, for gen.throw)
+    /// execute; handlers below the generator frame are protected, so nothing
+    /// escapes into the caller's try blocks.
+    fn generator_abrupt_resume(
+        &mut self,
+        gen_oid: ObjectId,
+        exc: Value,
+        sentinel: Option<ObjectId>,
+    ) -> Result<AbruptOutcome, VmError> {
+        let pre_frames = self.frames.len();
+        let pre_stack = self.stack.len();
+        match self.generator_resume(gen_oid, Value::undefined())? {
+            GeneratorAction::Resumed => {}
+            GeneratorAction::Done(v) => return Ok(AbruptOutcome::Completed(v)),
+        }
+        // Discard the resume input the yield expression would have produced.
+        self.pop()?;
+        let gen_depth = self.frames.len();
+        let prev_protect = self.protect_throw_depth;
+        self.protect_throw_depth = gen_depth;
+        let run = match self.handle_throw(exc) {
+            Ok(()) => self.run_until(gen_depth - 1),
+            Err(e) => Err(e),
+        };
+        self.protect_throw_depth = prev_protect;
+        // Mark completed unless the generator suspended again (gen.throw
+        // caught by the body and followed by another yield).
+        let suspended_again = self.heap.get(gen_oid).is_some_and(|o| matches!(
+            &o.kind,
+            ObjectKind::Generator { state: GeneratorState::SuspendedYield, .. }
+        ));
+        if !suspended_again
+            && let Some(obj) = self.heap.get_mut(gen_oid)
+            && let ObjectKind::Generator { state, .. } = &mut obj.kind
+        {
+            *state = GeneratorState::Completed;
+        }
+        match run {
+            Ok(v) => Ok(AbruptOutcome::Completed(v)),
+            Err(VmError::Throw(v)) => {
+                // Unwind anything the aborted resume left behind.
+                while self.frames.len() > pre_frames {
+                    self.frames.pop();
+                }
+                self.truncate_stack(pre_stack);
+                if sentinel.is_some() && v.as_object_id() == sentinel {
+                    Ok(AbruptOutcome::SentinelEscaped)
+                } else {
+                    Ok(AbruptOutcome::Threw(v))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Outcome of resuming a generator with an abrupt completion.
+enum AbruptOutcome {
+    /// The injected sentinel unwound out of the generator frame (clean close).
+    SentinelEscaped,
+    /// A different exception escaped (a finally threw, or gen.throw's
+    /// exception was not caught).
+    Threw(Value),
+    /// The generator completed with a value (a finally returned, or the body
+    /// caught the exception and ran to completion / yielded again).
+    Completed(Value),
 }

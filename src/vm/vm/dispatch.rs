@@ -1939,6 +1939,12 @@ impl Vm {
                         }
                         self.truncate_stack(frame.base.saturating_sub(1));
                         let iter_result = self.make_iter_result(result, true)?;
+                        // A nested run (generator close/throw resumption)
+                        // targets the generator frame itself — hand the result
+                        // back instead of running the caller's code.
+                        if self.frames.len() <= stop_depth {
+                            return Ok(iter_result);
+                        }
                         self.push(iter_result);
                     } else if self.frames.len() <= stop_depth {
                         self.truncate_stack(frame.base.saturating_sub(1));
@@ -4383,6 +4389,13 @@ impl Vm {
                                     self.push(Value::object_id(pid));
                                     continue;
                                 }
+                                Err(VmError::Throw(reason)) => {
+                                    // gen.throw() rethrows / a finalizer threw during
+                                    // gen.return(): a catchable exception at the
+                                    // call site, not a VM abort.
+                                    self.handle_throw(reason)?;
+                                    continue;
+                                }
                                 Err(e) => return Err(e),
                             }
                         }
@@ -6144,26 +6157,31 @@ impl Vm {
                                     }).collect()
                                 }
                                 ObjectKind::Generator { .. } => {
-                                    // Drive generator until done
+                                    // Drive the generator to completion. A resume
+                                    // pushes its frame; run_until targets that frame,
+                                    // so Yield/Return hand back the iter result here
+                                    // instead of running the caller's code.
                                     let mut result = Vec::new();
                                     loop {
                                         let next_name = self.interner.intern("next");
-                                        let next_result = self.exec_generator_method(src_oid, next_name, &[]);
-                                        match next_result {
-                                            Ok(crate::vm::generator::GeneratorAction::Done(iter_res)) => {
-                                                if let Some(io) = iter_res.as_object_id()
-                                                    && let Some(obj) = self.heap.get(io)
-                                                {
-                                                    let done_key = self.interner.intern("done");
-                                                    let value_key = self.interner.intern("value");
-                                                    let is_done = obj.get_property(done_key).map(|v| v.to_boolean()).unwrap_or(true);
-                                                    if is_done { break; }
-                                                    let val = obj.get_property(value_key).unwrap_or(Value::undefined());
-                                                    result.push(val);
-                                                } else { break; }
+                                        let iter_res = match self.exec_generator_method(src_oid, next_name, &[]) {
+                                            Ok(crate::vm::generator::GeneratorAction::Done(r)) => r,
+                                            Ok(crate::vm::generator::GeneratorAction::Resumed) => {
+                                                let depth = self.frames.len() - 1;
+                                                self.run_until(depth)?
                                             }
-                                            _ => break,
-                                        }
+                                            Err(e) => return Err(e),
+                                        };
+                                        if let Some(io) = iter_res.as_object_id()
+                                            && let Some(obj) = self.heap.get(io)
+                                        {
+                                            let done_key = self.interner.intern("done");
+                                            let value_key = self.interner.intern("value");
+                                            let is_done = obj.get_property(done_key).map(|v| v.to_boolean()).unwrap_or(true);
+                                            if is_done { break; }
+                                            let val = obj.get_property(value_key).unwrap_or(Value::undefined());
+                                            result.push(val);
+                                        } else { break; }
                                         if result.len() > 100_000 { break; } // safety
                                     }
                                     result
@@ -7586,17 +7604,35 @@ impl Vm {
 
                 OpCode::Await => {
                     let awaited = self.pop()?;
-                    // If it's a fulfilled promise, unwrap the value
+                    // If it's a promise, unwrap the settled value.
                     if let Some(oid) = awaited.as_object_id() {
-                        let promise_info = self.heap.get(oid).and_then(|o| {
-                            if let ObjectKind::Promise { state, result, .. } = &o.kind {
-                                Some((*state, *result))
-                            } else { None }
-                        });
-                        if let Some((state, result)) = promise_info {
+                        let read_state = |vm: &Self| {
+                            vm.heap.get(oid).and_then(|o| {
+                                if let ObjectKind::Promise { state, result, .. } = &o.kind {
+                                    Some((*state, *result))
+                                } else { None }
+                            })
+                        };
+                        if let Some((state, result)) = read_state(self) {
+                            let (state, result) = if state == PromiseState::Pending {
+                                // The engine's async functions run synchronously, so a
+                                // pending promise here is usually waiting on already
+                                // queued reactions (e.g. thenable adoption). Drain the
+                                // microtask queue and re-check before giving up.
+                                self.drain_microtasks()?;
+                                read_state(self).unwrap_or((state, result))
+                            } else {
+                                (state, result)
+                            };
                             match state {
                                 PromiseState::Fulfilled => { self.push(result); }
-                                PromiseState::Rejected => { self.push(result); } // simplified
+                                // Awaiting a rejected promise throws its reason.
+                                PromiseState::Rejected => {
+                                    self.handle_throw(result)?;
+                                }
+                                // Still genuinely pending (settled by host code later):
+                                // the sync-async model can't suspend — resume with
+                                // undefined as before.
                                 PromiseState::Pending => { self.push(Value::undefined()); }
                             }
                             continue;
@@ -7624,15 +7660,36 @@ impl Vm {
                         // Resolve upvalues to values
                         let saved_upvalues: Vec<Value> = self.frames.last().unwrap().upvalues.iter().map(|uv| uv.get(&self.stack)).collect();
 
+                        // Detach this frame's exception handlers: their frame
+                        // index and stack depth are only valid for THIS
+                        // activation. They're re-attached (repositioned) when
+                        // the generator resumes.
+                        let fidx = self.frames.len() - 1;
+                        let mut handlers = Vec::new();
+                        while let Some(h) = self.exc_handlers.last() {
+                            if h.frame_idx == fidx {
+                                let h = self.exc_handlers.pop().unwrap();
+                                handlers.push(crate::runtime::object::SavedExcHandler {
+                                    catch_target: h.catch_target,
+                                    finally_target: h.finally_target,
+                                    rel_stack_depth: h.stack_depth.saturating_sub(base),
+                                });
+                            } else {
+                                break;
+                            }
+                        }
+                        handlers.reverse();
+
                         // Update generator object
                         if let Some(obj) = self.heap.get_mut(gid)
-                            && let ObjectKind::Generator { state, ip: saved_ip, saved_stack: ss, saved_upvalues: su, this_value: tv, .. } = &mut obj.kind
+                            && let ObjectKind::Generator { state, ip: saved_ip, saved_stack: ss, saved_upvalues: su, this_value: tv, saved_handlers: sh, .. } = &mut obj.kind
                         {
                             *state = GeneratorState::SuspendedYield;
                             *saved_ip = ip;
                             *ss = saved_stack;
                             *su = saved_upvalues;
                             *tv = this_value;
+                            *sh = handlers;
                         }
 
                         // Pop the generator frame
@@ -7642,6 +7699,11 @@ impl Vm {
                         // Push {value, done: false}; for async generators, wrap in a
                         // resolved Promise so the caller sees Promise<{value, done}>.
                         let result = self.make_iter_result(yielded_value, false)?;
+                        // Nested run targeting this generator frame (close/throw
+                        // resumption): hand the result back, don't run the caller.
+                        if self.frames.len() <= stop_depth {
+                            return Ok(result);
+                        }
                         if is_async_gen {
                             let pid = self.allocate_promise();
                             self.resolve_promise(pid, result)?;
@@ -7674,6 +7736,7 @@ impl Vm {
                         saved_upvalues,
                         this_value: frame.this_value,
                         saved_args: frame.saved_args,
+                        saved_handlers: Vec::new(),
                     };
                     let gen_oid = self.heap.allocate(gen_obj);
                     // Drop the frame's stack slots (back to func slot).

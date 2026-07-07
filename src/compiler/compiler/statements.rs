@@ -236,6 +236,7 @@ impl<'a> Compiler<'a> {
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
             is_switch: false,
+            for_of_iter_slot: None,
         });
 
         self.compile_expr(&w.test)?;
@@ -268,6 +269,7 @@ impl<'a> Compiler<'a> {
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
             is_switch: false,
+            for_of_iter_slot: None,
         });
 
         self.compile_statement(&d.body)?;
@@ -320,6 +322,7 @@ impl<'a> Compiler<'a> {
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
             is_switch: false,
+            for_of_iter_slot: None,
         });
 
         // Condition.
@@ -473,6 +476,7 @@ impl<'a> Compiler<'a> {
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
             is_switch: false,
+            for_of_iter_slot: None,
         });
         self.compile_statement(&f.body)?;
         self.chunk.emit_loop(loop_start, line);
@@ -564,12 +568,13 @@ impl<'a> Compiler<'a> {
         self.compile_expr(&f.right)?;
         self.chunk.emit_op(OpCode::GetIterator, line);
 
-        // For fresh-binding-simple: track iterator as anonymous local so slot accounting is correct.
-        if fresh_binding_simple {
-            let anon = self.interner.intern("(for-of-iter)");
-            self.add_local(anon);
-            self.mark_initialized();
-        }
+        // Track the iterator as an anonymous local: slot accounting stays
+        // correct for body locals, and abrupt exits/throws can address it to
+        // run IteratorClose. (At global scope it lives in the script frame.)
+        let anon = self.interner.intern("(for-of-iter)");
+        self.add_local(anon);
+        self.mark_initialized();
+        let iter_slot = (self.locals.len() - 1) as u16;
 
         self.emit_completion_reset(line);
         let loop_start = self.chunk.len();
@@ -800,6 +805,13 @@ impl<'a> Compiler<'a> {
         // For fresh-binding-simple: scope_depth - 1 is the outer (iter_anon) depth, so that
         // break/continue correctly pop the per-iteration binding before jumping.
         let loop_scope_depth = if fresh_binding_simple { self.scope_depth - 1 } else { self.scope_depth };
+        // Guard the body with an exception handler whose catch region closes
+        // the iterator and rethrows: a throw crossing the loop must run the
+        // iterator's return() (e.g. a generator's pending finally blocks).
+        self.chunk.emit_byte(OpCode::PushExcHandler as u8, line);
+        let handler_placeholder = self.chunk.code.len();
+        self.chunk.code.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+
         self.loops.push(LoopCtx {
             continue_target: loop_start,
             break_patches: Vec::new(),
@@ -810,9 +822,12 @@ impl<'a> Compiler<'a> {
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
             is_switch: false,
+            for_of_iter_slot: Some(iter_slot),
         });
 
         self.compile_statement(&f.body)?;
+
+        self.chunk.emit_op(OpCode::PopExcHandler, line);
 
         // For fresh-binding-simple: close per-iteration scope before looping back.
         if fresh_binding_simple {
@@ -822,18 +837,37 @@ impl<'a> Compiler<'a> {
         // Loop back
         self.chunk.emit_loop(loop_start, line);
 
-        // Exit: pop the result (and iterator for non-fresh-binding).
-        // For fresh-binding-simple the outer end_scope() below handles the iterator.
+        // Exit: pop the result and close the iterator.
         self.chunk.patch_jump(exit_jump);
         self.chunk.emit_op(OpCode::Pop, line); // pop result
         // Patch break jumps to land here. Both natural exit and break go through
         // IteratorClose; for natural exit the iter's __iter_done__ flag is set
-        // so close becomes a no-op, but for break/throw/return the iterator's
-        // .return() must run.
+        // so close becomes a no-op, but for break the iterator's .return()
+        // must run. (Break sites popped the body handler themselves.)
         self.patch_loop_breaks();
-        if !fresh_binding_simple {
-            self.chunk.emit_op(OpCode::IteratorClose, line); // close + pop iterator
+        self.chunk.emit_op(OpCode::IteratorClose, line); // close + pop iterator
+        let skip_catch = self.chunk.emit_jump(OpCode::Jump, line);
+
+        // Catch region: close the iterator, rethrow.
+        if self.chunk.len() > u16::MAX as usize {
+            self.chunk.jump_overflow = true;
         }
+        let catch_target = self.chunk.len() as u16;
+        self.chunk.code[handler_placeholder] = (catch_target >> 8) as u8;
+        self.chunk.code[handler_placeholder + 1] = (catch_target & 0xFF) as u8;
+        if iter_slot <= u8::MAX as u16 {
+            self.chunk.emit_op_u8(OpCode::GetLocal, iter_slot as u8, line);
+        } else {
+            self.chunk.emit_op_u16(OpCode::GetLocalWide, iter_slot, line);
+        }
+        self.chunk.emit_op(OpCode::IteratorClose, line);
+        self.chunk.emit_op(OpCode::Throw, line);
+        self.chunk.patch_jump(skip_catch);
+
+        // The iterator's stack slot was consumed by IteratorClose — drop the
+        // compiler-side local entry without emitting another pop.
+        debug_assert_eq!(self.locals.last().map(|l| l.name), Some(anon));
+        self.locals.pop();
 
         if !is_var { self.end_scope(); }
         Ok(())
@@ -895,6 +929,7 @@ impl<'a> Compiler<'a> {
             try_depth: self.finally_stack.len(),
             with_depth: self.with_depth,
             is_switch: true,
+            for_of_iter_slot: None,
         });
 
         let mut body_starts: Vec<usize> = Vec::new();
@@ -952,6 +987,78 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// Unwind the constructs crossed by an abrupt exit (break/continue/
+    /// return): inlined `finally` bodies and for-of iterator handlers, in
+    /// reverse nesting order. `target_loop` is the loop being exited to
+    /// (None for return); crossed for-of loops get their handler popped and
+    /// iterator closed, while the target loop itself (`pop_target_handler`)
+    /// only pops its per-iteration handler — its own epilogue or next
+    /// iteration handles the iterator. Runs BEFORE locals are popped: both
+    /// finalizer bodies and the iterator reads address live stack slots.
+    pub(super) fn compile_abrupt_unwind(
+        &mut self,
+        target_loop: Option<usize>,
+        target_try_depth: usize,
+        pop_target_handler: bool,
+        line: u32,
+    ) -> Result<(), String> {
+        // Detach the levels being unwound while their bodies compile — a
+        // `return` / `break` INSIDE an inlined finally calls back into this
+        // function, and with the levels still on the stack it would
+        // re-inline the same blocks forever (stack overflow at compile time).
+        let detached = self.finally_stack.split_off(target_try_depth);
+        let emit_level = |this: &mut Self, level: &(Option<std::rc::Rc<Vec<Statement>>>, bool)| -> Result<(), String> {
+            let (finally_opt, handler_active) = level;
+            // Inside a catch block the runtime handler is already gone
+            // (handle_throw popped it on entry).
+            if *handler_active {
+                this.chunk.emit_op(OpCode::PopExcHandler, line);
+            }
+            if let Some(stmts_rc) = finally_opt {
+                let stmts = (**stmts_rc).clone();
+                for stmt in &stmts {
+                    this.compile_statement(stmt)?;
+                }
+            }
+            Ok(())
+        };
+        let mut fin_abs = target_try_depth + detached.len();
+        let lo = target_loop.map(|i| i + 1).unwrap_or(0);
+        let mut li = self.loops.len();
+        while li > lo {
+            li -= 1;
+            // Finallys registered inside this loop unwind before its handler.
+            let boundary = self.loops[li].try_depth.max(target_try_depth);
+            while fin_abs > boundary {
+                fin_abs -= 1;
+                let level = detached[fin_abs - target_try_depth].clone();
+                emit_level(self, &level)?;
+            }
+            if let Some(slot) = self.loops[li].for_of_iter_slot {
+                self.chunk.emit_op(OpCode::PopExcHandler, line);
+                if slot <= u8::MAX as u16 {
+                    self.chunk.emit_op_u8(OpCode::GetLocal, slot as u8, line);
+                } else {
+                    self.chunk.emit_op_u16(OpCode::GetLocalWide, slot, line);
+                }
+                self.chunk.emit_op(OpCode::IteratorClose, line);
+            }
+        }
+        while fin_abs > target_try_depth {
+            fin_abs -= 1;
+            let level = detached[fin_abs - target_try_depth].clone();
+            emit_level(self, &level)?;
+        }
+        if pop_target_handler
+            && let Some(ti) = target_loop
+            && self.loops[ti].for_of_iter_slot.is_some()
+        {
+            self.chunk.emit_op(OpCode::PopExcHandler, line);
+        }
+        self.finally_stack.extend(detached);
+        Ok(())
+    }
+
     pub(super) fn compile_return(&mut self, r: &ReturnStatement) -> Result<(), String> {
         let line = r.span.start;
         // A return from inside try blocks must unwind their exception
@@ -963,46 +1070,15 @@ impl<'a> Compiler<'a> {
         // a throw during its evaluation still reaches this try's catch.
         if let Some(arg) = &r.argument {
             self.compile_expr(arg)?;
-            self.compile_inline_finallys(0, line)?;
+            self.compile_abrupt_unwind(None, 0, false, line)?;
             self.chunk.emit_op(OpCode::Return, line);
         } else {
-            self.compile_inline_finallys(0, line)?;
+            self.compile_abrupt_unwind(None, 0, false, line)?;
             self.chunk.emit_op(OpCode::ReturnUndefined, line);
         }
         Ok(())
     }
 
-    /// Inline finally blocks for all try handlers entered after `target_try_depth`.
-    /// Called before break/continue jumps so that finally blocks always execute.
-    pub(super) fn compile_inline_finallys(&mut self, target_try_depth: usize, line: u32) -> Result<(), String> {
-        let depth = self.finally_stack.len();
-        if depth <= target_try_depth {
-            return Ok(());
-        }
-        // Detach the levels being unwound while their bodies compile — a
-        // `return` / `break` INSIDE an inlined finally calls back into this
-        // function, and with the levels still on the stack it would re-inline
-        // the same blocks forever (stack overflow at compile time).
-        let unwound = self.finally_stack.split_off(target_try_depth);
-        for (finally_opt, handler_active) in unwound.iter().rev() {
-            // Inside a catch block the runtime handler is already gone
-            // (handle_throw popped it on entry) — emitting a pop here
-            // would remove an unrelated OUTER handler instead.
-            if *handler_active {
-                self.chunk.emit_op(OpCode::PopExcHandler, line);
-            }
-            if let Some(stmts_rc) = finally_opt {
-                let stmts = (**stmts_rc).clone();
-                for stmt in &stmts {
-                    self.compile_statement(stmt)?;
-                }
-            }
-        }
-        // Restore: the unwind is a compile-time projection for this exit
-        // path only; subsequent statements still sit inside the trys.
-        self.finally_stack.extend(unwound);
-        Ok(())
-    }
 
     pub(super) fn compile_break(&mut self, b: &BreakStatement) -> Result<(), String> {
         let line = b.span.start;
@@ -1019,6 +1095,10 @@ impl<'a> Compiler<'a> {
         let loop_depth = self.loops[target_idx].scope_depth;
         let target_try_depth = self.loops[target_idx].try_depth;
         let target_with_depth = self.loops[target_idx].with_depth;
+        // Unwind (finally bodies + crossed for-of iterator closes) runs
+        // BEFORE the locals are popped: both reference stack slots that
+        // PopN destroys.
+        self.compile_abrupt_unwind(Some(target_idx), target_try_depth, true, line)?;
         let pop_n = self.locals_above_depth(loop_depth);
         if pop_n > 0 && pop_n <= u8::MAX as usize {
             self.chunk.emit_op_u8(OpCode::PopN, pop_n as u8, line);
@@ -1027,7 +1107,6 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::Pop, line);
             }
         }
-        self.compile_inline_finallys(target_try_depth, line)?;
         // Exit any `with` scopes between here and the target loop.
         for _ in target_with_depth..self.with_depth {
             self.chunk.emit_op(OpCode::WithExit, line);
@@ -1058,6 +1137,8 @@ impl<'a> Compiler<'a> {
         let target_with_depth = self.loops[ctx_idx].with_depth;
         let deferred = self.loops[ctx_idx].has_deferred_continue;
 
+        // Unwind before PopN — see compile_break.
+        self.compile_abrupt_unwind(Some(ctx_idx), target_try_depth, true, line)?;
         let pop_n = self.locals_above_depth(loop_depth);
         if pop_n > 0 && pop_n <= u8::MAX as usize {
             self.chunk.emit_op_u8(OpCode::PopN, pop_n as u8, line);
@@ -1066,7 +1147,6 @@ impl<'a> Compiler<'a> {
                 self.chunk.emit_op(OpCode::Pop, line);
             }
         }
-        self.compile_inline_finallys(target_try_depth, line)?;
         // Exit any `with` scopes between here and the target loop.
         for _ in target_with_depth..self.with_depth {
             self.chunk.emit_op(OpCode::WithExit, line);
@@ -1089,6 +1169,29 @@ impl<'a> Compiler<'a> {
 
     pub(super) fn compile_try(&mut self, t: &TryStatement) -> Result<(), String> {
         let line = t.span.start;
+
+        // try/catch/finally lowers to try { try/catch } finally — the
+        // finalizer must also run when the CATCH block throws or exits
+        // early, which the flat form couldn't express (the runtime handler
+        // is already popped once the catch is entered).
+        if t.handler.is_some() && t.finalizer.is_some() {
+            let inner = TryStatement {
+                block: t.block.clone(),
+                handler: t.handler.clone(),
+                finalizer: None,
+                span: t.span,
+            };
+            let outer = TryStatement {
+                block: BlockStatement {
+                    body: vec![Statement::Try(Box::new(inner))],
+                    span: t.span,
+                },
+                handler: None,
+                finalizer: t.finalizer.clone(),
+                span: t.span,
+            };
+            return self.compile_try(&outer);
+        }
 
         // Emit PushExcHandler with placeholder offsets for catch and finally.
         // Layout: [PushExcHandler, catch_hi, catch_lo, finally_hi, finally_lo]
@@ -1130,9 +1233,48 @@ impl<'a> Compiler<'a> {
             self.chunk.jump_overflow = true;
         }
         let catch_target = self.chunk.len() as u16;
-        if t.handler.is_some() {
+        if t.handler.is_some() || t.finalizer.is_some() {
             self.chunk.code[catch_placeholder] = (catch_target >> 8) as u8;
             self.chunk.code[catch_placeholder + 1] = (catch_target & 0xFF) as u8;
+        }
+
+        // No catch clause: the handler region is a synthetic catch that runs
+        // the finalizer and rethrows the pending exception. A return/break/
+        // continue inside the finalizer exits normally, swallowing it.
+        if t.handler.is_none()
+            && let Some(finalizer) = &t.finalizer
+        {
+            // Popped here so early exits inside the finalizer body don't
+            // re-inline this same finalizer.
+            self.finally_stack.pop();
+            // handle_throw pushed the exception value; keep it across the
+            // finalizer body.
+            if self.scope_depth > 0 {
+                self.begin_scope();
+                let exc_name = self.interner.intern("__pending_exc__");
+                self.add_local(exc_name);
+                self.mark_initialized();
+                let exc_slot = (self.locals.len() - 1) as u16;
+                for stmt in &finalizer.body {
+                    self.compile_statement(stmt)?;
+                }
+                if exc_slot <= u8::MAX as u16 {
+                    self.chunk.emit_op_u8(OpCode::GetLocal, exc_slot as u8, line);
+                } else {
+                    self.chunk.emit_op_u16(OpCode::GetLocalWide, exc_slot, line);
+                }
+                self.chunk.emit_op(OpCode::Throw, line);
+                self.end_scope();
+            } else {
+                let exc_name = self.interner.intern("__pending_exc__");
+                let idx = self.make_string_constant(exc_name);
+                self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
+                for stmt in &finalizer.body {
+                    self.compile_statement(stmt)?;
+                }
+                self.chunk.emit_op_u16(OpCode::GetGlobal, idx, line);
+                self.chunk.emit_op(OpCode::Throw, line);
+            }
         }
 
         // Compile catch block.
@@ -1174,8 +1316,11 @@ impl<'a> Compiler<'a> {
         }
 
         // Leaving try+catch: the finally region itself (below) and any code
-        // after must not re-inline this finalizer.
-        self.finally_stack.pop();
+        // after must not re-inline this finalizer. (The synthetic no-catch
+        // handler above already popped it.)
+        if t.handler.is_some() || t.finalizer.is_none() {
+            self.finally_stack.pop();
+        }
 
         self.chunk.patch_jump(skip_catch);
 
@@ -1221,6 +1366,7 @@ impl<'a> Compiler<'a> {
                 try_depth: self.finally_stack.len(),
                 with_depth: self.with_depth,
                 is_switch: false,
+                for_of_iter_slot: None,
             });
             self.compile_statement(&l.body)?;
             self.patch_loop_breaks();
@@ -1236,6 +1382,7 @@ impl<'a> Compiler<'a> {
                 try_depth: self.finally_stack.len(),
                 with_depth: self.with_depth,
                 is_switch: false,
+                for_of_iter_slot: None,
             });
             self.compile_statement(&l.body)?;
             self.patch_loop_breaks();

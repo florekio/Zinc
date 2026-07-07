@@ -86,6 +86,11 @@ struct LoopCtx {
     /// True for a `switch` context, which accepts `break` but is NOT a valid
     /// `continue` target — `continue` must skip it to the enclosing loop.
     is_switch: bool,
+    /// For for-of loops: the anonymous local slot holding the iterator, plus
+    /// a per-iteration exception handler guarding the body. Abrupt exits that
+    /// cross this loop must pop the handler and close the iterator; exits
+    /// targeting it pop the handler only (the loop epilogue closes).
+    for_of_iter_slot: Option<u16>,
 }
 
 // ---------------------------------------------------------------------------
