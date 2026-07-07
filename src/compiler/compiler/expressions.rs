@@ -1552,6 +1552,19 @@ impl<'a> Compiler<'a> {
 
     pub(super) fn compile_yield(&mut self, y: &YieldExpression) -> Result<(), String> {
         let line = y.span.start;
+        if y.delegate
+            && self.chunk.flags.contains(ChunkFlags::GENERATOR)
+            && !self.chunk.flags.contains(ChunkFlags::ASYNC)
+        {
+            // Sync generators: dedicated delegation opcode — next/throw/return
+            // on the outer generator forward to the inner iterator with full
+            // protocol semantics (see the VM's yield_star_delegate).
+            let arg = y.argument.as_ref().ok_or_else(|| "yield* requires an argument".to_string())?;
+            self.compile_expr(arg)?;
+            self.chunk.emit_op(OpCode::GetIterator, line);
+            self.chunk.emit_op(OpCode::YieldStar, line);
+            return Ok(());
+        }
         if y.delegate {
             // yield * <expr>:
             //   let it = GetIterator(<expr>);

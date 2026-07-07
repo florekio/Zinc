@@ -7788,56 +7788,12 @@ impl Vm {
                     let yielded_value = self.pop()?;
                     let frame = self.frames.last().unwrap();
                     let gen_oid = frame.generator_id;
-                    let base = frame.base;
-                    let ip = frame.ip;
                     let chunk_idx = frame.chunk_idx;
-                    let this_value = frame.this_value;
                     let is_async_gen = chunk_idx < self.chunks.len()
                         && self.chunks[chunk_idx].flags.contains(ChunkFlags::ASYNC);
 
                     if let Some(gid) = gen_oid {
-                        // Save the current stack (locals + operand stack)
-                        let saved_stack: Vec<Value> = self.stack[base..].to_vec();
-
-                        // Resolve upvalues to values
-                        let saved_upvalues: Vec<Value> = self.frames.last().unwrap().upvalues.iter().map(|uv| uv.get(&self.stack)).collect();
-
-                        // Detach this frame's exception handlers: their frame
-                        // index and stack depth are only valid for THIS
-                        // activation. They're re-attached (repositioned) when
-                        // the generator resumes.
-                        let fidx = self.frames.len() - 1;
-                        let mut handlers = Vec::new();
-                        while let Some(h) = self.exc_handlers.last() {
-                            if h.frame_idx == fidx {
-                                let h = self.exc_handlers.pop().unwrap();
-                                handlers.push(crate::runtime::object::SavedExcHandler {
-                                    catch_target: h.catch_target,
-                                    finally_target: h.finally_target,
-                                    rel_stack_depth: h.stack_depth.saturating_sub(base),
-                                });
-                            } else {
-                                break;
-                            }
-                        }
-                        handlers.reverse();
-
-                        // Update generator object
-                        if let Some(obj) = self.heap.get_mut(gid)
-                            && let ObjectKind::Generator { state, ip: saved_ip, saved_stack: ss, saved_upvalues: su, this_value: tv, saved_handlers: sh, .. } = &mut obj.kind
-                        {
-                            *state = GeneratorState::SuspendedYield;
-                            *saved_ip = ip;
-                            *ss = saved_stack;
-                            *su = saved_upvalues;
-                            *tv = this_value;
-                            *sh = handlers;
-                        }
-
-                        // Pop the generator frame
-                        self.frames.pop();
-                        self.truncate_stack(base - 1); // remove placeholder too
-
+                        self.suspend_current_generator(gid);
                         // Push {value, done: false}; for async generators, wrap in a
                         // resolved Promise so the caller sees Promise<{value, done}>.
                         let result = self.make_iter_result(yielded_value, false)?;
@@ -7856,6 +7812,65 @@ impl Vm {
                     } else {
                         return Err(VmError::RuntimeError("yield outside generator".into()));
                     }
+                }
+
+                // yield* delegation entry. Stack: [iter]. Records the inner
+                // iterator on the generator object and runs the first
+                // next(undefined) step; while the delegation is active,
+                // next/throw/return on the OUTER generator forward to the
+                // inner iterator (see yield_star_delegate). When the inner
+                // completes, the outer resumes with its value as the result
+                // of the yield* expression.
+                OpCode::YieldStar => {
+                    let iter_val = self.pop()?;
+                    let gen_oid = self.frames.last().and_then(|f| f.generator_id);
+                    let Some(gid) = gen_oid else {
+                        return Err(VmError::RuntimeError("yield* outside generator".into()));
+                    };
+                    let step = self.iter_protocol_call(iter_val, "next", &[Value::undefined()]);
+                    let res = match step {
+                        Ok(r) => r,
+                        Err(VmError::Throw(v)) => {
+                            self.handle_throw(v)?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if res.as_object_id().is_none() {
+                        self.throw_type_error("Iterator result is not an object")?;
+                        continue;
+                    }
+                    let done = match self.read_iter_prop(res, "done") {
+                        Ok(v) => self.truthy(v),
+                        Err(VmError::Throw(v)) => {
+                            self.handle_throw(v)?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if done {
+                        let value = match self.read_iter_prop(res, "value") {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => {
+                                self.handle_throw(v)?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        self.push(value);
+                        continue;
+                    }
+                    // Not done: enter delegation and suspend, forwarding the
+                    // inner result object verbatim.
+                    let del_key = self.interner.intern("__yield_star_iter__");
+                    if let Some(obj) = self.heap.get_mut(gid) {
+                        obj.set_property(del_key, iter_val);
+                    }
+                    self.suspend_current_generator(gid);
+                    if self.frames.len() <= stop_depth {
+                        return Ok(res);
+                    }
+                    self.push(res);
                 }
 
                 OpCode::CreateGenerator => {
@@ -7889,8 +7904,7 @@ impl Vm {
                     self.push(Value::object_id(gen_oid));
                 }
 
-                OpCode::YieldStar
-                | OpCode::AsyncReturn
+                OpCode::AsyncReturn
                 | OpCode::AsyncThrow => {
                     return Err(VmError::RuntimeError(format!(
                         "{opcode:?} not yet implemented"
