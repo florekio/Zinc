@@ -274,6 +274,9 @@ pub struct Vm {
     /// globals map but are NOT properties of globalThis, and SetGlobal must
     /// not mirror them onto it.
     pub(crate) lex_globals: std::collections::HashSet<crate::util::interner::StringId>,
+    /// Top-level lexical bindings whose declaration has not executed yet
+    /// (script/eval-level TDZ): reads and writes throw ReferenceError.
+    pub(crate) tdz_globals: std::collections::HashSet<crate::util::interner::StringId>,
     /// One-shot with_base override for the next frame pushed by
     /// call_function_this. Direct eval runs in the caller's scope, so its
     /// frame must inherit the caller's with-visibility instead of starting a

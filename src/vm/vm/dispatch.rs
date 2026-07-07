@@ -768,6 +768,16 @@ impl Vm {
                         self.push(v);
                         continue;
                     }
+                    // Script-level lexical TDZ: declared but not yet initialized.
+                    if !self.tdz_globals.is_empty() && self.tdz_globals.contains(&name_id) {
+                        let name = self.interner.resolve(name_id).to_owned();
+                        let err = self.make_native_error(
+                            "ReferenceError",
+                            &format!("Cannot access '{name}' before initialization"),
+                        );
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     // Fast path: Vec-based lookup (O(1) instead of HashMap)
                     // null in the vec means "not present" (we never store null as a global)
                     let idx = name_id.0 as usize;
@@ -872,6 +882,16 @@ impl Vm {
                         self.with_scope_set(oid, name_id, val)?;
                         continue;
                     }
+                    // Script-level lexical TDZ: assignment before initialization.
+                    if !self.tdz_globals.is_empty() && self.tdz_globals.contains(&name_id) {
+                        let name = self.interner.resolve(name_id).to_owned();
+                        let err = self.make_native_error(
+                            "ReferenceError",
+                            &format!("Cannot access '{name}' before initialization"),
+                        );
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     // Strict-mode: assigning to an unresolvable reference (no binding
                     // exists anywhere in scope) throws ReferenceError per spec.
                     let chunk_idx = self.cur_chunk();
@@ -928,6 +948,9 @@ impl Vm {
                         VmError::RuntimeError("expected string constant for variable name".into())
                     })?;
                     let val = self.pop()?;
+                    if !self.tdz_globals.is_empty() {
+                        self.tdz_globals.remove(&name_id);
+                    }
                     self.globals.insert(name_id, val);
                     let idx = name_id.0 as usize;
                     if idx >= self.globals_vec.len() { self.globals_vec.resize(idx + 1, Value::null()); }
@@ -950,6 +973,19 @@ impl Vm {
                     }
                 }
 
+                OpCode::DeclareGlobalLex => {
+                    let name_index = self.read_u16() as usize;
+                    let name_val = self.chunks[self.cur_chunk()].constants[name_index];
+                    if let Some(name_id) = name_val.as_string_id() {
+                        // Only enter the TDZ if the binding isn't already
+                        // initialized (re-declaring across scripts keeps the
+                        // existing binding usable).
+                        if !self.globals.contains_key(&name_id) {
+                            self.tdz_globals.insert(name_id);
+                        }
+                    }
+                }
+
                 OpCode::DefineGlobalLex => {
                     let name_index = self.read_u16() as usize;
                     let name_val = self.chunks[self.cur_chunk()].constants[name_index];
@@ -965,6 +1001,7 @@ impl Vm {
                     // Lexical global (top-level let/const): lives in the global
                     // environment but is NOT a property of globalThis.
                     self.lex_globals.insert(name_id);
+                    self.tdz_globals.remove(&name_id);
                 }
 
                 OpCode::GetLocal => {
@@ -972,6 +1009,14 @@ impl Vm {
                     let base = self.frames.last().unwrap().base;
                     let idx = base + slot;
                     let val = if idx < self.stack.len() { self.stack[idx] } else { Value::undefined() };
+                    if val.is_empty_marker() {
+                        let err = self.make_native_error(
+                            "ReferenceError",
+                            "Cannot access lexical binding before initialization",
+                        );
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     self.push(val);
                 }
 
@@ -980,7 +1025,17 @@ impl Vm {
                     let val = self.peek()?;
                     let base = self.frames.last().unwrap().base;
                     let idx = base + slot;
-                    if idx < self.stack.len() { self.stack[idx] = val; }
+                    if idx < self.stack.len() {
+                        if self.stack[idx].is_empty_marker() {
+                            let err = self.make_native_error(
+                                "ReferenceError",
+                                "Cannot access lexical binding before initialization",
+                            );
+                            self.handle_throw(err)?;
+                            continue;
+                        }
+                        self.stack[idx] = val;
+                    }
                 }
 
                 OpCode::GetLocalWide => {
@@ -2097,6 +2152,14 @@ impl Vm {
                             Value::undefined()
                         }
                     };
+                    if val.is_empty_marker() {
+                        let err = self.make_native_error(
+                            "ReferenceError",
+                            "Cannot access lexical binding before initialization",
+                        );
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     self.push(val);
                 }
 
@@ -2139,6 +2202,20 @@ impl Vm {
                     let idx = self.read_byte() as usize;
                     let val = self.peek()?;
                     let frame_idx = self.frames.len() - 1;
+                    // Writing a captured lexical before its declaration ran
+                    // is a TDZ violation.
+                    let current = self.frames[frame_idx]
+                        .upvalues
+                        .get(idx)
+                        .map(|uv| uv.get(&self.stack));
+                    if current.is_some_and(|v| v.is_empty_marker()) {
+                        let err = self.make_native_error(
+                            "ReferenceError",
+                            "Cannot access lexical binding before initialization",
+                        );
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     if idx < self.frames[frame_idx].upvalues.len() {
                         // Shared cell: every closure capturing this variable
                         // observes the write, matching real closure semantics.
@@ -2168,9 +2245,20 @@ impl Vm {
                     self.pop()?;
                 }
 
-                OpCode::InitLet | OpCode::CheckTdz => {
+                OpCode::InitLet => {
+                    // End of a lexical binding's TDZ: replace the marker with
+                    // undefined so subsequent reads/writes go through.
+                    let slot = self.read_byte() as usize;
+                    let base = self.frames.last().unwrap().base;
+                    let idx = base + slot;
+                    if idx < self.stack.len() && self.stack[idx].is_empty_marker() {
+                        self.stack[idx] = Value::undefined();
+                    }
+                }
+
+                OpCode::CheckTdz => {
                     let _slot = self.read_byte();
-                    // No-op for now (TDZ not enforced)
+                    // Unused (reads check the marker directly).
                 }
 
                 OpCode::DeleteProp => {
@@ -8113,6 +8201,10 @@ impl Vm {
 
                 OpCode::MarkDirectEval => {
                     self.direct_eval_pending = true;
+                }
+
+                OpCode::PushEmpty => {
+                    self.push(Value::empty());
                 }
 
                 OpCode::WithEnter => {

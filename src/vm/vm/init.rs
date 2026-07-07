@@ -529,6 +529,7 @@ impl Vm {
             with_stack: Vec::new(),
             closure_withs: std::collections::HashMap::new(),
             lex_globals: std::collections::HashSet::new(),
+            tdz_globals: std::collections::HashSet::new(),
             eval_inherit_with_base: None,
             direct_eval_pending: false,
             closure_private_env: std::collections::HashMap::new(),

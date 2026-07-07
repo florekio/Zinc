@@ -72,7 +72,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         | OpCode::Debugger | OpCode::NewTarget | OpCode::ImportMeta
         | OpCode::ToPropertyKey | OpCode::WithEnter | OpCode::WithExit
         | OpCode::GetSuperElem | OpCode::ArrayAppend
-        | OpCode::SetCompletion | OpCode::MarkDirectEval | OpCode::Halt => {
+        | OpCode::SetCompletion | OpCode::MarkDirectEval | OpCode::PushEmpty | OpCode::Halt => {
             out.push_str(&format!("{op}\n"));
             offset + 1
         }
@@ -147,7 +147,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         | OpCode::ClassStaticMethod | OpCode::ClassMethod
         | OpCode::ClassField | OpCode::ClassStaticField | OpCode::ClassPrivateMethod
         | OpCode::SetFunctionName | OpCode::ImportModule | OpCode::ExportAllFrom | OpCode::CollectRest
-        | OpCode::TypeOfGlobal | OpCode::DeleteGlobal | OpCode::WithRefResolve => {
+        | OpCode::TypeOfGlobal | OpCode::DeleteGlobal | OpCode::DeclareGlobalLex | OpCode::WithRefResolve => {
             let idx = chunk.read_u16(offset + 1);
             out.push_str(&format!("{op:<20} [{idx}]\n"));
             offset + 3

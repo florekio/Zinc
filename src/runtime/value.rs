@@ -217,6 +217,19 @@ impl Value {
         self.0 == TAG_UNDEFINED
     }
 
+    /// Internal "uninitialized binding" marker for TDZ enforcement. Never
+    /// observable by JS code: it only lives in pre-reserved lexical slots,
+    /// and reads/writes of those slots check for it and throw.
+    #[inline]
+    pub fn empty() -> Self {
+        Value(TAG_UNDEFINED | 1)
+    }
+
+    #[inline]
+    pub fn is_empty_marker(&self) -> bool {
+        self.0 == TAG_UNDEFINED | 1
+    }
+
     #[inline]
     pub fn is_nullish(&self) -> bool {
         self.is_null() || self.is_undefined()

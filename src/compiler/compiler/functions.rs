@@ -310,6 +310,28 @@ impl<'a> Compiler<'a> {
             .iter()
             .any(|s| matches!(s, Statement::Function(f) if f.id.is_some()));
         let do_hoist = !has_top_level_lex || (lex_all_simple && has_fn_decls);
+        // Reserve slots for top-level lexicals up front (independent of the
+        // function-hoist pass): closures compiled before the declaration then
+        // capture the real binding instead of a missing global, and the slot
+        // holds the TDZ marker until the declaration runs.
+        if has_top_level_lex && lex_all_simple {
+            for stmt in body_stmts {
+                if let Statement::Variable(d) = stmt
+                    && matches!(d.kind, VarKind::Let | VarKind::Const)
+                {
+                    for dec in &d.declarations {
+                        if let Pattern::Identifier(id) = &dec.id
+                            && self.resolve_local(id.name).is_none()
+                        {
+                            self.chunk.emit_op(OpCode::PushEmpty, dec.span.start);
+                            self.add_local(id.name);
+                            self.mark_initialized();
+                            self.predeclared_lex.push(id.name);
+                        }
+                    }
+                }
+            }
+        }
         let mut hoisted_fns: Vec<StringId> = Vec::new();
         // Function declaration named `arguments` shouldn't shadow the arguments
         // object when params have expressions (defaults/destructuring/rest), per
@@ -320,26 +342,6 @@ impl<'a> Compiler<'a> {
         ));
         let arguments_id = self.interner.intern("arguments");
         if do_hoist {
-            // Reserve slots for top-level lexicals first (see above)
-            // so the hoisted function bodies can capture them.
-            if has_top_level_lex {
-                for stmt in body_stmts {
-                    if let Statement::Variable(d) = stmt
-                        && matches!(d.kind, VarKind::Let | VarKind::Const)
-                    {
-                        for dec in &d.declarations {
-                            if let Pattern::Identifier(id) = &dec.id
-                                && self.resolve_local(id.name).is_none()
-                            {
-                                self.chunk.emit_op(OpCode::Undefined, dec.span.start);
-                                self.add_local(id.name);
-                                self.mark_initialized();
-                                self.predeclared_lex.push(id.name);
-                            }
-                        }
-                    }
-                }
-            }
             // Two-pass hoist so a function declaration is in scope *before* its
             // own body compiles — otherwise a nested function that references
             // the declaration (recursion, or a closure that calls back into a

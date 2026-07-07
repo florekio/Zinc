@@ -91,11 +91,13 @@ impl<'a> Compiler<'a> {
                         } else if let Some(slot) = self.take_predeclared_lex(name) {
                             // Slot was reserved at function entry by the
                             // hoist pass — assign into it instead of pushing
-                            // a fresh local.
+                            // a fresh local. InitLet ends the TDZ so the
+                            // SetLocal below doesn't reject the write.
                             if decl.kind == VarKind::Const {
                                 self.locals[slot].is_const = true;
                             }
                             if slot <= u8::MAX as usize {
+                                self.chunk.emit_op_u8(OpCode::InitLet, slot as u8, line);
                                 self.chunk.emit_op_u8(OpCode::SetLocal, slot as u8, line);
                             } else {
                                 self.chunk.emit_op_u16(OpCode::SetLocalWide, slot as u16, line);
@@ -115,10 +117,13 @@ impl<'a> Compiler<'a> {
                     } else if decl.kind == VarKind::Var {
                         // var without init: hoisting already initialized to undefined; no-op
                     } else if let Some(slot) = self.take_predeclared_lex(name) {
-                        // Pre-reserved slot already holds undefined; just
-                        // record constness.
+                        // Pre-reserved slot holds the TDZ marker — the
+                        // declaration ends the TDZ (binding becomes undefined).
                         if decl.kind == VarKind::Const {
                             self.locals[slot].is_const = true;
+                        }
+                        if slot <= u8::MAX as usize {
+                            self.chunk.emit_op_u8(OpCode::InitLet, slot as u8, line);
                         }
                     } else {
                         // let/const without init: create binding initialized to undefined
@@ -395,8 +400,21 @@ impl<'a> Compiler<'a> {
                 // compile_set_variable instead (below). Only let/const need a
                 // fresh scoped local.
             } else {
-                self.chunk.emit_op(OpCode::Undefined, line);
+                // A let/const loop var is born in its TDZ: per spec it is in
+                // scope (uninitialized) while the object expression evaluates,
+                // so `for (let k in {a: k})` throws ReferenceError. The
+                // per-iteration store clears the marker (InitLet below).
+                if is_var || is_bare {
+                    self.chunk.emit_op(OpCode::Undefined, line);
+                } else {
+                    self.chunk.emit_op(OpCode::PushEmpty, line);
+                }
                 if self.scope_depth <= 1 {
+                    // Globals hold undefined (no TDZ tracking there).
+                    if !(is_var || is_bare) {
+                        self.chunk.emit_op(OpCode::Pop, line);
+                        self.chunk.emit_op(OpCode::Undefined, line);
+                    }
                     let idx = self.make_string_constant(name);
                     self.chunk.emit_op_u16(OpCode::DefineGlobal, idx, line);
                     is_global = true;
@@ -447,6 +465,11 @@ impl<'a> Compiler<'a> {
             // stores into the loop var directly (bypasses the const check).
             // After this raw store, mark the local as const so the body's
             // assignments throw.
+            // The per-iteration BindingInitialization ends the loop var's
+            // TDZ before storing into it.
+            if let Some(slot) = local_slot {
+                self.chunk.emit_op_u8(OpCode::InitLet, slot, line);
+            }
             if is_const {
                 if let Some(slot) = local_slot {
                     self.chunk.emit_op_u8(OpCode::SetLocal, slot, line);
@@ -562,6 +585,26 @@ impl<'a> Compiler<'a> {
                 }
             }
             LoopVar::None => {}
+        }
+
+        // Per spec, the head's let/const bindings are already in scope —
+        // uninitialized (TDZ) — while the iterable expression evaluates:
+        // `for (let x of [x])` throws ReferenceError. Reserve marker locals
+        // shadowing any outer bindings; the surrounding scope pops them.
+        if is_let_const
+            && let ForInOfLeft::Variable(decl) = &f.left
+        {
+            for d in &decl.declarations {
+                // Simple identifier bindings only: the per-iteration binding
+                // shadows this marker with a fresh local. Destructured heads
+                // pre-declare their names and write into them directly, so a
+                // shadowing marker would capture those writes.
+                if let Pattern::Identifier(id) = &d.id {
+                    self.chunk.emit_op(OpCode::PushEmpty, line);
+                    self.add_local(id.name);
+                    self.mark_initialized();
+                }
+            }
         }
 
         // Compile the iterable and get its iterator

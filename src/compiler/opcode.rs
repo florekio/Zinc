@@ -122,6 +122,10 @@ pub enum OpCode {
     DeleteProp = 0x54,
     /// delete globalName (u16 name)
     DeleteGlobal = 0x55,
+    /// Declare a top-level lexical binding as existing-but-uninitialized
+    /// (u16 name). Reads/writes before DefineGlobalLex initializes it throw
+    /// ReferenceError (script/eval-level TDZ).
+    DeclareGlobalLex = 0x56,
 
     // ---- Control Flow ----
     /// Unconditional relative jump (i16 offset)
@@ -175,6 +179,8 @@ pub enum OpCode {
     /// but does NOT mirror the binding onto the globalThis object — top-level
     /// let/const live in the declarative global environment only.
     DefineGlobalLex = 0x7E,
+    /// Push the internal TDZ marker (uninitialized lexical binding).
+    PushEmpty = 0x7F,
 
     // ---- Property Access ----
     /// obj.name -- replace obj with value (u16 name constant)
@@ -427,9 +433,9 @@ impl OpCode {
             | 0x20..=0x29
             | 0x30..=0x36
             | 0x40..=0x49
-            | 0x50..=0x55
+            | 0x50..=0x56
             | 0x60..=0x67
-            | 0x70..=0x7E
+            | 0x70..=0x7F
             | 0x80..=0x8F
             | 0x90..=0x97
             | 0xA0..=0xAA
@@ -543,6 +549,7 @@ impl OpCode {
             | OpCode::ArrayAppend
             | OpCode::SetCompletion
             | OpCode::MarkDirectEval
+            | OpCode::PushEmpty
             | OpCode::Halt => 1,
 
             // 2 bytes (u8 operand)
@@ -568,6 +575,7 @@ impl OpCode {
             | OpCode::LoadBigInt
             | OpCode::TypeOfGlobal
             | OpCode::DeleteGlobal
+            | OpCode::DeclareGlobalLex
             | OpCode::Jump
             | OpCode::JumpIfFalse
             | OpCode::JumpIfTrue

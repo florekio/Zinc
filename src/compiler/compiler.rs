@@ -209,6 +209,33 @@ impl<'a> Compiler<'a> {
             }
         }
 
+        // Script/eval-level lexical TDZ: register every top-level let/const/
+        // class name as declared-but-uninitialized before any statement runs.
+        // Reads and writes throw ReferenceError until the declaration
+        // (DefineGlobalLex / class definition) initializes the binding.
+        if self.scope_depth == 0 {
+            let mut lex_names: Vec<StringId> = Vec::new();
+            for stmt in &program.body {
+                match stmt {
+                    Statement::Variable(d) if matches!(d.kind, VarKind::Let | VarKind::Const) => {
+                        for dec in &d.declarations {
+                            collect_binding_names_into(&dec.id, &mut lex_names);
+                        }
+                    }
+                    Statement::Class(c) => {
+                        if let Some(name) = c.id {
+                            lex_names.push(name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for name in lex_names {
+                let idx = self.make_string_constant(name);
+                self.chunk.emit_op_u16(OpCode::DeclareGlobalLex, idx, 0);
+            }
+        }
+
         // Hoist top-level function declarations with their value (per spec, function
         // declarations are hoisted to the top of the script with a closure).
         let mut hoisted_top_fns: Vec<StringId> = Vec::new();
