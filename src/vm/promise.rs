@@ -16,6 +16,20 @@ impl Vm {
                 return Ok(());
             }
         };
+        // Per ResolvePromise, resolving with a thenable adopts its state
+        // instead of fulfilling with the promise object as the value (an
+        // async function returning a promise resolves to its settled value).
+        if let Some(inner_oid) = value.as_object_id()
+            && inner_oid != oid
+            && self.heap.get(inner_oid)
+                .is_some_and(|o| matches!(o.kind, ObjectKind::Promise { .. }))
+        {
+            let then_name = self.interner.intern("then");
+            let resolve_sentinel = Value::function(-600_000 - oid.0 as i32);
+            let reject_sentinel = Value::function(-700_000 - oid.0 as i32);
+            self.exec_promise_method(inner_oid, then_name, &[resolve_sentinel, reject_sentinel])?;
+            return Ok(());
+        }
         // Transition to Fulfilled
         if let Some(obj) = self.heap.get_mut(oid)
             && let ObjectKind::Promise { state, result, reactions: r, .. } = &mut obj.kind {
