@@ -1611,62 +1611,17 @@ impl Vm {
                         // super() to native collection / date constructors:
                         // mutate `this` (the subclass-allocated instance) so it
                         // has the proper internal kind, and return it.
-                        if is_super_call && matches!(sentinel, -540 | -541 | -542 | -543 | -550) {
+                        if is_super_call
+                            && matches!(sentinel, -540 | -541 | -542 | -543 | -550 | -507 | -506 | -505 | -504 | -580)
+                        {
                             if let Some(f) = self.frames.last_mut() { f.pending_super_call = false; }
                             let this_val = self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined());
-                            if let Some(this_oid) = this_val.as_object_id() {
-                                let new_kind = match sentinel {
-                                    -540 => {
-                                        let mut entries = Vec::new();
-                                        if argc > 0
-                                            && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
-                                            && let Some(obj) = self.heap.get(arr_oid)
-                                            && let ObjectKind::Array(ref elems) = obj.kind
-                                        {
-                                            let elems = elems.clone();
-                                            for elem in &elems {
-                                                if let Some(pair_oid) = elem.as_object_id()
-                                                    && let Some(pair_obj) = self.heap.get(pair_oid)
-                                                    && let ObjectKind::Array(ref pair) = pair_obj.kind
-                                                    && pair.len() >= 2
-                                                {
-                                                    entries.push((pair[0], pair[1]));
-                                                }
-                                            }
-                                        }
-                                        ObjectKind::Map { entries }
-                                    }
-                                    -541 => {
-                                        let mut entries = Vec::new();
-                                        if argc > 0
-                                            && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
-                                            && let Some(obj) = self.heap.get(arr_oid)
-                                            && let ObjectKind::Array(ref elems) = obj.kind
-                                        {
-                                            entries = elems.clone();
-                                        }
-                                        ObjectKind::Set { entries }
-                                    }
-                                    -542 => ObjectKind::WeakMap { entries: Vec::new() },
-                                    -543 => ObjectKind::WeakSet { entries: Vec::new() },
-                                    -550 => {
-                                        let ms = if argc == 0 {
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|d| d.as_millis() as f64)
-                                                .unwrap_or(0.0)
-                                        } else if argc == 1 {
-                                            self.to_f64(self.stack[func_pos + 1])
-                                        } else {
-                                            0.0
-                                        };
-                                        ObjectKind::Date(ms)
-                                    }
-                                    _ => unreachable!(),
-                                };
-                                if let Some(obj) = self.heap.get_mut(this_oid) {
-                                    obj.kind = new_kind;
-                                }
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
+                            if let Some(this_oid) = this_val.as_object_id()
+                                && let Some(new_kind) = self.native_subclass_kind(sentinel, &args)
+                                && let Some(obj) = self.heap.get_mut(this_oid)
+                            {
+                                obj.kind = new_kind;
                             }
                             self.truncate_stack(func_pos);
                             self.push(this_val);
@@ -4554,14 +4509,16 @@ impl Vm {
                             let mn = self.interner.resolve(method_name).to_owned();
                             let result = match mn.as_str() {
                                 "getTime" | "valueOf" => Value::number(ms),
-                                "getFullYear" => Value::int(epoch_to_ymd(ms).0),
-                                "getMonth" => Value::int(epoch_to_ymd(ms).1),
-                                "getDate" => Value::int(epoch_to_ymd(ms).2),
-                                "getHours" => Value::int(((ms / 3_600_000.0).rem_euclid(24.0)) as i32),
-                                "getMinutes" => Value::int(((ms / 60_000.0).rem_euclid(60.0)) as i32),
-                                "getSeconds" => Value::int(((ms / 1000.0).rem_euclid(60.0)) as i32),
-                                "getMilliseconds" => Value::int((ms.rem_euclid(1000.0)) as i32),
-                                "getDay" => {
+                                // The VM has no timezone (offset 0), so the
+                                // UTC accessors alias the local ones.
+                                "getFullYear" | "getUTCFullYear" => Value::int(epoch_to_ymd(ms).0),
+                                "getMonth" | "getUTCMonth" => Value::int(epoch_to_ymd(ms).1),
+                                "getDate" | "getUTCDate" => Value::int(epoch_to_ymd(ms).2),
+                                "getHours" | "getUTCHours" => Value::int(((ms / 3_600_000.0).rem_euclid(24.0)) as i32),
+                                "getMinutes" | "getUTCMinutes" => Value::int(((ms / 60_000.0).rem_euclid(60.0)) as i32),
+                                "getSeconds" | "getUTCSeconds" => Value::int(((ms / 1000.0).rem_euclid(60.0)) as i32),
+                                "getMilliseconds" | "getUTCMilliseconds" => Value::int((ms.rem_euclid(1000.0)) as i32),
+                                "getDay" | "getUTCDay" => {
                                     // UNIX epoch (1970-01-01) was Thursday = 4
                                     let days = (ms / 86_400_000.0).floor() as i64;
                                     Value::int((((days + 4) % 7 + 7) % 7) as i32)
@@ -5498,16 +5455,10 @@ impl Vm {
                                 continue;
                             }
                             -550 => { // new Date()
-                                let ms = if argc == 0 {
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as f64)
-                                        .unwrap_or(0.0)
-                                } else if argc == 1 {
-                                    self.to_f64(self.stack[func_pos + 1])
-                                } else {
-                                    0.0
-                                };
+                                let args: Vec<Value> = (0..argc)
+                                    .map(|i| self.stack[func_pos + 1 + i])
+                                    .collect();
+                                let ms = self.date_ms_from_args(&args);
                                 let obj = JsObject {
                                     properties: Vec::new(), prototype: None,
                                     kind: ObjectKind::Date(ms),
@@ -5757,7 +5708,11 @@ impl Vm {
                                 if v.is_function() {
                                     let sentinel = v.as_function().unwrap();
                                     if (-516..=-510).contains(&sentinel)
-                                        || matches!(sentinel, -540 | -541 | -542 | -543 | -550)
+                                        || matches!(
+                                            sentinel,
+                                            -540 | -541 | -542 | -543 | -550
+                                                | -507 | -506 | -505 | -504 | -580 | -520
+                                        )
                                     {
                                         native_super_sentinel = Some(sentinel);
                                     }
@@ -5991,60 +5946,51 @@ impl Vm {
                         // `this` so it has the proper internal kind. (Mirror what
                         // super() to that sentinel would do.)
                         if let Some(sentinel) = native_super_sentinel
-                            && matches!(sentinel, -540 | -541 | -542 | -543 | -550)
+                            && matches!(sentinel, -540 | -541 | -542 | -543 | -550 | -507 | -506 | -505 | -504 | -580)
                             && let Some(this_oid) = this_val.as_object_id()
                         {
-                            let new_kind = match sentinel {
-                                -540 => {
-                                    let mut entries = Vec::new();
-                                    if argc > 0
-                                        && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
-                                        && let Some(obj) = self.heap.get(arr_oid)
-                                        && let ObjectKind::Array(ref elems) = obj.kind
-                                    {
-                                        let elems = elems.clone();
-                                        for elem in &elems {
-                                            if let Some(pair_oid) = elem.as_object_id()
-                                                && let Some(pair_obj) = self.heap.get(pair_oid)
-                                                && let ObjectKind::Array(ref pair) = pair_obj.kind
-                                                && pair.len() >= 2
-                                            {
-                                                entries.push((pair[0], pair[1]));
-                                            }
-                                        }
-                                    }
-                                    ObjectKind::Map { entries }
-                                }
-                                -541 => {
-                                    let mut entries = Vec::new();
-                                    if argc > 0
-                                        && let Some(arr_oid) = self.stack[func_pos + 1].as_object_id()
-                                        && let Some(obj) = self.heap.get(arr_oid)
-                                        && let ObjectKind::Array(ref elems) = obj.kind
-                                    {
-                                        entries = elems.clone();
-                                    }
-                                    ObjectKind::Set { entries }
-                                }
-                                -542 => ObjectKind::WeakMap { entries: Vec::new() },
-                                -543 => ObjectKind::WeakSet { entries: Vec::new() },
-                                -550 => {
-                                    let ms = if argc == 0 {
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.as_millis() as f64)
-                                            .unwrap_or(0.0)
-                                    } else if argc == 1 {
-                                        self.to_f64(self.stack[func_pos + 1])
-                                    } else {
-                                        0.0
-                                    };
-                                    ObjectKind::Date(ms)
-                                }
-                                _ => unreachable!(),
-                            };
-                            if let Some(obj) = self.heap.get_mut(this_oid) {
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack.get(func_pos + 1 + i).copied().unwrap_or(Value::undefined())).collect();
+                            if let Some(new_kind) = self.native_subclass_kind(sentinel, &args)
+                                && let Some(obj) = self.heap.get_mut(this_oid)
+                            {
                                 obj.kind = new_kind;
+                            }
+                        }
+                        // Default ctor extending Promise: run the executor with this
+                        // promise's resolve/reject; a missing/non-callable executor is a
+                        // TypeError.
+                        if let Some(-520) = native_super_sentinel
+                            && let Some(this_oid) = this_val.as_object_id()
+                        {
+                            let executor = self.stack.get(func_pos + 1).copied().unwrap_or(Value::undefined());
+                            let callable = executor.is_function()
+                                || executor.as_object_id()
+                                    .and_then(|o| self.heap.get(o))
+                                    .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)));
+                            if argc == 0 || !callable {
+                                self.truncate_stack(func_pos);
+                                self.throw_type_error("Promise resolver is not a function")?;
+                                continue;
+                            }
+                            if let Some(obj) = self.heap.get_mut(this_oid) {
+                                obj.kind = ObjectKind::Promise {
+                                    state: PromiseState::Pending,
+                                    result: Value::undefined(),
+                                    reactions: Vec::new(),
+                                };
+                            }
+                            let resolve_fn = Value::function(-600_000 - this_oid.0 as i32);
+                            let reject_fn = Value::function(-700_000 - this_oid.0 as i32);
+                            let prev_protect = self.protect_throw_depth;
+                            self.protect_throw_depth = self.frames.len() + 1;
+                            let r = self.call_function_this(executor, Value::undefined(), &[resolve_fn, reject_fn]);
+                            self.protect_throw_depth = prev_protect;
+                            match r {
+                                Ok(_) => {}
+                                Err(VmError::Throw(v)) => {
+                                    self.reject_promise(this_oid, v)?;
+                                }
+                                Err(e) => return Err(e),
                             }
                         }
                         // No constructor -- just return the object with prototype methods

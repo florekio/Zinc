@@ -854,3 +854,149 @@ impl Vm {
         false
     }
 }
+
+impl Vm {
+    /// Milliseconds since epoch from Date constructor arguments:
+    /// () → now, (ms) → ms, (year, month[, day, h, m, s, ms]) → local
+    /// components (treated as UTC — the VM has no timezone).
+    pub(crate) fn date_ms_from_args(&mut self, args: &[Value]) -> f64 {
+        match args.len() {
+            0 => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as f64)
+                .unwrap_or(0.0),
+            1 => self.to_f64(args[0]),
+            _ => {
+                let num = |vm: &mut Self, i: usize, default: f64| -> f64 {
+                    args.get(i).map(|v| vm.to_f64(*v)).unwrap_or(default)
+                };
+                let mut year = num(self, 0, 0.0);
+                let month = num(self, 1, 0.0);
+                let day = num(self, 2, 1.0);
+                let hour = num(self, 3, 0.0);
+                let min = num(self, 4, 0.0);
+                let sec = num(self, 5, 0.0);
+                let ms = num(self, 6, 0.0);
+                if !year.is_finite() || !month.is_finite() || !day.is_finite() {
+                    return f64::NAN;
+                }
+                if (0.0..=99.0).contains(&year) {
+                    year += 1900.0;
+                }
+                // Normalize month overflow into years.
+                let total_months = year as i64 * 12 + month as i64;
+                let y = total_months.div_euclid(12);
+                let m = total_months.rem_euclid(12); // 0-based month
+                // days-from-civil (Howard Hinnant's algorithm), month 1-based
+                let (yy, mm) = (y, m + 1);
+                let a = if mm <= 2 { yy - 1 } else { yy };
+                let era = if a >= 0 { a } else { a - 399 } / 400;
+                let yoe = a - era * 400;
+                let mp = (mm + 9) % 12;
+                let doy = (153 * mp + 2) / 5;
+                let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                let days_civil = era * 146_097 + doe - 719_468; // days since 1970-01-01 for day 1
+                let days = days_civil as f64 + (day - 1.0);
+                days * 86_400_000.0
+                    + hour * 3_600_000.0
+                    + min * 60_000.0
+                    + sec * 1000.0
+                    + ms
+            }
+        }
+    }
+
+    /// Internal kind for `this` when a class extends a native built-in:
+    /// mirrors what `new Builtin(...args)` would produce. Used by both the
+    /// explicit super(...) path and the implicit default constructor.
+    pub(crate) fn native_subclass_kind(&mut self, sentinel: i32, args: &[Value]) -> Option<ObjectKind> {
+        match sentinel {
+            // Array
+            -507 => {
+                let elements: Vec<Value> = if args.len() == 1 {
+                    let only = args[0];
+                    if let Some(n) = only.as_number()
+                        && n.is_finite() && n.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(&n)
+                    {
+                        vec![Value::undefined(); n as usize]
+                    } else if let Some(n) = only.as_int() {
+                        if n >= 0 { vec![Value::undefined(); n as usize] } else { vec![only] }
+                    } else {
+                        vec![only]
+                    }
+                } else {
+                    args.to_vec()
+                };
+                Some(ObjectKind::Array(elements))
+            }
+            // String / Number / Boolean wrappers
+            -504 => {
+                let s = if args.is_empty() { String::new() } else { self.value_to_string(args[0]) };
+                let id = self.interner.intern(&s);
+                Some(ObjectKind::Wrapper(Value::string(id)))
+            }
+            -505 => {
+                let n = if args.is_empty() { 0.0 } else { self.to_f64(args[0]) };
+                Some(ObjectKind::Wrapper(Value::number(n)))
+            }
+            -506 => {
+                let b = if args.is_empty() { false } else { self.truthy(args[0]) };
+                Some(ObjectKind::Wrapper(Value::boolean(b)))
+            }
+            // Date
+            -550 => Some(ObjectKind::Date(self.date_ms_from_args(args))),
+            // RegExp
+            -580 => {
+                let pattern = if !args.is_empty() { self.value_to_string(args[0]) } else { String::new() };
+                let flags = if args.len() > 1 { self.value_to_string(args[1]) } else { String::new() };
+                Some(ObjectKind::RegExp { pattern, flags })
+            }
+            // Map: entries iterable — array of entry OBJECTS, each read via
+            // its "0" / "1" properties (array pairs included).
+            -540 => {
+                let mut entries = Vec::new();
+                if let Some(arr_oid) = args.first().and_then(|v| v.as_object_id())
+                    && let Some(obj) = self.heap.get(arr_oid)
+                    && let ObjectKind::Array(ref elems) = obj.kind
+                {
+                    let elems = elems.clone();
+                    let zero = self.interner.intern("0");
+                    let one = self.interner.intern("1");
+                    for elem in &elems {
+                        if let Some(pair_oid) = elem.as_object_id() {
+                            if let Some(pair_obj) = self.heap.get(pair_oid)
+                                && let ObjectKind::Array(ref pair) = pair_obj.kind
+                            {
+                                let k = pair.first().copied().unwrap_or(Value::undefined());
+                                let v = pair.get(1).copied().unwrap_or(Value::undefined());
+                                entries.push((k, v));
+                            } else {
+                                let k = self.heap.get(pair_oid)
+                                    .and_then(|o| o.get_property(zero))
+                                    .unwrap_or(Value::undefined());
+                                let v = self.heap.get(pair_oid)
+                                    .and_then(|o| o.get_property(one))
+                                    .unwrap_or(Value::undefined());
+                                entries.push((k, v));
+                            }
+                        }
+                    }
+                }
+                Some(ObjectKind::Map { entries })
+            }
+            -541 => {
+                let mut entries = Vec::new();
+                if let Some(arr_oid) = args.first().and_then(|v| v.as_object_id())
+                    && let Some(obj) = self.heap.get(arr_oid)
+                    && let ObjectKind::Array(ref elems) = obj.kind
+                {
+                    entries = elems.clone();
+                }
+                Some(ObjectKind::Set { entries })
+            }
+            -542 => Some(ObjectKind::WeakMap { entries: Vec::new() }),
+            -543 => Some(ObjectKind::WeakSet { entries: Vec::new() }),
+            _ => None,
+        }
+    }
+}
