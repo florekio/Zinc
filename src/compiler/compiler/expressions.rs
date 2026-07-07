@@ -1217,6 +1217,16 @@ impl<'a> Compiler<'a> {
         for arg in &c.arguments {
             self.compile_expr(arg)?;
         }
+        // Syntactic direct eval: bare `eval(...)` resolving to the global.
+        // The marker lets the VM apply direct-eval context rules (indirect
+        // eval — `(0, eval)(...)` etc. — gets none).
+        if let Expression::Identifier(id) = &c.callee
+            && self.interner.resolve(id.name) == "eval"
+            && self.resolve_local(id.name).is_none()
+            && self.resolve_upvalue(id.name).is_none()
+        {
+            self.chunk.emit_op(OpCode::MarkDirectEval, line);
+        }
         self.chunk.emit_op_u8(OpCode::Call, argc, line);
         Ok(())
     }

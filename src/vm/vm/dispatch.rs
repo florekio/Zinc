@@ -1001,6 +1001,10 @@ impl Vm {
 
                 // ---- Functions -------------------------------------------
                 OpCode::Call => {
+                    // Consume the direct-eval marker (emitted for THIS Call)
+                    // up front so it can't leak past an early-continue path
+                    // when `eval` was rebound to something else.
+                    let direct_eval = std::mem::take(&mut self.direct_eval_pending);
                     let mut argc = self.read_byte() as usize;
                     let func_pos = self.stack.len() - 1 - argc;
                     let func_val = self.stack[func_pos];
@@ -1365,6 +1369,45 @@ impl Vm {
                             self.handle_throw(err)?;
                             continue;
                         }
+                        // Contextual early errors: super()/super.prop/new.target
+                        // are only legal in eval code when the eval is DIRECT and
+                        // the calling context permits them; `arguments` is never
+                        // legal in a class field initializer, even via direct
+                        // eval. Indirect eval runs as global code — none allowed.
+                        {
+                            let r = scan_eval_restrictions(&program, &self.interner);
+                            let cur_flags = self.chunks[self.cur_chunk()].flags;
+                            let in_function = self.frames.len() > 1;
+                            let in_derived_ctor = self.frames.last()
+                                .map(|f| f.is_derived_ctor)
+                                .unwrap_or(false);
+                            let violation = if !direct_eval {
+                                if r.super_call || r.super_prop {
+                                    Some("'super' keyword unexpected here")
+                                } else if r.new_target {
+                                    Some("new.target expression is not allowed here")
+                                } else {
+                                    None
+                                }
+                            } else if (r.super_call && !in_derived_ctor)
+                                || (r.super_prop && !in_function)
+                            {
+                                Some("'super' keyword unexpected here")
+                            } else if r.new_target && !in_function {
+                                Some("new.target expression is not allowed here")
+                            } else if r.arguments_ref
+                                && cur_flags.contains(ChunkFlags::FIELD_INIT)
+                            {
+                                Some("'arguments' is not allowed in class field initializer")
+                            } else {
+                                None
+                            };
+                            if let Some(msg) = violation {
+                                let err = self.make_native_error("SyntaxError", msg);
+                                self.handle_throw(err)?;
+                                continue;
+                            }
+                        }
                         // EvalDeclarationInstantiation early error: a direct eval
                         // running in a parameter default may not declare a var or
                         // function whose name collides with a parameter / body
@@ -1417,7 +1460,31 @@ impl Vm {
                         self.maybe_disasm_chunks(&flat_chunks);
                         self.chunks.extend(flat_chunks);
                         // Execute inheriting the current `this` binding (spec requirement)
-                        let eval_fn = Value::function(base_idx as i32);
+                        let mut eval_fn = Value::function(base_idx as i32);
+                        // Direct eval also runs in the caller's private-name
+                        // environment (`eval("this.#m")` inside a method sees the
+                        // class's #m). Allocate a closure identity for this eval
+                        // body and copy the caller's chain onto it.
+                        if direct_eval && base_idx <= 0xFFFF {
+                            let caller_env = self.frames.last()
+                                .filter(|f| f.base > 0)
+                                .and_then(|f| self.stack.get(f.base - 1))
+                                .and_then(|v| v.as_function())
+                                .filter(|p| *p >= 0)
+                                .map(|p| ((p as u32) >> 16) as usize)
+                                .filter(|cid| *cid != 0)
+                                .and_then(|cid| self.closure_private_env.get(&cid).cloned());
+                            if let Some(env) = caller_env {
+                                let cid = self.closure_upvalues.len();
+                                if cid <= 0x7FFF {
+                                    self.closure_upvalues.push(Vec::new());
+                                    self.closure_private_env.insert(cid, env);
+                                    eval_fn = Value::function(
+                                        ((cid as i32) << 16) | (base_idx as i32 & 0xFFFF),
+                                    );
+                                }
+                            }
+                        }
                         let current_this = self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined());
                         let frames_before = self.frames.len();
                         let stack_before = self.stack.len();
@@ -3626,6 +3693,15 @@ impl Vm {
                             ))?;
                             continue;
                         }
+                        // Evaluation-identity brand: each evaluation of a class is a
+                        // distinct private environment, so #name of one evaluation is
+                        // invisible to another even under the same mangled key.
+                        if !self.private_access_allowed(oid, &name_str) {
+                            self.throw_type_error(&format!(
+                                "Cannot read private member {name_str} from an object whose class did not declare it"
+                            ))?;
+                            continue;
+                        }
                         // Check for private getter (__get_#name__)
                         let getter_fn = self.heap.get_property_chain(oid, getter_key);
                         if let Some(gfn) = getter_fn && gfn.is_function() {
@@ -3679,6 +3755,13 @@ impl Vm {
                         }
                         // PrivateBrandCheck: writing #name to an unrelated object throws.
                         if self.private_brand_missing(oid, &name_str) {
+                            self.throw_type_error(&format!(
+                                "Cannot write private member {name_str} to an object whose class did not declare it"
+                            ))?;
+                            continue;
+                        }
+                        // Evaluation-identity brand (see GetPrivate).
+                        if !self.private_access_allowed(oid, &name_str) {
                             self.throw_type_error(&format!(
                                 "Cannot write private member {name_str} to an object whose class did not declare it"
                             ))?;
@@ -3755,6 +3838,12 @@ impl Vm {
                         continue;
                     };
                     let name_str = self.interner.resolve(name_id).to_owned();
+                    // Evaluation-identity brand: `#x in o` is false when o was not
+                    // constructed by THIS evaluation of the class (see GetPrivate).
+                    if !self.private_access_allowed(oid, &name_str) {
+                        self.push(Value::boolean(false));
+                        continue;
+                    }
                     let priv_key = self.interner.intern(&format!("__priv_{name_str}__"));
                     let getter_key = self.interner.intern(&format!("__get_{name_str}__"));
                     let setter_key = self.interner.intern(&format!("__set_{name_str}__"));
@@ -3837,6 +3926,22 @@ impl Vm {
                             self.truncate_stack(obj_pos);
                             let err = self.make_native_error("TypeError", &format!(
                                 "Cannot read private member {mname} from a non-object"
+                            ));
+                            self.handle_throw(err)?;
+                            continue;
+                        }
+                    }
+                    // Evaluation-identity brand for private method calls: the
+                    // receiver must have been constructed by THIS evaluation of
+                    // the class (see GetPrivate).
+                    if let Some(moid) = obj_val.as_object_id() {
+                        let mname = self.interner.resolve(method_name).to_owned();
+                        if mname.starts_with('#')
+                            && !self.private_access_allowed(moid, &mname)
+                        {
+                            self.truncate_stack(obj_pos);
+                            let err = self.make_native_error("TypeError", &format!(
+                                "Cannot read private member {mname} from an object whose class did not declare it"
                             ));
                             self.handle_throw(err)?;
                             continue;
@@ -5593,19 +5698,48 @@ impl Vm {
                                 .and_then(|o| o.get_property(super_key))
                                 .and_then(|v| v.as_object_id());
                         }
-                        for &coid in field_class_chain.iter().rev() {
+                        let mut field_throw: Option<Value> = None;
+                        'field_chain: for &coid in field_class_chain.iter().rev() {
                             let instance_fields: Vec<(String, Value)> = self.heap.get(coid)
                                 .map(|o| o.properties.iter()
                                     .filter_map(|(k, p)| {
                                         let key_str = self.interner.resolve(*k);
                                         if key_str.starts_with(ifield_prefix) && key_str.ends_with("__") {
                                             let inner = &key_str[ifield_prefix.len()..key_str.len() - 2];
+                                            // Redeclared fields are stored under
+                                            // name\u{1}N keys — strip the ordinal.
+                                            let inner = inner.split('\u{1}').next().unwrap_or(inner);
                                             Some((inner.to_owned(), p.value))
                                         } else { None }
                                     })
                                     .collect())
                                 .unwrap_or_default();
                             for (field_name, field_val) in instance_fields {
+                                // Initializers are stored as thunks — run each with
+                                // `this` bound to the new instance, in declaration
+                                // order (a later field sees the earlier ones). The
+                                // call is protected so a throw bubbles back here and
+                                // aborts construction via the caller's handler.
+                                let value = if field_val.is_function() {
+                                    let prev_protect = self.protect_throw_depth;
+                                    self.protect_throw_depth = self.frames.len() + 1;
+                                    let r = self.call_function_this(
+                                        field_val,
+                                        Value::object_id(new_oid),
+                                        &[],
+                                    );
+                                    self.protect_throw_depth = prev_protect;
+                                    match r {
+                                        Ok(v) => v,
+                                        Err(VmError::Throw(v)) => {
+                                            field_throw = Some(v);
+                                            break 'field_chain;
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                } else {
+                                    field_val
+                                };
                                 // Private fields (#name) are stored under __priv_#name__ to avoid
                                 // being visible via hasOwnProperty("#name").
                                 // Public fields (no #) keep their plain names.
@@ -5616,9 +5750,13 @@ impl Vm {
                                 };
                                 let real_key = self.interner.intern(&store_name);
                                 if let Some(new_o) = self.heap.get_mut(new_oid) {
-                                    new_o.set_property(real_key, field_val);
+                                    new_o.set_property(real_key, value);
                                 }
                             }
+                        }
+                        if let Some(v) = field_throw {
+                            self.handle_throw(v)?;
+                            continue;
                         }
 
                         // Detect derived-class constructor: the class object has a `__super__`
@@ -6408,6 +6546,24 @@ impl Vm {
                         }
                     }
                     self.closure_upvalues.push(upvalues);
+                    // Inherit the creating context's lexical private-name
+                    // environment chain (class code creating nested closures —
+                    // methods of inner classes, escaped arrows — keeps access
+                    // to the enclosing classes' private names).
+                    if let Some(f) = self.frames.last()
+                        && f.base > 0
+                        && let Some(callee) = self.stack.get(f.base - 1)
+                        && let Some(parent_packed) = callee.as_function()
+                        && parent_packed >= 0
+                    {
+                        let parent_cid = ((parent_packed as u32) >> 16) as usize;
+                        if parent_cid != 0
+                            && let Some(env) = self.closure_private_env.get(&parent_cid)
+                        {
+                            let env = env.clone();
+                            self.closure_private_env.insert(closure_id, env);
+                        }
+                    }
                     // If the closure is created inside a `with` body, capture the
                     // with-scope chain visible to the creating frame. Calls to the
                     // closure re-push it so names still resolve through the with
@@ -6490,6 +6646,7 @@ impl Vm {
                     // Class is on the stack
                     let class_val = self.peek()?;
                     if let Some(class_oid) = class_val.as_object_id() {
+                        self.register_class_closure(method_val, class_oid);
                         let proto_key = self.interner.intern("prototype");
                         let proto_val = self.heap.get(class_oid)
                             .and_then(|o| o.get_property(proto_key));
@@ -6529,6 +6686,9 @@ impl Vm {
                     let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
                     let name_id = name_val.as_string_id().unwrap();
                     let method_val = self.pop()?;
+                    if let Some(class_oid) = self.peek()?.as_object_id() {
+                        self.register_class_closure(method_val, class_oid);
+                    }
                     // Static class members named "prototype" throw TypeError per spec.
                     // The compiler mangles getter/setter names to __get_prototype__ /
                     // __set_prototype__, so check both forms.
@@ -6560,6 +6720,28 @@ impl Vm {
                     let name_id = name_val.as_string_id().unwrap();
                     let field_val = self.pop()?;
                     let class_val = self.peek()?;
+                    // Static initializers are thunks: run now, `this` = the class.
+                    // Protected call so a throw unwinds via the dispatch loop's
+                    // handler machinery with the arm's stack already balanced.
+                    if let Some(class_oid) = class_val.as_object_id() {
+                        self.register_class_closure(field_val, class_oid);
+                    }
+                    let field_val = if field_val.is_function() {
+                        let prev_protect = self.protect_throw_depth;
+                        self.protect_throw_depth = self.frames.len() + 1;
+                        let r = self.call_function_this(field_val, class_val, &[]);
+                        self.protect_throw_depth = prev_protect;
+                        match r {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => {
+                                self.handle_throw(v)?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    } else {
+                        field_val
+                    };
                     if let Some(class_oid) = class_val.as_object_id()
                         && let Some(class_obj) = self.heap.get_mut(class_oid) {
                             let name_str = self.interner.resolve(name_id).to_owned();
@@ -6573,16 +6755,17 @@ impl Vm {
                 }
 
                 OpCode::ClassField => {
-                    // Instance field: store default value on class under __ifield_{name}__
-                    // Applied to each new instance during Construct.
+                    // Instance field: store the initializer thunk on the class under
+                    // __ifield_{name}__; applied to each new instance during Construct.
                     let name_idx = self.read_u16() as usize;
                     let name_val = self.chunks[self.cur_chunk()].constants[name_idx];
                     let name_id = name_val.as_string_id().unwrap();
                     let field_val = self.pop()?;
                     let class_val = self.peek()?;
                     if let Some(class_oid) = class_val.as_object_id() {
+                        self.register_class_closure(field_val, class_oid);
                         let field_name = self.interner.resolve(name_id).to_owned();
-                        let ifield_key = self.interner.intern(&format!("__ifield_{field_name}__"));
+                        let ifield_key = self.ifield_store_key(class_oid, &field_name);
                         if let Some(class_obj) = self.heap.get_mut(class_oid) {
                             class_obj.set_property(ifield_key, field_val);
                         }
@@ -6595,12 +6778,13 @@ impl Vm {
                     let key_val = self.pop()?;
                     let class_val = self.peek()?;
                     if let Some(class_oid) = class_val.as_object_id() {
+                        self.register_class_closure(field_val, class_oid);
                         let field_name = if key_val.is_symbol() {
                             format!("__sym_{}__", key_val.as_symbol_id().unwrap())
                         } else {
                             self.value_to_string(key_val)
                         };
-                        let ifield_key = self.interner.intern(&format!("__ifield_{field_name}__"));
+                        let ifield_key = self.ifield_store_key(class_oid, &field_name);
                         if let Some(class_obj) = self.heap.get_mut(class_oid) {
                             class_obj.set_property(ifield_key, field_val);
                         }
@@ -6612,6 +6796,28 @@ impl Vm {
                     let field_val = self.pop()?;
                     let key_val = self.pop()?;
                     let class_val = self.peek()?;
+                    // Static initializers are thunks: run now, `this` = the class.
+                    // Protected call so a throw unwinds via the dispatch loop's
+                    // handler machinery with the arm's stack already balanced.
+                    if let Some(class_oid) = class_val.as_object_id() {
+                        self.register_class_closure(field_val, class_oid);
+                    }
+                    let field_val = if field_val.is_function() {
+                        let prev_protect = self.protect_throw_depth;
+                        self.protect_throw_depth = self.frames.len() + 1;
+                        let r = self.call_function_this(field_val, class_val, &[]);
+                        self.protect_throw_depth = prev_protect;
+                        match r {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => {
+                                self.handle_throw(v)?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    } else {
+                        field_val
+                    };
                     if let Some(class_oid) = class_val.as_object_id() {
                         let store_key = if key_val.is_symbol() {
                             let sym_name = format!("__sym_{}__", key_val.as_symbol_id().unwrap());
@@ -6633,6 +6839,7 @@ impl Vm {
                     let method_val = self.pop()?;
                     let class_val = self.peek()?;
                     if let Some(class_oid) = class_val.as_object_id() {
+                        self.register_class_closure(method_val, class_oid);
                         let proto_key = self.interner.intern("prototype");
                         let proto_oid = self.heap.get(class_oid)
                             .and_then(|o| o.get_property(proto_key))
@@ -7839,6 +8046,10 @@ impl Vm {
                     return Err(VmError::RuntimeError(
                         "SetFunctionName not yet implemented".into(),
                     ));
+                }
+
+                OpCode::MarkDirectEval => {
+                    self.direct_eval_pending = true;
                 }
 
                 OpCode::WithEnter => {

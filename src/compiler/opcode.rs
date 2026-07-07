@@ -222,6 +222,10 @@ pub enum OpCode {
     /// if null, fall through to the static read (which pushes the value on
     /// top of the null ref). Both paths end with [ref, value].
     WithRefGet = 0x8E,
+    /// Marks the immediately following Call as a syntactic direct `eval(...)`
+    /// call. Direct eval inherits contextual permissions (super/new.target)
+    /// from the caller; indirect eval does not.
+    MarkDirectEval = 0x8F,
 
     // ---- Function Calls ----
     /// Call function (u8 argc): stack=[fn, arg0..argN]
@@ -426,7 +430,7 @@ impl OpCode {
             | 0x50..=0x55
             | 0x60..=0x67
             | 0x70..=0x7E
-            | 0x80..=0x8E
+            | 0x80..=0x8F
             | 0x90..=0x97
             | 0xA0..=0xAA
             | 0xB0..=0xB1
@@ -538,6 +542,7 @@ impl OpCode {
             | OpCode::PushComputedExclude
             | OpCode::ArrayAppend
             | OpCode::SetCompletion
+            | OpCode::MarkDirectEval
             | OpCode::Halt => 1,
 
             // 2 bytes (u8 operand)

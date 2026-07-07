@@ -490,3 +490,367 @@ pub(crate) fn radix_fmt(mut n: u64, radix: u32) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Contextually-restricted constructs found in eval code. Whether each is a
+/// SyntaxError depends on where the eval was called from (EarlyErrors for
+/// eval via the direct-eval additional rules).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct EvalRestrictions {
+    pub super_call: bool,
+    pub super_prop: bool,
+    pub new_target: bool,
+    pub arguments_ref: bool,
+}
+
+/// Scan eval code for super() / super.prop / new.target / `arguments` in
+/// positions that inherit the CALLING context: top-level code and arrow
+/// bodies. Ordinary function, class and object-method bodies re-scope these
+/// constructs, so they are not descended into.
+pub(crate) fn scan_eval_restrictions(
+    program: &crate::ast::node::Program,
+    interner: &crate::util::interner::Interner,
+) -> EvalRestrictions {
+    use crate::ast::node::*;
+
+    struct Scan<'a> {
+        r: EvalRestrictions,
+        it: &'a crate::util::interner::Interner,
+    }
+
+    impl Scan<'_> {
+        fn stmt(&mut self, s: &Statement) {
+            match s {
+                Statement::Block(b) => b.body.iter().for_each(|s| self.stmt(s)),
+                Statement::Variable(v) => {
+                    for d in &v.declarations {
+                        self.pat(&d.id);
+                        if let Some(init) = &d.init { self.expr(init); }
+                    }
+                }
+                Statement::Expression(e) => self.expr(&e.expression),
+                Statement::If(i) => {
+                    self.expr(&i.test);
+                    self.stmt(&i.consequent);
+                    if let Some(a) = &i.alternate { self.stmt(a); }
+                }
+                Statement::While(w) => { self.expr(&w.test); self.stmt(&w.body); }
+                Statement::DoWhile(d) => { self.stmt(&d.body); self.expr(&d.test); }
+                Statement::For(f) => {
+                    if let Some(init) = &f.init {
+                        match init {
+                            ForInit::Variable(v) => {
+                                for d in &v.declarations {
+                                    self.pat(&d.id);
+                                    if let Some(e) = &d.init { self.expr(e); }
+                                }
+                            }
+                            ForInit::Expression(e) => self.expr(e),
+                        }
+                    }
+                    if let Some(t) = &f.test { self.expr(t); }
+                    if let Some(u) = &f.update { self.expr(u); }
+                    self.stmt(&f.body);
+                }
+                Statement::ForIn(f) => { self.for_left(&f.left); self.expr(&f.right); self.stmt(&f.body); }
+                Statement::ForOf(f) => { self.for_left(&f.left); self.expr(&f.right); self.stmt(&f.body); }
+                Statement::Switch(sw) => {
+                    self.expr(&sw.discriminant);
+                    for c in &sw.cases {
+                        if let Some(t) = &c.test { self.expr(t); }
+                        c.consequent.iter().for_each(|s| self.stmt(s));
+                    }
+                }
+                Statement::Return(r) => { if let Some(a) = &r.argument { self.expr(a); } }
+                Statement::Throw(t) => self.expr(&t.argument),
+                Statement::Try(t) => {
+                    t.block.body.iter().for_each(|s| self.stmt(s));
+                    if let Some(h) = &t.handler { h.body.body.iter().for_each(|s| self.stmt(s)); }
+                    if let Some(f) = &t.finalizer { f.body.iter().for_each(|s| self.stmt(s)); }
+                }
+                Statement::With(w) => { self.expr(&w.object); self.stmt(&w.body); }
+                Statement::Labeled(l) => self.stmt(&l.body),
+                // Function/class bodies establish their own context for these
+                // constructs — do not descend. (A class heritage clause does
+                // evaluate in the outer context; rare enough to skip.)
+                Statement::Function(_) | Statement::Class(_) => {}
+                _ => {}
+            }
+        }
+
+        fn for_left(&mut self, l: &ForInOfLeft) {
+            match l {
+                ForInOfLeft::Variable(v) => {
+                    for d in &v.declarations { self.pat(&d.id); }
+                }
+                ForInOfLeft::Pattern(p) => self.pat(p),
+                ForInOfLeft::Expression(e) => self.expr(e),
+            }
+        }
+
+        fn pat(&mut self, p: &Pattern) {
+            match p {
+                Pattern::Assignment(a) => { self.pat(&a.left); self.expr(&a.right); }
+                Pattern::Array(arr) => {
+                    for e in arr.elements.iter().flatten() { self.pat(e); }
+                }
+                Pattern::Rest(r) => self.pat(&r.argument),
+                _ => {}
+            }
+        }
+
+        fn expr(&mut self, e: &Expression) {
+            match e {
+                Expression::Identifier(id) => {
+                    if self.it.resolve(id.name) == "arguments" {
+                        self.r.arguments_ref = true;
+                    }
+                }
+                Expression::Call(c) => {
+                    if matches!(&c.callee, Expression::Super(_)) {
+                        self.r.super_call = true;
+                    } else {
+                        self.expr(&c.callee);
+                    }
+                    c.arguments.iter().for_each(|a| self.expr(a));
+                }
+                Expression::New(n) => {
+                    self.expr(&n.callee);
+                    n.arguments.iter().for_each(|a| self.expr(a));
+                }
+                Expression::Member(m) => {
+                    if matches!(&m.object, Expression::Super(_)) {
+                        self.r.super_prop = true;
+                    } else {
+                        self.expr(&m.object);
+                    }
+                    if let MemberProperty::Expression(k) = &m.property { self.expr(k); }
+                }
+                Expression::MetaProperty(mp) => {
+                    if self.it.resolve(mp.meta) == "new" && self.it.resolve(mp.property) == "target" {
+                        self.r.new_target = true;
+                    }
+                }
+                Expression::ArrowFunction(a) => {
+                    // Arrows inherit super/new.target/arguments from the
+                    // surrounding (eval) context — descend.
+                    for p in &a.params { self.pat(p); }
+                    match &a.body {
+                        ArrowBody::Expression(e) => self.expr(e),
+                        ArrowBody::Block(b) => b.body.iter().for_each(|s| self.stmt(s)),
+                    }
+                }
+                Expression::Unary(u) => self.expr(&u.argument),
+                Expression::Update(u) => self.expr(&u.argument),
+                Expression::Binary(b) => { self.expr(&b.left); self.expr(&b.right); }
+                Expression::Logical(l) => { self.expr(&l.left); self.expr(&l.right); }
+                Expression::Conditional(c) => { self.expr(&c.test); self.expr(&c.consequent); self.expr(&c.alternate); }
+                Expression::Assignment(a) => {
+                    match &a.left {
+                        AssignmentTarget::Identifier(id) => {
+                            if self.it.resolve(id.name) == "arguments" { self.r.arguments_ref = true; }
+                        }
+                        AssignmentTarget::Member(m) => {
+                            if matches!(&m.object, Expression::Super(_)) {
+                                self.r.super_prop = true;
+                            } else {
+                                self.expr(&m.object);
+                            }
+                            if let MemberProperty::Expression(k) = &m.property { self.expr(k); }
+                        }
+                        AssignmentTarget::Pattern(p) => self.pat(p),
+                    }
+                    self.expr(&a.right);
+                }
+                Expression::Sequence(s) => s.expressions.iter().for_each(|e| self.expr(e)),
+                Expression::Array(arr) => {
+                    for el in arr.elements.iter().flatten() { self.expr(el); }
+                }
+                Expression::Object(o) => {
+                    for p in &o.properties {
+                        match p {
+                            ObjectProperty::Property(prop) => {
+                                if let PropertyKey::Computed(k) = &prop.key { self.expr(k); }
+                                // Method values (function exprs) are skipped by
+                                // the Function arm below; plain values descend.
+                                self.expr(&prop.value);
+                            }
+                            ObjectProperty::SpreadElement(sp) => self.expr(&sp.argument),
+                        }
+                    }
+                }
+                Expression::Spread(sp) => self.expr(&sp.argument),
+                Expression::Yield(y) => { if let Some(a) = &y.argument { self.expr(a); } }
+                Expression::Await(a) => self.expr(&a.argument),
+                Expression::TemplateLiteral(t) => t.expressions.iter().for_each(|e| self.expr(e)),
+                Expression::TaggedTemplate(t) => {
+                    self.expr(&t.tag);
+                    t.quasi.expressions.iter().for_each(|e| self.expr(e));
+                }
+                Expression::OptionalChain(oc) => {
+                    if matches!(&oc.base, Expression::Super(_)) {
+                        self.r.super_prop = true;
+                    } else {
+                        self.expr(&oc.base);
+                    }
+                    for el in &oc.chain {
+                        match el {
+                            OptionalChainElement::Member { property, .. } => {
+                                if let MemberProperty::Expression(k) = property { self.expr(k); }
+                            }
+                            OptionalChainElement::Call { arguments, .. } => {
+                                arguments.iter().for_each(|a| self.expr(a));
+                            }
+                        }
+                    }
+                }
+                // Function/class/method bodies re-scope these constructs.
+                Expression::Function(_) | Expression::Class(_) => {}
+                _ => {}
+            }
+        }
+    }
+
+    let mut scan = Scan { r: EvalRestrictions::default(), it: interner };
+    for s in &program.body {
+        scan.stmt(s);
+    }
+    scan.r
+}
+
+impl Vm {
+
+    /// Storage key for an instance-field initializer on the class object.
+    /// A redeclared field (`class C { y = a; y = b; }`) must keep BOTH
+    /// initializers (each runs, in order, the last value wins), so duplicates
+    /// get an ordinal suffix separated by \u{1} that install-time strips.
+    pub(crate) fn ifield_store_key(
+        &mut self,
+        class_oid: ObjectId,
+        field_name: &str,
+    ) -> crate::util::interner::StringId {
+        let base = self.interner.intern(&format!("__ifield_{field_name}__"));
+        let taken = self.heap.get(class_oid)
+            .is_some_and(|o| o.get_property(base).is_some());
+        if !taken {
+            return base;
+        }
+        let mut n = 1usize;
+        loop {
+            let key = self.interner.intern(&format!("__ifield_{field_name}{SEP}{n}__", SEP = '\u{1}'));
+            let used = self.heap.get(class_oid)
+                .is_some_and(|o| o.get_property(key).is_some());
+            if !used {
+                return key;
+            }
+            n += 1;
+        }
+    }
+
+    /// Record that `method_val` (a closure installed on a class: method,
+    /// accessor, constructor or field-initializer thunk) belongs to the class
+    /// evaluation `class_oid`: prepend that class to the closure's inherited
+    /// private-environment chain.
+    pub(crate) fn register_class_closure(&mut self, method_val: Value, class_oid: ObjectId) {
+        if let Some(packed) = method_val.as_function()
+            && packed >= 0
+        {
+            let cid = ((packed as u32) >> 16) as usize;
+            if cid != 0 {
+                let mut env = vec![class_oid];
+                if let Some(existing) = self.closure_private_env.get(&cid) {
+                    env.extend(existing.iter().copied().filter(|c| *c != class_oid));
+                }
+                self.closure_private_env.insert(cid, std::rc::Rc::new(env));
+            }
+        }
+    }
+
+    /// Whether the class evaluation `class_oid` declares the private name
+    /// `name` (e.g. "#x"): any own instance-field initializer, private
+    /// method/field or private accessor stored under the mangled keys on the
+    /// class object or its prototype.
+    pub(crate) fn class_declares_private(&mut self, class_oid: ObjectId, name: &str) -> bool {
+        let priv_key = self.interner.intern(&format!("__priv_{name}__"));
+        let get_key = self.interner.intern(&format!("__get_{name}__"));
+        let set_key = self.interner.intern(&format!("__set_{name}__"));
+        let ifield_prefix = format!("__ifield_{name}");
+        let proto_key = self.interner.intern("prototype");
+        let on_class = self.heap.get(class_oid).is_some_and(|o| {
+            o.get_property(priv_key).is_some()
+                || o.get_property(get_key).is_some()
+                || o.get_property(set_key).is_some()
+                || o.properties.iter().any(|(k, _)| {
+                    let ks = self.interner.resolve(*k);
+                    ks.starts_with(&ifield_prefix)
+                        && (ks.len() == ifield_prefix.len() + 2 // __ifield_#x__
+                            || ks.as_bytes().get(ifield_prefix.len()) == Some(&1)) // ordinal
+                })
+        });
+        if on_class {
+            return true;
+        }
+        let proto_oid = self.heap.get(class_oid)
+            .and_then(|o| o.get_property(proto_key))
+            .and_then(|v| v.as_object_id());
+        proto_oid
+            .and_then(|p| self.heap.get(p))
+            .is_some_and(|o| {
+                o.get_property(priv_key).is_some()
+                    || o.get_property(get_key).is_some()
+                    || o.get_property(set_key).is_some()
+            })
+    }
+
+    /// Evaluation-identity brand check for the currently executing closure.
+    /// The private name binds to the INNERMOST class evaluation on the
+    /// closure's lexical private-environment chain that declares it (an
+    /// inner class's #x shadows the outer's); the receiver must carry that
+    /// exact evaluation's brand. Returns true when the executing code has no
+    /// chain or no chain class declares the name (fall back to key-presence
+    /// semantics).
+    pub(crate) fn private_access_allowed(&mut self, oid: ObjectId, name: &str) -> bool {
+        let env = self.frames.last()
+            .filter(|f| f.base > 0)
+            .and_then(|f| self.stack.get(f.base - 1))
+            .and_then(|v| v.as_function())
+            .filter(|p| *p >= 0)
+            .map(|p| ((p as u32) >> 16) as usize)
+            .filter(|cid| *cid != 0)
+            .and_then(|cid| self.closure_private_env.get(&cid).cloned());
+        let Some(env) = env else { return true };
+        for &c in env.iter() {
+            if self.class_declares_private(c, name) {
+                return self.object_branded_by(oid, c);
+            }
+        }
+        true
+    }
+
+    /// Whether `oid` carries the private brand of the class evaluation
+    /// `class_oid`: it is the class itself (static access), or an instance
+    /// whose construction chain (__class__ then __super__ links) includes
+    /// that exact class object.
+    pub(crate) fn object_branded_by(&mut self, oid: ObjectId, class_oid: ObjectId) -> bool {
+        if oid == class_oid {
+            return true;
+        }
+        let class_key = self.interner.intern("__class__");
+        let super_key = self.interner.intern("__super__");
+        let mut cur = self.heap.get(oid)
+            .and_then(|o| o.get_property(class_key))
+            .and_then(|v| v.as_object_id());
+        let mut hops = 0;
+        while let Some(c) = cur {
+            if c == class_oid {
+                return true;
+            }
+            hops += 1;
+            if hops > 128 {
+                break;
+            }
+            cur = self.heap.get(c)
+                .and_then(|o| o.get_property(super_key))
+                .and_then(|v| v.as_object_id());
+        }
+        false
+    }
+}

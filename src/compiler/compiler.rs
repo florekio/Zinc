@@ -141,6 +141,13 @@ pub struct Compiler<'a> {
     /// declared inside the body (e.g. `let x`) is inner to the with scope and
     /// never guarded.
     with_local_floor: Vec<usize>,
+    /// Set while compiling parameter `k`'s default expression:
+    /// `(k, param_count)`. Parameters initialize left to right, so a direct
+    /// reference to parameter slot >= k is a TDZ violation — the compiler
+    /// emits a ReferenceError throw in place of the read (`f(x = x)`,
+    /// `f(a = b, b)`). Cleared while compiling nested function bodies, whose
+    /// own bindings are unaffected.
+    param_init_active: Option<(usize, usize)>,
 }
 
 impl<'a> Compiler<'a> {
@@ -166,6 +173,7 @@ impl<'a> Compiler<'a> {
             class_depth: 0,
             predeclared_lex: Vec::new(),
             with_local_floor: Vec::new(),
+            param_init_active: None,
         }
     }
 
@@ -314,6 +322,19 @@ impl<'a> Compiler<'a> {
             self.chunk.emit_op(OpCode::Undefined, line);
             self.chunk.emit_op(OpCode::SetCompletion, line);
         }
+    }
+
+    /// Emit bytecode that throws a runtime ReferenceError (without touching
+    /// the operand stack — the throw unwinds it).
+    fn emit_throw_reference_error(&mut self, msg: &str, line: u32) {
+        let re_name = self.interner.intern("ReferenceError");
+        let re_idx = self.make_string_constant(re_name);
+        self.chunk.emit_op_u16(OpCode::GetGlobal, re_idx, line);
+        let msg_id = self.interner.intern(msg);
+        let msg_idx = self.make_string_constant(msg_id);
+        self.chunk.emit_op_u16(OpCode::Const, msg_idx, line);
+        self.chunk.emit_op_u8(OpCode::Construct, 1, line);
+        self.chunk.emit_op(OpCode::Throw, line);
     }
 
     /// Emit bytecode that pops the current stack value and throws a runtime TypeError.

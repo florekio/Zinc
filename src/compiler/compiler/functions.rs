@@ -158,13 +158,18 @@ impl<'a> Compiler<'a> {
                     }
                 }
                  ClassMember::Property(p) => {
+                    // Field initializers run per instance (statics: once, with
+                    // `this` = the class), NOT at class-definition time — the
+                    // value is compiled into a 0-param thunk the VM calls at
+                    // install time with the right `this`. Computed KEYS do
+                    // evaluate at class definition, per spec.
                     if matches!(&p.key, PropertyKey::Computed(_) | PropertyKey::NumberLiteral(_)) {
                         // Computed key: emit key expr, then value, then computed opcode.
                         // (compile_property_key already emits ToPropertyKey for the
                         // Computed variant.)
                         self.compile_property_key(&p.key, line)?;
                         if let Some(val) = &p.value {
-                            self.compile_expr(val)?;
+                            self.emit_field_init_thunk(val, line)?;
                         } else {
                             self.chunk.emit_op(OpCode::Undefined, line);
                         }
@@ -176,7 +181,7 @@ impl<'a> Compiler<'a> {
                         self.chunk.emit_op(op, line);
                     } else {
                         if let Some(val) = &p.value {
-                            self.compile_expr(val)?;
+                            self.emit_field_init_thunk(val, line)?;
                         } else {
                             self.chunk.emit_op(OpCode::Undefined, line);
                         }
@@ -400,6 +405,34 @@ impl<'a> Compiler<'a> {
         self.compile_function_body_with_self(name, params, body, is_async, is_generator, None)
     }
 
+    /// Compile a class field initializer expression into a 0-param thunk
+    /// (`function() { return <expr>; }`) and emit the Closure for it. The VM
+    /// calls the thunk with `this` bound to the new instance (or the class,
+    /// for static fields) when the field is installed.
+    fn emit_field_init_thunk(&mut self, val: &Expression, line: u32) -> Result<(), String> {
+        let name = self.interner.intern("<field_init>");
+        let span = crate::ast::span::Span::new(line, line);
+        let block = BlockStatement {
+            body: vec![Statement::Return(ReturnStatement {
+                argument: Some(val.clone()),
+                span,
+            })],
+            span,
+        };
+        let mut child_chunk = self.compile_function_body(name, &[], &block, false, false)?;
+        child_chunk.flags |= ChunkFlags::FIELD_INIT;
+        let chunk_idx = self.chunk.child_chunks.len() as u16;
+        let uv_descs = child_chunk.upvalue_descriptors.clone();
+        self.chunk.child_chunks.push(child_chunk);
+        self.chunk.emit_op_u16(OpCode::Closure, chunk_idx, line);
+        for desc in &uv_descs {
+            self.chunk.emit_byte(if desc.is_local { 1 } else { 0 }, line);
+            self.chunk.emit_byte((desc.index >> 8) as u8, line);
+            self.chunk.emit_byte((desc.index & 0xFF) as u8, line);
+        }
+        Ok(())
+    }
+
     pub(super) fn compile_function_body_with_self(
         &mut self,
         name: StringId,
@@ -462,6 +495,9 @@ impl<'a> Compiler<'a> {
         // `with` nesting does not cross function boundaries.
         let parent_with_depth = std::mem::take(&mut self.with_depth);
         let parent_with_local_floor = std::mem::take(&mut self.with_local_floor);
+        // Parameter-TDZ tracking is per-function: a nested function created in
+        // a default expression may freely reference outer params as upvalues.
+        let parent_param_init = std::mem::take(&mut self.param_init_active);
         self.enclosing_chain.push(EnclosingFrame {
             locals: parent_locals,
             upvalues: parent_upvalues,
@@ -526,7 +562,9 @@ impl<'a> Compiler<'a> {
                 // Default value expression (a direct eval here is in the
                 // parameter scope — mark it so var/function decls early-error).
                 self.chunk.emit_op(OpCode::BeginParamExpr, line);
+                self.param_init_active = Some((i, params.len()));
                 self.compile_expr(&a.right)?;
+                self.param_init_active = None;
                 self.chunk.emit_op(OpCode::EndParamExpr, line);
                 // Set the local
                 self.chunk.emit_op(OpCode::SetLocal, line);
@@ -629,6 +667,7 @@ impl<'a> Compiler<'a> {
         self.finally_stack = parent_finally_stack;
         self.with_depth = parent_with_depth;
         self.with_local_floor = parent_with_local_floor;
+        self.param_init_active = parent_param_init;
 
         if compiled.jump_overflow {
             let name = self.interner.resolve(compiled.name).to_owned();
@@ -684,6 +723,9 @@ impl<'a> Compiler<'a> {
         // `with` nesting does not cross function boundaries.
         let parent_with_depth = std::mem::take(&mut self.with_depth);
         let parent_with_local_floor = std::mem::take(&mut self.with_local_floor);
+        // Parameter-TDZ tracking is per-function: a nested function created in
+        // a default expression may freely reference outer params as upvalues.
+        let parent_param_init = std::mem::take(&mut self.param_init_active);
         // Push parent's scope onto the chain so the arrow body (and anything
         // nested in it) can capture transitively.
         self.enclosing_chain.push(EnclosingFrame {
@@ -746,7 +788,9 @@ impl<'a> Compiler<'a> {
                 self.chunk.code.push(0);
                 self.chunk.code.push(0);
                 self.chunk.emit_op(OpCode::BeginParamExpr, line);
+                self.param_init_active = Some((i, params.len()));
                 self.compile_expr(&a.right)?;
+                self.param_init_active = None;
                 self.chunk.emit_op(OpCode::EndParamExpr, line);
                 self.chunk.emit_op(OpCode::SetLocal, line);
                 self.chunk.code.push(i as u8);
@@ -832,6 +876,7 @@ impl<'a> Compiler<'a> {
         self.finally_stack = parent_finally_stack;
         self.with_depth = parent_with_depth;
         self.with_local_floor = parent_with_local_floor;
+        self.param_init_active = parent_param_init;
 
         if compiled.jump_overflow {
             let name = self.interner.resolve(compiled.name).to_owned();

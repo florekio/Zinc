@@ -72,7 +72,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize, interner: &Interner, ou
         | OpCode::Debugger | OpCode::NewTarget | OpCode::ImportMeta
         | OpCode::ToPropertyKey | OpCode::WithEnter | OpCode::WithExit
         | OpCode::GetSuperElem | OpCode::ArrayAppend
-        | OpCode::SetCompletion | OpCode::Halt => {
+        | OpCode::SetCompletion | OpCode::MarkDirectEval | OpCode::Halt => {
             out.push_str(&format!("{op}\n"));
             offset + 1
         }

@@ -178,6 +178,11 @@ impl Vm {
             roots.extend(captured.iter().copied());
         }
 
+        // Root 5c: class evaluations on closures' private-environment chains
+        for env in self.closure_private_env.values() {
+            roots.extend(env.iter().copied());
+        }
+
         // Root 6: microtask queue
         for task in &self.microtask_queue {
             match task {

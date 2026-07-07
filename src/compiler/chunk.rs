@@ -17,6 +17,9 @@ bitflags::bitflags! {
         /// Top-level script or eval code. Value-producing statements update the
         /// VM completion register so `eval(...)` yields the spec completion value.
         const SCRIPT    = 0b0100_0000;
+        /// Class field initializer thunk. A direct eval from here may not
+        /// reference `arguments` (ClassFieldDefinition early errors).
+        const FIELD_INIT = 0b1000_0000;
     }
 }
 

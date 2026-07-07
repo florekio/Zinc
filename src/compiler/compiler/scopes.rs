@@ -227,7 +227,27 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// While compiling parameter k's default expression, a direct reference
+    /// to parameter slot >= k reads an uninitialized binding — emit a
+    /// ReferenceError throw in its place (parameters initialize left to
+    /// right, so this is statically known).
+    fn param_tdz_violation(&mut self, name: StringId) -> bool {
+        if let Some((k, param_count)) = self.param_init_active
+            && let Some(slot) = self.resolve_local(name)
+        {
+            slot >= k && slot < param_count
+        } else {
+            false
+        }
+    }
+
     pub(super) fn compile_get_variable(&mut self, name: StringId, line: u32) -> Result<(), String> {
+        if self.param_tdz_violation(name) {
+            let var_name = self.interner.resolve(name).to_owned();
+            self.emit_throw_reference_error(
+                &format!("Cannot access '{var_name}' before initialization"), line);
+            return Ok(());
+        }
         if let Some(slot) = self.resolve_local(name) {
             let guard = self.local_needs_with_guard(slot)
                 .then(|| self.emit_with_guard(OpCode::WithGetCheck, name, line));
@@ -255,6 +275,12 @@ impl<'a> Compiler<'a> {
     }
 
     pub(super) fn compile_set_variable(&mut self, name: StringId, line: u32) -> Result<(), String> {
+        if self.param_tdz_violation(name) {
+            let var_name = self.interner.resolve(name).to_owned();
+            self.emit_throw_reference_error(
+                &format!("Cannot access '{var_name}' before initialization"), line);
+            return Ok(());
+        }
         if let Some(slot) = self.resolve_local(name) {
             if self.locals[slot].is_const {
                 let var_name = self.interner.resolve(name).to_owned();

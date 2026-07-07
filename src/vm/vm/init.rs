@@ -530,6 +530,8 @@ impl Vm {
             closure_withs: std::collections::HashMap::new(),
             lex_globals: std::collections::HashSet::new(),
             eval_inherit_with_base: None,
+            direct_eval_pending: false,
+            closure_private_env: std::collections::HashMap::new(),
             script_completion: Value::undefined(),
             param_scope_depth: 0,
             // Index 0 is a reserved dummy: plain chunk-index function values

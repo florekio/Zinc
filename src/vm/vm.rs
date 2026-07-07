@@ -279,6 +279,17 @@ pub struct Vm {
     /// frame must inherit the caller's with-visibility instead of starting a
     /// fresh (empty) one.
     pub(crate) eval_inherit_with_base: Option<usize>,
+    /// Set by MarkDirectEval for the immediately following Call: the callee
+    /// was the syntactic identifier `eval`, so if it resolves to the eval
+    /// builtin the call is a DIRECT eval (inherits contextual permissions).
+    pub(crate) direct_eval_pending: bool,
+    /// Lexical private-name environment chain per closure (innermost class
+    /// first), keyed by closure_id. A closure created inside class code
+    /// inherits its creator's chain; installing a closure on a class prepends
+    /// that class evaluation. Used for brand checks: two evaluations of the
+    /// same class text are distinct environments, so #x of one is invisible
+    /// to the other even though both store it under the same mangled key.
+    pub(crate) closure_private_env: std::collections::HashMap<usize, std::rc::Rc<Vec<ObjectId>>>,
     /// Completion value of the currently running script/eval. Value-producing
     /// statements update it via SetCompletion; Halt returns it. Saved/restored
     /// around nested `eval` so an inner eval can't corrupt the outer's value.
