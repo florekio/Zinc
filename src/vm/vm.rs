@@ -452,37 +452,16 @@ impl Vm {
 
     /// Throw a TypeError as a JS exception (caught by try/catch) or propagate as VmError.
     pub(crate) fn throw_type_error(&mut self, msg: &str) -> Result<(), VmError> {
-        if let Some(handler) = self.exc_handlers.pop() {
-            let mut err = crate::runtime::object::JsObject::ordinary();
-            let msg_key = self.interner.intern("message");
-            let msg_id = self.interner.intern(msg);
-            err.set_property(msg_key, Value::string(msg_id));
-            let name_key = self.interner.intern("name");
-            let type_error = self.interner.intern("TypeError");
-            err.set_property(name_key, Value::string(type_error));
-            // Also set up prototype chain for instanceof TypeError
-            let proto = self.get_type_error_prototype();
-            if let Some(proto_id) = proto {
-                err.prototype = Some(proto_id);
-            }
-            let oid = self.heap.allocate(err);
-            while self.frames.len() > handler.frame_idx + 1 {
-                self.frames.pop();
-            }
-            self.truncate_stack(handler.stack_depth);
-            self.with_stack.truncate(handler.with_depth);
-            self.push(Value::object_id(oid));
-            self.frames.last_mut().unwrap().ip = handler.catch_target as usize;
-            Ok(())
-        } else {
-            Err(VmError::TypeError(msg.to_owned()))
-        }
-    }
-
-    fn get_type_error_prototype(&mut self) -> Option<crate::runtime::object::ObjectId> {
-        // TypeError is a native sentinel function (-511); its prototype is
-        // tracked in func_prototypes, not on the heap.
-        self.func_prototypes.get(&-511).copied()
+        // Route through handle_throw: it honors protect_throw_depth, so a
+        // TypeError raised inside a protected nested call (field initializer
+        // thunks, getters, …) bubbles back to the calling opcode instead of
+        // unwinding the outer dispatch state out from under it. (The old
+        // inline unwind popped the outer handler directly, and the caller's
+        // continuation then pushed on top of the redirected stack — a catch
+        // block could observe the half-constructed receiver instead of the
+        // error.)
+        let err = self.make_native_error("TypeError", msg);
+        self.handle_throw(err)
     }
 
     #[inline(always)]

@@ -1480,18 +1480,18 @@ impl Vm {
                                 }
                             }
                         }
-                        // EvalDeclarationInstantiation early error: a direct eval
-                        // running in a parameter default may not declare a var or
-                        // function whose name collides with a parameter / body
-                        // lexical / the parameter-scoped `arguments` binding.
-                        if self.param_scope_depth > 0
-                            && let Some(frame) = self.frames.last()
-                        {
+                        // EvalDeclarationInstantiation early error: a direct
+                        // eval's var/function declarations may not collide with
+                        // a lexical binding of the calling scope (`function f()
+                        // { let x; eval('var x'); }`), nor — while running in a
+                        // parameter default — with a parameter name.
+                        if direct_eval && let Some(frame) = self.frames.last() {
                             let cidx = frame.chunk_idx;
                             let declared = collect_eval_hoisted_names(&program);
                             let collides = declared.iter().any(|n|
-                                self.chunks[cidx].param_names.contains(n)
-                                || self.chunks[cidx].lexical_names.contains(n));
+                                self.chunks[cidx].lexical_names.contains(n)
+                                || (self.param_scope_depth > 0
+                                    && self.chunks[cidx].param_names.contains(n)));
                             if collides {
                                 let err = self.make_native_error("SyntaxError",
                                     "Identifier in eval declaration conflicts with a binding in the enclosing scope");
