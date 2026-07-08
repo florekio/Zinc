@@ -507,6 +507,10 @@ impl<'a> Compiler<'a> {
 
         self.scope_depth = 1; // function body is its own scope
 
+        self.chunk.simple_params = params
+            .iter()
+            .all(|p| matches!(p, Pattern::Identifier(_)));
+
         // Declare parameters as locals (use anonymous slot for destructuring patterns).
         for (param_idx, param) in params.iter().enumerate() {
             match param {

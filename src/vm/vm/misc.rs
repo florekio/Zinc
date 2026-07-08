@@ -109,6 +109,7 @@ impl Vm {
         let mut flags = Property::ALL;
         let mut value = Value::undefined();
         let mut has_value = false;
+        let mut present: u8 = 0;
         if let Some(desc_oid) = desc_val.as_object_id() {
             let writable_key = self.interner.intern("writable");
             let enumerable_key = self.interner.intern("enumerable");
@@ -121,12 +122,18 @@ impl Vm {
                 has_value = true;
             }
             flags = 0;
-            if let Some(v) = self.heap.get_property_chain(desc_oid, writable_key)
-                && v.to_boolean() { flags |= Property::WRITABLE; }
-            if let Some(v) = self.heap.get_property_chain(desc_oid, enumerable_key)
-                && v.to_boolean() { flags |= Property::ENUMERABLE; }
-            if let Some(v) = self.heap.get_property_chain(desc_oid, configurable_key)
-                && v.to_boolean() { flags |= Property::CONFIGURABLE; }
+            if let Some(v) = self.heap.get_property_chain(desc_oid, writable_key) {
+                present |= Property::WRITABLE;
+                if v.to_boolean() { flags |= Property::WRITABLE; }
+            }
+            if let Some(v) = self.heap.get_property_chain(desc_oid, enumerable_key) {
+                present |= Property::ENUMERABLE;
+                if v.to_boolean() { flags |= Property::ENUMERABLE; }
+            }
+            if let Some(v) = self.heap.get_property_chain(desc_oid, configurable_key) {
+                present |= Property::CONFIGURABLE;
+                if v.to_boolean() { flags |= Property::CONFIGURABLE; }
+            }
             let accessor_flags = flags & (Property::ENUMERABLE | Property::CONFIGURABLE);
             if let Some(getter) = self.heap.get_property_chain(desc_oid, get_key)
                 && getter.is_function() {
@@ -153,6 +160,31 @@ impl Vm {
             })
             .unwrap_or(false);
         if !has_accessor {
+            // Attributes omitted from the descriptor keep the property's
+            // CURRENT values when it already exists ({configurable: false}
+            // on a normal array element leaves it writable+enumerable).
+            // Array elements without a map entry default to all-true.
+            let existing_flags = self.heap.get(target_oid)
+                .and_then(|o| o.get_property_descriptor(key_id))
+                .map(|p| p.flags)
+                .or_else(|| {
+                    canonical_array_index(&key_str).and_then(|idx| {
+                        self.heap.get(target_oid).and_then(|o| {
+                            if let ObjectKind::Array(ref e) = o.kind {
+                                (idx < e.len()).then_some(Property::ALL)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                });
+            if let Some(ex) = existing_flags {
+                for bit in [Property::WRITABLE, Property::ENUMERABLE, Property::CONFIGURABLE] {
+                    if present & bit == 0 {
+                        flags = (flags & !bit) | (ex & bit);
+                    }
+                }
+            }
             // Array-index defines must land in the array's element storage,
             // not the property map. Arrays keep elements in a separate Vec
             // (backing `arr[i]` and `.length`); a map-only define is invisible
@@ -1049,8 +1081,24 @@ impl Vm {
         let oid = if let Some(oid) = cached {
             oid
         } else {
-            let args = self.frames[frame_idx].saved_args.clone();
+            let mut args = self.frames[frame_idx].saved_args.clone();
             let chunk_idx = self.frames[frame_idx].chunk_idx;
+            // Mapped portion (sloppy functions): parameters may have been
+            // reassigned before `arguments` materialized — read the LIVE
+            // slots, not the call-time snapshot.
+            if !self.chunks[chunk_idx].flags.contains(crate::compiler::chunk::ChunkFlags::STRICT)
+                && self.chunks[chunk_idx].simple_params
+            {
+                let base = self.frames[frame_idx].base;
+                let pc = self.chunks[chunk_idx].param_count as usize;
+                for (i, slot) in args.iter_mut().enumerate().take(pc) {
+                    if let Some(v) = self.stack.get(base + i)
+                        && !v.is_empty_marker()
+                    {
+                        *slot = *v;
+                    }
+                }
+            }
             let is_strict = self.chunks[chunk_idx]
                 .flags
                 .contains(crate::compiler::chunk::ChunkFlags::STRICT);
@@ -1084,5 +1132,83 @@ impl Vm {
             oid
         };
         Value::object_id(oid)
+    }
+}
+
+impl Vm {
+    /// Mapped-arguments aliasing (sloppy functions): writing `arguments[idx]`
+    /// while its creating frame is live also writes the parameter slot.
+    /// Returns true when the object is a live frame's arguments object.
+    pub(crate) fn sync_mapped_argument_to_param(
+        &mut self,
+        oid: ObjectId,
+        idx: usize,
+        val: Value,
+    ) -> bool {
+        let Some(fi) = (0..self.frames.len())
+            .rev()
+            .find(|&i| self.frames[i].arguments_oid == Some(oid))
+        else {
+            return false;
+        };
+        let chunk_idx = self.frames[fi].chunk_idx;
+        if self.chunks[chunk_idx].flags.contains(crate::compiler::chunk::ChunkFlags::STRICT)
+            || !self.chunks[chunk_idx].simple_params
+        {
+            return false;
+        }
+        if idx >= self.chunks[chunk_idx].param_count as usize {
+            return true; // arguments object, but index beyond the mapping
+        }
+        // An index redefined non-writable — or deleted — is unmapped.
+        let key_id = self.interner.intern(&idx.to_string());
+        let tombstone = self.interner.intern(&format!("__argmap_del_{idx}__"));
+        let unmapped = self.heap.get(oid).is_some_and(|o| {
+            o.get_property(tombstone).is_some()
+                || o.get_property_descriptor(key_id)
+                    .is_some_and(|p| !p.is_writable())
+        });
+        if unmapped {
+            return true;
+        }
+        let pos = self.frames[fi].base + idx;
+        if pos < self.stack.len() {
+            self.stack[pos] = val;
+        }
+        true
+    }
+
+    /// Mapped-arguments aliasing, parameter side: writing a parameter slot of
+    /// a sloppy function with a materialized arguments object also writes
+    /// `arguments[slot]` (unless that index was unmapped by defineProperty).
+    pub(crate) fn sync_param_to_mapped_argument(&mut self, slot: usize, val: Value) {
+        let Some(f) = self.frames.last() else { return };
+        let Some(aoid) = f.arguments_oid else { return };
+        let chunk_idx = f.chunk_idx;
+        if slot >= self.chunks[chunk_idx].param_count as usize
+            || self.chunks[chunk_idx].flags.contains(crate::compiler::chunk::ChunkFlags::STRICT)
+            || !self.chunks[chunk_idx].simple_params
+        {
+            return;
+        }
+        let key_id = self.interner.intern(&slot.to_string());
+        let tombstone = self.interner.intern(&format!("__argmap_del_{slot}__"));
+        if self.heap.get(aoid).is_some_and(|o| o.get_property(tombstone).is_some()) {
+            return; // deleted → unmapped
+        }
+        let named = self.heap.get(aoid).and_then(|o| o.get_property_descriptor(key_id));
+        if named.is_some_and(|p| !p.is_writable()) {
+            return; // unmapped
+        }
+        if let Some(obj) = self.heap.get_mut(aoid) {
+            if let ObjectKind::Array(ref mut e) = obj.kind
+                && slot < e.len()
+            {
+                e[slot] = val;
+            }
+            if named.is_some() {
+                obj.set_property(key_id, val);
+            }
+        }
     }
 }

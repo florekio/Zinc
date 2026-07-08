@@ -1009,6 +1009,12 @@ impl Vm {
                             continue;
                         }
                         self.stack[idx] = val;
+                        // Mapped arguments: a parameter write reflects into a
+                        // materialized arguments object (rare — gated on the
+                        // frame having one).
+                        if self.frames.last().is_some_and(|f| f.arguments_oid.is_some()) {
+                            self.sync_param_to_mapped_argument(slot, val);
+                        }
                     }
                 }
 
@@ -2281,12 +2287,22 @@ impl Vm {
                                 if named_nonconfig {
                                     false
                                 } else {
+                                    // Deleting a mapped-arguments index removes
+                                    // the parameter aliasing permanently.
+                                    let is_live_args = self.frames.iter()
+                                        .any(|f| f.arguments_oid == Some(oid));
+                                    let tombstone = is_live_args.then(|| {
+                                        self.interner.intern(&format!("__argmap_del_{idx}__"))
+                                    });
                                     if let Some(obj) = self.heap.get_mut(oid) {
                                         obj.delete_property(key_id);
                                         if let ObjectKind::Array(ref mut elems) = obj.kind
                                             && idx < elems.len()
                                         {
                                             elems[idx] = Value::undefined();
+                                        }
+                                        if let Some(ts) = tombstone {
+                                            obj.define_property(ts, Property::with_flags(Value::boolean(true), 0));
                                         }
                                     }
                                     true
@@ -3622,6 +3638,9 @@ impl Vm {
                         if has_named
                             && let Some(idx) = idx
                         {
+                            // Live mapped-arguments write: also update the
+                            // parameter slot (sloppy functions).
+                            self.sync_mapped_argument_to_param(oid, idx, val);
                             let key_id = self.interner.intern(&idx.to_string());
                             if let Some(desc) = self.heap.get(oid)
                                 .and_then(|o| o.get_property_descriptor(key_id))

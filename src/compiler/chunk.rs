@@ -68,6 +68,9 @@ pub struct Chunk {
     /// The body references the `arguments` object (set for arrow chunks so
     /// closure creation knows to capture the defining scope's arguments).
     pub uses_arguments: bool,
+    /// Every formal parameter is a plain identifier (no defaults, rest or
+    /// destructuring). Mapped-arguments aliasing only applies to these.
+    pub simple_params: bool,
     /// Set when a patched jump's offset exceeded the i16 encoding — the
     /// bytecode is CORRUPT (the offset wrapped) and must not run. The
     /// compiler turns this into a per-script compile error; the long-term
@@ -128,6 +131,7 @@ impl Chunk {
             ic_slot_count: 0,
             jump_overflow: false,
             uses_arguments: false,
+            simple_params: true,
         }
     }
 
