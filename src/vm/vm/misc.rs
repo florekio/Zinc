@@ -1287,3 +1287,20 @@ impl Vm {
         Some(val)
     }
 }
+
+impl Vm {
+    /// Index of the innermost non-arrow frame: `super()` / super-state flags
+    /// inside arrow functions belong to the enclosing constructor's frame,
+    /// not the arrow's own.
+    pub(crate) fn super_frame_idx(&self) -> usize {
+        let mut i = self.frames.len().saturating_sub(1);
+        while i > 0
+            && self.chunks[self.frames[i].chunk_idx]
+                .flags
+                .contains(crate::compiler::chunk::ChunkFlags::ARROW)
+        {
+            i -= 1;
+        }
+        i
+    }
+}

@@ -1179,15 +1179,17 @@ impl Vm {
                             };
 
                             // Check if this is a super() call
-                            let is_super = self.frames.last().map(|f| f.pending_super_call).unwrap_or(false);
+                            let sfi = self.super_frame_idx();
+                            let is_super = self.frames[sfi].pending_super_call;
                             let this_val = if is_super {
-                                if let Some(f) = self.frames.last_mut() {
+                                {
+                                    let f = &mut self.frames[sfi];
                                     f.pending_super_call = false;
                                     // Mark caller so the parent ctor's return value can rebind
                                     // `this` per BindThisValue.
                                     f.await_super_result = true;
                                 }
-                                self.frames.last().unwrap().this_value
+                                self.frames[sfi].this_value
                             } else if self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
                                 // Arrow functions use the `this` captured at creation
                                 // (lexical); fall back to the caller's for closures
@@ -1589,10 +1591,11 @@ impl Vm {
                     if func_val.is_function() {
                         let sentinel = func_val.as_function().unwrap();
                         // super() to native error/collection constructors: initialize `this`
-                        let is_super_call = self.frames.last().map(|f| f.pending_super_call).unwrap_or(false);
+                        let super_fi = self.super_frame_idx();
+                        let is_super_call = self.frames[super_fi].pending_super_call;
                         if is_super_call && (-516..=-510).contains(&sentinel) {
-                            if let Some(f) = self.frames.last_mut() { f.pending_super_call = false; }
-                            let this_val = self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined());
+                            self.frames[super_fi].pending_super_call = false;
+                            let this_val = self.frames[super_fi].this_value;
                             let error_type = match sentinel {
                                 -510 => "Error", -511 => "TypeError", -512 => "RangeError",
                                 -513 => "ReferenceError", -514 => "SyntaxError",
@@ -1631,8 +1634,8 @@ impl Vm {
                         if is_super_call
                             && matches!(sentinel, -540 | -541 | -542 | -543 | -550 | -507 | -506 | -505 | -504 | -580)
                         {
-                            if let Some(f) = self.frames.last_mut() { f.pending_super_call = false; }
-                            let this_val = self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined());
+                            self.frames[super_fi].pending_super_call = false;
+                            let this_val = self.frames[super_fi].this_value;
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                             if let Some(this_oid) = this_val.as_object_id()
                                 && let Some(new_kind) = self.native_subclass_kind(sentinel, &args)
@@ -6197,13 +6200,15 @@ impl Vm {
                             .unwrap_or_default()
                     } else { vec![] };
                     // Propagate `this` for super() calls with spread arguments.
-                    let is_super = self.frames.last().map(|f| f.pending_super_call).unwrap_or(false);
+                    let sfi = self.super_frame_idx();
+                    let is_super = self.frames[sfi].pending_super_call;
                     let result = if is_super {
-                        if let Some(f) = self.frames.last_mut() {
+                        {
+                            let f = &mut self.frames[sfi];
                             f.pending_super_call = false;
                             f.super_called = true;
                         }
-                        let this_val = self.frames.last().unwrap().this_value;
+                        let this_val = self.frames[sfi].this_value;
                         self.call_function_this(func_val, this_val, &args)?
                     } else {
                         self.call_function(func_val, &args)?
@@ -7246,12 +7251,13 @@ impl Vm {
                 }
 
                 OpCode::GetSuperConstructor => {
+                    // super() state lives on the nearest non-arrow frame — an
+                    // arrow in a derived constructor calls the CONSTRUCTOR's
+                    // super.
+                    let sfi = self.super_frame_idx();
                     // Per spec, calling super() twice in a derived constructor throws
                     // ReferenceError ("`this` already initialized").
-                    if let Some(f) = self.frames.last()
-                        && f.is_derived_ctor
-                        && f.super_called
-                    {
+                    if self.frames[sfi].is_derived_ctor && self.frames[sfi].super_called {
                         let err = self.make_native_error(
                             "ReferenceError",
                             "Super constructor may only be called once",
@@ -7260,7 +7266,7 @@ impl Vm {
                         continue;
                     }
                     // Resolve parent constructor: this.__class__.__super__.__constructor__
-                    let this_val = self.frames.last().unwrap().this_value;
+                    let this_val = self.frames[sfi].this_value;
                     let class_key = self.interner.intern("__class__");
                     let super_key = self.interner.intern("__super__");
                     let ctor_key = self.interner.intern("__constructor__");
@@ -7286,10 +7292,9 @@ impl Vm {
 
                     // Mark that the next Call should propagate this_value AND record
                     // that super() was invoked, so derived-class return checks pass.
-                    if let Some(f) = self.frames.last_mut() {
-                        f.pending_super_call = true;
-                        f.super_called = true;
-                    }
+                    let sfi = self.super_frame_idx();
+                    self.frames[sfi].pending_super_call = true;
+                    self.frames[sfi].super_called = true;
                 }
 
                 OpCode::Throw => {
