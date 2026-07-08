@@ -2966,6 +2966,11 @@ impl Vm {
                             continue;
                         }
                         let result = match sentinel {
+                            // Extractable Date statics — identity-cached
+                            // NativeFn wrappers (see fn_property_get).
+                            -550 if matches!(name_str, "now" | "parse" | "UTC") => {
+                                self.fn_property_get(sentinel, name_id, obj_val)
+                            }
                             -505 => match name_str {
                                 "prototype" => Value::object_id(self.number_prototype),
                                 "NaN" => Value::number(f64::NAN),
@@ -5154,8 +5159,11 @@ impl Vm {
                                     .unwrap_or(0.0)
                             ),
                             "UTC" => {
-                                // Simplified: sum argc components based on (y, m, d, h, mn, s, ms)
-                                Value::number(0.0)
+                                let args: Vec<Value> = (0..argc)
+                                    .map(|i| self.stack[obj_pos + 1 + i])
+                                    .collect();
+                                // Timezone-less VM: UTC == component construction.
+                                Value::number(self.date_ms_from_args(&args))
                             }
                             "parse" => Value::number(f64::NAN),
                             _ => Value::undefined(),

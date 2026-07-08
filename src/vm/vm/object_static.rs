@@ -660,6 +660,47 @@ impl Vm {
                 "call" | "apply" | "bind" => obj_val,
                 _ => Value::undefined(),
             },
+            -550 => match name_str.as_str() {
+                // Extractable Date statics (`var p = Date.parse; p(...)`),
+                // identity-cached via fn_property_overrides.
+                "now" | "parse" | "UTC" => {
+                    let which = name_str.clone();
+                    let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                        move |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
+                            Ok(match which.as_str() {
+                                "now" => Value::number(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as f64)
+                                        .unwrap_or(0.0),
+                                ),
+                                // The VM is timezone-less, so UTC == local
+                                // component construction.
+                                "UTC" => Value::number(vm.date_ms_from_args(args)),
+                                _ => Value::number(f64::NAN), // parse: unsupported formats
+                            })
+                        },
+                    );
+                    let fn_obj = JsObject {
+                        properties: Vec::new(),
+                        prototype: None,
+                        kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native {
+                            name: name_id,
+                            func,
+                        }),
+                        marked: false,
+                        extensible: true,
+                    };
+                    let oid = self.heap.allocate(fn_obj);
+                    let val = Value::object_id(oid);
+                    self.fn_property_overrides.insert((sentinel, name_id), Some(val));
+                    val
+                }
+                "name" => { let id = self.interner.intern("Date"); Value::string(id) }
+                "length" => Value::int(7),
+                "call" | "apply" | "bind" => obj_val,
+                _ => Value::undefined(),
+            },
             -570 => match name_str.as_str() {
                 "for" => Value::function(-752),
                 "keyFor" => Value::function(-753),
