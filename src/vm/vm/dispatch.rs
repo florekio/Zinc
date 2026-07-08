@@ -2925,6 +2925,21 @@ impl Vm {
                             && let Some(&g) = self.globals.get(&name_id) {
                                 val = g;
                             }
+                        // Builtin prototype methods materialize lazily on the
+                        // first value-read (String.prototype.charAt, an
+                        // uncurried Array.prototype.push, …).
+                        if val.is_undefined() {
+                            let mut cur = Some(oid);
+                            while let Some(c) = cur {
+                                if c == self.string_prototype || c == self.array_prototype {
+                                    if let Some(v) = self.reify_builtin_proto_method(c, name_id) {
+                                        val = v;
+                                    }
+                                    break;
+                                }
+                                cur = self.heap.get(c).and_then(|o| o.prototype);
+                            }
+                        }
                         self.push(val);
                     } else if obj_val.is_string() {
                         // String property/method access (interned or inline).

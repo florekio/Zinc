@@ -1212,3 +1212,78 @@ impl Vm {
         }
     }
 }
+
+impl Vm {
+    /// Lazily materialize a builtin prototype method as a real, identity-
+    /// cached function property. Instance calls keep dispatching natively;
+    /// this covers VALUE reads — `typeof String.prototype.charAt`,
+    /// `var push = Array.prototype.push; push.call(arr, x)` — which
+    /// otherwise saw undefined because the prototypes are empty objects.
+    pub(crate) fn reify_builtin_proto_method(
+        &mut self,
+        oid: ObjectId,
+        name_id: StringId,
+    ) -> Option<Value> {
+        const STRING_METHODS: &[&str] = &[
+            "at", "charAt", "charCodeAt", "codePointAt", "concat", "endsWith",
+            "includes", "indexOf", "lastIndexOf", "match", "matchAll",
+            "normalize", "padEnd", "padStart", "repeat", "replace", "slice",
+            "split", "startsWith", "substr", "substring", "toLowerCase",
+            "toString", "toUpperCase", "trim", "trimEnd", "trimStart",
+        ];
+        const ARRAY_METHODS: &[&str] = &[
+            "at", "concat", "copyWithin", "every", "fill", "filter", "find",
+            "findIndex", "findLast", "findLastIndex", "flat", "flatMap",
+            "forEach", "includes", "indexOf", "join", "keys", "lastIndexOf",
+            "map", "pop", "push", "reduce", "reduceRight", "reverse", "shift",
+            "slice", "some", "sort", "splice", "toLocaleString", "toReversed",
+            "toSorted", "toSpliced", "toString", "unshift", "with",
+        ];
+        let name = self.interner.resolve(name_id).to_owned();
+        let is_string = oid == self.string_prototype && STRING_METHODS.contains(&name.as_str());
+        let is_array = oid == self.array_prototype && ARRAY_METHODS.contains(&name.as_str());
+        if !is_string && !is_array {
+            return None;
+        }
+        let func: crate::runtime::object::NativeFn = if is_string {
+            std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
+                let s = vm.value_to_string(this);
+                let ascii = s.is_ascii();
+                Ok(vm.exec_string_method(&s, name_id, args, ascii))
+            })
+        } else {
+            std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
+                let Some(this_oid) = this.as_object_id() else {
+                    return Err(vm.make_native_error(
+                        "TypeError",
+                        "Array.prototype method called on incompatible receiver",
+                    ));
+                };
+                match vm.exec_array_method(this_oid, name_id, args) {
+                    Ok(v) => Ok(v),
+                    Err(VmError::Throw(v)) => Err(v),
+                    Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                }
+            })
+        };
+        let fn_obj = JsObject {
+            properties: Vec::new(),
+            prototype: None,
+            kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native {
+                name: name_id,
+                func,
+            }),
+            marked: false,
+            extensible: true,
+        };
+        let f_oid = self.heap.allocate(fn_obj);
+        let val = Value::object_id(f_oid);
+        if let Some(proto) = self.heap.get_mut(oid) {
+            proto.define_property(
+                name_id,
+                Property::with_flags(val, Property::WRITABLE | Property::CONFIGURABLE),
+            );
+        }
+        Some(val)
+    }
+}
