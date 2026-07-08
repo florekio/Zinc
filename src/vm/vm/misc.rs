@@ -108,6 +108,7 @@ impl Vm {
         let key_id = self.interner.intern(&key_str);
         let mut flags = Property::ALL;
         let mut value = Value::undefined();
+        let mut has_value = false;
         if let Some(desc_oid) = desc_val.as_object_id() {
             let writable_key = self.interner.intern("writable");
             let enumerable_key = self.interner.intern("enumerable");
@@ -117,6 +118,7 @@ impl Vm {
             let set_key = self.interner.intern("set");
             if let Some(v) = self.heap.get_property_chain(desc_oid, value_key) {
                 value = v;
+                has_value = true;
             }
             flags = 0;
             if let Some(v) = self.heap.get_property_chain(desc_oid, writable_key)
@@ -194,8 +196,25 @@ impl Vm {
                     return target;
                 }
             }
+            // Partial-flag define on an array index: flags live in the
+            // property map, the VALUE stays in element storage. Keep the two
+            // in sync — write the element when the descriptor carries a
+            // value, and store the CURRENT element value in the map entry
+            // when it doesn't (so reads via either path agree).
+            let mut map_value = value;
+            if let Some(idx) = canonical_array_index(&key_str)
+                && let Some(obj) = self.heap.get_mut(target_oid)
+                && let ObjectKind::Array(ref mut elements) = obj.kind
+                && idx < elements.len()
+            {
+                if has_value {
+                    elements[idx] = value;
+                } else {
+                    map_value = elements[idx];
+                }
+            }
             if let Some(obj) = self.heap.get_mut(target_oid) {
-                obj.define_property(key_id, Property::with_flags(value, flags));
+                obj.define_property(key_id, Property::with_flags(map_value, flags));
             }
         }
         target

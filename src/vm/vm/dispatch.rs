@@ -2271,13 +2271,26 @@ impl Vm {
                             } else if is_array
                                 && let Ok(idx) = key_str.parse::<usize>()
                             {
-                                if let Some(obj) = self.heap.get_mut(oid)
-                                    && let ObjectKind::Array(ref mut elems) = obj.kind
-                                    && idx < elems.len()
-                                {
-                                    elems[idx] = Value::undefined();
+                                // An index that was reconfigured via
+                                // defineProperty keeps its flags in the
+                                // property map — non-configurable indices
+                                // can't be deleted (mapped arguments).
+                                let named_nonconfig = self.heap.get(oid)
+                                    .and_then(|o| o.get_property_descriptor(key_id))
+                                    .is_some_and(|p| !p.is_configurable());
+                                if named_nonconfig {
+                                    false
+                                } else {
+                                    if let Some(obj) = self.heap.get_mut(oid) {
+                                        obj.delete_property(key_id);
+                                        if let ObjectKind::Array(ref mut elems) = obj.kind
+                                            && idx < elems.len()
+                                        {
+                                            elems[idx] = Value::undefined();
+                                        }
+                                    }
+                                    true
                                 }
-                                true
                             } else {
                                 let getter_key = self.interner.intern(&format!("__get_{key_str}__"));
                                 let setter_key = self.interner.intern(&format!("__set_{key_str}__"));
@@ -3591,6 +3604,58 @@ impl Vm {
                         }
                         self.push(val);
                         continue;
+                    }
+                    // A reconfigured array index (defineProperty stored its
+                    // flags in the property map — mapped arguments etc.) may be
+                    // non-writable: sloppy writes are ignored, strict throws.
+                    // Gated on a non-empty property map so plain arrays skip it.
+                    if let Some(oid) = obj_val.as_object_id() {
+                        let idx: Option<usize> = key.as_int()
+                            .filter(|i| *i >= 0)
+                            .map(|i| i as usize)
+                            .or_else(|| key.as_number()
+                                .filter(|n| n.fract() == 0.0 && *n >= 0.0 && n.is_finite() && *n < 4_294_967_295.0)
+                                .map(|n| n as usize));
+                        let has_named = idx.is_some() && self.heap.get(oid).is_some_and(|o| {
+                            matches!(o.kind, ObjectKind::Array(_)) && !o.properties.is_empty()
+                        });
+                        if has_named
+                            && let Some(idx) = idx
+                        {
+                            let key_id = self.interner.intern(&idx.to_string());
+                            if let Some(desc) = self.heap.get(oid)
+                                .and_then(|o| o.get_property_descriptor(key_id))
+                            {
+                                if !desc.is_writable() {
+                                    let in_strict = self.chunks[self.cur_chunk()]
+                                        .flags
+                                        .contains(ChunkFlags::STRICT);
+                                    if in_strict {
+                                        let err = self.make_native_error(
+                                            "TypeError",
+                                            &format!("Cannot assign to read only property '{idx}'"),
+                                        );
+                                        self.handle_throw(err)?;
+                                    } else {
+                                        self.push(val);
+                                    }
+                                    continue;
+                                }
+                                // Writable: keep element storage and the map
+                                // entry's value in sync.
+                                if let Some(obj) = self.heap.get_mut(oid) {
+                                    if let ObjectKind::Array(ref mut elements) = obj.kind {
+                                        while elements.len() <= idx {
+                                            elements.push(Value::undefined());
+                                        }
+                                        elements[idx] = val;
+                                    }
+                                    obj.set_property(key_id, val);
+                                }
+                                self.push(val);
+                                continue;
+                            }
+                        }
                     }
                     if let Some(oid) = obj_val.as_object_id()
                         && let Some(obj) = self.heap.get_mut(oid)
