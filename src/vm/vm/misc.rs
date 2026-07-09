@@ -404,6 +404,213 @@ pub(crate) fn format_date(ms: f64) -> String {
     format_iso(ms)
 }
 
+/// MakeDay+MakeTime+TimeClip: components (0-based month, fractional values
+/// allowed per spec ToNumber results) → epoch ms. NaN in any slot → NaN.
+pub(crate) fn ymd_hms_to_ms(year: f64, month0: f64, day: f64, hour: f64, min: f64, sec: f64, milli: f64) -> f64 {
+    if !year.is_finite() || !month0.is_finite() || !day.is_finite()
+        || !hour.is_finite() || !min.is_finite() || !sec.is_finite() || !milli.is_finite()
+    {
+        return f64::NAN;
+    }
+    // Normalize month overflow into years (days-from-civil, Howard Hinnant).
+    let total_months = year.trunc() as i64 * 12 + month0.trunc() as i64;
+    let y = total_months.div_euclid(12);
+    let m = total_months.rem_euclid(12);
+    let (yy, mm) = (y, m + 1);
+    let a = if mm <= 2 { yy - 1 } else { yy };
+    let era = if a >= 0 { a } else { a - 399 } / 400;
+    let yoe = a - era * 400;
+    let mp = (mm + 9) % 12;
+    let doy = (153 * mp + 2) / 5;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days_civil = era * 146_097 + doe - 719_468;
+    let ms = (days_civil as f64 + (day.trunc() - 1.0)) * 86_400_000.0
+        + hour.trunc() * 3_600_000.0
+        + min.trunc() * 60_000.0
+        + sec.trunc() * 1000.0
+        + milli.trunc();
+    if ms.abs() > 8.64e15 { f64::NAN } else { ms } // TimeClip
+}
+
+pub(crate) const DAY_NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+pub(crate) const MONTH_NAMES: [&str; 12] =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// Day of week for an epoch-ms instant (0 = Sunday).
+pub(crate) fn epoch_weekday(ms: f64) -> i32 {
+    let days = (ms / 86_400_000.0).floor() as i64;
+    (((days + 4) % 7 + 7) % 7) as i32
+}
+
+/// Date.prototype.toString format (the engine is UTC-only).
+pub(crate) fn format_date_tostring(ms: f64) -> String {
+    if ms.is_nan() {
+        return "Invalid Date".to_string();
+    }
+    let (y, m0, d) = epoch_to_ymd(ms);
+    format!(
+        "{} {} {:02} {:04} {:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
+        DAY_NAMES[epoch_weekday(ms) as usize],
+        MONTH_NAMES[m0 as usize],
+        d,
+        y,
+        (ms / 3_600_000.0).rem_euclid(24.0) as i32,
+        (ms / 60_000.0).rem_euclid(60.0) as i32,
+        (ms / 1000.0).rem_euclid(60.0) as i32,
+    )
+}
+
+/// Date.parse: ISO 8601 plus the engine's own toString / toUTCString
+/// formats. Unrecognized input → NaN.
+pub(crate) fn parse_date_string(s: &str) -> f64 {
+    let t = s.trim();
+    if t.is_empty() {
+        return f64::NAN;
+    }
+    if let Some(ms) = parse_iso_date(t) {
+        return ms;
+    }
+    parse_textual_date(t).unwrap_or(f64::NAN)
+}
+
+/// "YYYY-MM-DD", "±YYYYYY-MM-DD", with optional "THH:MM[:SS[.mmm]]" and
+/// optional "Z" / "±HH:MM" offset.
+fn parse_iso_date(t: &str) -> Option<f64> {
+    let (date_part, time_part) = match t.split_once('T') {
+        Some((d, tm)) => (d, Some(tm)),
+        None => (t, None),
+    };
+    // Extended years carry a mandatory sign and six digits.
+    let (sign, rest) = match date_part.as_bytes().first()? {
+        b'+' => (1i64, &date_part[1..]),
+        b'-' => (-1i64, &date_part[1..]),
+        _ => (1, date_part),
+    };
+    let mut dit = rest.split('-');
+    let ys = dit.next()?;
+    let has_sign = date_part.starts_with(['+', '-']);
+    if !(ys.len() == 4 || (has_sign && ys.len() == 6)) || !ys.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year = sign * ys.parse::<i64>().ok()?;
+    // Year zero is positive by definition: "-000000" is invalid.
+    if sign == -1 && year == 0 {
+        return None;
+    }
+    let month = match dit.next() {
+        Some(m) if m.len() == 2 && m.bytes().all(|b| b.is_ascii_digit()) => m.parse::<i64>().ok()?,
+        Some(_) => return None,
+        None => 1,
+    };
+    let day = match dit.next() {
+        Some(d) if d.len() == 2 && d.bytes().all(|b| b.is_ascii_digit()) => d.parse::<i64>().ok()?,
+        Some(_) => return None,
+        None => 1,
+    };
+    if dit.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (mut hour, mut min, mut sec, mut milli, mut offset_min) = (0i64, 0i64, 0i64, 0i64, 0i64);
+    if let Some(tm) = time_part {
+        // Strip the timezone designator.
+        let (clock, off): (&str, Option<(i64, &str)>) = if let Some(c) = tm.strip_suffix('Z') {
+            (c, None)
+        } else if let Some(pos) = tm.rfind(['+', '-']) {
+            let (c, o) = tm.split_at(pos);
+            let sign = if o.starts_with('-') { -1 } else { 1 };
+            (c, Some((sign, &o[1..])))
+        } else {
+            (tm, None)
+        };
+        if let Some((osign, ostr)) = off {
+            let (oh, om) = ostr.split_once(':')?;
+            if oh.len() != 2 || om.len() != 2 {
+                return None;
+            }
+            offset_min = osign * (oh.parse::<i64>().ok()? * 60 + om.parse::<i64>().ok()?);
+        }
+        let mut cit = clock.split(':');
+        let hs = cit.next()?;
+        if hs.len() != 2 {
+            return None;
+        }
+        hour = hs.parse().ok()?;
+        min = cit.next()?.parse().ok()?;
+        if let Some(ss) = cit.next() {
+            match ss.split_once('.') {
+                Some((sw, sf)) => {
+                    sec = sw.parse().ok()?;
+                    let frac: String = sf.chars().take(3).collect();
+                    if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    milli = format!("{frac:0<3}").parse().ok()?;
+                }
+                None => sec = ss.parse().ok()?,
+            }
+        }
+        if cit.next().is_some() || hour > 24 || min > 59 || sec > 59 {
+            return None;
+        }
+    }
+    let ms = ymd_hms_to_ms(
+        year as f64,
+        (month - 1) as f64,
+        day as f64,
+        hour as f64,
+        min as f64,
+        sec as f64,
+        milli as f64,
+    ) - (offset_min * 60_000) as f64;
+    Some(ms)
+}
+
+/// "Thu Jan 01 1970 00:00:00 GMT+0000 (...)" and
+/// "Thu, 01 Jan 1970 00:00:00 GMT".
+fn parse_textual_date(t: &str) -> Option<f64> {
+    let toks: Vec<&str> = t.split_whitespace().collect();
+    if toks.len() < 4 {
+        return None;
+    }
+    let utc_style = toks[0].ends_with(',');
+    let (mon_tok, day_tok, year_tok) = if utc_style {
+        (toks[2], toks[1], toks[3])
+    } else {
+        (toks[1], toks[2], toks[3])
+    };
+    let month = MONTH_NAMES.iter().position(|m| *m == mon_tok)? as i64;
+    let day: i64 = day_tok.parse().ok()?;
+    let year: i64 = year_tok.parse().ok()?;
+    let (mut hour, mut min, mut sec) = (0i64, 0i64, 0i64);
+    let mut offset_min = 0i64;
+    if let Some(clock) = toks.get(4) {
+        let mut cit = clock.split(':');
+        hour = cit.next()?.parse().ok()?;
+        min = cit.next()?.parse().ok()?;
+        sec = cit.next().unwrap_or("0").parse().ok()?;
+    }
+    if let Some(tz) = toks.get(5)
+        && let Some(o) = tz.strip_prefix("GMT")
+        && o.len() == 5
+    {
+        let sign = if o.starts_with('-') { -1 } else { 1 };
+        let oh: i64 = o[1..3].parse().ok()?;
+        let om: i64 = o[3..5].parse().ok()?;
+        offset_min = sign * (oh * 60 + om);
+    }
+    Some(
+        ymd_hms_to_ms(
+            year as f64,
+            month as f64,
+            day as f64,
+            hour as f64,
+            min as f64,
+            sec as f64,
+            0.0,
+        ) - (offset_min * 60_000) as f64,
+    )
+}
+
 /// StringToBigInt: parse a string (per `==` and `BigInt(str)`) into a BigInt.
 /// Allows surrounding whitespace, an optional sign, and 0x/0o/0b prefixes.
 /// Empty/whitespace-only yields 0n; anything malformed yields None.
@@ -929,7 +1136,20 @@ impl Vm {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as f64)
                 .unwrap_or(0.0),
-            1 => self.to_f64(args[0]),
+            1 => {
+                // ToPrimitive; a string parses like Date.parse, anything
+                // else goes through ToNumber + TimeClip.
+                let prim = self
+                    .try_coerce_to_primitive_hint(args[0], "default")
+                    .unwrap_or(args[0]);
+                if prim.is_string() || self.is_cons_string(prim) {
+                    let s = self.value_to_string(prim);
+                    parse_date_string(&s)
+                } else {
+                    let n = self.to_f64(prim);
+                    if n.is_finite() && n.abs() <= 8.64e15 { n.trunc() } else { f64::NAN }
+                }
+            }
             _ => {
                 let num = |vm: &mut Self, i: usize, default: f64| -> f64 {
                     args.get(i).map(|v| vm.to_f64(*v)).unwrap_or(default)
@@ -1219,6 +1439,22 @@ impl Vm {
     /// this covers VALUE reads — `typeof String.prototype.charAt`,
     /// `var push = Array.prototype.push; push.call(arr, x)` — which
     /// otherwise saw undefined because the prototypes are empty objects.
+    /// Reflection helper: before hasOwnProperty / getOwnPropertyDescriptor
+    /// inspect a tracked builtin prototype, materialize the queried method so
+    /// lazily-reified prototypes (Date) answer like eagerly-populated ones.
+    pub(crate) fn ensure_builtin_proto_method(&mut self, oid: ObjectId, name_id: StringId) {
+        if (oid == self.string_prototype
+            || oid == self.array_prototype
+            || oid == self.object_prototype
+            || oid == self.number_prototype
+            || oid == self.boolean_prototype
+            || oid == self.date_prototype)
+            && !self.heap.get(oid).is_some_and(|o| o.has_own_property(name_id))
+        {
+            let _ = self.reify_builtin_proto_method(oid, name_id);
+        }
+    }
+
     pub(crate) fn reify_builtin_proto_method(
         &mut self,
         oid: ObjectId,
@@ -1258,6 +1494,21 @@ impl Vm {
         ];
         const BOOLEAN_METHODS: &[(&str, i32, i32)] =
             &[("toString", 0, -630), ("valueOf", 0, -631)];
+        const DATE_METHODS: &[(&str, i32)] = &[
+            ("getTime", 0), ("valueOf", 0), ("getFullYear", 0), ("getUTCFullYear", 0),
+            ("getMonth", 0), ("getUTCMonth", 0), ("getDate", 0), ("getUTCDate", 0),
+            ("getDay", 0), ("getUTCDay", 0), ("getHours", 0), ("getUTCHours", 0),
+            ("getMinutes", 0), ("getUTCMinutes", 0), ("getSeconds", 0), ("getUTCSeconds", 0),
+            ("getMilliseconds", 0), ("getUTCMilliseconds", 0), ("getTimezoneOffset", 0),
+            ("getYear", 0), ("setYear", 1),
+            ("setTime", 1), ("setMilliseconds", 1), ("setUTCMilliseconds", 1),
+            ("setSeconds", 2), ("setUTCSeconds", 2), ("setMinutes", 3), ("setUTCMinutes", 3),
+            ("setHours", 4), ("setUTCHours", 4), ("setDate", 1), ("setUTCDate", 1),
+            ("setMonth", 2), ("setUTCMonth", 2), ("setFullYear", 3), ("setUTCFullYear", 3),
+            ("toString", 0), ("toDateString", 0), ("toTimeString", 0), ("toISOString", 0),
+            ("toUTCString", 0), ("toGMTString", 0), ("toJSON", 1),
+            ("toLocaleString", 0), ("toLocaleDateString", 0), ("toLocaleTimeString", 0),
+        ];
 
         enum Route {
             String,
@@ -1267,6 +1518,7 @@ impl Vm {
             /// (Object.prototype.toLocaleString → this.toString()).
             CoercibleSentinel(i32),
             Number,
+            Date,
         }
         let name = self.interner.resolve(name_id).to_owned();
         let entry: Option<(Route, i32)> = if oid == self.string_prototype {
@@ -1283,6 +1535,9 @@ impl Vm {
             NUMBER_METHODS.iter().find(|(n, _)| *n == name).map(|(_, l)| (Route::Number, *l))
         } else if oid == self.boolean_prototype {
             BOOLEAN_METHODS.iter().find(|(n, _, _)| *n == name).map(|(_, l, s)| (Route::Sentinel(*s), *l))
+        } else if oid == self.date_prototype {
+            let lookup = if name == "toGMTString" { "toUTCString" } else { name.as_str() };
+            DATE_METHODS.iter().find(|(n, _)| *n == lookup).map(|(_, l)| (Route::Date, *l))
         } else {
             None
         };
@@ -1326,6 +1581,24 @@ impl Vm {
                 }
                 Ok(vm.exec_native_method(sent, this, args))
             }),
+            Route::Date => {
+                // thisTimeValue: only Date receivers; toGMTString aliases
+                // toUTCString (same behavior, own name "toGMTString").
+                let method = if name == "toGMTString" { "toUTCString".to_owned() } else { name.clone() };
+                std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
+                    let Some(this_oid) = this.as_object_id() else {
+                        return Err(vm.make_native_error(
+                            "TypeError",
+                            "Date.prototype method called on incompatible receiver",
+                        ));
+                    };
+                    match vm.exec_date_method(this_oid, &method, args) {
+                        Ok(v) => Ok(v),
+                        Err(VmError::Throw(v)) => Err(v),
+                        Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                    }
+                })
+            }
             Route::Number => std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
                 // thisNumberValue: only Number primitives / wrappers.
                 let inner = vm.unwrap_wrapper_primitive(this, |v| v.is_int() || v.is_number());

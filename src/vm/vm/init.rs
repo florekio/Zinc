@@ -101,6 +101,14 @@ impl Vm {
         let number_prototype = heap.allocate(num_proto);
         func_prototypes.insert(-505i32, number_prototype);
 
+        // Create Date.prototype (prototype = Object.prototype). Methods are
+        // reified lazily via reify_builtin_proto_method.
+        let mut date_proto = JsObject::ordinary();
+        date_proto.prototype = Some(object_prototype);
+        date_proto.define_property(ctor_key, Property::with_flags(Value::function(-550), Property::WRITABLE | Property::CONFIGURABLE));
+        let date_prototype = heap.allocate(date_proto);
+        func_prototypes.insert(-550i32, date_prototype);
+
         // Create String.prototype (prototype = Object.prototype)
         let mut str_proto = JsObject::ordinary();
         str_proto.prototype = Some(object_prototype);
@@ -567,6 +575,7 @@ impl Vm {
             iterator_prototype: None,
             boolean_prototype,
             number_prototype,
+            date_prototype,
             string_prototype,
             global_this_oid,
             math_oid: Some(math_oid),

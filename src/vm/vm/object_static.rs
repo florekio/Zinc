@@ -228,6 +228,7 @@ impl Vm {
                 }
                 if let Some(oid) = first_arg.as_object_id() {
                     let key_id = self.interner.intern(&key_str);
+                    self.ensure_builtin_proto_method(oid, key_id);
                     // Check for accessor properties first
                     let getter_key_str = format!("__get_{key_str}__");
                     let setter_key_str = format!("__set_{key_str}__");
@@ -594,6 +595,32 @@ impl Vm {
         Ok(Some(result))
     }
 
+    /// Spec `name`/`length` for the well-known negative sentinels (global
+    /// constructors, global functions, extractable statics, Math methods).
+    pub(crate) fn sentinel_fn_meta(sentinel: i32) -> Option<(&'static str, i32)> {
+        const T: &[(i32, &str, i32)] = &[
+            (-500, "parseInt", 2), (-501, "parseFloat", 1), (-502, "isNaN", 1), (-503, "isFinite", 1),
+            (-504, "String", 1), (-505, "Number", 1), (-506, "Boolean", 1), (-507, "Array", 1), (-508, "Object", 1),
+            (-509, "encodeURI", 1), (-517, "decodeURIComponent", 1), (-518, "encodeURIComponent", 1), (-519, "decodeURI", 1),
+            (-510, "Error", 1), (-511, "TypeError", 1), (-512, "RangeError", 1), (-513, "ReferenceError", 1),
+            (-514, "SyntaxError", 1), (-515, "EvalError", 1), (-516, "URIError", 1),
+            (-520, "Promise", 1), (-540, "Map", 0), (-541, "Set", 0), (-542, "WeakMap", 0), (-543, "WeakSet", 0),
+            (-550, "Date", 7), (-551, "Function", 1), (-560, "eval", 1), (-570, "Symbol", 0),
+            (-580, "RegExp", 2), (-638, "BigInt", 1),
+            (-530, "isNaN", 1), (-531, "isFinite", 1), (-532, "isInteger", 1), (-533, "isSafeInteger", 1),
+            (-534, "fromCharCode", 1), (-535, "fromCodePoint", 1), (-536, "raw", 1),
+            (-751, "isArray", 1), (-752, "for", 1), (-753, "keyFor", 1),
+            (-700, "sin", 1), (-701, "cos", 1), (-702, "abs", 1), (-703, "floor", 1),
+            (-704, "ceil", 1), (-705, "round", 1), (-706, "sqrt", 1), (-707, "pow", 2),
+            (-708, "max", 2), (-709, "min", 2), (-710, "exp", 1), (-711, "log", 1),
+            (-712, "log2", 1), (-713, "log10", 1), (-714, "random", 0), (-715, "trunc", 1),
+            (-716, "sign", 1), (-717, "cbrt", 1), (-718, "hypot", 2), (-719, "atan2", 2),
+            (-720, "atan", 1), (-721, "asin", 1), (-722, "acos", 1), (-723, "tan", 1),
+            (-724, "clz32", 1), (-725, "imul", 2), (-726, "fround", 1),
+        ];
+        T.iter().find(|(s, _, _)| *s == sentinel).map(|(_, n, l)| (*n, *l))
+    }
+
     /// Get a function's own property value, consulting the override table.
     /// Returns None if the property doesn't exist (or was deleted).
     pub(crate) fn fn_get_own_prop(&mut self, sentinel: i32, key: StringId) -> Option<Value> {
@@ -612,6 +639,9 @@ impl Vm {
                     let visible = if name_s.starts_with('<') { String::new() } else { name_s };
                     let vsid = self.interner.intern(&visible);
                     Some(Value::string(vsid))
+                } else if let Some((n, _)) = Self::sentinel_fn_meta(sentinel) {
+                    let sid = self.interner.intern(n);
+                    Some(Value::string(sid))
                 } else {
                     let empty = self.interner.intern("");
                     Some(Value::string(empty))
@@ -620,6 +650,8 @@ impl Vm {
             "length" => {
                 if chunk_idx > 0 && chunk_idx < self.chunks.len() {
                     Some(Value::int(self.chunks[chunk_idx].formal_length as i32))
+                } else if let Some((_, l)) = Self::sentinel_fn_meta(sentinel) {
+                    Some(Value::int(l))
                 } else {
                     Some(Value::int(0))
                 }
@@ -677,7 +709,13 @@ impl Vm {
                                 // The VM is timezone-less, so UTC == local
                                 // component construction.
                                 "UTC" => Value::number(vm.date_ms_from_args(args)),
-                                _ => Value::number(f64::NAN), // parse: unsupported formats
+                                _ => {
+                                    let s = args
+                                        .first()
+                                        .map(|v| vm.value_to_string(*v))
+                                        .unwrap_or_default();
+                                    Value::number(super::parse_date_string(&s))
+                                }
                             })
                         },
                     );
@@ -698,6 +736,7 @@ impl Vm {
                 }
                 "name" => { let id = self.interner.intern("Date"); Value::string(id) }
                 "length" => Value::int(7),
+                "prototype" => Value::object_id(self.date_prototype),
                 "call" | "apply" | "bind" => obj_val,
                 _ => Value::undefined(),
             },

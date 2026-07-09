@@ -758,6 +758,180 @@ impl Vm {
         }
     }
 
+    // ---- Date method dispatch ----
+    /// All Date.prototype methods for a Date receiver, shared by the
+    /// CallMethod fast path and the reified prototype wrappers. The engine is
+    /// timezone-less (offset 0), so UTC and local accessors alias.
+    pub(crate) fn exec_date_method(
+        &mut self,
+        oid: crate::runtime::object::ObjectId,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        use super::vm::{epoch_to_ymd, epoch_weekday, format_iso, ymd_hms_to_ms, DAY_NAMES, MONTH_NAMES};
+        let ms = match self.heap.get(oid).map(|o| &o.kind) {
+            Some(&ObjectKind::Date(ms)) => ms,
+            _ => {
+                return Err(VmError::Throw(self.make_native_error(
+                    "TypeError",
+                    "this is not a Date object",
+                )))
+            }
+        };
+        // Time-of-day components (valid only when ms is finite).
+        let hour = (ms / 3_600_000.0).rem_euclid(24.0).floor();
+        let min = (ms / 60_000.0).rem_euclid(60.0).floor();
+        let sec = (ms / 1000.0).rem_euclid(60.0).floor();
+        let milli = ms.rem_euclid(1000.0).floor();
+        let nan_guarded = |v: f64| -> Value {
+            if ms.is_nan() { Value::number(f64::NAN) } else { Value::number(v) }
+        };
+        let result = match name {
+            "getTime" | "valueOf" => Value::number(ms),
+            "getFullYear" | "getUTCFullYear" => nan_guarded(epoch_to_ymd(ms).0 as f64),
+            "getMonth" | "getUTCMonth" => nan_guarded(epoch_to_ymd(ms).1 as f64),
+            "getDate" | "getUTCDate" => nan_guarded(epoch_to_ymd(ms).2 as f64),
+            "getDay" | "getUTCDay" => nan_guarded(epoch_weekday(ms) as f64),
+            "getHours" | "getUTCHours" => nan_guarded(hour),
+            "getMinutes" | "getUTCMinutes" => nan_guarded(min),
+            "getSeconds" | "getUTCSeconds" => nan_guarded(sec),
+            "getMilliseconds" | "getUTCMilliseconds" => nan_guarded(milli),
+            "getTimezoneOffset" => nan_guarded(0.0),
+            "getYear" => nan_guarded((epoch_to_ymd(ms).0 - 1900) as f64),
+            "setTime" => {
+                let t = match args.first() {
+                    Some(v) => self.coerce_to_f64(*v)?,
+                    None => f64::NAN,
+                };
+                let t = if t.is_finite() && t.abs() <= 8.64e15 { t.trunc() } else { f64::NAN };
+                self.store_date_ms(oid, t);
+                Value::number(t)
+            }
+            "setMilliseconds" | "setUTCMilliseconds"
+            | "setSeconds" | "setUTCSeconds"
+            | "setMinutes" | "setUTCMinutes"
+            | "setHours" | "setUTCHours"
+            | "setDate" | "setUTCDate"
+            | "setMonth" | "setUTCMonth"
+            | "setFullYear" | "setUTCFullYear"
+            | "setYear" => {
+                let (y0, mon0, d0) = epoch_to_ymd(ms);
+                // Current components; a NaN receiver poisons every slot except
+                // the ones being written (setFullYear on an invalid date is
+                // still defined for the fields it sets — the rest stay NaN).
+                let cur = if ms.is_nan() {
+                    // setFullYear treats an invalid date as +0 time-of-year
+                    // (month 0, day 1, midnight); the others stay poisoned.
+                    if matches!(name, "setFullYear" | "setUTCFullYear" | "setYear") {
+                        [f64::NAN, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+                    } else {
+                        [f64::NAN; 7]
+                    }
+                } else {
+                    [y0 as f64, mon0 as f64, d0 as f64, hour, min, sec, milli]
+                };
+                // Which component slot the first argument targets, and how
+                // many trailing slots the argument list may fill.
+                let first_slot = match name {
+                    "setFullYear" | "setUTCFullYear" | "setYear" => 0,
+                    "setMonth" | "setUTCMonth" => 1,
+                    "setDate" | "setUTCDate" => 2,
+                    "setHours" | "setUTCHours" => 3,
+                    "setMinutes" | "setUTCMinutes" => 4,
+                    "setSeconds" | "setUTCSeconds" => 5,
+                    _ => 6, // setMilliseconds
+                };
+                // setMonth's optional 2nd arg is the day; setHours' extras run
+                // through ms — i.e. args fill consecutive slots from first_slot,
+                // but date-part setters stop at the day slot.
+                let max_slots = if name == "setYear" {
+                    1
+                } else if first_slot <= 2 {
+                    3 - first_slot
+                } else {
+                    7 - first_slot
+                };
+                let mut comps = cur;
+                for (i, a) in args.iter().take(max_slots).enumerate() {
+                    let mut v = self.coerce_to_f64(*a)?;
+                    if name == "setYear" && i == 0 && (0.0..=99.0).contains(&v.trunc()) {
+                        v = v.trunc() + 1900.0;
+                    }
+                    comps[first_slot + i] = v;
+                }
+                let new_ms =
+                    ymd_hms_to_ms(comps[0], comps[1], comps[2], comps[3], comps[4], comps[5], comps[6]);
+                self.store_date_ms(oid, new_ms);
+                Value::number(new_ms)
+            }
+            "toISOString" => {
+                if !ms.is_finite() {
+                    return Err(VmError::Throw(
+                        self.make_native_error("RangeError", "Invalid time value"),
+                    ));
+                }
+                let s = format_iso(ms);
+                self.new_str(&s)
+            }
+            "toJSON" => {
+                if !ms.is_finite() {
+                    Value::null()
+                } else {
+                    let s = format_iso(ms);
+                    self.new_str(&s)
+                }
+            }
+            "toString" | "toLocaleString" => {
+                let s = super::vm::format_date_tostring(ms);
+                self.new_str(&s)
+            }
+            "toDateString" | "toLocaleDateString" => {
+                if ms.is_nan() {
+                    self.new_str("Invalid Date")
+                } else {
+                    let (y, m0, d) = epoch_to_ymd(ms);
+                    let s = format!(
+                        "{} {} {:02} {:04}",
+                        DAY_NAMES[epoch_weekday(ms) as usize], MONTH_NAMES[m0 as usize], d, y
+                    );
+                    self.new_str(&s)
+                }
+            }
+            "toTimeString" | "toLocaleTimeString" => {
+                if ms.is_nan() {
+                    self.new_str("Invalid Date")
+                } else {
+                    let s = format!(
+                        "{:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
+                        hour as i32, min as i32, sec as i32
+                    );
+                    self.new_str(&s)
+                }
+            }
+            "toUTCString" => {
+                if ms.is_nan() {
+                    self.new_str("Invalid Date")
+                } else {
+                    let (y, m0, d) = epoch_to_ymd(ms);
+                    let s = format!(
+                        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+                        DAY_NAMES[epoch_weekday(ms) as usize], d, MONTH_NAMES[m0 as usize], y,
+                        hour as i32, min as i32, sec as i32
+                    );
+                    self.new_str(&s)
+                }
+            }
+            _ => Value::undefined(),
+        };
+        Ok(result)
+    }
+
+    fn store_date_ms(&mut self, oid: crate::runtime::object::ObjectId, ms: f64) {
+        if let Some(o) = self.heap.get_mut(oid) {
+            o.kind = ObjectKind::Date(ms);
+        }
+    }
+
     // ---- Array method dispatch ----
     pub(crate) fn exec_array_method(&mut self, oid: crate::runtime::object::ObjectId, method_name: StringId, args: &[Value]) -> Result<Value, VmError> {
         let name = self.interner.resolve(method_name).to_owned();
@@ -1977,6 +2151,7 @@ impl Vm {
                         Some(ObjectKind::Set { .. }) => "Set",
                         Some(ObjectKind::WeakMap { .. }) => "WeakMap",
                         Some(ObjectKind::WeakSet { .. }) => "WeakSet",
+                        Some(ObjectKind::Date(_)) => "Date",
                         Some(ObjectKind::ConsString { .. } | ObjectKind::FlatString { .. }) => "String",
                         Some(ObjectKind::BigInt(_)) => "BigInt",
                         Some(ObjectKind::Wrapper(inner)) => {

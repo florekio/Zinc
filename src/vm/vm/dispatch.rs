@@ -1362,13 +1362,14 @@ impl Vm {
                         continue;
                     }
 
-                    // Date() called as a function (not constructor) returns current date string
+                    // Date() called as a function (not constructor) returns the
+                    // current date in toString format (spec: like new Date().toString()).
                     if func_val.is_function() && func_val.as_function() == Some(-550) {
                         let ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as f64)
                             .unwrap_or(0.0);
-                        let s = format_date(ms);
+                        let s = format_date_tostring(ms);
                         let id = self.interner.intern(&s);
                         self.truncate_stack(func_pos);
                         self.push(Value::string(id));
@@ -2800,7 +2801,8 @@ impl Vm {
                         continue;
                     }
                     let obj_val = self.pop()?;
-                    let name_str = self.interner.resolve(name_id);
+                    let name_str = self.interner.resolve(name_id).to_owned();
+                    let name_str = name_str.as_str();
                     if let Some(oid) = obj_val.as_object_id() {
                         // ConsString: O(1) .length from cached field; otherwise flatten to string
                         if let Some(obj) = self.heap.get(oid)
@@ -2970,7 +2972,8 @@ impl Vm {
                                     || c == self.array_prototype
                                     || c == self.object_prototype
                                     || c == self.number_prototype
-                                    || c == self.boolean_prototype)
+                                    || c == self.boolean_prototype
+                                    || c == self.date_prototype)
                                     && let Some(v) = self.reify_builtin_proto_method(c, name_id)
                                 {
                                     val = v;
@@ -3019,12 +3022,23 @@ impl Vm {
                             self.push(ov.unwrap_or(Value::undefined()));
                             continue;
                         }
+                        // Spec name/length for well-known sentinels (Array.name,
+                        // Math.max.length, …) — the per-sentinel arms below
+                        // predate the table and mostly lack these.
+                        if matches!(name_str, "name" | "length")
+                            && Self::sentinel_fn_meta(sentinel).is_some()
+                        {
+                            let v = self.fn_get_own_prop(sentinel, name_id).unwrap_or(Value::undefined());
+                            self.push(v);
+                            continue;
+                        }
                         let result = match sentinel {
                             // Extractable Date statics — identity-cached
                             // NativeFn wrappers (see fn_property_get).
                             -550 if matches!(name_str, "now" | "parse" | "UTC") => {
                                 self.fn_property_get(sentinel, name_id, obj_val)
                             }
+                            -550 if name_str == "prototype" => Value::object_id(self.date_prototype),
                             -505 => match name_str {
                                 "prototype" => Value::object_id(self.number_prototype),
                                 "NaN" => Value::number(f64::NAN),
@@ -4614,32 +4628,19 @@ impl Vm {
                         }
                         // Check for Date methods
                         if let Some(obj) = self.heap.get(oid)
-                            && let ObjectKind::Date(ms) = obj.kind
+                            && matches!(obj.kind, ObjectKind::Date(_))
                         {
                             let mn = self.interner.resolve(method_name).to_owned();
-                            let result = match mn.as_str() {
-                                "getTime" | "valueOf" => Value::number(ms),
-                                // The VM has no timezone (offset 0), so the
-                                // UTC accessors alias the local ones.
-                                "getFullYear" | "getUTCFullYear" => Value::int(epoch_to_ymd(ms).0),
-                                "getMonth" | "getUTCMonth" => Value::int(epoch_to_ymd(ms).1),
-                                "getDate" | "getUTCDate" => Value::int(epoch_to_ymd(ms).2),
-                                "getHours" | "getUTCHours" => Value::int(((ms / 3_600_000.0).rem_euclid(24.0)) as i32),
-                                "getMinutes" | "getUTCMinutes" => Value::int(((ms / 60_000.0).rem_euclid(60.0)) as i32),
-                                "getSeconds" | "getUTCSeconds" => Value::int(((ms / 1000.0).rem_euclid(60.0)) as i32),
-                                "getMilliseconds" | "getUTCMilliseconds" => Value::int((ms.rem_euclid(1000.0)) as i32),
-                                "getDay" | "getUTCDay" => {
-                                    // UNIX epoch (1970-01-01) was Thursday = 4
-                                    let days = (ms / 86_400_000.0).floor() as i64;
-                                    Value::int((((days + 4) % 7 + 7) % 7) as i32)
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            let r = self.exec_date_method(oid, &mn, &args);
+                            let result = match r {
+                                Ok(v) => v,
+                                Err(VmError::Throw(v)) => {
+                                    self.truncate_stack(obj_pos);
+                                    self.handle_throw(v)?;
+                                    continue;
                                 }
-                                "getTimezoneOffset" => Value::int(0),
-                                "toISOString" | "toString" | "toJSON" => {
-                                    let s = format_iso(ms);
-                                    let id = self.interner.intern(&s);
-                                    Value::string(id)
-                                }
-                                _ => Value::undefined(),
+                                Err(e) => return Err(e),
                             };
                             self.truncate_stack(obj_pos);
                             self.push(result);
@@ -4710,6 +4711,7 @@ impl Vm {
                                 let key_id = self.interner.intern(&key);
                                 let getter_key = self.interner.intern(&format!("__get_{key}__"));
                                 let setter_key = self.interner.intern(&format!("__set_{key}__"));
+                                self.ensure_builtin_proto_method(oid, key_id);
                                 let has = self.heap.get(oid).map(|o| {
                                     // For arrays, also check element indices
                                     let array_idx = key.parse::<usize>().ok().and_then(|idx| {
@@ -4810,6 +4812,7 @@ impl Vm {
                                         ObjectKind::Set { .. } => "[object Set]",
                                         ObjectKind::WeakMap { .. } => "[object WeakMap]",
                                         ObjectKind::WeakSet { .. } => "[object WeakSet]",
+                                        ObjectKind::Date(_) => "[object Date]",
                                         _ => "[object Object]",
                                     }
                                 } else { "[object Object]" };
@@ -5175,7 +5178,14 @@ impl Vm {
                                 // Timezone-less VM: UTC == component construction.
                                 Value::number(self.date_ms_from_args(&args))
                             }
-                            "parse" => Value::number(f64::NAN),
+                            "parse" => {
+                                let s = if argc > 0 {
+                                    self.value_to_string(self.stack[obj_pos + 1])
+                                } else {
+                                    String::new()
+                                };
+                                Value::number(parse_date_string(&s))
+                            }
                             _ => Value::undefined(),
                         };
                         self.truncate_stack(obj_pos);
@@ -5573,7 +5583,7 @@ impl Vm {
                                     .collect();
                                 let ms = self.date_ms_from_args(&args);
                                 let obj = JsObject {
-                                    properties: Vec::new(), prototype: None,
+                                    properties: Vec::new(), prototype: Some(self.date_prototype),
                                     kind: ObjectKind::Date(ms),
                                     marked: false, extensible: true,
                                 };

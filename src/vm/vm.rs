@@ -356,6 +356,8 @@ pub struct Vm {
     pub(crate) boolean_prototype: ObjectId,
     /// Singleton Number.prototype object
     pub(crate) number_prototype: ObjectId,
+    /// Singleton Date.prototype object
+    pub(crate) date_prototype: ObjectId,
     /// Singleton String.prototype object
     pub(crate) string_prototype: ObjectId,
     /// Singleton globalThis object — used as the default `this` for non-strict function calls
