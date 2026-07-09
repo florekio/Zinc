@@ -304,7 +304,7 @@ impl Vm {
                 // Cap the target length: real engines RangeError past the max
                 // string length; a dense multi-GB fill would OOM the process.
                 let target_len = (args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize)
-                    .min(10_000_000);
+                    .min(1_000_000);
                 let pad = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_else(|| " ".into());
                 // An empty filler pads nothing (spec: return the string as-is)
                 // — without this check the fill loop below never terminates.
@@ -362,9 +362,417 @@ impl Vm {
         }
     }
 
+
+    /// Get(O, "length") for an array-like, getter-aware, clamped to the
+    /// iteration cap so a poisoned length can't spin the VM.
+    fn array_like_length(&mut self, oid: crate::runtime::object::ObjectId) -> Result<u64, VmError> {
+        // Dense arrays without a shadowing named length use the element count.
+        let len_key = self.interner.intern("length");
+        let (is_array, elems_len, named) = match self.heap.get(oid) {
+            Some(o) => (
+                matches!(o.kind, ObjectKind::Array(_)),
+                if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 },
+                o.get_property(len_key),
+            ),
+            None => (false, 0, None),
+        };
+        if is_array && named.is_none() {
+            return Ok(elems_len as u64);
+        }
+        // Per-level walk: an own property of ANY form (data, getter, or
+        // setter-only accessor — whose Get is undefined) shadows inherited
+        // ones. A flat chain lookup of the getter key would wrongly see an
+        // inherited getter past an own setter-only accessor.
+        let getter_key = self.interner.intern("__get_length__");
+        let setter_key = self.interner.intern("__set_length__");
+        let mut raw = Value::undefined();
+        let mut cur = Some(oid);
+        let mut hops = 0;
+        while let Some(c) = cur {
+            let (getter, data, has_setter, proto) = match self.heap.get(c) {
+                Some(o) => (
+                    o.get_property(getter_key).filter(|v| v.is_function()),
+                    o.get_property(len_key),
+                    o.get_property(setter_key).is_some(),
+                    o.prototype,
+                ),
+                None => (None, None, false, None),
+            };
+            if let Some(gfn) = getter {
+                raw = self.call_function_this(gfn, Value::object_id(oid), &[])?;
+                break;
+            }
+            if let Some(v) = data {
+                raw = v;
+                break;
+            }
+            if has_setter {
+                break; // accessor without a getter: Get returns undefined
+            }
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            cur = proto;
+        }
+        let n = self.to_f64(raw);
+        if n.is_nan() || n <= 0.0 {
+            return Ok(0);
+        }
+        Ok((n.min(9_007_199_254_740_991.0) as u64).min(1_000_000))
+    }
+
+    /// HasProperty + Get for an array-like index: own accessors, dense
+    /// elements, named data properties, then the prototype chain. Getters run
+    /// with the receiver as `this`. None = absent (hole).
+    fn array_like_get(
+        &mut self,
+        oid: crate::runtime::object::ObjectId,
+        idx: u64,
+    ) -> Result<Option<Value>, VmError> {
+        let key = self.interner.intern(&idx.to_string());
+        let getter_key = self.interner.intern(&format!("__get_{idx}__"));
+        let setter_key = self.interner.intern(&format!("__set_{idx}__"));
+        let receiver = Value::object_id(oid);
+        let mut cur = Some(oid);
+        let mut hops = 0;
+        while let Some(c) = cur {
+            let (getter, data, has_setter, in_elems, proto) = match self.heap.get(c) {
+                Some(o) => (
+                    o.get_property(getter_key).filter(|v| v.is_function()),
+                    o.get_property(key),
+                    o.get_property(setter_key).is_some(),
+                    if let ObjectKind::Array(ref e) = o.kind {
+                        ((idx as usize) < e.len()).then(|| e[idx as usize])
+                    } else {
+                        None
+                    },
+                    o.prototype,
+                ),
+                None => (None, None, false, None, None),
+            };
+            if let Some(gfn) = getter {
+                return self.call_function_this(gfn, receiver, &[]).map(Some);
+            }
+            if let Some(v) = data {
+                return Ok(Some(v));
+            }
+            if has_setter {
+                // Accessor without a getter: the property exists, Get is undefined.
+                return Ok(Some(Value::undefined()));
+            }
+            if let Some(v) = in_elems {
+                return Ok(Some(v));
+            }
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            cur = proto;
+        }
+        // String wrapper receivers expose char indices.
+        if let Some(o) = self.heap.get(oid)
+            && let ObjectKind::Wrapper(inner) = o.kind
+            && inner.is_string()
+        {
+            let s = self.value_to_string(inner);
+            if let Some(ch) = s.chars().nth(idx as usize) {
+                return Ok(Some(self.new_str(&ch.to_string())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// ToNumber that runs user valueOf/toString (ordinary `to_f64` is
+    /// non-mutating and can't) — index arguments coerce observably per spec.
+    fn coerce_to_f64(&mut self, v: Value) -> Result<f64, VmError> {
+        let p = if v.is_object() {
+            self.try_coerce_to_primitive_hint(v, "number")?
+        } else {
+            v
+        };
+        Ok(self.to_f64(p))
+    }
+
+    /// Whether an array carries reconfigured index properties (accessors or
+    /// named data entries) that the dense fast paths would miss.
+    fn array_has_index_props(&self, oid: crate::runtime::object::ObjectId) -> bool {
+        self.heap.get(oid).is_some_and(|o| {
+            o.properties.iter().any(|(k, _)| {
+                let ks = self.interner.resolve(*k);
+                ks.bytes().all(|b| b.is_ascii_digit())
+                    || (ks.starts_with("__get_") && ks[6..ks.len().saturating_sub(2)].bytes().all(|b| b.is_ascii_digit()))
+                    || ks == "length"
+            })
+        })
+    }
+
+    /// Spec-shaped implementations of the iteration-family Array.prototype
+    /// methods for GENERIC receivers (array-likes, arrays with reconfigured
+    /// indices): length via Get, elements via HasProperty/Get with holes.
+    /// Returns Ok(None) for methods without a generic form (caller falls
+    /// back to the dense implementation).
+    fn exec_array_method_generic(
+        &mut self,
+        oid: crate::runtime::object::ObjectId,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, VmError> {
+        let obj_val = Value::object_id(oid);
+        let callback = args.first().copied().unwrap_or(Value::undefined());
+        let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
+        let require_callback = |vm: &mut Self| -> Result<(), VmError> {
+            let callable = callback.is_function()
+                || callback.as_object_id()
+                    .and_then(|o| vm.heap.get(o))
+                    .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)));
+            if callable {
+                Ok(())
+            } else {
+                Err(VmError::Throw(vm.make_native_error(
+                    "TypeError",
+                    "callback is not a function",
+                )))
+            }
+        };
+        match name {
+            "forEach" | "map" | "filter" | "every" | "some"
+            | "find" | "findIndex" | "findLast" | "findLastIndex" => {
+                let len = self.array_like_length(oid)?;
+                require_callback(self)?;
+                let mut mapped: Vec<Value> = Vec::new();
+                let mut filtered: Vec<Value> = Vec::new();
+                let forward = !matches!(name, "findLast" | "findLastIndex");
+                let indices: Vec<u64> = if forward { (0..len).collect() } else { (0..len).rev().collect() };
+                for k in indices {
+                    let elem = self.array_like_get(oid, k)?;
+                    // find-family visits holes as undefined; the others skip.
+                    let visits_holes = matches!(name, "find" | "findIndex" | "findLast" | "findLastIndex");
+                    let Some(v) = elem.or(visits_holes.then(Value::undefined)) else {
+                        if name == "map" {
+                            mapped.push(Value::undefined());
+                        }
+                        continue;
+                    };
+                    let r = self.call_function_this(
+                        callback,
+                        this_arg,
+                        &[v, Value::number(k as f64), obj_val],
+                    )?;
+                    match name {
+                        "forEach" => {}
+                        "map" => mapped.push(r),
+                        "filter" => {
+                            if r.to_boolean() {
+                                filtered.push(v);
+                            }
+                        }
+                        "every" => {
+                            if !r.to_boolean() {
+                                return Ok(Some(Value::boolean(false)));
+                            }
+                        }
+                        "some" => {
+                            if r.to_boolean() {
+                                return Ok(Some(Value::boolean(true)));
+                            }
+                        }
+                        "find" | "findLast" => {
+                            if r.to_boolean() {
+                                return Ok(Some(v));
+                            }
+                        }
+                        "findIndex" | "findLastIndex" => {
+                            if r.to_boolean() {
+                                return Ok(Some(Value::number(k as f64)));
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Ok(Some(match name {
+                    "forEach" => Value::undefined(),
+                    "map" => {
+                        let mut arr = JsObject::array(mapped);
+                        arr.prototype = Some(self.array_prototype);
+                        Value::object_id(self.heap.allocate(arr))
+                    }
+                    "filter" => {
+                        let mut arr = JsObject::array(filtered);
+                        arr.prototype = Some(self.array_prototype);
+                        Value::object_id(self.heap.allocate(arr))
+                    }
+                    "every" => Value::boolean(true),
+                    "some" => Value::boolean(false),
+                    "find" | "findLast" => Value::undefined(),
+                    _ => Value::number(-1.0),
+                }))
+            }
+            "reduce" | "reduceRight" => {
+                let len = self.array_like_length(oid)?;
+                require_callback(self)?;
+                let has_init = args.len() > 1;
+                let mut acc = args.get(1).copied();
+                let indices: Vec<u64> = if name == "reduce" {
+                    (0..len).collect()
+                } else {
+                    (0..len).rev().collect()
+                };
+                let mut it = indices.into_iter();
+                if !has_init {
+                    // Seed from the first PRESENT element (holes skipped).
+                    for k in it.by_ref() {
+                        if let Some(v) = self.array_like_get(oid, k)? {
+                            acc = Some(v);
+                            break;
+                        }
+                    }
+                    if acc.is_none() {
+                        return Err(VmError::Throw(self.make_native_error(
+                            "TypeError",
+                            "Reduce of empty array with no initial value",
+                        )));
+                    }
+                }
+                let mut acc = acc.unwrap_or(Value::undefined());
+                for k in it {
+                    if let Some(v) = self.array_like_get(oid, k)? {
+                        acc = self.call_function_this(
+                            callback,
+                            Value::undefined(),
+                            &[acc, v, Value::number(k as f64), obj_val],
+                        )?;
+                    }
+                }
+                Ok(Some(acc))
+            }
+            "indexOf" | "lastIndexOf" | "includes" => {
+                let len = self.array_like_length(oid)? as i64;
+                let search = args.first().copied().unwrap_or(Value::undefined());
+                let from = match args.get(1) {
+                    Some(v) => self.coerce_to_f64(*v)?,
+                    None if name == "lastIndexOf" => (len - 1) as f64,
+                    None => 0.0,
+                };
+                let norm = |f: f64, len: i64| -> i64 {
+                    if f.is_nan() { 0 } else if f < 0.0 { (len as f64 + f).max(0.0) as i64 } else { f.min(len as f64) as i64 }
+                };
+                let result = if name == "lastIndexOf" {
+                    let start = if from.is_nan() { -1 } else if from < 0.0 { len + from as i64 } else { (from as i64).min(len - 1) };
+                    let mut found = -1i64;
+                    let mut k = start;
+                    while k >= 0 {
+                        if let Some(v) = self.array_like_get(oid, k as u64)?
+                            && self.strict_eq(v, search)
+                        {
+                            found = k;
+                            break;
+                        }
+                        k -= 1;
+                    }
+                    found
+                } else {
+                    let start = norm(from, len);
+                    let mut found = -1i64;
+                    for k in start..len {
+                        let elem = self.array_like_get(oid, k as u64)?;
+                        let matched = match elem {
+                            Some(v) => {
+                                if name == "includes" {
+                                    // SameValueZero: NaN matches NaN.
+                                    self.strict_eq(v, search)
+                                        || (self.to_f64(v).is_nan()
+                                            && self.to_f64(search).is_nan()
+                                            && (v.is_number() || v.is_int())
+                                            && (search.is_number() || search.is_int()))
+                                } else {
+                                    self.strict_eq(v, search)
+                                }
+                            }
+                            // includes treats holes as undefined.
+                            None => name == "includes" && search.is_undefined(),
+                        };
+                        if matched {
+                            found = k;
+                            break;
+                        }
+                    }
+                    found
+                };
+                Ok(Some(if name == "includes" {
+                    Value::boolean(result >= 0)
+                } else {
+                    Value::number(result as f64)
+                }))
+            }
+            "join" => {
+                let len = self.array_like_length(oid)?;
+                let sep = args.first()
+                    .filter(|v| !v.is_undefined())
+                    .map(|v| self.value_to_string(*v))
+                    .unwrap_or_else(|| ",".into());
+                let mut parts: Vec<String> = Vec::with_capacity(len as usize);
+                for k in 0..len {
+                    let v = self.array_like_get(oid, k)?;
+                    parts.push(match v {
+                        Some(v) if !v.is_undefined() && !v.is_null() => self.value_to_string(v),
+                        _ => String::new(),
+                    });
+                }
+                Ok(Some(self.new_str(&parts.join(&sep))))
+            }
+            "at" => {
+                let len = self.array_like_length(oid)? as i64;
+                let rel = match args.first() {
+                    Some(v) => self.coerce_to_f64(*v)? as i64,
+                    None => 0,
+                };
+                let k = if rel < 0 { len + rel } else { rel };
+                if k < 0 || k >= len {
+                    return Ok(Some(Value::undefined()));
+                }
+                Ok(Some(self.array_like_get(oid, k as u64)?.unwrap_or(Value::undefined())))
+            }
+            "slice" => {
+                let len = self.array_like_length(oid)? as i64;
+                let norm = |f: f64| -> i64 {
+                    if f.is_nan() { 0 } else if f < 0.0 { (len + f as i64).max(0) } else { (f as i64).min(len) }
+                };
+                let start = match args.first() {
+                    Some(v) => norm(self.coerce_to_f64(*v)?),
+                    None => 0,
+                };
+                let end = match args.get(1).filter(|v| !v.is_undefined()) {
+                    Some(v) => norm(self.coerce_to_f64(*v)?),
+                    None => len,
+                };
+                let mut out = Vec::new();
+                for k in start..end {
+                    out.push(self.array_like_get(oid, k as u64)?.unwrap_or(Value::undefined()));
+                }
+                let mut arr = JsObject::array(out);
+                arr.prototype = Some(self.array_prototype);
+                Ok(Some(Value::object_id(self.heap.allocate(arr))))
+            }
+            _ => Ok(None),
+        }
+    }
+
     // ---- Array method dispatch ----
     pub(crate) fn exec_array_method(&mut self, oid: crate::runtime::object::ObjectId, method_name: StringId, args: &[Value]) -> Result<Value, VmError> {
         let name = self.interner.resolve(method_name).to_owned();
+        // Generic receivers (array-likes, arrays with reconfigured index
+        // properties) take the spec-shaped path; dense arrays stay fast.
+        let needs_generic = match self.heap.get(oid).map(|o| (matches!(o.kind, ObjectKind::Array(_)), o.properties.is_empty())) {
+            Some((true, true)) => false,
+            Some((true, false)) => self.array_has_index_props(oid),
+            _ => true,
+        };
+        if needs_generic
+            && let Some(v) = self.exec_array_method_generic(oid, &name, args)?
+        {
+            return Ok(v);
+        }
         match name.as_str() {
             "push" => {
                 if let Some(obj) = self.heap.get_mut(oid)
@@ -1584,7 +1992,18 @@ impl Vm {
                 } else {
                     "Object"
                 };
-                let s = self.interner.intern(&format!("[object {tag}]"));
+                // Get(O, @@toStringTag): a string-valued tag overrides the
+                // builtin one (Math, JSON, user objects).
+                let tag_override = this_val.as_object_id().and_then(|oid| {
+                    let tag_key = self.interner.intern(&format!("__sym_{}__", self.sym_to_string_tag));
+                    self.heap.get_property_chain(oid, tag_key)
+                        .filter(|v| v.is_string())
+                        .map(|v| self.value_to_string(v))
+                });
+                let s = match tag_override {
+                    Some(t) => self.interner.intern(&format!("[object {t}]")),
+                    None => self.interner.intern(&format!("[object {tag}]")),
+                };
                 Value::string(s)
             }
             -598 => { // Error.prototype.toString — `${name}: ${message}`

@@ -272,7 +272,16 @@ fn main() {
 
     // Run category subprocesses in parallel (bounded by core count): each is
     // fully isolated, so only the result collection needs ordering.
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(10);
+    // Keep memory bounded on small machines: each worker is a full VM and
+    // heavy built-ins tests allocate aggressively. Override with
+    // ZINC_TEST262_JOBS when more headroom is available.
+    let workers = std::env::var("ZINC_TEST262_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(4)
+        })
+        .max(1);
     let next: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     /// (order, category, passed, failed, skipped, total, fail-log text)
     type CategoryResult<'a> = (usize, &'a str, usize, usize, usize, usize, String);

@@ -1674,9 +1674,9 @@ impl Vm {
                                 if let Some(n) = only.as_number()
                                     && n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64
                                 {
-                                    vec![Value::undefined(); (n as usize).min(10_000_000)]
+                                    vec![Value::undefined(); (n as usize).min(1_000_000)]
                                 } else if let Some(n) = only.as_int() {
-                                    if n >= 0 { vec![Value::undefined(); (n as usize).min(10_000_000)] } else { vec![only] }
+                                    if n >= 0 { vec![Value::undefined(); (n as usize).min(1_000_000)] } else { vec![only] }
                                 } else {
                                     vec![only]
                                 }
@@ -2305,8 +2305,14 @@ impl Vm {
                                 // defineProperty keeps its flags in the
                                 // property map — non-configurable indices
                                 // can't be deleted (mapped arguments).
+                                let idx_getter_key = self.interner.intern(&format!("__get_{idx}__"));
+                                let idx_setter_key = self.interner.intern(&format!("__set_{idx}__"));
                                 let named_nonconfig = self.heap.get(oid)
-                                    .and_then(|o| o.get_property_descriptor(key_id))
+                                    .and_then(|o| {
+                                        o.get_property_descriptor(key_id)
+                                            .or_else(|| o.get_property_descriptor(idx_getter_key))
+                                            .or_else(|| o.get_property_descriptor(idx_setter_key))
+                                    })
                                     .is_some_and(|p| !p.is_configurable());
                                 if named_nonconfig {
                                     false
@@ -2320,6 +2326,11 @@ impl Vm {
                                     });
                                     if let Some(obj) = self.heap.get_mut(oid) {
                                         obj.delete_property(key_id);
+                                        // A reconfigured index stores its accessor
+                                        // halves under __get_/__set_ — remove them
+                                        // too, or a deleted getter stays visible.
+                                        obj.delete_property(idx_getter_key);
+                                        obj.delete_property(idx_setter_key);
                                         if let ObjectKind::Array(ref mut elems) = obj.kind
                                             && idx < elems.len()
                                         {
@@ -3712,7 +3723,7 @@ impl Vm {
                                 // entry's value in sync.
                                 if let Some(obj) = self.heap.get_mut(oid) {
                                     if let ObjectKind::Array(ref mut elements) = obj.kind {
-                                        while elements.len() <= idx && elements.len() < 10_000_000 {
+                                        while elements.len() <= idx && elements.len() < 1_000_000 {
                                             elements.push(Value::undefined());
                                         }
                                         if idx < elements.len() { elements[idx] = val; }
@@ -3733,7 +3744,7 @@ impl Vm {
                                 && i >= 0
                             {
                                 let idx = i as usize;
-                                while elements.len() <= idx && elements.len() < 10_000_000 {
+                                while elements.len() <= idx && elements.len() < 1_000_000 {
                                     elements.push(Value::undefined());
                                 }
                                 if idx < elements.len() { elements[idx] = val; }
@@ -3750,7 +3761,7 @@ impl Vm {
                                 && n < 4_294_967_295.0
                             {
                                 let idx = n as usize;
-                                while elements.len() <= idx && elements.len() < 10_000_000 {
+                                while elements.len() <= idx && elements.len() < 1_000_000 {
                                     elements.push(Value::undefined());
                                 }
                                 if idx < elements.len() { elements[idx] = val; }
@@ -5607,9 +5618,9 @@ impl Vm {
                             if let Some(n) = only.as_number()
                                 && n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64
                             {
-                                vec![Value::undefined(); (n as usize).min(10_000_000)]
+                                vec![Value::undefined(); (n as usize).min(1_000_000)]
                             } else if let Some(n) = only.as_int() {
-                                if n >= 0 { vec![Value::undefined(); (n as usize).min(10_000_000)] } else { vec![only] }
+                                if n >= 0 { vec![Value::undefined(); (n as usize).min(1_000_000)] } else { vec![only] }
                             } else {
                                 vec![only]
                             }
@@ -6264,7 +6275,7 @@ impl Vm {
                                 if idx < elements.len() && elements.len() > idx {
                                     elements.push(val);
                                 } else {
-                                    while elements.len() <= idx && elements.len() < 10_000_000 {
+                                    while elements.len() <= idx && elements.len() < 1_000_000 {
                                         elements.push(Value::undefined());
                                     }
                                     if idx < elements.len() { elements[idx] = val; }

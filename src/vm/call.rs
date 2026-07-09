@@ -238,9 +238,9 @@ impl Vm {
                 if let Some(n) = args[0].as_number()
                     && n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64
                 {
-                    vec![Value::undefined(); (n as usize).min(10_000_000)]
+                    vec![Value::undefined(); (n as usize).min(1_000_000)]
                 } else if let Some(n) = args[0].as_int() {
-                    if n >= 0 { vec![Value::undefined(); (n as usize).min(10_000_000)] } else { vec![args[0]] }
+                    if n >= 0 { vec![Value::undefined(); (n as usize).min(1_000_000)] } else { vec![args[0]] }
                 } else {
                     vec![args[0]]
                 }

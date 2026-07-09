@@ -243,12 +243,19 @@ impl Vm {
             let k = interner.intern(name);
             math_obj.define_property(k, Property::with_flags(Value::function(sentinel), Property::WRITABLE | Property::CONFIGURABLE));
         }
+        // @@toStringTag (symbol id 3, matching sym_to_string_tag below):
+        // Object.prototype.toString reads it → "[object Math]".
+        let tostring_tag_key = interner.intern("__sym_3__");
+        let math_tag = interner.intern("Math");
+        math_obj.define_property(tostring_tag_key, Property::with_flags(Value::string(math_tag), Property::CONFIGURABLE));
         let math_oid = heap.allocate(math_obj);
         let math_name = interner.intern("Math");
         globals.insert(math_name, Value::object_id(math_oid));
 
         // Create JSON object (methods handled in exec_json_method)
-        let json_obj = JsObject::ordinary();
+        let mut json_obj = JsObject::ordinary();
+        let json_tag = interner.intern("JSON");
+        json_obj.define_property(tostring_tag_key, Property::with_flags(Value::string(json_tag), Property::CONFIGURABLE));
         let json_oid = heap.allocate(json_obj);
         let json_name = interner.intern("JSON");
         globals.insert(json_name, Value::object_id(json_oid));

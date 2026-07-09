@@ -220,7 +220,7 @@ impl Vm {
                     if let Some(obj) = self.heap.get_mut(target_oid)
                         && let ObjectKind::Array(ref mut elements) = obj.kind
                     {
-                        while elements.len() <= idx && elements.len() < 10_000_000 {
+                        while elements.len() <= idx && elements.len() < 1_000_000 {
                             elements.push(Value::undefined());
                         }
                         if idx < elements.len() { elements[idx] = value; }
@@ -982,9 +982,9 @@ impl Vm {
                     if let Some(n) = only.as_number()
                         && n.is_finite() && n.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(&n)
                     {
-                        vec![Value::undefined(); (n as usize).min(10_000_000)]
+                        vec![Value::undefined(); (n as usize).min(1_000_000)]
                     } else if let Some(n) = only.as_int() {
-                        if n >= 0 { vec![Value::undefined(); (n as usize).min(10_000_000)] } else { vec![only] }
+                        if n >= 0 { vec![Value::undefined(); (n as usize).min(1_000_000)] } else { vec![only] }
                     } else {
                         vec![only]
                     }
