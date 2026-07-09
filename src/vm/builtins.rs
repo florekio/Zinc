@@ -230,7 +230,8 @@ impl Vm {
                     let v = self.new_str(part);
                     parts.push(v);
                 }
-                let arr = JsObject::array(parts);
+                let mut arr = JsObject::array(parts);
+                arr.prototype = Some(self.array_prototype);
                 let oid = self.heap.allocate(arr);
                 Value::object_id(oid)
             }
@@ -1095,7 +1096,8 @@ impl Vm {
                     let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
                     results.push(result);
                 }
-                let arr = JsObject::array(results);
+                let mut arr = JsObject::array(results);
+                arr.prototype = Some(self.array_prototype);
                 let new_oid = self.heap.allocate(arr);
                 Ok(Value::object_id(new_oid))
             }
@@ -1112,7 +1114,8 @@ impl Vm {
                         results.push(*elem);
                     }
                 }
-                let arr = JsObject::array(results);
+                let mut arr = JsObject::array(results);
+                arr.prototype = Some(self.array_prototype);
                 let new_oid = self.heap.allocate(arr);
                 Ok(Value::object_id(new_oid))
             }
@@ -1259,7 +1262,8 @@ impl Vm {
                         }
                     }
 
-                let arr = JsObject::array(deleted);
+                let mut arr = JsObject::array(deleted);
+                arr.prototype = Some(self.array_prototype);
                 let new_oid = self.heap.allocate(arr);
                 Ok(Value::object_id(new_oid))
             }
@@ -1273,7 +1277,8 @@ impl Vm {
                 let start = if raw_start < 0 { (len + raw_start).max(0) as usize } else { raw_start.min(len) as usize };
                 let end = if raw_end < 0 { (len + raw_end).max(0) as usize } else { raw_end.min(len) as usize };
                 let sliced = if start < end { elements[start..end].to_vec() } else { vec![] };
-                let arr = JsObject::array(sliced);
+                let mut arr = JsObject::array(sliced);
+                arr.prototype = Some(self.array_prototype);
                 let new_oid = self.heap.allocate(arr);
                 Ok(Value::object_id(new_oid))
             }
@@ -1290,7 +1295,8 @@ impl Vm {
                         result.push(*arg);
                     }
                 }
-                let arr = JsObject::array(result);
+                let mut arr = JsObject::array(result);
+                arr.prototype = Some(self.array_prototype);
                 let new_oid = self.heap.allocate(arr);
                 Ok(Value::object_id(new_oid))
             }
@@ -1353,7 +1359,8 @@ impl Vm {
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 let result = self.flatten_array(&elements, depth);
-                let arr = JsObject::array(result);
+                let mut arr = JsObject::array(result);
+                arr.prototype = Some(self.array_prototype);
                 let new_oid = self.heap.allocate(arr);
                 Ok(Value::object_id(new_oid))
             }
@@ -1373,7 +1380,8 @@ impl Vm {
                         mapped.push(result);
                     }
                 }
-                let arr = JsObject::array(mapped);
+                let mut arr = JsObject::array(mapped);
+                arr.prototype = Some(self.array_prototype);
                 let new_oid = self.heap.allocate(arr);
                 Ok(Value::object_id(new_oid))
             }
@@ -1433,7 +1441,8 @@ impl Vm {
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 elements.reverse();
-                let arr = JsObject::array(elements);
+                let mut arr = JsObject::array(elements);
+                arr.prototype = Some(self.array_prototype);
                 Ok(Value::object_id(self.heap.allocate(arr)))
             }
             "toSorted" => {
@@ -1460,7 +1469,8 @@ impl Vm {
                     }
                     elements[j] = key;
                 }
-                let arr = JsObject::array(elements);
+                let mut arr = JsObject::array(elements);
+                arr.prototype = Some(self.array_prototype);
                 Ok(Value::object_id(self.heap.allocate(arr)))
             }
             "with" => {
@@ -1476,7 +1486,8 @@ impl Vm {
                     return Err(VmError::RuntimeError("RangeError: Invalid index".into()));
                 }
                 elements[i as usize] = val;
-                let arr = JsObject::array(elements);
+                let mut arr = JsObject::array(elements);
+                arr.prototype = Some(self.array_prototype);
                 Ok(Value::object_id(self.heap.allocate(arr)))
             }
             "toSpliced" => {
@@ -1495,7 +1506,8 @@ impl Vm {
                 };
                 let new_items: Vec<Value> = args.iter().skip(2).copied().collect();
                 elements.splice(start..start + delete_count, new_items);
-                let arr = JsObject::array(elements);
+                let mut arr = JsObject::array(elements);
+                arr.prototype = Some(self.array_prototype);
                 Ok(Value::object_id(self.heap.allocate(arr)))
             }
             "toString" => {

@@ -2139,7 +2139,8 @@ impl Vm {
                             rest_elements.push(self.stack[base + i]);
                         }
                     }
-                    let arr = JsObject::array(rest_elements);
+                    let mut arr = JsObject::array(rest_elements);
+                arr.prototype = Some(self.array_prototype);
                     let arr_oid = self.heap.allocate(arr);
                     // Store in the target local slot
                     let base = self.frames.last().unwrap().base;
@@ -5118,7 +5119,8 @@ impl Vm {
                                 if !is_known_kind && source.as_object_id().is_some() {
                                     match self.array_from_iterable(source, map_fn) {
                                         Ok(Some(values)) => {
-                                            let arr = JsObject::array(values);
+                                            let mut arr = JsObject::array(values);
+                arr.prototype = Some(self.array_prototype);
                                             let new_oid = self.heap.allocate(arr);
                                             self.truncate_stack(obj_pos);
                                             self.push(Value::object_id(new_oid));
@@ -5143,7 +5145,8 @@ impl Vm {
                                             ObjectKind::Map { entries } => {
                                                 let pairs = entries.clone();
                                                 pairs.into_iter().map(|(k, v)| {
-                                                    let pair_arr = JsObject::array(vec![k, v]);
+                                                    let mut pair_arr = JsObject::array(vec![k, v]);
+                pair_arr.prototype = Some(self.array_prototype);
                                                     Value::object_id(self.heap.allocate(pair_arr))
                                                 }).collect()
                                             }
@@ -5180,7 +5183,8 @@ impl Vm {
                                         result.push(*elem);
                                     }
                                 }
-                                let arr = JsObject::array(result);
+                                let mut arr = JsObject::array(result);
+                arr.prototype = Some(self.array_prototype);
                                 let new_oid = self.heap.allocate(arr);
                                 self.truncate_stack(obj_pos);
                                 self.push(Value::object_id(new_oid));
@@ -5188,7 +5192,8 @@ impl Vm {
                             }
                             "of" => {
                                 let items: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                                let arr = JsObject::array(items);
+                                let mut arr = JsObject::array(items);
+                arr.prototype = Some(self.array_prototype);
                                 let new_oid = self.heap.allocate(arr);
                                 self.truncate_stack(obj_pos);
                                 self.push(Value::object_id(new_oid));
@@ -5674,7 +5679,8 @@ impl Vm {
                         } else {
                             (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect()
                         };
-                        let arr_obj = JsObject::array(elements);
+                        let mut arr_obj = JsObject::array(elements);
+                arr_obj.prototype = Some(self.array_prototype);
                         let oid = self.heap.allocate(arr_obj);
                         if let Some(o) = self.heap.get_mut(oid) {
                             o.prototype = Some(self.array_prototype);
@@ -6357,7 +6363,8 @@ impl Vm {
                                     // Map yields [k,v] pair arrays
                                     let pairs = entries.clone();
                                     pairs.into_iter().map(|(k, v)| {
-                                        let pair_arr = JsObject::array(vec![k, v]);
+                                        let mut pair_arr = JsObject::array(vec![k, v]);
+                pair_arr.prototype = Some(self.array_prototype);
                                         Value::object_id(self.heap.allocate(pair_arr))
                                     }).collect()
                                 }
@@ -7514,7 +7521,8 @@ impl Vm {
                             let id = self.interner.intern(&c.to_string());
                             Value::string(id)
                         }).collect();
-                        let arr = JsObject::array(chars);
+                        let mut arr = JsObject::array(chars);
+                arr.prototype = Some(self.array_prototype);
                         let arr_oid = self.heap.allocate(arr);
                         let iter_proto = self.iterator_prototype_oid();
                         let iter_obj = JsObject {
@@ -7628,7 +7636,8 @@ impl Vm {
                                     if let ObjectKind::Map { ref entries } = src_obj.kind {
                                         if idx < entries.len() {
                                             let (k, v) = entries[idx];
-                                            let pair = JsObject::array(vec![k, v]);
+                                            let mut pair = JsObject::array(vec![k, v]);
+                pair.prototype = Some(self.array_prototype);
                                             let pair_id = self.heap.allocate(pair);
                                             (Value::object_id(pair_id), false)
                                         } else {
@@ -8349,10 +8358,12 @@ impl Vm {
                     for i in 0..num_exprs {
                         exprs.push(self.stack[tag_pos + 1 + num_quasis + i]);
                     }
-                    let strings_arr = JsObject::array(quasi_strings.clone());
+                    let mut strings_arr = JsObject::array(quasi_strings.clone());
+                strings_arr.prototype = Some(self.array_prototype);
                     let arr_oid = self.heap.allocate(strings_arr);
                     // Add 'raw' property pointing to same array (simplified)
-                    let raw_arr = JsObject::array(quasi_strings);
+                    let mut raw_arr = JsObject::array(quasi_strings);
+                raw_arr.prototype = Some(self.array_prototype);
                     let raw_oid = self.heap.allocate(raw_arr);
                     let raw_key = self.interner.intern("raw");
                     if let Some(obj) = self.heap.get_mut(arr_oid) {

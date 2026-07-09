@@ -585,7 +585,8 @@ impl Vm {
                         }
                     }
                 }
-                let arr = JsObject::array(syms);
+                let mut arr = JsObject::array(syms);
+                arr.prototype = Some(self.array_prototype);
                 Value::object_id(self.heap.allocate(arr))
             }
             "fromEntries" => {
