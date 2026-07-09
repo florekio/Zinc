@@ -1349,8 +1349,46 @@ impl Vm {
 
                     // RegExp(pattern, flags) — without new, same as new RegExp
                     if func_val.is_function() && func_val.as_function() == Some(-580) {
-                        let pattern = if argc > 0 { self.value_to_string(self.stack[func_pos + 1]) } else { String::new() };
-                        let flags = if argc > 1 { self.value_to_string(self.stack[func_pos + 2]) } else { String::new() };
+                        // A RegExp source argument copies its pattern (and
+                        // flags, unless explicitly overridden).
+                        let src_re: Option<(String, String)> = if argc > 0 {
+                            self.stack[func_pos + 1].as_object_id()
+                                .and_then(|o| self.heap.get(o))
+                                .and_then(|o| if let ObjectKind::RegExp { ref pattern, ref flags } = o.kind {
+                                    Some((pattern.clone(), flags.clone()))
+                                } else { None })
+                        } else { None };
+                        let pattern = match &src_re {
+                            Some((p, _)) => p.clone(),
+                            None if argc > 0 && !self.stack[func_pos + 1].is_undefined() => {
+                                let v = self.stack[func_pos + 1];
+                                let prim = self.try_coerce_to_primitive_hint(v, "string").unwrap_or(v);
+                                self.value_to_string(prim)
+                            }
+                            _ => String::new(),
+                        };
+                        let flags = if argc > 1 && !self.stack[func_pos + 2].is_undefined() {
+                            let v = self.stack[func_pos + 2];
+                            let prim = self.try_coerce_to_primitive_hint(v, "string").unwrap_or(v);
+                            self.value_to_string(prim)
+                        } else if let Some((_, f)) = &src_re {
+                            f.clone()
+                        } else {
+                            String::new()
+                        };
+                        // Early errors: invalid flags / pattern grammar.
+                        let unicode = flags.contains('u') || flags.contains('v');
+                        let syntax_err = crate::vm::regexp::validate_js_flags(&flags).err()
+                            .or_else(|| crate::vm::regexp::validate_js_pattern(&pattern, unicode).err());
+                        if let Some(msg) = syntax_err {
+                            let err = self.make_native_error(
+                                "SyntaxError",
+                                &format!("Invalid regular expression: /{pattern}/{flags}: {msg}"),
+                            );
+                            self.truncate_stack(func_pos);
+                            self.handle_throw(err)?;
+                            continue;
+                        }
                         let obj = JsObject {
                             properties: Vec::new(), prototype: self.func_prototypes.get(&-580).copied(),
                             kind: ObjectKind::RegExp { pattern, flags },
@@ -5640,8 +5678,46 @@ impl Vm {
 
                     // new RegExp(pattern, flags)
                     if func_val.is_function() && func_val.as_function() == Some(-580) {
-                        let pattern = if argc > 0 { self.value_to_string(self.stack[func_pos + 1]) } else { String::new() };
-                        let flags = if argc > 1 { self.value_to_string(self.stack[func_pos + 2]) } else { String::new() };
+                        // A RegExp source argument copies its pattern (and
+                        // flags, unless explicitly overridden).
+                        let src_re: Option<(String, String)> = if argc > 0 {
+                            self.stack[func_pos + 1].as_object_id()
+                                .and_then(|o| self.heap.get(o))
+                                .and_then(|o| if let ObjectKind::RegExp { ref pattern, ref flags } = o.kind {
+                                    Some((pattern.clone(), flags.clone()))
+                                } else { None })
+                        } else { None };
+                        let pattern = match &src_re {
+                            Some((p, _)) => p.clone(),
+                            None if argc > 0 && !self.stack[func_pos + 1].is_undefined() => {
+                                let v = self.stack[func_pos + 1];
+                                let prim = self.try_coerce_to_primitive_hint(v, "string").unwrap_or(v);
+                                self.value_to_string(prim)
+                            }
+                            _ => String::new(),
+                        };
+                        let flags = if argc > 1 && !self.stack[func_pos + 2].is_undefined() {
+                            let v = self.stack[func_pos + 2];
+                            let prim = self.try_coerce_to_primitive_hint(v, "string").unwrap_or(v);
+                            self.value_to_string(prim)
+                        } else if let Some((_, f)) = &src_re {
+                            f.clone()
+                        } else {
+                            String::new()
+                        };
+                        // Early errors: invalid flags / pattern grammar.
+                        let unicode = flags.contains('u') || flags.contains('v');
+                        let syntax_err = crate::vm::regexp::validate_js_flags(&flags).err()
+                            .or_else(|| crate::vm::regexp::validate_js_pattern(&pattern, unicode).err());
+                        if let Some(msg) = syntax_err {
+                            let err = self.make_native_error(
+                                "SyntaxError",
+                                &format!("Invalid regular expression: /{pattern}/{flags}: {msg}"),
+                            );
+                            self.truncate_stack(func_pos);
+                            self.handle_throw(err)?;
+                            continue;
+                        }
                         let obj = JsObject {
                             properties: Vec::new(), prototype: self.func_prototypes.get(&-580).copied(),
                             kind: ObjectKind::RegExp { pattern, flags },

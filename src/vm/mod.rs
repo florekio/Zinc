@@ -6,7 +6,7 @@ mod embed;
 mod json;
 mod promise;
 mod generator;
-mod regexp;
+pub(crate) mod regexp;
 mod map;
 mod typedarray;
 

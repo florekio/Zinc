@@ -1618,6 +1618,17 @@ impl<'a> Compiler<'a> {
 
     pub(super) fn compile_regexp(&mut self, r: &RegExpLiteral) -> Result<(), String> {
         let line = r.span.start;
+        // Early errors: an invalid literal pattern is a SyntaxError at
+        // parse time, before any code runs.
+        {
+            let pat = self.interner.resolve(r.pattern);
+            let flags = self.interner.resolve(r.flags);
+            let unicode = flags.contains('u') || flags.contains('v');
+            crate::vm::regexp::validate_js_flags(flags)
+                .map_err(|e| format!("Invalid regular expression flags: {e}"))?;
+            crate::vm::regexp::validate_js_pattern(pat, unicode)
+                .map_err(|e| format!("Invalid regular expression: {e}"))?;
+        }
         let pat_idx = self.make_string_constant(r.pattern);
         let flags_idx = self.make_string_constant(r.flags);
         self.chunk.emit_byte(OpCode::CreateRegExp as u8, line);

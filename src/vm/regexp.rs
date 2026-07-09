@@ -26,8 +26,25 @@ pub(crate) fn translate_js_regex(pattern: &str) -> String {
                 }
             }
             '[' if !in_class => {
+                // JS empty classes: `[]` never matches, `[^]` matches
+                // anything — the Rust engine rejects both spellings.
+                if chars.peek() == Some(&']') {
+                    chars.next();
+                    out.push_str("[^\\s\\S]");
+                    continue;
+                }
                 in_class = true;
                 out.push('[');
+                if chars.peek() == Some(&'^') {
+                    out.push('^');
+                    chars.next();
+                    if chars.peek() == Some(&']') {
+                        chars.next();
+                        out.pop();
+                        out.push_str("\\s\\S]");
+                        in_class = false;
+                    }
+                }
             }
             '[' if in_class => {
                 // Literal `[` inside a class — escape for the Rust engine.
@@ -386,4 +403,213 @@ impl Vm {
             _ => None,
         }
     }
+}
+
+/// Structural validation of a JS RegExp pattern: rejects definite grammar
+/// violations (unbalanced groups/classes, dangling quantifiers, reversed
+/// {m,n} ranges, trailing backslash) while staying permissive about
+/// constructs the backing engine may or may not support.
+pub fn validate_js_pattern(pattern: &str, unicode: bool) -> Result<(), String> {
+    let b: Vec<char> = pattern.chars().collect();
+    let n = b.len();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    let mut prev_quantifiable = false;
+    while i < n {
+        match b[i] {
+            '\\' => {
+                if i + 1 >= n {
+                    return Err("\\ at end of pattern".into());
+                }
+                // Unicode property escapes \p{...} / \P{...} consume their
+                // braces as part of the escape.
+                if matches!(b[i + 1], 'p' | 'P') && i + 2 < n && b[i + 2] == '{' {
+                    let mut j = i + 3;
+                    while j < n && b[j] != '}' {
+                        j += 1;
+                    }
+                    if j >= n {
+                        return Err("invalid property escape".into());
+                    }
+                    i = j + 1;
+                } else {
+                    i += 2;
+                }
+                prev_quantifiable = true;
+            }
+            '(' => {
+                depth += 1;
+                if i + 1 < n && b[i + 1] == '?' {
+                    if i + 2 >= n {
+                        return Err("unterminated group".into());
+                    }
+                    match b[i + 2] {
+                        ':' | '=' | '!' => i += 3,
+                        // Modifier groups (?ims-ims:...) — ES2025.
+                        'i' | 'm' | 's' | '-' => {
+                            let mut j = i + 2;
+                            while j < n && matches!(b[j], 'i' | 'm' | 's') {
+                                j += 1;
+                            }
+                            if j < n && b[j] == '-' {
+                                j += 1;
+                                while j < n && matches!(b[j], 'i' | 'm' | 's') {
+                                    j += 1;
+                                }
+                            }
+                            if j >= n || b[j] != ':' {
+                                return Err("invalid group".into());
+                            }
+                            i = j + 1;
+                        }
+                        '<' => {
+                            if i + 3 < n && (b[i + 3] == '=' || b[i + 3] == '!') {
+                                i += 4;
+                            } else {
+                                let mut j = i + 3;
+                                while j < n && b[j] != '>' {
+                                    j += 1;
+                                }
+                                if j >= n || j == i + 3 {
+                                    return Err("invalid named capture group".into());
+                                }
+                                i = j + 1;
+                            }
+                        }
+                        _ => return Err("invalid group".into()),
+                    }
+                } else {
+                    i += 1;
+                }
+                prev_quantifiable = false;
+            }
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err("unmatched )".into());
+                }
+                i += 1;
+                prev_quantifiable = true;
+            }
+            '[' => {
+                // JS classes close on the FIRST unescaped ']' — '[]' is a
+                // valid empty class (unlike POSIX, no literal-] rule).
+                let mut j = i + 1;
+                if j < n && b[j] == '^' {
+                    j += 1;
+                }
+                let mut closed = false;
+                while j < n {
+                    match b[j] {
+                        '\\' => j += 2,
+                        ']' => {
+                            closed = true;
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                if !closed {
+                    return Err("unterminated character class".into());
+                }
+                i = j + 1;
+                prev_quantifiable = true;
+            }
+            '*' | '+' | '?' => {
+                if !prev_quantifiable {
+                    return Err("nothing to repeat".into());
+                }
+                i += 1;
+                if i < n && b[i] == '?' {
+                    i += 1;
+                }
+                prev_quantifiable = false;
+            }
+            '{' => {
+                // Try to parse {n} / {n,} / {n,m}
+                let mut j = i + 1;
+                let d1_start = j;
+                while j < n && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let d1 = j - d1_start;
+                let mut d2: Option<(usize, usize)> = None;
+                if d1 > 0 && j < n && b[j] == ',' {
+                    j += 1;
+                    let s = j;
+                    while j < n && b[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j > s {
+                        d2 = Some((s, j));
+                    }
+                }
+                if d1 > 0 && j < n && b[j] == '}' {
+                    if !prev_quantifiable {
+                        return Err("nothing to repeat".into());
+                    }
+                    if let Some((s, e)) = d2 {
+                        let lo: String = b[d1_start..d1_start + d1].iter().collect();
+                        let hi: String = b[s..e].iter().collect();
+                        if let (Ok(a), Ok(z)) = (lo.parse::<u64>(), hi.parse::<u64>())
+                            && a > z
+                        {
+                            return Err("numbers out of order in {} quantifier".into());
+                        }
+                    }
+                    i = j + 1;
+                    if i < n && b[i] == '?' {
+                        i += 1;
+                    }
+                    prev_quantifiable = false;
+                } else {
+                    if unicode {
+                        return Err("lone quantifier brackets".into());
+                    }
+                    i += 1;
+                    prev_quantifiable = true;
+                }
+            }
+            ']' | '}' => {
+                if unicode {
+                    return Err("lone quantifier brackets".into());
+                }
+                i += 1;
+                prev_quantifiable = true;
+            }
+            '|' => {
+                i += 1;
+                prev_quantifiable = false;
+            }
+            '^' | '$' => {
+                i += 1;
+                prev_quantifiable = false;
+            }
+            _ => {
+                i += 1;
+                prev_quantifiable = true;
+            }
+        }
+    }
+    if depth != 0 {
+        return Err("unterminated group".into());
+    }
+    Ok(())
+}
+
+/// Validate a RegExp flags string: only dgimsuvy, no duplicates.
+pub fn validate_js_flags(flags: &str) -> Result<(), String> {
+    let mut seen = [false; 8];
+    for c in flags.chars() {
+        let idx = match c {
+            'd' => 0, 'g' => 1, 'i' => 2, 'm' => 3,
+            's' => 4, 'u' => 5, 'v' => 6, 'y' => 7,
+            _ => return Err(format!("invalid flag '{c}'")),
+        };
+        if seen[idx] {
+            return Err(format!("duplicate flag '{c}'"));
+        }
+        seen[idx] = true;
+    }
+    Ok(())
 }
