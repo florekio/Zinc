@@ -1245,20 +1245,50 @@ impl Vm {
             ("toSorted", 1), ("toSpliced", 2), ("toString", 0),
             ("unshift", 1), ("with", 2),
         ];
+        // Object.prototype methods route through their exec_native_method
+        // sentinels; Boolean.prototype through -630/-631.
+        const OBJECT_METHODS: &[(&str, i32, i32)] = &[
+            ("hasOwnProperty", 1, -590), ("propertyIsEnumerable", 1, -591),
+            ("toString", 0, -592), ("valueOf", 0, -593),
+            ("isPrototypeOf", 1, -594),
+        ];
+        const NUMBER_METHODS: &[(&str, i32)] = &[
+            ("toString", 1), ("toLocaleString", 0), ("valueOf", 0),
+            ("toFixed", 1), ("toExponential", 1), ("toPrecision", 1),
+        ];
+        const BOOLEAN_METHODS: &[(&str, i32, i32)] =
+            &[("toString", 0, -630), ("valueOf", 0, -631)];
+
+        enum Route {
+            String,
+            Array,
+            Sentinel(i32),
+            /// Sentinel dispatch behind a RequireObjectCoercible check
+            /// (Object.prototype.toLocaleString → this.toString()).
+            CoercibleSentinel(i32),
+            Number,
+        }
         let name = self.interner.resolve(name_id).to_owned();
-        let string_entry = (oid == self.string_prototype)
-            .then(|| STRING_METHODS.iter().find(|(n, _)| *n == name))
-            .flatten();
-        let array_entry = (oid == self.array_prototype)
-            .then(|| ARRAY_METHODS.iter().find(|(n, _)| *n == name))
-            .flatten();
-        let (is_string, fn_len) = match (string_entry, array_entry) {
-            (Some((_, l)), _) => (true, *l),
-            (_, Some((_, l))) => (false, *l),
-            _ => return None,
+        let entry: Option<(Route, i32)> = if oid == self.string_prototype {
+            STRING_METHODS.iter().find(|(n, _)| *n == name).map(|(_, l)| (Route::String, *l))
+        } else if oid == self.array_prototype {
+            ARRAY_METHODS.iter().find(|(n, _)| *n == name).map(|(_, l)| (Route::Array, *l))
+        } else if oid == self.object_prototype {
+            if name == "toLocaleString" {
+                Some((Route::CoercibleSentinel(-592), 0))
+            } else {
+                OBJECT_METHODS.iter().find(|(n, _, _)| *n == name).map(|(_, l, s)| (Route::Sentinel(*s), *l))
+            }
+        } else if oid == self.number_prototype {
+            NUMBER_METHODS.iter().find(|(n, _)| *n == name).map(|(_, l)| (Route::Number, *l))
+        } else if oid == self.boolean_prototype {
+            BOOLEAN_METHODS.iter().find(|(n, _, _)| *n == name).map(|(_, l, s)| (Route::Sentinel(*s), *l))
+        } else {
+            None
         };
-        let func: crate::runtime::object::NativeFn = if is_string {
-            std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
+        let (route, fn_len) = entry?;
+        let func: crate::runtime::object::NativeFn = match route {
+            Route::String => std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
                 // RequireObjectCoercible: String.prototype methods reject
                 // null/undefined receivers.
                 if this.is_nullish() {
@@ -1270,9 +1300,8 @@ impl Vm {
                 let s = vm.value_to_string(this);
                 let ascii = s.is_ascii();
                 Ok(vm.exec_string_method(&s, name_id, args, ascii))
-            })
-        } else {
-            std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
+            }),
+            Route::Array => std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
                 let Some(this_oid) = this.as_object_id() else {
                     return Err(vm.make_native_error(
                         "TypeError",
@@ -1284,7 +1313,34 @@ impl Vm {
                     Err(VmError::Throw(v)) => Err(v),
                     Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
                 }
-            })
+            }),
+            Route::Sentinel(sent) => std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
+                Ok(vm.exec_native_method(sent, this, args))
+            }),
+            Route::CoercibleSentinel(sent) => std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
+                if this.is_nullish() {
+                    return Err(vm.make_native_error(
+                        "TypeError",
+                        "Cannot convert undefined or null to object",
+                    ));
+                }
+                Ok(vm.exec_native_method(sent, this, args))
+            }),
+            Route::Number => std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
+                // thisNumberValue: only Number primitives / wrappers.
+                let inner = vm.unwrap_wrapper_primitive(this, |v| v.is_int() || v.is_number());
+                let Some(inner) = inner else {
+                    return Err(vm.make_native_error(
+                        "TypeError",
+                        "Number.prototype method called on incompatible receiver",
+                    ));
+                };
+                match vm.exec_number_method(inner, name_id, args) {
+                    Ok(v) => Ok(v),
+                    Err(VmError::Throw(v)) => Err(v),
+                    Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                }
+            }),
         };
         let mut fn_obj = JsObject {
             properties: Vec::new(),

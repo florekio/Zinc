@@ -2955,10 +2955,14 @@ impl Vm {
                         if val.is_undefined() {
                             let mut cur = Some(oid);
                             while let Some(c) = cur {
-                                if c == self.string_prototype || c == self.array_prototype {
-                                    if let Some(v) = self.reify_builtin_proto_method(c, name_id) {
-                                        val = v;
-                                    }
+                                if (c == self.string_prototype
+                                    || c == self.array_prototype
+                                    || c == self.object_prototype
+                                    || c == self.number_prototype
+                                    || c == self.boolean_prototype)
+                                    && let Some(v) = self.reify_builtin_proto_method(c, name_id)
+                                {
+                                    val = v;
                                     break;
                                 }
                                 cur = self.heap.get(c).and_then(|o| o.prototype);
@@ -4337,81 +4341,15 @@ impl Vm {
 
                     // Number primitive methods: (42).toString(16), (3.14).toFixed(2)
                     if effective_val.is_number() || effective_val.is_int() {
-                        let mn = self.interner.resolve(method_name).to_owned();
-                        let n = self.to_f64(effective_val);
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                        let result = match mn.as_str() {
-                            "toString" => {
-                                let radix = args.first().and_then(|v| v.as_number()).unwrap_or(10.0) as u32;
-                                let s = if radix == 10 {
-                                    self.value_to_string(effective_val)
-                                } else if n.fract() == 0.0 && n.is_finite() {
-                                    // Integer with non-10 radix
-                                    let i = n as i64;
-                                    if i >= 0 { radix_fmt(i as u64, radix) }
-                                    else { format!("-{}", radix_fmt((-i) as u64, radix)) }
-                                } else {
-                                    self.value_to_string(effective_val)
-                                };
-                                let id = self.interner.intern(&s);
-                                Value::string(id)
+                        let result = match self.exec_number_method(effective_val, method_name, &args) {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => {
+                                self.truncate_stack(obj_pos);
+                                self.handle_throw(v)?;
+                                continue;
                             }
-                            "valueOf" => effective_val,
-                            "toFixed" => {
-                                let digits = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                                let s = format!("{:.prec$}", n, prec = digits);
-                                let id = self.interner.intern(&s);
-                                Value::string(id)
-                            }
-                            "toPrecision" => {
-                                let s = if let Some(p) = args.first().and_then(|v| v.as_number()) {
-                                    let p = p as usize;
-                                    if n == 0.0 {
-                                        format!("{:.prec$}", 0.0, prec = p.saturating_sub(1))
-                                    } else {
-                                        let mag = n.abs().log10().floor() as i32;
-                                        if mag >= -6 && mag < p as i32 {
-                                            let decimals = (p as i32 - 1 - mag).max(0) as usize;
-                                            format!("{:.prec$}", n, prec = decimals)
-                                        } else {
-                                            let mantissa = n / 10f64.powi(mag);
-                                            let decimals = p.saturating_sub(1);
-                                            let sign = if mag >= 0 { "+" } else { "-" };
-                                            format!("{:.prec$}e{}{}", mantissa, sign, mag.abs(), prec = decimals)
-                                        }
-                                    }
-                                } else {
-                                    self.value_to_string(obj_val)
-                                };
-                                let id = self.interner.intern(&s);
-                                Value::string(id)
-                            }
-                            "toExponential" => {
-                                let digits = args.first().and_then(|v| v.as_number()).map(|d| d as usize);
-                                let s = if n == 0.0 {
-                                    let decimals = digits.unwrap_or(0);
-                                    if decimals == 0 { "0e+0".to_string() }
-                                    else { format!("{:.prec$}e+0", 0.0, prec = decimals) }
-                                } else {
-                                    let mag = n.abs().log10().floor() as i32;
-                                    let mantissa = n / 10f64.powi(mag);
-                                    let sign = if mag >= 0 { "+" } else { "-" };
-                                    match digits {
-                                        Some(d) => format!("{:.prec$}e{}{}", mantissa, sign, mag.abs(), prec = d),
-                                        None => {
-                                            // Minimum digits: default formatting, trim trailing zeros
-                                            let mut m = format!("{mantissa}");
-                                            if m.contains('.') {
-                                                m = m.trim_end_matches('0').trim_end_matches('.').to_string();
-                                            }
-                                            format!("{}e{}{}", m, sign, mag.abs())
-                                        }
-                                    }
-                                };
-                                let id = self.interner.intern(&s);
-                                Value::string(id)
-                            }
-                            _ => Value::undefined(),
+                            Err(e) => return Err(e),
                         };
                         self.truncate_stack(obj_pos);
                         self.push(result);
