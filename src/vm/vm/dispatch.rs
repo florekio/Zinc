@@ -3127,7 +3127,11 @@ impl Vm {
                                 "defineProperty" => {
                                     let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
                                         |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
-                                            Ok(vm.object_define_property(args))
+                                            match vm.object_define_property(args) {
+                                                Ok(v) => Ok(v),
+                                                Err(VmError::Throw(v)) => Err(v),
+                                                Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                                            }
                                         }
                                     );
                                     let fn_obj = JsObject {
@@ -3364,9 +3368,13 @@ impl Vm {
                             let has_own = self.heap.get(oid)
                                 .map(|o| o.has_own_property(name_id))
                                 .unwrap_or(false);
-                            if in_strict && (is_readonly_own || is_readonly_proto || has_getter || (!extensible && !has_own)) {
+                            // A stored setter half that isn't callable
+                            // (set: undefined) still marks an accessor —
+                            // assignment must not fall through to a data write.
+                            let is_accessor = has_getter || setter_fn.is_some();
+                            if in_strict && (is_readonly_own || is_readonly_proto || is_accessor || (!extensible && !has_own)) {
                                 let prop = self.interner.resolve(name_id).to_owned();
-                                let msg = if has_getter {
+                                let msg = if is_accessor {
                                     format!("Cannot set property '{prop}' which has only a getter")
                                 } else if is_readonly_own || is_readonly_proto {
                                     format!("Cannot assign to read only property '{prop}'")
@@ -3377,8 +3385,9 @@ impl Vm {
                                 self.handle_throw(err)?;
                                 continue;
                             }
-                            // In non-strict mode with a getter and no setter, silently fail.
-                            if has_getter {
+                            // In non-strict mode with an accessor and no callable
+                            // setter, silently fail.
+                            if is_accessor {
                                 self.push(val);
                                 continue;
                             }
@@ -3458,37 +3467,37 @@ impl Vm {
                         && let Some(obj) = self.heap.get(oid)
                     {
                         if let ObjectKind::Array(ref elements) = obj.kind {
-                            // Fast path: SMI index (most common case)
+                            // In-bounds index reads stay on the dense fast
+                            // path; misses fall through to the generic lookup
+                            // so index accessors (__get_N__) and the prototype
+                            // chain are consulted.
                             if let Some(i) = key.as_int()
                                 && i >= 0
                             {
-                                let val = elements.get(i as usize).copied().unwrap_or(Value::undefined());
-                                self.push(val);
-                                continue;
-                            }
-                            // Float index — only canonical integers count as
-                            // array indices; fractional numbers fall through
-                            // to string-property lookup.
-                            if let Some(n) = key.as_number()
+                                if let Some(val) = elements.get(i as usize).copied() {
+                                    self.push(val);
+                                    continue;
+                                }
+                            } else if let Some(n) = key.as_number()
                                 && n >= 0.0
                                 && n.fract() == 0.0
                                 && n.is_finite()
                                 && n < 4_294_967_295.0
                             {
-                                let val = elements.get(n as usize).copied().unwrap_or(Value::undefined());
-                                self.push(val);
-                                continue;
-                            }
-                            // String key on array: "length" or numeric string like "0"
-                            if let Some(name_id) = key.as_string_id() {
+                                if let Some(val) = elements.get(n as usize).copied() {
+                                    self.push(val);
+                                    continue;
+                                }
+                            } else if let Some(name_id) = key.as_string_id() {
                                 let name = self.interner.resolve(name_id);
                                 if name == "length" {
                                     self.push(Value::int(elements.len() as i32));
                                     continue;
                                 }
-                                // Try parsing string as numeric index: arr["0"]
-                                if let Ok(idx) = name.parse::<usize>() {
-                                    let val = elements.get(idx).copied().unwrap_or(Value::undefined());
+                                // Numeric string index: arr["0"]
+                                if let Ok(idx) = name.parse::<usize>()
+                                    && let Some(val) = elements.get(idx).copied()
+                                {
                                     self.push(val);
                                     continue;
                                 }
@@ -3815,6 +3824,10 @@ impl Vm {
                             let in_strict = self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT);
                             let getter_key = self.interner.intern(&format!("__get_{name_str}__"));
                             let has_getter = self.heap.get_property_chain(oid, getter_key).is_some();
+                            // A stored but non-callable setter half (set:
+                            // undefined) still marks an accessor.
+                            let is_accessor = has_getter
+                                || self.heap.get_property_chain(oid, setter_key).is_some();
                             let is_readonly_own = self.heap.get(oid).and_then(|o| {
                                 o.get_property_descriptor(name_id).filter(|p| !p.is_writable())
                             }).is_some();
@@ -3822,9 +3835,9 @@ impl Vm {
                             let has_own = self.heap.get(oid)
                                 .map(|o| o.has_own_property(name_id))
                                 .unwrap_or(false);
-                            if in_strict && (is_readonly_own || has_getter || (!extensible && !has_own)) {
+                            if in_strict && (is_readonly_own || is_accessor || (!extensible && !has_own)) {
                                 let prop = self.interner.resolve(name_id).to_owned();
-                                let msg = if has_getter {
+                                let msg = if is_accessor {
                                     format!("Cannot set property '{prop}' which has only a getter")
                                 } else if is_readonly_own {
                                     format!("Cannot assign to read only property '{prop}'")
@@ -3835,7 +3848,7 @@ impl Vm {
                                 self.handle_throw(err)?;
                                 continue;
                             }
-                            if has_getter {
+                            if is_accessor {
                                 self.push(val);
                                 continue;
                             }
@@ -5044,7 +5057,15 @@ impl Vm {
                     if obj_val.is_function() && obj_val.as_function() == Some(-508) {
                         let mn = self.interner.resolve(method_name).to_owned();
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                        let result = self.exec_object_static(&mn, &args)?.unwrap_or(Value::undefined());
+                        let result = match self.exec_object_static(&mn, &args) {
+                            Ok(v) => v.unwrap_or(Value::undefined()),
+                            Err(VmError::Throw(v)) => {
+                                self.truncate_stack(obj_pos);
+                                self.handle_throw(v)?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
                         self.truncate_stack(obj_pos);
                         self.push(result);
                         continue;
@@ -5682,7 +5703,10 @@ impl Vm {
                                 && let Some(sid) = wrapped.as_string_id() {
                                     let len = self.interner.resolve(sid).chars().count() as i32;
                                     let len_key = self.interner.intern("length");
-                                    obj.set_property(len_key, Value::int(len));
+                                    // Spec: non-writable, non-enumerable,
+                                    // non-configurable (must not show up in
+                                    // for-in or descriptor enumeration).
+                                    obj.define_property(len_key, Property::with_flags(Value::int(len), 0));
                                 }
                             let oid = self.heap.allocate(obj);
                             self.truncate_stack(func_pos);

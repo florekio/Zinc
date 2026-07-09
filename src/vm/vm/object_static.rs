@@ -121,64 +121,74 @@ impl Vm {
             }
             "values" => {
                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
-                    let vals: Vec<Value> = self.heap.get(oid)
-                        .map(|o| {
-                            if let ObjectKind::Array(ref elems) = o.kind {
-                                elems.clone()
-                            } else {
-                                o.properties.iter()
-                                    .filter(|(k, p)| p.is_enumerable()
-                                        && !is_internal_key(self.interner.resolve(*k)))
-                                    .map(|(_, p)| p.value).collect()
-                            }
-                        })
+                    let elems: Vec<Value> = self.heap.get(oid)
+                        .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                         .unwrap_or_default();
+                    let mut vals = elems;
+                    for key in self.enumerable_own_string_keys(oid) {
+                        let v = self.getter_aware_get(oid, &key)?.unwrap_or(Value::undefined());
+                        vals.push(v);
+                    }
                     self.alloc_array(vals)
                 } else { Value::undefined() }
             }
             "entries" => {
                 if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
-                    let pairs: Vec<(Value, Value)> = self.heap.get(oid)
-                        .map(|o| o.properties.iter()
-                            .filter(|(k, p)| p.is_enumerable()
-                                && !is_internal_key(self.interner.resolve(*k)))
-                            .map(|&(k, ref p)| (Value::string(k), p.value)).collect())
+                    let elems: Vec<Value> = self.heap.get(oid)
+                        .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                         .unwrap_or_default();
                     let mut entries = Vec::new();
-                    for (k, v) in pairs {
+                    for (i, v) in elems.into_iter().enumerate() {
+                        let k = self.new_str(&i.to_string());
                         let pair = self.alloc_array(vec![k, v]);
+                        entries.push(pair);
+                    }
+                    for key in self.enumerable_own_string_keys(oid) {
+                        let v = self.getter_aware_get(oid, &key)?.unwrap_or(Value::undefined());
+                        let k_id = self.interner.intern(&key);
+                        let pair = self.alloc_array(vec![Value::string(k_id), v]);
                         entries.push(pair);
                     }
                     self.alloc_array(entries)
                 } else { Value::undefined() }
             }
-            "assign" => self.exec_object_assign(args),
+            "assign" => {
+                if args.first().copied().unwrap_or(Value::undefined()).is_nullish() {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Cannot convert undefined or null to object",
+                    )));
+                }
+                self.exec_object_assign(args)
+            }
             "create" => {
-                let proto = args.first().copied().unwrap_or(Value::null());
+                let proto = args.first().copied().unwrap_or(Value::undefined());
+                if !(proto.is_null() || proto.as_object_id().is_some() || proto.is_function()) {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Object prototype may only be an Object or null",
+                    )));
+                }
                 let mut obj = JsObject::ordinary();
                 obj.prototype = proto.as_object_id();
-                // Handle property descriptors argument (2nd arg)
-                if let Some(desc_val) = args.get(1)
-                    && let Some(desc_oid) = desc_val.as_object_id()
-                {
-                    let props: Vec<(StringId, Value)> = self.heap.get(desc_oid)
-                        .map(|o| o.properties.iter().map(|&(k, ref p)| (k, p.value)).collect())
-                        .unwrap_or_default();
-                    for (key, desc_obj_val) in props {
-                        if let Some(d_oid) = desc_obj_val.as_object_id() {
-                            let value_key = self.interner.intern("value");
-                            let val = self.heap.get_property_chain(d_oid, value_key)
-                                .unwrap_or(Value::undefined());
-                            obj.set_property(key, val);
-                        }
-                    }
+                let target = Value::object_id(self.heap.allocate(obj));
+                if let Some(descs) = args.get(1).copied().filter(|v| !v.is_undefined()) {
+                    self.apply_property_descriptors(target, descs)?;
                 }
-                Value::object_id(self.heap.allocate(obj))
+                target
             }
-            "defineProperty" => self.object_define_property(args),
+            "defineProperty" => self.object_define_property(args)?,
             "defineProperties" => {
-                // Simplified: treat like Object.assign for now
-                args.first().copied().unwrap_or(Value::undefined())
+                let target = args.first().copied().unwrap_or(Value::undefined());
+                if target.as_object_id().is_none() && !target.is_function() {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Object.defineProperties called on non-object",
+                    )));
+                }
+                let descs = args.get(1).copied().unwrap_or(Value::undefined());
+                self.apply_property_descriptors(target, descs)?;
+                target
             }
             "getOwnPropertyDescriptor" => {
                 let first_arg = args.first().copied().unwrap_or(Value::undefined());
@@ -556,10 +566,20 @@ impl Vm {
                     let keys: Vec<StringId> = self.heap.get(oid)
                         .map(|o| o.properties.iter().map(|&(k, _)| k).collect())
                         .unwrap_or_default();
+                    let mut seen = std::collections::HashSet::new();
                     for k in keys {
                         let name = self.interner.resolve(k);
-                        if let Some(rest) = name.strip_prefix("__sym_").and_then(|s| s.strip_suffix("__"))
+                        // Data props are "__sym_N__"; accessor halves are
+                        // "__get___sym_N__" / "__set___sym_N__".
+                        let body = name
+                            .strip_prefix("__get_")
+                            .or_else(|| name.strip_prefix("__set_"))
+                            .map(|s| s.strip_suffix("__").unwrap_or(s))
+                            .unwrap_or(name);
+                        if let Some(rest) = body.strip_prefix("__sym_")
+                            && let Some(rest) = rest.strip_suffix("__").or(Some(rest))
                             && let Ok(n) = rest.parse::<u32>()
+                            && seen.insert(n)
                         {
                             syms.push(Value::symbol(n));
                         }

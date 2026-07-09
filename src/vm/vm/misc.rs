@@ -52,7 +52,153 @@ impl Vm {
             && self.heap.get_property_chain(oid, setter_key).is_none()
     }
 
-    pub(crate) fn object_define_property(&mut self, args: &[Value]) -> Value {
+    /// ObjectDefineProperties: apply every own enumerable key of `descs` to
+    /// `target` as a property descriptor. Shared by Object.create and
+    /// Object.defineProperties.
+    pub(crate) fn apply_property_descriptors(&mut self, target: Value, descs: Value) -> Result<(), VmError> {
+        let Some(doid) = descs.as_object_id() else {
+            // ToObject(Properties): null/undefined throw; other primitives
+            // box to objects with no own enumerable string keys.
+            if descs.is_nullish() {
+                return Err(VmError::Throw(self.make_native_error(
+                    "TypeError",
+                    "Cannot convert undefined or null to object",
+                )));
+            }
+            return Ok(());
+        };
+        // Own enumerable keys, with accessor halves (__get_X__/__set_X__)
+        // reduced to X; symbol keys keep their storage encoding.
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(o) = self.heap.get(doid) {
+            for (k, p) in &o.properties {
+                if !p.is_enumerable() {
+                    continue;
+                }
+                let ks = self.interner.resolve(*k);
+                let base = if ks.starts_with("__sym_") && ks.ends_with("__") {
+                    ks
+                } else if let Some(rest) = ks
+                    .strip_prefix("__get_")
+                    .and_then(|r| r.strip_suffix("__"))
+                    .or_else(|| ks.strip_prefix("__set_").and_then(|r| r.strip_suffix("__")))
+                {
+                    rest
+                } else if is_internal_key(ks) {
+                    continue;
+                } else {
+                    ks
+                };
+                if !keys.iter().any(|e| e == base) {
+                    keys.push(base.to_string());
+                }
+            }
+        }
+        for kstr in keys {
+            let key_id = self.interner.intern(&kstr);
+            // Get(descObj, key) — getter-aware, receiver = the desc object.
+            let getter_key = self.interner.intern(&format!("__get_{kstr}__"));
+            let dval = if let Some(g) = self
+                .heap
+                .get(doid)
+                .and_then(|o| o.get_property(getter_key))
+                .filter(|v| v.is_function())
+            {
+                self.call_function_this(g, descs, &[])?
+            } else {
+                self.heap
+                    .get(doid)
+                    .and_then(|o| o.get_property(key_id))
+                    .unwrap_or(Value::undefined())
+            };
+            if dval.as_object_id().is_none() && !dval.is_function() {
+                return Err(VmError::Throw(self.make_native_error(
+                    "TypeError",
+                    "Property description must be an object",
+                )));
+            }
+            self.object_define_property(&[target, Value::string(key_id), dval])?;
+        }
+        Ok(())
+    }
+
+    /// Own enumerable string keys in spec order (numeric ascending, then
+    /// insertion order), with accessor halves reduced to their base name and
+    /// internal/symbol keys skipped. Shared by Object.values / entries.
+    pub(crate) fn enumerable_own_string_keys(&mut self, oid: ObjectId) -> Vec<String> {
+        let raw: Vec<(String, bool)> = self.heap.get(oid)
+            .map(|o| o.properties.iter()
+                .map(|(k, p)| (self.interner.resolve(*k).to_owned(), p.is_enumerable()))
+                .collect())
+            .unwrap_or_default();
+        let mut ordered: Vec<String> = Vec::new();
+        for (ks, enumerable) in raw {
+            if !enumerable {
+                continue;
+            }
+            let base = if let Some(rest) = ks
+                .strip_prefix("__get_")
+                .and_then(|r| r.strip_suffix("__"))
+                .or_else(|| ks.strip_prefix("__set_").and_then(|r| r.strip_suffix("__")))
+            {
+                rest.to_string()
+            } else if is_internal_key(&ks) {
+                continue;
+            } else {
+                ks
+            };
+            if base.starts_with("__sym_") {
+                continue;
+            }
+            if !ordered.contains(&base) {
+                ordered.push(base);
+            }
+        }
+        let (mut numeric, rest): (Vec<String>, Vec<String>) =
+            ordered.into_iter().partition(|k| k.parse::<u64>().is_ok());
+        numeric.sort_by_key(|k| k.parse::<u64>().unwrap());
+        numeric.extend(rest);
+        numeric
+    }
+
+    /// Get(O, key) for a named key: getter-aware, per-level shadowing
+    /// (own setter-only accessors read as undefined), chain-walking.
+    pub(crate) fn getter_aware_get(&mut self, oid: ObjectId, key: &str) -> Result<Option<Value>, VmError> {
+        let key_id = self.interner.intern(key);
+        let getter_key = self.interner.intern(&format!("__get_{key}__"));
+        let setter_key = self.interner.intern(&format!("__set_{key}__"));
+        let receiver = Value::object_id(oid);
+        let mut cur = Some(oid);
+        let mut hops = 0;
+        while let Some(c) = cur {
+            let (g, d, has_set, proto) = match self.heap.get(c) {
+                Some(o) => (
+                    o.get_property(getter_key).filter(|v| v.is_function()),
+                    o.get_property(key_id),
+                    o.get_property(setter_key).is_some(),
+                    o.prototype,
+                ),
+                None => (None, None, false, None),
+            };
+            if let Some(g) = g {
+                return self.call_function_this(g, receiver, &[]).map(Some);
+            }
+            if let Some(d) = d {
+                return Ok(Some(d));
+            }
+            if has_set {
+                return Ok(Some(Value::undefined()));
+            }
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            cur = proto;
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn object_define_property(&mut self, args: &[Value]) -> Result<Value, VmError> {
         // A canonical array index per ECMAScript: the string is the decimal
         // form of a non-negative integer < 2^32-1, with no leading zeros
         // ("0" itself is fine). "01", "1.5", "-1", "4294967295" are not.
@@ -97,9 +243,9 @@ impl Vm {
             if let Some(value) = value {
                 self.fn_property_overrides.insert((sentinel, key_id), Some(value));
             }
-            return target;
+            return Ok(target);
         }
-        let Some(target_oid) = target.as_object_id() else { return target };
+        let Some(target_oid) = target.as_object_id() else { return Ok(target) };
         let key_str = if key_val.is_symbol() {
             format!("__sym_{}__", key_val.as_symbol_id().unwrap())
         } else {
@@ -110,47 +256,185 @@ impl Vm {
         let mut value = Value::undefined();
         let mut has_value = false;
         let mut present: u8 = 0;
+        let mut prior_accessor_flags: Option<u8> = None;
         if let Some(desc_oid) = desc_val.as_object_id() {
-            let writable_key = self.interner.intern("writable");
-            let enumerable_key = self.interner.intern("enumerable");
-            let configurable_key = self.interner.intern("configurable");
-            let value_key = self.interner.intern("value");
-            let get_key = self.interner.intern("get");
-            let set_key = self.interner.intern("set");
-            if let Some(v) = self.heap.get_property_chain(desc_oid, value_key) {
-                value = v;
-                has_value = true;
-            }
+            // ToPropertyDescriptor: fields read via Get (getters run) in
+            // spec order — enumerable, configurable, value, writable, get, set.
             flags = 0;
-            if let Some(v) = self.heap.get_property_chain(desc_oid, writable_key) {
-                present |= Property::WRITABLE;
-                if v.to_boolean() { flags |= Property::WRITABLE; }
-            }
-            if let Some(v) = self.heap.get_property_chain(desc_oid, enumerable_key) {
+            if let Some(v) = self.getter_aware_get(desc_oid, "enumerable")? {
                 present |= Property::ENUMERABLE;
                 if v.to_boolean() { flags |= Property::ENUMERABLE; }
             }
-            if let Some(v) = self.heap.get_property_chain(desc_oid, configurable_key) {
+            if let Some(v) = self.getter_aware_get(desc_oid, "configurable")? {
                 present |= Property::CONFIGURABLE;
                 if v.to_boolean() { flags |= Property::CONFIGURABLE; }
             }
+            if let Some(v) = self.getter_aware_get(desc_oid, "value")? {
+                value = v;
+                has_value = true;
+            }
+            if let Some(v) = self.getter_aware_get(desc_oid, "writable")? {
+                present |= Property::WRITABLE;
+                if v.to_boolean() { flags |= Property::WRITABLE; }
+            }
             let accessor_flags = flags & (Property::ENUMERABLE | Property::CONFIGURABLE);
-            if let Some(getter) = self.heap.get_property_chain(desc_oid, get_key)
-                && getter.is_function() {
-                    let getter_key = self.interner.intern(&format!("__get_{key_str}__"));
-                    if let Some(obj) = self.heap.get_mut(target_oid) {
-                        obj.define_property(getter_key,
-                            Property::with_flags(getter, accessor_flags));
+            // Parse get/set without applying yet — validation against an
+            // existing non-configurable property must happen first.
+            let mut new_getter: Option<Value> = None;
+            let mut new_setter: Option<Value> = None;
+            let mut desc_has_get = false;
+            let mut desc_has_set = false;
+            if let Some(g) = self.getter_aware_get(desc_oid, "get")? {
+                desc_has_get = true;
+                if g.is_function() { new_getter = Some(g); }
+            }
+            if let Some(s) = self.getter_aware_get(desc_oid, "set")? {
+                desc_has_set = true;
+                if s.is_function() { new_setter = Some(s); }
+            }
+            let desc_is_accessor = desc_has_get || desc_has_set;
+            let desc_is_data = has_value || present & Property::WRITABLE != 0;
+
+            // ValidateAndApplyPropertyDescriptor: an existing
+            // non-configurable property rejects incompatible redefines.
+            let gk = self.interner.intern(&format!("__get_{key_str}__"));
+            let sk = self.interner.intern(&format!("__set_{key_str}__"));
+            let (ex_named, ex_get, ex_set) = match self.heap.get(target_oid) {
+                Some(o) => (
+                    o.get_property_descriptor(key_id).map(|p| (p.value, p.flags)),
+                    o.get_property_descriptor(gk).map(|p| (p.value, p.flags)),
+                    o.get_property_descriptor(sk).map(|p| (p.value, p.flags)),
+                ),
+                None => (None, None, None),
+            };
+            let ex_is_accessor = ex_get.is_some() || ex_set.is_some();
+            let ex_flags = if ex_is_accessor {
+                ex_get.or(ex_set).map(|(_, f)| f)
+            } else {
+                ex_named.map(|(_, f)| f)
+            };
+            if let Some(exf) = ex_flags
+                && exf & Property::CONFIGURABLE == 0
+            {
+                let same_fn = |a: Option<Value>, b: Option<(Value, u8)>| -> bool {
+                    match (a, b) {
+                        (None, None) => true,
+                        // `get: undefined` in the descriptor matches a stored
+                        // undefined half.
+                        (None, Some((y, _))) => y.is_undefined(),
+                        (Some(x), Some((y, _))) => x == y,
+                        (Some(_), None) => false,
+                    }
+                };
+                let reject =
+                    // Can't make it configurable again
+                    (present & Property::CONFIGURABLE != 0 && flags & Property::CONFIGURABLE != 0)
+                    // Can't flip enumerable
+                    || (present & Property::ENUMERABLE != 0
+                        && (flags ^ exf) & Property::ENUMERABLE != 0)
+                    // Can't convert between data and accessor
+                    || (desc_is_data && ex_is_accessor)
+                    || (desc_is_accessor && !ex_is_accessor)
+                    // Accessor: get/set must match exactly
+                    || (ex_is_accessor
+                        && ((desc_has_get && !same_fn(new_getter, ex_get))
+                            || (desc_has_set && !same_fn(new_setter, ex_set))))
+                    // Non-writable data: no value change, no re-enabling write
+                    || (!ex_is_accessor
+                        && exf & Property::WRITABLE == 0
+                        && ((present & Property::WRITABLE != 0 && flags & Property::WRITABLE != 0)
+                            || (has_value
+                                && !ex_named.map(|(v, _)| {
+                                    v == value
+                                        || (v.as_number().is_some_and(f64::is_nan)
+                                            && value.as_number().is_some_and(f64::is_nan))
+                                }).unwrap_or(false))));
+                if reject {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        &format!("Cannot redefine property: {key_str}"),
+                    )));
+                }
+            }
+
+            // Attributes absent from the descriptor keep the existing
+            // accessor's values (re-installing just a getter must not reset
+            // enumerable/configurable).
+            let mut acc_flags = accessor_flags;
+            if let Some((_, exf)) = ex_get.or(ex_set) {
+                for bit in [Property::ENUMERABLE, Property::CONFIGURABLE] {
+                    if present & bit == 0 {
+                        acc_flags = (acc_flags & !bit) | (exf & bit);
                     }
                 }
-            if let Some(setter) = self.heap.get_property_chain(desc_oid, set_key)
-                && setter.is_function() {
-                    let setter_key = self.interner.intern(&format!("__set_{key_str}__"));
-                    if let Some(obj) = self.heap.get_mut(target_oid) {
-                        obj.define_property(setter_key,
-                            Property::with_flags(setter, accessor_flags));
+            }
+            // Explicit `get: undefined` / `set: undefined` still creates the
+            // accessor half (an accessor property with no functions exists,
+            // reads as undefined, and is redefinable with identical halves).
+            // Converting an existing data entry renames it in place so the
+            // property keeps its creation-order position.
+            if (desc_has_get || desc_has_set)
+                && let Some(obj) = self.heap.get_mut(target_oid)
+            {
+                let first_half = if desc_has_get { gk } else { sk };
+                if !obj.has_own_property(first_half)
+                    && let Some(e) = obj.properties.iter_mut().find(|e| e.0 == key_id)
+                {
+                    e.0 = first_half;
+                }
+            }
+            let mut installed_accessor = false;
+            if desc_has_get
+                && let Some(obj) = self.heap.get_mut(target_oid) {
+                    obj.define_property(
+                        gk,
+                        Property::with_flags(new_getter.unwrap_or(Value::undefined()), acc_flags),
+                    );
+                    installed_accessor = true;
+                }
+            if desc_has_set
+                && let Some(obj) = self.heap.get_mut(target_oid) {
+                    obj.define_property(
+                        sk,
+                        Property::with_flags(new_setter.unwrap_or(Value::undefined()), acc_flags),
+                    );
+                    installed_accessor = true;
+                }
+            // An accessor define replaces an existing data property.
+            if installed_accessor
+                && let Some(obj) = self.heap.get_mut(target_oid) {
+                    obj.delete_property(key_id);
+                }
+            // A data define ({value} / {writable}) replaces an existing
+            // accessor property — drop the stale halves so the new value
+            // isn't shadowed (and the old getter can't resurface). The
+            // converted property inherits the accessor's enumerable /
+            // configurable where the descriptor is silent, and keeps the
+            // accessor's POSITION (creation order survives redefinition).
+            if !installed_accessor && desc_is_data && ex_is_accessor {
+                prior_accessor_flags = ex_get.or(ex_set).map(|(_, f)| f);
+                if let Some(obj) = self.heap.get_mut(target_oid) {
+                    if let Some(entry) = obj.properties.iter_mut()
+                        .find(|e| e.0 == gk || e.0 == sk)
+                    {
+                        entry.0 = key_id; // later define_property updates in place
+                    }
+                    obj.delete_property(gk);
+                    obj.delete_property(sk);
+                }
+            }
+            // A flags-only redefine of an existing accessor updates the
+            // halves' attributes in place (nothing else changes).
+            if !installed_accessor && !desc_is_data && !desc_is_accessor && ex_is_accessor
+                && present & (Property::ENUMERABLE | Property::CONFIGURABLE) != 0
+                && let Some(obj) = self.heap.get_mut(target_oid)
+            {
+                for k in [gk, sk] {
+                    if let Some(e) = obj.properties.iter_mut().find(|e| e.0 == k) {
+                        e.1 = Property::with_flags(e.1.value, acc_flags);
                     }
                 }
+            }
         }
         let has_accessor = self.heap.get(target_oid)
             .map(|o| {
@@ -167,6 +451,7 @@ impl Vm {
             let existing_flags = self.heap.get(target_oid)
                 .and_then(|o| o.get_property_descriptor(key_id))
                 .map(|p| p.flags)
+                .or(prior_accessor_flags)
                 .or_else(|| {
                     canonical_array_index(&key_str).and_then(|idx| {
                         self.heap.get(target_oid).and_then(|o| {
@@ -225,8 +510,46 @@ impl Vm {
                         }
                         if idx < elements.len() { elements[idx] = value; }
                     }
-                    return target;
+                    return Ok(target);
                 }
+            }
+            // Defining "length" on an Array resizes element storage; a named
+            // "length" property would shadow the live element count, so never
+            // create one (flags-only defines leave the length as-is).
+            if key_str == "length"
+                && self.heap.get(target_oid).is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)))
+            {
+                if has_value {
+                    let n = self.to_f64(value);
+                    let n32 = n as u32;
+                    if !(n.is_finite() && n >= 0.0 && n.fract() == 0.0 && (n32 as f64) == n) {
+                        return Err(VmError::Throw(
+                            self.make_native_error("RangeError", "Invalid array length"),
+                        ));
+                    }
+                    let req = n32 as usize;
+                    let cur_len = self.heap.get(target_oid).map(|o| {
+                        if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 }
+                    }).unwrap_or(0);
+                    if req > cur_len {
+                        // Growing creates HOLES, which dense storage can't
+                        // represent (undefined-filling would fabricate own
+                        // index properties). Store a shadowing named length
+                        // instead — reads observe it, elements stay sparse.
+                        if let Some(obj) = self.heap.get_mut(target_oid) {
+                            obj.define_property(
+                                key_id,
+                                Property::with_flags(Value::number(n32 as f64), Property::WRITABLE),
+                            );
+                        }
+                    } else if let Some(obj) = self.heap.get_mut(target_oid)
+                        && let ObjectKind::Array(ref mut elements) = obj.kind
+                    {
+                        elements.truncate(req);
+                        obj.delete_property(key_id); // drop any stale shadow
+                    }
+                }
+                return Ok(target);
             }
             // Partial-flag define on an array index: flags live in the
             // property map, the VALUE stays in element storage. Keep the two
@@ -234,6 +557,7 @@ impl Vm {
             // value, and store the CURRENT element value in the map entry
             // when it doesn't (so reads via either path agree).
             let mut map_value = value;
+            let mut value_resolved = has_value;
             if let Some(idx) = canonical_array_index(&key_str)
                 && let Some(obj) = self.heap.get_mut(target_oid)
                 && let ObjectKind::Array(ref mut elements) = obj.kind
@@ -243,13 +567,21 @@ impl Vm {
                     elements[idx] = value;
                 } else {
                     map_value = elements[idx];
+                    value_resolved = true;
                 }
+            }
+            // A descriptor without `value` keeps the CURRENT value of an
+            // existing property ({} or flags-only must not clobber it).
+            if !value_resolved
+                && let Some(p) = self.heap.get(target_oid).and_then(|o| o.get_property_descriptor(key_id))
+            {
+                map_value = p.value;
             }
             if let Some(obj) = self.heap.get_mut(target_oid) {
                 obj.define_property(key_id, Property::with_flags(map_value, flags));
             }
         }
-        target
+        Ok(target)
     }
 
     /// Implements `Function(...)` and `new Function(...)`: concatenates params,
