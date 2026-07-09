@@ -54,6 +54,13 @@ impl Vm {
                         }
                         return Err(VmError::RuntimeError("execution limit exceeded".into()));
                     }
+                    // Checked once per 1024 dispatches, so the Instant read is
+                    // amortized to nothing.
+                    if let Some(deadline) = self.deadline
+                        && std::time::Instant::now() > deadline
+                    {
+                        return Err(VmError::RuntimeError("execution time limit exceeded".into()));
+                    }
                 }
             }
 
@@ -1667,9 +1674,9 @@ impl Vm {
                                 if let Some(n) = only.as_number()
                                     && n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64
                                 {
-                                    vec![Value::undefined(); n as usize]
+                                    vec![Value::undefined(); (n as usize).min(10_000_000)]
                                 } else if let Some(n) = only.as_int() {
-                                    if n >= 0 { vec![Value::undefined(); n as usize] } else { vec![only] }
+                                    if n >= 0 { vec![Value::undefined(); (n as usize).min(10_000_000)] } else { vec![only] }
                                 } else {
                                     vec![only]
                                 }
@@ -1768,6 +1775,11 @@ impl Vm {
                                     ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { sentinel }) => {
                                         Some(Value::function(*sentinel))
                                     }
+                                    // Host/native function objects dispatch by
+                                    // object value (call_function_this unwraps).
+                                    ObjectKind::Function(crate::runtime::object::FunctionKind::Native { .. }) => {
+                                        Some(Value::object_id(target_oid))
+                                    }
                                     _ => None,
                                 }
                             });
@@ -1776,8 +1788,17 @@ impl Vm {
                                     .chain((0..argc).map(|i| self.stack[func_pos + 1 + i]))
                                     .collect();
                                 self.truncate_stack(func_pos);
-                                let result = self.call_with_async_wrap(fn_val, this_val, &call_args)?;
-                                self.push(result);
+                                let prev_protect = self.protect_throw_depth;
+                                self.protect_throw_depth = self.frames.len() + 1;
+                                let r = self.call_with_async_wrap(fn_val, this_val, &call_args);
+                                self.protect_throw_depth = prev_protect;
+                                match r {
+                                    Ok(v) => self.push(v),
+                                    Err(VmError::Throw(v)) => {
+                                        self.handle_throw(v)?;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
                                 continue;
                             }
                         }
@@ -3687,10 +3708,10 @@ impl Vm {
                                 // entry's value in sync.
                                 if let Some(obj) = self.heap.get_mut(oid) {
                                     if let ObjectKind::Array(ref mut elements) = obj.kind {
-                                        while elements.len() <= idx {
+                                        while elements.len() <= idx && elements.len() < 10_000_000 {
                                             elements.push(Value::undefined());
                                         }
-                                        elements[idx] = val;
+                                        if idx < elements.len() { elements[idx] = val; }
                                     }
                                     obj.set_property(key_id, val);
                                 }
@@ -3708,10 +3729,10 @@ impl Vm {
                                 && i >= 0
                             {
                                 let idx = i as usize;
-                                while elements.len() <= idx {
+                                while elements.len() <= idx && elements.len() < 10_000_000 {
                                     elements.push(Value::undefined());
                                 }
-                                elements[idx] = val;
+                                if idx < elements.len() { elements[idx] = val; }
                                 self.push(val);
                                 continue;
                             }
@@ -3725,10 +3746,10 @@ impl Vm {
                                 && n < 4_294_967_295.0
                             {
                                 let idx = n as usize;
-                                while elements.len() <= idx {
+                                while elements.len() <= idx && elements.len() < 10_000_000 {
                                     elements.push(Value::undefined());
                                 }
-                                elements[idx] = val;
+                                if idx < elements.len() { elements[idx] = val; }
                                 self.push(val);
                                 continue;
                             }
@@ -4439,7 +4460,18 @@ impl Vm {
                                 let this_arg = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
                                 let call_args: Vec<Value> = (1..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                                 self.truncate_stack(obj_pos);
-                                let result = self.call_with_async_wrap(obj_val, this_arg, &call_args)?;
+                                let prev_protect = self.protect_throw_depth;
+                                self.protect_throw_depth = self.frames.len() + 1;
+                                let r = self.call_with_async_wrap(obj_val, this_arg, &call_args);
+                                self.protect_throw_depth = prev_protect;
+                                let result = match r {
+                                    Ok(v) => v,
+                                    Err(VmError::Throw(v)) => {
+                                        self.handle_throw(v)?;
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                };
                                 self.push(result);
                                 continue;
                             }
@@ -4455,7 +4487,18 @@ impl Vm {
                                             }
                                 }
                                 self.truncate_stack(obj_pos);
-                                let result = self.call_with_async_wrap(obj_val, this_arg, &call_args)?;
+                                let prev_protect = self.protect_throw_depth;
+                                self.protect_throw_depth = self.frames.len() + 1;
+                                let r = self.call_with_async_wrap(obj_val, this_arg, &call_args);
+                                self.protect_throw_depth = prev_protect;
+                                let result = match r {
+                                    Ok(v) => v,
+                                    Err(VmError::Throw(v)) => {
+                                        self.handle_throw(v)?;
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                };
                                 self.push(result);
                                 continue;
                             }
@@ -5626,9 +5669,9 @@ impl Vm {
                             if let Some(n) = only.as_number()
                                 && n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64
                             {
-                                vec![Value::undefined(); n as usize]
+                                vec![Value::undefined(); (n as usize).min(10_000_000)]
                             } else if let Some(n) = only.as_int() {
-                                if n >= 0 { vec![Value::undefined(); n as usize] } else { vec![only] }
+                                if n >= 0 { vec![Value::undefined(); (n as usize).min(10_000_000)] } else { vec![only] }
                             } else {
                                 vec![only]
                             }
@@ -6283,10 +6326,10 @@ impl Vm {
                                 if idx < elements.len() && elements.len() > idx {
                                     elements.push(val);
                                 } else {
-                                    while elements.len() <= idx {
+                                    while elements.len() <= idx && elements.len() < 10_000_000 {
                                         elements.push(Value::undefined());
                                     }
-                                    elements[idx] = val;
+                                    if idx < elements.len() { elements[idx] = val; }
                                 }
                             }
                 }

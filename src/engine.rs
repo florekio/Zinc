@@ -60,6 +60,8 @@ impl Engine {
     pub fn set_max_steps(&mut self, n: u64) {
         self.max_steps = n;
         self.vm.max_steps = n;
+        // Bounded runs also get a wall-clock deadline (native-heavy steps).
+        self.vm.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
     }
 
     /// Suppress stdout/stderr writes from `console.log/warn/error`.

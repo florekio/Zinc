@@ -176,43 +176,54 @@ fn should_skip(source: &str, meta: &TestMeta) -> bool {
 }
 
 const CATEGORIES: &[&str] = &[
-    "expressions/addition", "expressions/subtraction", "expressions/multiplication",
-    "expressions/division", "expressions/remainder", "expressions/exponentiation",
-    "expressions/unary-minus", "expressions/unary-plus", "expressions/typeof",
-    "expressions/void", "expressions/delete", "expressions/logical-not",
-    "expressions/logical-and", "expressions/logical-or", "expressions/bitwise-and",
-    "expressions/bitwise-or", "expressions/bitwise-xor", "expressions/bitwise-not",
-    "expressions/left-shift", "expressions/right-shift", "expressions/unsigned-right-shift",
-    "expressions/equals", "expressions/does-not-equals", "expressions/strict-equals",
-    "expressions/strict-does-not-equals", "expressions/less-than",
-    "expressions/less-than-or-equal", "expressions/greater-than",
-    "expressions/greater-than-or-equal", "expressions/conditional", "expressions/comma",
-    "expressions/grouping", "expressions/postfix-increment", "expressions/postfix-decrement",
-    "expressions/prefix-increment", "expressions/prefix-decrement", "expressions/assignment",
-    "expressions/compound-assignment", "statements/if", "statements/while",
-    "statements/do-while", "statements/for", "statements/switch", "statements/break",
-    "statements/continue", "statements/return", "statements/throw", "statements/try",
-    "statements/block", "statements/empty", "statements/variable", "statements/expression",
-    "statements/labeled", "literals/numeric", "literals/string", "literals/boolean",
-    "literals/null", "comments", "white-space", "punctuators", "types", "asi",
-    "block-scope", "keywords", "line-terminators", "function-code", "global-code",
-    "identifier-resolution", "rest-parameters", "computed-property-names", "statementList",
-    "expressions/object", "expressions/function", "expressions/coalesce",
-    "expressions/concatenation", "expressions/logical-assignment", "expressions/modulus",
-    "expressions/relational", "expressions/arrow-function", "expressions/template-literal",
-    "expressions/this", "expressions/optional-chaining", "expressions/async-function",
-    "statements/for-of", "statements/const", "statements/let", "statements/class",
-    "statements/function", "statements/for-in", "expressions/array", "expressions/in",
-    "expressions/instanceof", "expressions/new", "expressions/call", "directive-prologue",
-    "future-reserved-words", "reserved-words",
+    "language/expressions/addition", "language/expressions/subtraction", "language/expressions/multiplication",
+    "language/expressions/division", "language/expressions/remainder", "language/expressions/exponentiation",
+    "language/expressions/unary-minus", "language/expressions/unary-plus", "language/expressions/typeof",
+    "language/expressions/void", "language/expressions/delete", "language/expressions/logical-not",
+    "language/expressions/logical-and", "language/expressions/logical-or", "language/expressions/bitwise-and",
+    "language/expressions/bitwise-or", "language/expressions/bitwise-xor", "language/expressions/bitwise-not",
+    "language/expressions/left-shift", "language/expressions/right-shift", "language/expressions/unsigned-right-shift",
+    "language/expressions/equals", "language/expressions/does-not-equals", "language/expressions/strict-equals",
+    "language/expressions/strict-does-not-equals", "language/expressions/less-than",
+    "language/expressions/less-than-or-equal", "language/expressions/greater-than",
+    "language/expressions/greater-than-or-equal", "language/expressions/conditional", "language/expressions/comma",
+    "language/expressions/grouping", "language/expressions/postfix-increment", "language/expressions/postfix-decrement",
+    "language/expressions/prefix-increment", "language/expressions/prefix-decrement", "language/expressions/assignment",
+    "language/expressions/compound-assignment", "language/statements/if", "language/statements/while",
+    "language/statements/do-while", "language/statements/for", "language/statements/switch", "language/statements/break",
+    "language/statements/continue", "language/statements/return", "language/statements/throw", "language/statements/try",
+    "language/statements/block", "language/statements/empty", "language/statements/variable", "language/statements/expression",
+    "language/statements/labeled", "language/literals/numeric", "language/literals/string", "language/literals/boolean",
+    "language/literals/null", "language/comments", "language/white-space", "language/punctuators", "language/types", "language/asi",
+    "language/block-scope", "language/keywords", "language/line-terminators", "language/function-code", "language/global-code",
+    "language/identifier-resolution", "language/rest-parameters", "language/computed-property-names", "language/statementList",
+    "language/expressions/object", "language/expressions/function", "language/expressions/coalesce",
+    "language/expressions/concatenation", "language/expressions/logical-assignment", "language/expressions/modulus",
+    "language/expressions/relational", "language/expressions/arrow-function", "language/expressions/template-literal",
+    "language/expressions/this", "language/expressions/optional-chaining", "language/expressions/async-function",
+    "language/statements/for-of", "language/statements/const", "language/statements/let", "language/statements/class",
+    "language/statements/function", "language/statements/for-in", "language/expressions/array", "language/expressions/in",
+    "language/expressions/instanceof", "language/expressions/new", "language/expressions/call", "language/directive-prologue",
+    "language/future-reserved-words", "language/reserved-words",
     // Phase-3 additions (more language-test directories)
-    "arguments-object", "destructuring", "eval-code", "identifiers", "source-text",
-    "expressions/async-arrow-function", "expressions/await", "expressions/class",
-    "expressions/delete", "expressions/generators", "expressions/member-expression",
-    "expressions/property-accessors", "expressions/super", "expressions/tagged-template",
-    "expressions/yield", "expressions/assignmenttargettype",
-    "statements/generators", "statements/with",
-    "statements/async-function",
+    "language/arguments-object", "language/destructuring", "language/eval-code", "language/identifiers", "language/source-text",
+    "language/expressions/async-arrow-function", "language/expressions/await", "language/expressions/class",
+    "language/expressions/delete", "language/expressions/generators", "language/expressions/member-expression",
+    "language/expressions/property-accessors", "language/expressions/super", "language/expressions/tagged-template",
+    "language/expressions/yield", "language/expressions/assignmenttargettype",
+    "language/statements/generators", "language/statements/with",
+    "language/statements/async-function",
+
+    // Built-ins suites (test262/test/built-ins/*)
+    "built-ins/Array", "built-ins/String", "built-ins/Object", "built-ins/Number",
+    "built-ins/Boolean", "built-ins/Date", "built-ins/Math", "built-ins/JSON",
+    "built-ins/Map", "built-ins/Set", "built-ins/WeakMap", "built-ins/WeakSet",
+    "built-ins/Promise", "built-ins/Function", "built-ins/Error", "built-ins/NativeErrors",
+    "built-ins/Symbol", "built-ins/RegExp", "built-ins/GeneratorPrototype",
+    "built-ins/Infinity", "built-ins/NaN", "built-ins/undefined", "built-ins/global",
+    "built-ins/isNaN", "built-ins/isFinite", "built-ins/parseInt", "built-ins/parseFloat",
+    "built-ins/eval", "built-ins/encodeURI", "built-ins/decodeURI",
+    "built-ins/encodeURIComponent", "built-ins/decodeURIComponent",
 ];
 
 fn main() {
@@ -259,47 +270,64 @@ fn main() {
 
     let start = Instant::now();
 
-    for category in CATEGORIES {
-        // Each category gets its own temp fail log, then we append to the main one.
-        let fail_tmp = format!("/tmp/zinc_test262_{}.log", category.replace('/', "_"));
-
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("--run-category").arg(category)
-           .arg("--fail-log").arg(&fail_tmp);
-        if verbose { cmd.arg("--verbose"); }
-
-        let output = match cmd.output() {
-            Ok(o) => o,
-            Err(e) => { eprintln!("failed to spawn subprocess for {category}: {e}"); continue; }
-        };
-
-        // Parse machine line: "MACHINE passed failed skipped total"
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(line) = stdout.lines().find(|l| l.starts_with("MACHINE ")) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() == 5 {
-                let p: usize = parts[1].parse().unwrap_or(0);
-                let f: usize = parts[2].parse().unwrap_or(0);
-                let s: usize = parts[3].parse().unwrap_or(0);
-                let t: usize = parts[4].parse().unwrap_or(0);
-                passed += p;
-                failed += f;
-                skipped += s;
-                total += t;
-                if t > 0 {
-                    category_results.push((category, t, p, f));
+    // Run category subprocesses in parallel (bounded by core count): each is
+    // fully isolated, so only the result collection needs ordering.
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(10);
+    let next: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    /// (order, category, passed, failed, skipped, total, fail-log text)
+    type CategoryResult<'a> = (usize, &'a str, usize, usize, usize, usize, String);
+    let results: std::sync::Mutex<Vec<CategoryResult>> = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i >= CATEGORIES.len() {
+                    break;
                 }
-            }
+                let category = CATEGORIES[i];
+                let fail_tmp = format!("/tmp/zinc_test262_{}.log", category.replace('/', "_"));
+                let mut cmd = std::process::Command::new(&exe);
+                cmd.arg("--run-category").arg(category)
+                    .arg("--fail-log").arg(&fail_tmp);
+                if verbose { cmd.arg("--verbose"); }
+                let output = match cmd.output() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("failed to spawn subprocess for {category}: {e}");
+                        continue;
+                    }
+                };
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut rec = (i, category, 0usize, 0usize, 0usize, 0usize, String::new());
+                if let Some(line) = stdout.lines().find(|l| l.starts_with("MACHINE ")) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() == 5 {
+                        rec.2 = parts[1].parse().unwrap_or(0);
+                        rec.3 = parts[2].parse().unwrap_or(0);
+                        rec.4 = parts[3].parse().unwrap_or(0);
+                        rec.5 = parts[4].parse().unwrap_or(0);
+                    }
+                }
+                rec.6 = fs::read_to_string(&fail_tmp).unwrap_or_default();
+                let _ = fs::remove_file(&fail_tmp);
+                results.lock().unwrap().push(rec);
+            });
         }
-
-        // Append fail lines from temp file to main output file
+    });
+    let mut results = results.into_inner().unwrap();
+    results.sort_by_key(|r| r.0);
+    for (_, category, p, f, s, t, fails) in results {
+        passed += p;
+        failed += f;
+        skipped += s;
+        total += t;
+        if t > 0 {
+            category_results.push((category, t, p, f));
+        }
         if let Some(ref mut out) = output_file {
             use std::io::Write;
-            if let Ok(content) = fs::read_to_string(&fail_tmp) {
-                let _ = out.write_all(content.as_bytes());
-            }
+            let _ = out.write_all(fails.as_bytes());
         }
-        let _ = fs::remove_file(&fail_tmp);
     }
 
     let elapsed = start.elapsed();
@@ -328,7 +356,7 @@ fn main() {
 /// Run a single category (called in subprocess mode).
 /// Prints "MACHINE <passed> <failed> <skipped> <total>" to stdout.
 fn run_single_category(category: &str, fail_log: Option<&str>, verbose: bool) {
-    let test_root = Path::new("test262/test/language");
+    let test_root = Path::new("test262/test");
     let harness_root = Path::new("test262/harness");
 
     if !test_root.exists() {
@@ -404,7 +432,7 @@ fn run_single_category(category: &str, fail_log: Option<&str>, verbose: bool) {
 
 /// Run with --filter for interactive use (single process, no subprocess isolation).
 fn run_filtered(filter: Option<&str>, output_path: Option<&str>, verbose: bool) {
-    let test_root = Path::new("test262/test/language");
+    let test_root = Path::new("test262/test");
     let harness_root = Path::new("test262/harness");
 
     if !test_root.exists() {

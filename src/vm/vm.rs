@@ -387,6 +387,10 @@ pub struct Vm {
     pub(crate) steps: u64,
     /// Max instructions before returning an error. 0 = unlimited.
     pub(crate) max_steps: u64,
+    /// Wall-clock deadline (set with max_steps): catches tests whose metered
+    /// steps each do heavy NATIVE work (O(n) string ops), which the step
+    /// budget alone bounds far too loosely.
+    pub(crate) deadline: Option<std::time::Instant>,
     /// Sampling profiler for diagnosing runaway loops (ZINC_FUEL_TRACE=1): at
     /// each fuel checkpoint (every 1024 instructions) the current (chunk_idx,
     /// source line) is tallied. On fuel exhaustion the hottest sites are dumped

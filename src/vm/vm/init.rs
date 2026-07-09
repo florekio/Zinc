@@ -580,6 +580,7 @@ impl Vm {
             computed_exclusions: Vec::new(),
             steps: 0,
             max_steps: 0,
+            deadline: None,
             fuel_samples: HashMap::new(),
             string_recv_kinds: [0; 4],
             fuel_call_counts: HashMap::new(),

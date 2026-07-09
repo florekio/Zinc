@@ -300,24 +300,27 @@ impl Vm {
                 let result = s.repeat(count);
                 self.new_str(&result)
             }
-            "padStart" => {
-                let target_len = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+            "padStart" | "padEnd" => {
+                // Cap the target length: real engines RangeError past the max
+                // string length; a dense multi-GB fill would OOM the process.
+                let target_len = (args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize)
+                    .min(10_000_000);
                 let pad = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_else(|| " ".into());
-                let mut result = s.to_string();
-                while result.len() < target_len {
-                    result.insert_str(0, &pad);
+                // An empty filler pads nothing (spec: return the string as-is)
+                // — without this check the fill loop below never terminates.
+                if pad.is_empty() || s.len() >= target_len {
+                    return self.new_str(s);
                 }
-                if result.len() > target_len { result.truncate(target_len); }
-                self.new_str(&result)
-            }
-            "padEnd" => {
-                let target_len = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                let pad = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_else(|| " ".into());
-                let mut result = s.to_string();
-                while result.len() < target_len {
-                    result.push_str(&pad);
+                let mut fill = String::with_capacity(target_len - s.len() + pad.len());
+                while fill.len() < target_len - s.len() {
+                    fill.push_str(&pad);
                 }
-                if result.len() > target_len { result.truncate(target_len); }
+                fill.truncate(target_len - s.len());
+                let result = if name == "padStart" {
+                    format!("{fill}{s}")
+                } else {
+                    format!("{s}{fill}")
+                };
                 self.new_str(&result)
             }
             "concat" => {

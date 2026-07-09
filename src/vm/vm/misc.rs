@@ -220,10 +220,10 @@ impl Vm {
                     if let Some(obj) = self.heap.get_mut(target_oid)
                         && let ObjectKind::Array(ref mut elements) = obj.kind
                     {
-                        while elements.len() <= idx {
+                        while elements.len() <= idx && elements.len() < 10_000_000 {
                             elements.push(Value::undefined());
                         }
-                        elements[idx] = value;
+                        if idx < elements.len() { elements[idx] = value; }
                     }
                     return target;
                 }
@@ -982,9 +982,9 @@ impl Vm {
                     if let Some(n) = only.as_number()
                         && n.is_finite() && n.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(&n)
                     {
-                        vec![Value::undefined(); n as usize]
+                        vec![Value::undefined(); (n as usize).min(10_000_000)]
                     } else if let Some(n) = only.as_int() {
-                        if n >= 0 { vec![Value::undefined(); n as usize] } else { vec![only] }
+                        if n >= 0 { vec![Value::undefined(); (n as usize).min(10_000_000)] } else { vec![only] }
                     } else {
                         vec![only]
                     }
@@ -1224,29 +1224,49 @@ impl Vm {
         oid: ObjectId,
         name_id: StringId,
     ) -> Option<Value> {
-        const STRING_METHODS: &[&str] = &[
-            "at", "charAt", "charCodeAt", "codePointAt", "concat", "endsWith",
-            "includes", "indexOf", "lastIndexOf", "match", "matchAll",
-            "normalize", "padEnd", "padStart", "repeat", "replace", "slice",
-            "split", "startsWith", "substr", "substring", "toLowerCase",
-            "toString", "toUpperCase", "trim", "trimEnd", "trimStart",
+        const STRING_METHODS: &[(&str, i32)] = &[
+            ("at", 1), ("charAt", 1), ("charCodeAt", 1), ("codePointAt", 1),
+            ("concat", 1), ("endsWith", 1), ("includes", 1), ("indexOf", 1),
+            ("lastIndexOf", 1), ("match", 1), ("matchAll", 1), ("normalize", 0),
+            ("padEnd", 1), ("padStart", 1), ("repeat", 1), ("replace", 2),
+            ("slice", 2), ("split", 2), ("startsWith", 1), ("substr", 2),
+            ("substring", 2), ("toLowerCase", 0), ("toString", 0),
+            ("toUpperCase", 0), ("trim", 0), ("trimEnd", 0), ("trimStart", 0),
         ];
-        const ARRAY_METHODS: &[&str] = &[
-            "at", "concat", "copyWithin", "every", "fill", "filter", "find",
-            "findIndex", "findLast", "findLastIndex", "flat", "flatMap",
-            "forEach", "includes", "indexOf", "join", "keys", "lastIndexOf",
-            "map", "pop", "push", "reduce", "reduceRight", "reverse", "shift",
-            "slice", "some", "sort", "splice", "toLocaleString", "toReversed",
-            "toSorted", "toSpliced", "toString", "unshift", "with",
+        const ARRAY_METHODS: &[(&str, i32)] = &[
+            ("at", 1), ("concat", 1), ("copyWithin", 2), ("every", 1),
+            ("fill", 1), ("filter", 1), ("find", 1), ("findIndex", 1),
+            ("findLast", 1), ("findLastIndex", 1), ("flat", 0), ("flatMap", 1),
+            ("forEach", 1), ("includes", 1), ("indexOf", 1), ("join", 1),
+            ("keys", 0), ("lastIndexOf", 1), ("map", 1), ("pop", 0),
+            ("push", 1), ("reduce", 1), ("reduceRight", 1), ("reverse", 0),
+            ("shift", 0), ("slice", 2), ("some", 1), ("sort", 1),
+            ("splice", 2), ("toLocaleString", 0), ("toReversed", 0),
+            ("toSorted", 1), ("toSpliced", 2), ("toString", 0),
+            ("unshift", 1), ("with", 2),
         ];
         let name = self.interner.resolve(name_id).to_owned();
-        let is_string = oid == self.string_prototype && STRING_METHODS.contains(&name.as_str());
-        let is_array = oid == self.array_prototype && ARRAY_METHODS.contains(&name.as_str());
-        if !is_string && !is_array {
-            return None;
-        }
+        let string_entry = (oid == self.string_prototype)
+            .then(|| STRING_METHODS.iter().find(|(n, _)| *n == name))
+            .flatten();
+        let array_entry = (oid == self.array_prototype)
+            .then(|| ARRAY_METHODS.iter().find(|(n, _)| *n == name))
+            .flatten();
+        let (is_string, fn_len) = match (string_entry, array_entry) {
+            (Some((_, l)), _) => (true, *l),
+            (_, Some((_, l))) => (false, *l),
+            _ => return None,
+        };
         let func: crate::runtime::object::NativeFn = if is_string {
             std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
+                // RequireObjectCoercible: String.prototype methods reject
+                // null/undefined receivers.
+                if this.is_nullish() {
+                    return Err(vm.make_native_error(
+                        "TypeError",
+                        "String.prototype method called on null or undefined",
+                    ));
+                }
                 let s = vm.value_to_string(this);
                 let ascii = s.is_ascii();
                 Ok(vm.exec_string_method(&s, name_id, args, ascii))
@@ -1266,9 +1286,9 @@ impl Vm {
                 }
             })
         };
-        let fn_obj = JsObject {
+        let mut fn_obj = JsObject {
             properties: Vec::new(),
-            prototype: None,
+            prototype: Some(self.function_prototype),
             kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native {
                 name: name_id,
                 func,
@@ -1276,6 +1296,18 @@ impl Vm {
             marked: false,
             extensible: true,
         };
+        // Real own `name` / `length` with spec attributes so verifyProperty
+        // and hasOwnProperty checks pass.
+        let name_key = self.interner.intern("name");
+        let len_key = self.interner.intern("length");
+        fn_obj.define_property(
+            name_key,
+            Property::with_flags(Value::string(name_id), Property::CONFIGURABLE),
+        );
+        fn_obj.define_property(
+            len_key,
+            Property::with_flags(Value::int(fn_len), Property::CONFIGURABLE),
+        );
         let f_oid = self.heap.allocate(fn_obj);
         let val = Value::object_id(f_oid);
         if let Some(proto) = self.heap.get_mut(oid) {
