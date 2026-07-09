@@ -415,7 +415,7 @@ impl Vm {
             }
             cur = proto;
         }
-        let n = self.to_f64(raw);
+        let n = self.coerce_to_f64(raw)?;
         if n.is_nan() || n <= 0.0 {
             return Ok(0);
         }
@@ -485,12 +485,25 @@ impl Vm {
 
     /// ToNumber that runs user valueOf/toString (ordinary `to_f64` is
     /// non-mutating and can't) — index arguments coerce observably per spec.
+    /// Symbols throw TypeError.
     fn coerce_to_f64(&mut self, v: Value) -> Result<f64, VmError> {
+        if v.is_symbol() {
+            return Err(VmError::Throw(self.make_native_error(
+                "TypeError",
+                "Cannot convert a Symbol value to a number",
+            )));
+        }
         let p = if v.is_object() {
             self.try_coerce_to_primitive_hint(v, "number")?
         } else {
             v
         };
+        if p.is_symbol() {
+            return Err(VmError::Throw(self.make_native_error(
+                "TypeError",
+                "Cannot convert a Symbol value to a number",
+            )));
+        }
         Ok(self.to_f64(p))
     }
 
@@ -947,6 +960,25 @@ impl Vm {
         {
             return Ok(v);
         }
+        // The callback must be callable even on an empty receiver (the dense
+        // loops below would never touch it).
+        if matches!(
+            name.as_str(),
+            "forEach" | "map" | "filter" | "every" | "some" | "find" | "findIndex"
+                | "findLast" | "findLastIndex" | "reduce" | "reduceRight" | "flatMap"
+        ) {
+            let cb = args.first().copied().unwrap_or(Value::undefined());
+            let callable = cb.is_function()
+                || cb.as_object_id()
+                    .and_then(|o| self.heap.get(o))
+                    .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)));
+            if !callable {
+                return Err(VmError::Throw(self.make_native_error(
+                    "TypeError",
+                    "callback is not a function",
+                )));
+            }
+        }
         match name.as_str() {
             "push" => {
                 if let Some(obj) = self.heap.get_mut(oid)
@@ -1267,8 +1299,14 @@ impl Vm {
                 let len = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
                     .unwrap_or(0) as i32;
-                let raw_start = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                let raw_end = args.get(2).and_then(|v| v.as_number()).map(|n| n as i32).unwrap_or(len);
+                let raw_start = match args.get(1) {
+                    Some(v) => self.coerce_to_f64(*v)? as i32,
+                    None => 0,
+                };
+                let raw_end = match args.get(2).filter(|v| !v.is_undefined()) {
+                    Some(v) => self.coerce_to_f64(*v)? as i32,
+                    None => len,
+                };
                 let start = if raw_start < 0 { (len + raw_start).max(0) as usize } else { raw_start.min(len) as usize };
                 let end = if raw_end < 0 { (len + raw_end).max(0) as usize } else { raw_end.min(len) as usize };
                 if let Some(obj) = self.heap.get_mut(oid)
@@ -1284,9 +1322,18 @@ impl Vm {
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 let len = elements.len() as i32;
-                let raw_target = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                let raw_start = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                let raw_end = args.get(2).and_then(|v| v.as_number()).map(|n| n as i32).unwrap_or(len);
+                let raw_target = match args.first() {
+                    Some(v) => self.coerce_to_f64(*v)? as i32,
+                    None => 0,
+                };
+                let raw_start = match args.get(1) {
+                    Some(v) => self.coerce_to_f64(*v)? as i32,
+                    None => 0,
+                };
+                let raw_end = match args.get(2).filter(|v| !v.is_undefined()) {
+                    Some(v) => self.coerce_to_f64(*v)? as i32,
+                    None => len,
+                };
                 let target = if raw_target < 0 { (len + raw_target).max(0) as usize } else { raw_target.min(len) as usize };
                 let start = if raw_start < 0 { (len + raw_start).max(0) as usize } else { raw_start.min(len) as usize };
                 let end = if raw_end < 0 { (len + raw_end).max(0) as usize } else { raw_end.min(len) as usize };
@@ -2058,8 +2105,8 @@ impl Vm {
     /// Execute a native method sentinel that requires `this` context.
     /// Sentinels -590 to -599: Object.prototype / Function.prototype methods.
     /// Sentinels -600 to -629: Array.prototype methods.
-    pub(crate) fn exec_native_method(&mut self, sentinel: i32, this_val: Value, args: &[Value]) -> Value {
-        match sentinel {
+    pub(crate) fn exec_native_method(&mut self, sentinel: i32, this_val: Value, args: &[Value]) -> Result<Value, VmError> {
+        let result = match sentinel {
             -590 => { // Object.prototype.hasOwnProperty — also checks __get_X__/__set_X__
                 let key_val = args.first().copied().unwrap_or(Value::undefined());
                 let key = if key_val.is_symbol() {
@@ -2258,7 +2305,7 @@ impl Vm {
             // Boolean.prototype.toString / valueOf — unwrap a Boolean primitive or wrapper.
             -630 | -631 => {
                 let inner = self.unwrap_wrapper_primitive(this_val, |v| v.is_boolean());
-                let Some(inner) = inner else { return Value::undefined(); };
+                let Some(inner) = inner else { return Ok(Value::undefined()); };
                 if sentinel == -630 {
                     let s = if inner.to_boolean() { "true" } else { "false" };
                     Value::string(self.interner.intern(s))
@@ -2269,7 +2316,7 @@ impl Vm {
             // Number.prototype.toString / valueOf — unwrap a Number primitive or wrapper.
             -632 | -633 => {
                 let inner = self.unwrap_wrapper_primitive(this_val, |v| v.is_int() || v.is_number());
-                let Some(inner) = inner else { return Value::undefined(); };
+                let Some(inner) = inner else { return Ok(Value::undefined()); };
                 if sentinel == -632 {
                     let s = self.value_to_string(inner);
                     Value::string(self.interner.intern(&s))
@@ -2293,18 +2340,29 @@ impl Vm {
                     -620 => "flatMap", -621 => "fill", -622 => "splice", -623 => "reduceRight",
                     -624 => "at", -625 => "keys", -626 => "values", -627 => "entries",
                     -628 => "lastIndexOf", -629 => "toString",
-                    _ => return Value::undefined(),
+                    _ => return Ok(Value::undefined()),
                 };
+                // ToObject(this): null/undefined receivers throw.
+                if this_val.is_nullish() {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Array.prototype method called on null or undefined",
+                    )));
+                }
                 let method_id = self.interner.intern(method_name);
-                // For array-like objects (including actual arrays)
-                if let Some(oid) = this_val.as_object_id() {
-                    self.exec_array_method(oid, method_id, args).unwrap_or(Value::undefined())
+                let recv = if let Some(oid) = this_val.as_object_id() {
+                    Some(oid)
                 } else {
-                    Value::undefined()
+                    self.box_primitive(this_val).as_object_id()
+                };
+                match recv {
+                    Some(oid) => return self.exec_array_method(oid, method_id, args),
+                    None => Value::undefined(),
                 }
             }
             _ => Value::undefined(),
-        }
+        };
+        Ok(result)
     }
 
     /// Check if a value is a String wrapper object.

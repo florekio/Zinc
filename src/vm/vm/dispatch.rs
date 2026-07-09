@@ -1729,7 +1729,15 @@ impl Vm {
                         if (-635..=-590).contains(&sentinel) || sentinel == -639 || sentinel == -640 {
                             // Native this-dependent methods called standalone (this=undefined)
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
-                            let result = self.exec_native_method(sentinel, Value::undefined(), &args);
+                            let result = match self.exec_native_method(sentinel, Value::undefined(), &args) {
+                                Ok(v) => v,
+                                Err(VmError::Throw(v)) => {
+                                    self.truncate_stack(func_pos);
+                                    self.handle_throw(v)?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            };
                             self.truncate_stack(func_pos);
                             self.push(result);
                             continue;
@@ -4527,7 +4535,15 @@ impl Vm {
                         if let Some(obj) = self.heap.get(oid)
                             && matches!(&obj.kind, ObjectKind::Array(_)) {
                                 let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                                let result = self.exec_array_method(oid, method_name, &args)?;
+                                let result = match self.exec_array_method(oid, method_name, &args) {
+                                    Ok(v) => v,
+                                    Err(VmError::Throw(v)) => {
+                                        self.truncate_stack(obj_pos);
+                                        self.handle_throw(v)?;
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                };
                                 self.truncate_stack(obj_pos);
                                 self.push(result);
                                 continue;

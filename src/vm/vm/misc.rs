@@ -1902,7 +1902,11 @@ impl Vm {
                 }
             }),
             Route::Sentinel(sent) => std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
-                Ok(vm.exec_native_method(sent, this, args))
+                match vm.exec_native_method(sent, this, args) {
+                    Ok(v) => Ok(v),
+                    Err(VmError::Throw(v)) => Err(v),
+                    Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                }
             }),
             Route::CoercibleSentinel(sent) => std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
                 if this.is_nullish() {
@@ -1911,7 +1915,11 @@ impl Vm {
                         "Cannot convert undefined or null to object",
                     ));
                 }
-                Ok(vm.exec_native_method(sent, this, args))
+                match vm.exec_native_method(sent, this, args) {
+                    Ok(v) => Ok(v),
+                    Err(VmError::Throw(v)) => Err(v),
+                    Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                }
             }),
             Route::Date => {
                 // thisTimeValue: only Date receivers; toGMTString aliases

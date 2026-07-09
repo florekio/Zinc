@@ -282,7 +282,7 @@ impl Vm {
         }
         // Native this-dependent method sentinels (-590 to -599 and -600 to -629 for Array.prototype)
         if (-635..=-590).contains(&packed) || packed == -639 || packed == -640 {
-            return Ok(self.exec_native_method(packed, this_value, args));
+            return self.exec_native_method(packed, this_value, args);
         }
         // Promise resolve/reject sentinels (used by promise chaining for thenable
         // adoption). Encoding mirrors the Call opcode handler.
