@@ -594,6 +594,32 @@ impl Vm {
             if let Some(obj) = self.heap.get_mut(target_oid) {
                 obj.define_property(key_id, Property::with_flags(map_value, flags));
             }
+            // Defining an array index at or beyond the dense length bumps
+            // the array's length per ArraySetLength (kept in the shadow
+            // property so reads observe it).
+            if let Some(idx) = canonical_array_index(&key_str) {
+                let (is_arr, elems_len, shadow) = match self.heap.get(target_oid) {
+                    Some(o) => (
+                        matches!(o.kind, ObjectKind::Array(_)),
+                        if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 },
+                        {
+                            let lk = self.interner.intern("length");
+                            o.get_property(lk).and_then(|v| v.as_number().or_else(|| v.as_int().map(|i| i as f64)))
+                        },
+                    ),
+                    None => (false, 0, None),
+                };
+                let effective = shadow.unwrap_or(elems_len as f64);
+                if is_arr && (idx as f64) >= effective {
+                    let lk = self.interner.intern("length");
+                    if let Some(o) = self.heap.get_mut(target_oid) {
+                        o.define_property(
+                            lk,
+                            Property::with_flags(Value::number((idx + 1) as f64), Property::WRITABLE),
+                        );
+                    }
+                }
+            }
         }
         Ok(target)
     }

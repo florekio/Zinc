@@ -70,10 +70,19 @@ impl Vm {
                     let is_array = self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Array(_))).unwrap_or(false);
                     if is_array {
                         let len = self.heap.get(oid).and_then(|o| if let ObjectKind::Array(ref e) = o.kind { Some(e.len()) } else { None }).unwrap_or(0);
-                        let keys: Vec<Value> = (0..len).map(|i| {
+                        let mut keys: Vec<Value> = (0..len).map(|i| {
                             let s = self.interner.intern(&i.to_string());
                             Value::string(s)
                         }).collect();
+                        // Named enumerable properties (index defines beyond the
+                        // dense length, accessors) enumerate as well.
+                        for k in self.enumerable_own_string_keys(oid) {
+                            if k.parse::<usize>().is_ok_and(|i| i < len) {
+                                continue;
+                            }
+                            let sid = self.interner.intern(&k);
+                            keys.push(Value::string(sid));
+                        }
                         self.alloc_array(keys)
                     } else {
                         let props: Vec<(StringId, bool)> = self.heap.get(oid)

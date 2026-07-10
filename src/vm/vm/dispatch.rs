@@ -2960,12 +2960,21 @@ impl Vm {
                         if let Some(obj) = self.heap.get(oid)
                             && let ObjectKind::Array(ref elements) = obj.kind {
                             if name_str == "length" {
-                                self.push(Value::int(elements.len() as i32));
+                                // A shadow length (define beyond the dense
+                                // storage) wins over the element count.
+                                if let Some(v) = obj.get_property(name_id) {
+                                    self.push(v);
+                                } else {
+                                    self.push(Value::int(elements.len() as i32));
+                                }
                                 continue;
                             }
                             // Numeric string index: arr["0"], arr["1"], etc.
-                            if let Ok(idx) = name_str.parse::<usize>() {
-                                let val = elements.get(idx).copied().unwrap_or(Value::undefined());
+                            // Misses fall through to the generic lookup
+                            // (index accessors, named props, prototype).
+                            if let Ok(idx) = name_str.parse::<usize>()
+                                && let Some(val) = elements.get(idx).copied()
+                            {
                                 self.push(val);
                                 continue;
                             }
@@ -3401,10 +3410,35 @@ impl Vm {
                                 .unwrap_or(false);
                             if is_array {
                                 let new_len = self.to_f64(val) as usize;
-                                if let Some(obj) = self.heap.get_mut(oid)
-                                    && let ObjectKind::Array(ref mut elements) = obj.kind
-                                {
-                                    elements.resize(new_len, Value::undefined());
+                                // Named index properties at or beyond the new
+                                // length are deleted; any shadow length is
+                                // superseded by this assignment.
+                                let doomed: Vec<StringId> = self.heap.get(oid)
+                                    .map(|o| o.properties.iter()
+                                        .filter(|(k, _)| {
+                                            let ks = self.interner.resolve(*k);
+                                            ks == "length"
+                                                || ks.parse::<usize>().is_ok_and(|i| i >= new_len)
+                                        })
+                                        .map(|(k, _)| *k)
+                                        .collect())
+                                    .unwrap_or_default();
+                                if let Some(obj) = self.heap.get_mut(oid) {
+                                    // Raw removal: the shadow length and the
+                                    // truncated indices go away regardless of
+                                    // configurable flags (internal bookkeeping,
+                                    // not a user delete).
+                                    obj.properties.retain(|(k, _)| !doomed.contains(k));
+                                    if let ObjectKind::Array(ref mut elements) = obj.kind {
+                                        if new_len <= elements.len() {
+                                            elements.truncate(new_len);
+                                        } else if new_len <= 1_000_000 {
+                                            elements.resize(new_len, Value::undefined());
+                                        } else {
+                                            let lk = self.interner.intern("length");
+                                            obj.define_property(lk, Property::with_flags(Value::number(new_len as f64), Property::WRITABLE));
+                                        }
+                                    }
                                 }
                                 self.push(val);
                                 continue;
@@ -3590,7 +3624,11 @@ impl Vm {
                             } else if let Some(name_id) = key.as_string_id() {
                                 let name = self.interner.resolve(name_id);
                                 if name == "length" {
-                                    self.push(Value::int(elements.len() as i32));
+                                    if let Some(v) = obj.get_property(name_id) {
+                                        self.push(v);
+                                    } else {
+                                        self.push(Value::int(elements.len() as i32));
+                                    }
                                     continue;
                                 }
                                 // Numeric string index: arr["0"]
@@ -7602,10 +7640,17 @@ impl Vm {
                     if let Some(oid) = val.as_object_id() {
                         let keys: Vec<_> = self.heap.get(oid)
                             .map(|o| {
-                                if let ObjectKind::Array(ref elems) = o.kind {
-                                    // Array: yield "0", "1", "2", ...
-                                    (0..elems.len()).map(|i| self.interner.intern(&i.to_string())).collect()
-                                } else {
+                                // Arrays seed with their element indices, then fall
+                                // through to the generic walk so named enumerable
+                                // properties (defineProperty beyond the dense
+                                // length, accessors) are enumerated too.
+                                let elem_seed: Vec<StringId> =
+                                    if let ObjectKind::Array(ref elems) = o.kind {
+                                        (0..elems.len()).map(|i| self.interner.intern(&i.to_string())).collect()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                {
                                     // Object: walk prototype chain. Per spec
                                     // OrdinaryOwnPropertyKeys + EnumerateObjectProperties,
                                     // a property name encountered on a child shadows the
@@ -7615,8 +7660,9 @@ impl Vm {
                                     // name as seen. Accessor properties stored under
                                     // __get_NAME__ / __set_NAME__ surface as the bare
                                     // NAME so for-in mirrors Object.keys behaviour.
-                                    let mut all_keys = Vec::new();
-                                    let mut seen: std::collections::HashSet<StringId> = std::collections::HashSet::new();
+                                    let mut all_keys = elem_seed.clone();
+                                    let mut seen: std::collections::HashSet<StringId> =
+                                        elem_seed.into_iter().collect();
                                     let mut cur = Some(oid);
                                     let mut depth = 0;
                                     while let Some(cid) = cur {
