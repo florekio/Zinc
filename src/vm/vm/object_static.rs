@@ -761,6 +761,63 @@ impl Vm {
                 "call" | "apply" | "bind" => obj_val,
                 _ => Value::undefined(),
             },
+            -520 => match name_str.as_str() {
+                // Extractable Promise statics (`var r = Promise.resolve;`),
+                // identity-cached like the Date statics.
+                "resolve" | "reject" | "all" | "race" | "allSettled" | "any" => {
+                    let is_settle = matches!(name_str.as_str(), "resolve" | "reject");
+                    let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                        move |vm: &mut Vm, this: Value, args: &[Value]| -> Result<Value, Value> {
+                            // NewPromiseCapability(this): the receiver must be a
+                            // constructor; custom ones are actually constructed and
+                            // their capability resolve/reject invoked.
+                            if let Some((instance, res, rej)) = vm.promise_new_capability(this)?
+                                && is_settle
+                            {
+                                let settle = if vm.interner.resolve(name_id) == "reject" { rej } else { res };
+                                let arg = args.first().copied().unwrap_or(Value::undefined());
+                                match vm.call_function_this(settle, Value::undefined(), &[arg]) {
+                                    Ok(_) => {}
+                                    Err(VmError::Throw(v)) => return Err(v),
+                                    Err(e) => return Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                                }
+                                return Ok(instance);
+                            }
+                            // Combinators keep native semantics after the
+                            // capability handshake.
+                            match vm.exec_promise_static(name_id, args) {
+                                Ok(v) => Ok(v),
+                                Err(VmError::Throw(v)) => Err(v),
+                                Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                            }
+                        },
+                    );
+                    let mut fn_obj = JsObject {
+                        properties: Vec::new(),
+                        prototype: Some(self.function_prototype),
+                        kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native {
+                            name: name_id,
+                            func,
+                        }),
+                        marked: false,
+                        extensible: true,
+                    };
+                    let name_key = self.interner.intern("name");
+                    let len_key = self.interner.intern("length");
+                    fn_obj.define_property(name_key, Property::with_flags(Value::string(name_id), Property::CONFIGURABLE));
+                    fn_obj.define_property(len_key, Property::with_flags(Value::int(1), Property::CONFIGURABLE));
+                    let oid = self.heap.allocate(fn_obj);
+                    let val = Value::object_id(oid);
+                    self.fn_property_overrides.insert((sentinel, name_id), Some(val));
+                    val
+                }
+                "prototype" => self.func_prototypes.get(&-520).copied()
+                    .map(Value::object_id).unwrap_or(Value::undefined()),
+                "name" => { let id = self.interner.intern("Promise"); Value::string(id) }
+                "length" => Value::int(1),
+                "call" | "apply" | "bind" => obj_val,
+                _ => Value::undefined(),
+            },
             -570 => match name_str.as_str() {
                 "for" => Value::function(-752),
                 "keyFor" => Value::function(-753),

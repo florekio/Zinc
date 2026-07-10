@@ -474,3 +474,98 @@ impl Vm {
         let _ = self.reject_promise(pid, reason);
     }
 }
+
+impl Vm {
+    /// NewPromiseCapability(C) for extracted Promise statics. Returns
+    /// Ok(None) for the native Promise constructor (fast path), Err for
+    /// non-constructors, and Ok(Some((instance, resolve, reject))) for a
+    /// custom constructor: it is invoked with a capability executor that
+    /// captures the resolve/reject it is handed.
+    pub(crate) fn promise_new_capability(
+        &mut self,
+        this: Value,
+    ) -> Result<Option<(Value, Value, Value)>, Value> {
+        use crate::compiler::chunk::ChunkFlags;
+        use std::sync::{Arc, Mutex};
+        if this.as_function() == Some(-520) {
+            return Ok(None);
+        }
+        let Some(packed) = this.as_function() else {
+            // Function objects (bound/native) pass through the native path;
+            // everything else is a non-constructor receiver.
+            let is_fn_obj = this.as_object_id()
+                .and_then(|o| self.heap.get(o))
+                .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)));
+            if is_fn_obj {
+                return Ok(None);
+            }
+            return Err(self.make_native_error(
+                "TypeError",
+                "Promise method called on a non-constructor receiver",
+            ));
+        };
+        if packed < 0 {
+            return Err(self.make_native_error(
+                "TypeError",
+                "Promise capability constructor is not a constructor",
+            ));
+        }
+        let chunk_idx = (packed & 0xFFFF) as usize;
+        if chunk_idx < self.chunks.len() && self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
+            return Err(self.make_native_error(
+                "TypeError",
+                "Promise capability constructor is not a constructor",
+            ));
+        }
+        // GetCapabilitiesExecutor: capture the (resolve, reject) pair the
+        // constructor hands to the executor.
+        let cap: Arc<Mutex<(Value, Value)>> =
+            Arc::new(Mutex::new((Value::undefined(), Value::undefined())));
+        let cap2 = cap.clone();
+        let executor: crate::runtime::object::NativeFn =
+            std::sync::Arc::new(move |_vm: &mut Vm, _this: Value, args: &[Value]| {
+                let mut g = cap2.lock().unwrap();
+                g.0 = args.first().copied().unwrap_or(Value::undefined());
+                g.1 = args.get(1).copied().unwrap_or(Value::undefined());
+                Ok(Value::undefined())
+            });
+        let exec_obj = JsObject {
+            properties: Vec::new(),
+            prototype: None,
+            kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native {
+                name: self.interner.intern("executor"),
+                func: executor,
+            }),
+            marked: false,
+            extensible: true,
+        };
+        let exec_val = Value::object_id(self.heap.allocate(exec_obj));
+        // Construct(C, «executor»): fresh this; a returned object wins.
+        let fresh = self.heap.allocate(JsObject::ordinary());
+        let ret = match self.call_function_this(this, Value::object_id(fresh), &[exec_val]) {
+            Ok(v) => v,
+            Err(VmError::Throw(v)) => return Err(v),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                return Err(self.make_native_error("Error", &msg));
+            }
+        };
+        let instance = if ret.as_object_id().is_some() { ret } else { Value::object_id(fresh) };
+        let (res, rej) = *cap.lock().unwrap();
+        // If the constructor didn't hand the executor callable resolve /
+        // reject functions, the capability is invalid.
+        let callable = |vm: &Self, v: Value| {
+            v.is_function()
+                || v.as_object_id()
+                    .and_then(|o| vm.heap.get(o))
+                    .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)))
+        };
+        if !callable(self, res) || !callable(self, rej) {
+            return Err(self.make_native_error(
+                "TypeError",
+                "Promise capability resolve or reject is not callable",
+            ));
+        }
+        Ok(Some((instance, res, rej)))
+    }
+}

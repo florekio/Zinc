@@ -1693,6 +1693,43 @@ impl Vm {
                             self.push(this_val);
                             continue;
                         }
+                        // super(...) to Promise: turn `this` into a pending
+                        // promise and run the executor against it.
+                        if is_super_call && sentinel == -520 {
+                            self.frames[super_fi].pending_super_call = false;
+                            let this_val = self.frames[super_fi].this_value;
+                            let executor = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                            if let Some(this_oid) = this_val.as_object_id() {
+                                if let Some(obj) = self.heap.get_mut(this_oid) {
+                                    obj.kind = ObjectKind::Promise {
+                                        state: crate::runtime::object::PromiseState::Pending,
+                                        result: Value::undefined(),
+                                        reactions: Vec::new(),
+                                    };
+                                }
+                                let resolve_val = Value::function(-600_000 - this_oid.0 as i32);
+                                let reject_val = Value::function(-700_000 - this_oid.0 as i32);
+                                match self.call_function(executor, &[resolve_val, reject_val]) {
+                                    Ok(_) => {}
+                                    Err(VmError::Throw(v)) => { self.reject_promise(this_oid, v)?; }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            self.truncate_stack(func_pos);
+                            self.push(this_val);
+                            continue;
+                        }
+                        // Promise is not callable without `new` (super() was
+                        // handled above).
+                        if sentinel == -520 {
+                            let err = self.make_native_error(
+                                "TypeError",
+                                "Promise constructor cannot be invoked without 'new'",
+                            );
+                            self.truncate_stack(func_pos);
+                            self.handle_throw(err)?;
+                            continue;
+                        }
                         // -507 is excluded: in exec_global_fn that id means
                         // Array.isArray (method dispatch), but a plain
                         // `Array(n)` call must CONSTRUCT (spec: Array called
@@ -3086,6 +3123,10 @@ impl Vm {
                                 self.fn_property_get(sentinel, name_id, obj_val)
                             }
                             -550 if name_str == "prototype" => Value::object_id(self.date_prototype),
+                            // Extractable Promise statics.
+                            -520 if matches!(name_str, "resolve" | "reject" | "all" | "race" | "allSettled" | "any") => {
+                                self.fn_property_get(sentinel, name_id, obj_val)
+                            }
                             -505 => match name_str {
                                 "prototype" => Value::object_id(self.number_prototype),
                                 "NaN" => Value::number(f64::NAN),
@@ -5429,13 +5470,25 @@ impl Vm {
                     // Handle Promise constructor
                     if func_val.is_function() && func_val.as_function() == Some(-520) {
                         let executor = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                        let callable = executor.is_function()
+                            || executor.as_object_id()
+                                .and_then(|o| self.heap.get(o))
+                                .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)));
+                        if !callable {
+                            let err = self.make_native_error("TypeError", "Promise resolver is not a function");
+                            self.truncate_stack(func_pos);
+                            self.handle_throw(err)?;
+                            continue;
+                        }
                         let pid = self.allocate_promise();
                         // Create resolve/reject sentinels
                         let resolve_val = Value::function(-600_000 - pid.0 as i32);
                         let reject_val = Value::function(-700_000 - pid.0 as i32);
-                        // Call the executor
-                        if executor.is_function() {
-                            let _ = self.call_function(executor, &[resolve_val, reject_val]);
+                        // Call the executor; an abrupt completion rejects the promise.
+                        match self.call_function(executor, &[resolve_val, reject_val]) {
+                            Ok(_) => {}
+                            Err(VmError::Throw(v)) => { self.reject_promise(pid, v)?; }
+                            Err(e) => return Err(e),
                         }
                         self.truncate_stack(func_pos);
                         self.push(Value::object_id(pid));
