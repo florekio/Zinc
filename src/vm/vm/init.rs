@@ -485,6 +485,76 @@ impl Vm {
             }
             let re_proto_oid = heap.allocate(re_proto);
             func_prototypes.insert(-580i32, re_proto_oid);
+            // Flag accessors are GETTERS on the prototype per spec —
+            // getOwnPropertyDescriptor(RegExp.prototype, "global").get is a
+            // real function; non-RegExp receivers throw TypeError, and the
+            // prototype itself answers source "(?:)" / flags "".
+            for prop in ["source", "flags", "global", "ignoreCase", "multiline", "dotAll", "sticky", "unicode", "hasIndices", "lastIndex"] {
+                if prop == "lastIndex" { continue; }
+                let prop_owned = prop.to_string();
+                let getter: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                    move |vm: &mut Vm, this: Value, _args: &[Value]| -> Result<Value, Value> {
+                        let oid = this.as_object_id();
+                        let re = oid.and_then(|o| vm.heap.get(o)).and_then(|o| {
+                            if let ObjectKind::RegExp { ref pattern, ref flags } = o.kind {
+                                Some((pattern.clone(), flags.clone()))
+                            } else { None }
+                        });
+                        let (pattern, flags) = match re {
+                            Some(pf) => pf,
+                            None => {
+                                // RegExp.prototype itself: source "(?:)",
+                                // flags "", boolean flags undefined.
+                                let is_proto = oid.is_some_and(|o| {
+                                    vm.func_prototypes.get(&-580).copied() == Some(o)
+                                });
+                                if is_proto {
+                                    return Ok(match prop_owned.as_str() {
+                                        "source" => vm.new_str("(?:)"),
+                                        "flags" => vm.new_str(""),
+                                        _ => Value::undefined(),
+                                    });
+                                }
+                                return Err(vm.make_native_error(
+                                    "TypeError",
+                                    "RegExp.prototype getter called on incompatible receiver",
+                                ));
+                            }
+                        };
+                        Ok(match prop_owned.as_str() {
+                            "source" => {
+                                if pattern.is_empty() { vm.new_str("(?:)") } else { vm.new_str(&pattern) }
+                            }
+                            "flags" => vm.new_str(&flags),
+                            "global" => Value::boolean(flags.contains('g')),
+                            "ignoreCase" => Value::boolean(flags.contains('i')),
+                            "multiline" => Value::boolean(flags.contains('m')),
+                            "dotAll" => Value::boolean(flags.contains('s')),
+                            "sticky" => Value::boolean(flags.contains('y')),
+                            "unicode" => Value::boolean(flags.contains('u')),
+                            "hasIndices" => Value::boolean(flags.contains('d')),
+                            _ => Value::undefined(),
+                        })
+                    },
+                );
+                let getter_name = interner.intern(&format!("get {prop}"));
+                let mut g_obj = JsObject {
+                    properties: Vec::new(),
+                    prototype: None,
+                    kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: getter_name, func: getter }),
+                    marked: false,
+                    extensible: true,
+                };
+                let name_key = interner.intern("name");
+                let len_key = interner.intern("length");
+                g_obj.define_property(name_key, Property::with_flags(Value::string(getter_name), Property::CONFIGURABLE));
+                g_obj.define_property(len_key, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
+                let g_val = Value::object_id(heap.allocate(g_obj));
+                let acc_key = interner.intern(&format!("__get_{prop}__"));
+                if let Some(proto) = heap.get_mut(re_proto_oid) {
+                    proto.define_property(acc_key, Property::with_flags(g_val, Property::CONFIGURABLE));
+                }
+            }
         }
         let set_name = interner.intern("Set");
         globals.insert(set_name, Value::function(-541));

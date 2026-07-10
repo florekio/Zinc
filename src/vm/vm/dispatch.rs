@@ -1389,11 +1389,13 @@ impl Vm {
                             self.handle_throw(err)?;
                             continue;
                         }
-                        let obj = JsObject {
+                        let mut obj = JsObject {
                             properties: Vec::new(), prototype: self.func_prototypes.get(&-580).copied(),
                             kind: ObjectKind::RegExp { pattern, flags },
                             marked: false, extensible: true,
                         };
+                        let li_key = self.interner.intern("lastIndex");
+                        obj.define_property(li_key, Property::with_flags(Value::int(0), Property::WRITABLE));
                         let oid = self.heap.allocate(obj);
                         self.truncate_stack(func_pos);
                         self.push(Value::object_id(oid));
@@ -3005,7 +3007,12 @@ impl Vm {
                             && let ObjectKind::RegExp { pattern, flags } = &obj.kind
                         {
                             let val = match name_str {
-                                "source" => { let id = self.interner.intern(pattern.as_str()); Value::string(id) }
+                                "source" => {
+                                    let src = if pattern.is_empty() { "(?:)" } else { pattern.as_str() };
+                                    let id = self.interner.intern(src);
+                                    Value::string(id)
+                                }
+                                "hasIndices" => Value::boolean(flags.contains('d')),
                                 "flags" => { let id = self.interner.intern(flags.as_str()); Value::string(id) }
                                 "global" => Value::boolean(flags.contains('g')),
                                 "ignoreCase" => Value::boolean(flags.contains('i')),
@@ -3030,7 +3037,7 @@ impl Vm {
                         let getter_key = self.interner.intern(&getter_key_str);
                         let getter_fn = self.heap.get_property_chain(oid, getter_key);
                         if let Some(gfn) = getter_fn
-                            && gfn.is_function()
+                            && self.value_callable(gfn)
                         {
                             let result = self.call_function_this(gfn, obj_val, &[])?;
                             self.push(result);
@@ -3336,7 +3343,7 @@ impl Vm {
                         let getter_key = self.interner.intern(&format!("__get_{name_str}__"));
                         let getter_fn = self.heap.get_property_chain(proto_oid, getter_key);
                         if let Some(gfn) = getter_fn
-                            && gfn.is_function()
+                            && self.value_callable(gfn)
                         {
                             let this_val = self.box_primitive(obj_val);
                             let result = self.call_function_this(gfn, this_val, &[])?;
@@ -3611,7 +3618,7 @@ impl Vm {
                             let getter_key_str = format!("__get_{name_str}__");
                             let getter_key = self.interner.intern(&getter_key_str);
                             if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
-                                && gfn.is_function() {
+                                && self.value_callable(gfn) {
                                     let result = self.call_function_this(gfn, obj_val, &[])?;
                                     self.push(result);
                                     continue;
@@ -3648,7 +3655,7 @@ impl Vm {
                             // Check for accessor first.
                             let getter_key = self.interner.intern(&format!("__get_{s}__"));
                             if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
-                                && gfn.is_function()
+                                && self.value_callable(gfn)
                             {
                                 let result = self.call_function_this(gfn, obj_val, &[])?;
                                 self.push(result);
@@ -4032,7 +4039,7 @@ impl Vm {
                         }
                         // Check for private getter (__get_#name__)
                         let getter_fn = self.heap.get_property_chain(oid, getter_key);
-                        if let Some(gfn) = getter_fn && gfn.is_function() {
+                        if let Some(gfn) = getter_fn && self.value_callable(gfn) {
                             let result = self.call_function_this(gfn, obj_val, &[])?;
                             self.push(result);
                         } else {
@@ -4113,7 +4120,7 @@ impl Vm {
                             let getter_key_str = format!("__get_{}__", name_str);
                             let getter_key = self.interner.intern(&getter_key_str);
                             let getter_fn = self.heap.get_property_chain(oid, getter_key);
-                            if let Some(gfn) = getter_fn && gfn.is_function() {
+                            if let Some(gfn) = getter_fn && self.value_callable(gfn) {
                                 self.throw_type_error(&format!(
                                     "Cannot set private accessor {name_str} with only a getter"
                                 ))?;
@@ -4709,9 +4716,12 @@ impl Vm {
                                 Err(e) => return Err(e),
                             }
                         }
-                        // Check for RegExp methods
+                        // Check for RegExp methods; unknown names fall through
+                        // to the generic dispatch (hasOwnProperty, …).
                         if let Some(obj) = self.heap.get(oid)
                             && matches!(&obj.kind, ObjectKind::RegExp { .. })
+                            && matches!(self.interner.resolve(method_name),
+                                "test" | "exec" | "toString" | "compile")
                         {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_regexp_method(oid, method_name, &args)?;
@@ -5113,7 +5123,7 @@ impl Vm {
                         if method_val.is_none() {
                             let getter_key = self.interner.intern(&format!("__get_{method_name_s}__"));
                             if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
-                                && gfn.is_function()
+                                && self.value_callable(gfn)
                                 && let Ok(rv) = self.call_function_this(gfn, obj_val, &[])
                             {
                                 method_val = Some(rv);
@@ -5845,11 +5855,13 @@ impl Vm {
                             self.handle_throw(err)?;
                             continue;
                         }
-                        let obj = JsObject {
+                        let mut obj = JsObject {
                             properties: Vec::new(), prototype: self.func_prototypes.get(&-580).copied(),
                             kind: ObjectKind::RegExp { pattern, flags },
                             marked: false, extensible: true,
                         };
+                        let li_key = self.interner.intern("lastIndex");
+                        obj.define_property(li_key, Property::with_flags(Value::int(0), Property::WRITABLE));
                         let oid = self.heap.allocate(obj);
                         self.truncate_stack(func_pos);
                         self.push(Value::object_id(oid));
@@ -6926,6 +6938,8 @@ impl Vm {
                     };
                     let mut obj = JsObject::regexp(pattern, flags);
                     obj.prototype = self.func_prototypes.get(&-580).copied();
+                    let li_key = self.interner.intern("lastIndex");
+                    obj.define_property(li_key, Property::with_flags(Value::int(0), Property::WRITABLE));
                     let oid = self.heap.allocate(obj);
                     self.push(Value::object_id(oid));
                 }
@@ -7924,7 +7938,7 @@ impl Vm {
                         let done_name = self.interner.intern("done");
                         let getter_key = self.interner.intern("__get_done__");
                         let done_val = if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
-                            && gfn.is_function()
+                            && self.value_callable(gfn)
                         {
                             self.call_function_this(gfn, result_val, &[])?
                         } else {
@@ -7945,7 +7959,7 @@ impl Vm {
                         // Check getter first, then plain property.
                         let getter_key = self.interner.intern("__get_value__");
                         if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
-                            && gfn.is_function()
+                            && self.value_callable(gfn)
                         {
                             let val = self.call_function_this(gfn, result_val, &[])?;
                             self.push(val);
@@ -8339,7 +8353,7 @@ impl Vm {
                             // If this is a getter key, call the getter to get the value
                             let value = if raw_s.starts_with("__get_") && raw_s.ends_with("__") {
                                 let getter_fn = self.heap.get_property_chain(src_oid, raw_key);
-                                if let Some(gfn) = getter_fn && gfn.is_function() {
+                                if let Some(gfn) = getter_fn && self.value_callable(gfn) {
                                     self.call_function_this(gfn, source, &[])?
                                 } else {
                                     Value::undefined()

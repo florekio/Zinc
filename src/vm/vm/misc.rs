@@ -161,6 +161,15 @@ impl Vm {
         numeric
     }
 
+    /// Callable check that covers packed function values AND heap function
+    /// objects (reified built-ins, bound functions, NativeFns).
+    pub(crate) fn value_callable(&self, v: Value) -> bool {
+        v.is_function()
+            || v.as_object_id()
+                .and_then(|o| self.heap.get(o))
+                .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)))
+    }
+
     /// Get(O, key) for a named key: getter-aware, per-level shadowing
     /// (own setter-only accessors read as undefined), chain-walking.
     pub(crate) fn getter_aware_get(&mut self, oid: ObjectId, key: &str) -> Result<Option<Value>, VmError> {
@@ -173,7 +182,7 @@ impl Vm {
         while let Some(c) = cur {
             let (g, d, has_set, proto) = match self.heap.get(c) {
                 Some(o) => (
-                    o.get_property(getter_key).filter(|v| v.is_function()),
+                    o.get_property(getter_key),
                     o.get_property(key_id),
                     o.get_property(setter_key).is_some(),
                     o.prototype,
@@ -181,7 +190,12 @@ impl Vm {
                 None => (None, None, false, None),
             };
             if let Some(g) = g {
-                return self.call_function_this(g, receiver, &[]).map(Some);
+                if self.value_callable(g) {
+                    return self.call_function_this(g, receiver, &[]).map(Some);
+                }
+                // Accessor half stored without a callable getter: the
+                // property exists, Get is undefined.
+                return Ok(Some(Value::undefined()));
             }
             if let Some(d) = d {
                 return Ok(Some(d));
