@@ -1787,6 +1787,22 @@ impl Vm {
         }
     }
 
+    /// ensure_builtin_proto_method along the whole prototype chain — for
+    /// lookups (ToPrimitive's toString/valueOf) that use get_property_chain
+    /// and would otherwise miss lazily-reified builtin methods.
+    pub(crate) fn ensure_chain_method(&mut self, oid: ObjectId, name_id: StringId) {
+        let mut cur = Some(oid);
+        let mut hops = 0;
+        while let Some(c) = cur {
+            self.ensure_builtin_proto_method(c, name_id);
+            cur = self.heap.get(c).and_then(|o| o.prototype);
+            hops += 1;
+            if hops > 8 {
+                break;
+            }
+        }
+    }
+
     pub(crate) fn reify_builtin_proto_method(
         &mut self,
         oid: ObjectId,
@@ -1884,7 +1900,18 @@ impl Vm {
                         "String.prototype method called on null or undefined",
                     ));
                 }
-                let s = vm.value_to_string(this);
+                // ToString(this): object receivers run their toString
+                // (String.prototype.split.call(Math, …) sees "[object Math]").
+                let prim = if this.is_object() && !this.is_symbol() {
+                    match vm.try_coerce_to_primitive_hint(this, "string") {
+                        Ok(p) => p,
+                        Err(VmError::Throw(v)) => return Err(v),
+                        Err(_) => this,
+                    }
+                } else {
+                    this
+                };
+                let s = vm.value_to_string(prim);
                 let ascii = s.is_ascii();
                 Ok(vm.exec_string_method(&s, name_id, args, ascii))
             }),

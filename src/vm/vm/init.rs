@@ -222,6 +222,7 @@ impl Vm {
         // Create Math object with constants and methods.
         // Per spec, Math.{PI,E,LN2,LN10,SQRT2,...} are non-writable, non-enumerable, non-configurable.
         let mut math_obj = JsObject::ordinary();
+        math_obj.prototype = Some(object_prototype);
         let pi_name = interner.intern("PI");
         math_obj.define_property(pi_name, Property::with_flags(Value::number(std::f64::consts::PI), 0));
         let e_name = interner.intern("E");
@@ -262,6 +263,7 @@ impl Vm {
 
         // Create JSON object (methods handled in exec_json_method)
         let mut json_obj = JsObject::ordinary();
+        json_obj.prototype = Some(object_prototype);
         let json_tag = interner.intern("JSON");
         json_obj.define_property(tostring_tag_key, Property::with_flags(Value::string(json_tag), Property::CONFIGURABLE));
         let json_oid = heap.allocate(json_obj);
@@ -478,7 +480,8 @@ impl Vm {
         globals.insert(function_name, Value::function(-551));
 
         // Reflect: plain object (spec requires it to be an ordinary object)
-        let reflect_obj = JsObject::ordinary();
+        let mut reflect_obj = JsObject::ordinary();
+        reflect_obj.prototype = Some(object_prototype);
         let reflect_oid = heap.allocate(reflect_obj);
         let reflect_name = interner.intern("Reflect");
         globals.insert(reflect_name, Value::object_id(reflect_oid));

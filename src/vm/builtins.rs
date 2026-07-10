@@ -222,13 +222,47 @@ impl Vm {
                 if let Some(result) = self.exec_string_regex_method(s, "split", args) {
                     return result;
                 }
-                let sep = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let limit = args.get(1).and_then(|v| v.as_number()).map(|n| n as usize);
+                let sep_arg = args.first().copied().unwrap_or(Value::undefined());
+                let limit = args.get(1)
+                    .filter(|v| !v.is_undefined())
+                    .map(|v| {
+                        let prim = if v.is_object() {
+                            self.try_coerce_to_primitive_hint(*v, "number").unwrap_or(*v)
+                        } else {
+                            *v
+                        };
+                        let n = self.to_f64(prim);
+                        super::vm::f64_to_int32(n) as u32 as usize
+                    });
                 let mut parts: Vec<Value> = Vec::new();
-                for part in s.split(&sep) {
-                    if let Some(lim) = limit && parts.len() >= lim { break; }
-                    let v = self.new_str(part);
-                    parts.push(v);
+                if limit != Some(0) {
+                    if sep_arg.is_undefined() {
+                        // No separator: the whole string is the only element.
+                        parts.push(self.new_str(s));
+                    } else {
+                        // ToString(separator) runs user toString/valueOf.
+                        let sep_prim = if sep_arg.is_object() {
+                            self.try_coerce_to_primitive_hint(sep_arg, "string").unwrap_or(sep_arg)
+                        } else {
+                            sep_arg
+                        };
+                        let sep = self.value_to_string(sep_prim);
+                        if sep.is_empty() {
+                            // Per-char split (Rust's split("") adds boundary
+                            // empties that JS doesn't have).
+                            for c in s.chars() {
+                                if let Some(lim) = limit && parts.len() >= lim { break; }
+                                let v = self.new_str(&c.to_string());
+                                parts.push(v);
+                            }
+                        } else {
+                            for part in s.split(&sep) {
+                                if let Some(lim) = limit && parts.len() >= lim { break; }
+                                let v = self.new_str(part);
+                                parts.push(v);
+                            }
+                        }
+                    }
                 }
                 let mut arr = JsObject::array(parts);
                 arr.prototype = Some(self.array_prototype);
@@ -1837,7 +1871,14 @@ impl Vm {
                         Value::string(self.interner.intern(&s))
                     }
                     Some(v) => {
-                        let s = self.value_to_string(v);
+                        // Full ToString: objects go through ToPrimitive with
+                        // the string hint (toString → valueOf fallback).
+                        let prim = if v.is_object() && !v.is_symbol() {
+                            self.try_coerce_to_primitive_hint(v, "string").unwrap_or(v)
+                        } else {
+                            v
+                        };
+                        let s = self.value_to_string(prim);
                         self.new_str(&s)
                     }
                 }
@@ -2478,17 +2519,25 @@ impl Vm {
             } else {
                 ("valueOf", "toString")
             };
+            let callable = |vm: &Self, v: Value| {
+                v.is_function()
+                    || v.as_object_id()
+                        .and_then(|o| vm.heap.get(o))
+                        .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)))
+            };
             let first_key = self.interner.intern(try_first);
+            self.ensure_chain_method(oid, first_key);
             if let Some(fn1) = self.heap.get_property_chain(oid, first_key)
-                && fn1.is_function()
+                && callable(self, fn1)
             {
                 tried_method = true;
                 let result = self.call_function_this(fn1, val, &[])?;
                 if !result.is_object() || self.is_bigint(result) { return Ok(result); }
             }
             let second_key = self.interner.intern(try_second);
+            self.ensure_chain_method(oid, second_key);
             if let Some(fn2) = self.heap.get_property_chain(oid, second_key)
-                && fn2.is_function()
+                && callable(self, fn2)
             {
                 tried_method = true;
                 let result = self.call_function_this(fn2, val, &[])?;

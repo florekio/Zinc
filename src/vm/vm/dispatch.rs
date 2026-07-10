@@ -4467,6 +4467,30 @@ impl Vm {
 
                     // Number primitive methods: (42).toString(16), (3.14).toFixed(2)
                     if effective_val.is_number() || effective_val.is_int() {
+                        // User-installed Number.prototype methods win over the
+                        // native table for non-builtin names.
+                        let mn_str = self.interner.resolve(method_name);
+                        if !matches!(mn_str, "toString" | "toLocaleString" | "valueOf" | "toFixed" | "toExponential" | "toPrecision" | "constructor")
+                            && let Some(f) = self.heap.get_property_chain(self.number_prototype, method_name)
+                            && (f.is_function()
+                                || f.as_object_id().and_then(|o| self.heap.get(o))
+                                    .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_))))
+                        {
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            let r = self.call_with_async_wrap(f, effective_val, &args);
+                            let result = match r {
+                                Ok(v) => v,
+                                Err(VmError::Throw(v)) => {
+                                    self.truncate_stack(obj_pos);
+                                    self.handle_throw(v)?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            };
+                            self.truncate_stack(obj_pos);
+                            self.push(result);
+                            continue;
+                        }
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                         let result = match self.exec_number_method(effective_val, method_name, &args) {
                             Ok(v) => v,
@@ -4768,9 +4792,42 @@ impl Vm {
                         // Check for Math methods (fast: cached ObjectId comparison)
                         if self.math_oid == Some(oid) {
                             // Fast path: read args directly from stack, avoid Vec alloc for 1-2 args
+                            // User-installed methods on the Math object win
+                            // over the native table (Math.split = ... patterns).
+                            if let Some(f) = self.heap.get(oid).and_then(|o| o.get_property(method_name))
+                                && (f.is_function()
+                                    || f.as_object_id().and_then(|o| self.heap.get(o))
+                                        .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_))))
+                            {
+                                let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                                let r = self.call_with_async_wrap(f, obj_val, &args);
+                                let result = match r {
+                                    Ok(v) => v,
+                                    Err(VmError::Throw(v)) => {
+                                        self.truncate_stack(obj_pos);
+                                        self.handle_throw(v)?;
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                };
+                                self.truncate_stack(obj_pos);
+                                self.push(result);
+                                continue;
+                            }
                             let arg0 = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
                             let arg1 = if argc > 1 { self.stack[obj_pos + 2] } else { Value::undefined() };
                             let name_str = self.interner.resolve(method_name);
+                            // Unknown names fall through to the generic object
+                            // dispatch (Math.toString() → Object.prototype).
+                            let is_math_fn = matches!(name_str,
+                                "sin" | "cos" | "abs" | "floor" | "ceil" | "round" | "sqrt" | "pow"
+                                | "max" | "min" | "exp" | "log" | "log2" | "log10" | "random" | "trunc"
+                                | "sign" | "cbrt" | "hypot" | "atan2" | "atan" | "asin" | "acos" | "tan"
+                                | "clz32" | "imul" | "fround" | "log1p" | "expm1" | "sinh" | "cosh"
+                                | "tanh" | "asinh" | "acosh" | "atanh");
+                            if !is_math_fn {
+                                // fall through past the Math fast path
+                            } else {
                             let result = match name_str {
                                 "sin" => Value::number(self.to_f64(arg0).sin()),
                                 "cos" => Value::number(self.to_f64(arg0).cos()),
@@ -4795,9 +4852,12 @@ impl Vm {
                             self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
+                            }
                         }
                         // Check for JSON methods (fast: cached ObjectId comparison)
-                        if self.json_oid == Some(oid) {
+                        if self.json_oid == Some(oid)
+                            && matches!(self.interner.resolve(method_name), "parse" | "stringify")
+                        {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                             let result = self.exec_json_method(method_name, &args);
                             self.truncate_stack(obj_pos);
@@ -4925,7 +4985,17 @@ impl Vm {
                                         _ => "[object Object]",
                                     }
                                 } else { "[object Object]" };
-                                let id = self.interner.intern(tag);
+                                // A string-valued @@toStringTag overrides the
+                                // builtin tag (Math, JSON, user objects).
+                                let tag_key = self.interner.intern(&format!("__sym_{}__", self.sym_to_string_tag));
+                                let id = if let Some(v) = self.heap.get_property_chain(oid, tag_key)
+                                    .filter(|v| v.is_string())
+                                {
+                                    let t = self.value_to_string(v);
+                                    self.interner.intern(&format!("[object {t}]"))
+                                } else {
+                                    self.interner.intern(tag)
+                                };
                                 self.truncate_stack(obj_pos);
                                 self.push(Value::string(id));
                                 continue;
@@ -5829,7 +5899,14 @@ impl Vm {
                             let arg = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
                             let wrapped = match sentinel {
                                 -504 => { // String
-                                    let s = if no_args { String::new() } else { self.value_to_string(arg) };
+                                    // ToString runs ToPrimitive (string hint)
+                                    // on object arguments first.
+                                    let prim = if !no_args && arg.is_object() && !arg.is_symbol() {
+                                        self.try_coerce_to_primitive_hint(arg, "string").unwrap_or(arg)
+                                    } else {
+                                        arg
+                                    };
+                                    let s = if no_args { String::new() } else { self.value_to_string(prim) };
                                     let id = self.interner.intern(&s);
                                     Value::string(id)
                                 }

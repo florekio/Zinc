@@ -364,9 +364,30 @@ impl Vm {
                 }
             }
             "split" => {
-                let parts: Vec<Value> = re
-                    .split(s)
-                    .filter_map(Result::ok)
+                let raw: Vec<&str> = re.split(s).filter_map(Result::ok).collect();
+                // JS SplitMatch skips zero-width matches at the string's
+                // boundaries: an empty-matching regex must not produce
+                // leading/trailing "" the way the Rust engine does.
+                let empty_width = re.find(s).ok().flatten().is_some_and(|m| m.start() == m.end());
+                let mut slice: &[&str] = &raw;
+                if empty_width && !s.is_empty() {
+                    if slice.first() == Some(&"") {
+                        slice = &slice[1..];
+                    }
+                    if slice.last() == Some(&"") {
+                        slice = &slice[..slice.len() - 1];
+                    }
+                }
+                // ToUint32 limit; NaN/absent → unlimited (2^32-1).
+                let limit = args.get(1)
+                    .filter(|v| !v.is_undefined())
+                    .map(|v| {
+                        let n = self.to_f64(*v);
+                        super::vm::f64_to_int32(n) as u32 as usize
+                    });
+                let parts: Vec<Value> = slice
+                    .iter()
+                    .take(limit.unwrap_or(usize::MAX))
                     .map(|part| {
                         let id = self.interner.intern(part);
                         Value::string(id)
