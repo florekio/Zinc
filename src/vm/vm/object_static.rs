@@ -41,6 +41,31 @@ impl Vm {
     }
 
     pub(crate) fn exec_object_static(&mut self, mn: &str, args: &[Value]) -> Result<Option<Value>, VmError> {
+        // ToObject / RequireObjectCoercible on the first argument: nullish
+        // receivers throw TypeError for these statics.
+        if matches!(
+            mn,
+            "keys" | "values" | "entries" | "getPrototypeOf" | "setPrototypeOf"
+                | "getOwnPropertyDescriptor" | "getOwnPropertyDescriptors"
+                | "getOwnPropertyNames" | "getOwnPropertySymbols" | "defineProperty"
+                | "defineProperties"
+        ) && args.first().copied().unwrap_or(Value::undefined()).is_nullish()
+        {
+            return Err(VmError::Throw(self.make_native_error(
+                "TypeError",
+                &format!("Object.{mn} called on null or undefined"),
+            )));
+        }
+        // defineProperty requires an actual object target.
+        if mn == "defineProperty" {
+            let t = args.first().copied().unwrap_or(Value::undefined());
+            if t.as_object_id().is_none() && !t.is_function() {
+                return Err(VmError::Throw(self.make_native_error(
+                    "TypeError",
+                    "Object.defineProperty called on non-object",
+                )));
+            }
+        }
         let result = match mn {
             "keys" => {
                 // Function values keep their own properties in
@@ -67,9 +92,16 @@ impl Vm {
                         .collect();
                     self.alloc_array(values)
                 } else if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
-                    let is_array = self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Array(_))).unwrap_or(false);
+                    let is_array = self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Array(_) | ObjectKind::Wrapper(_))).unwrap_or(false);
                     if is_array {
-                        let len = self.heap.get(oid).and_then(|o| if let ObjectKind::Array(ref e) = o.kind { Some(e.len()) } else { None }).unwrap_or(0);
+                        let len = self.heap.get(oid).and_then(|o| match &o.kind {
+                            ObjectKind::Array(e) => Some(e.len()),
+                            ObjectKind::Wrapper(inner) if inner.is_string() => {
+                                let st = self.interner.resolve(inner.as_string_id()?);
+                                Some(st.chars().count())
+                            }
+                            _ => Some(0),
+                        }).unwrap_or(0);
                         let mut keys: Vec<Value> = (0..len).map(|i| {
                             let s = self.interner.intern(&i.to_string());
                             Value::string(s)
@@ -126,6 +158,15 @@ impl Vm {
                         keys.extend(string.into_iter().map(Value::string));
                         self.alloc_array(keys)
                     }
+                } else if let Some(sv) = args.first().copied()
+                    .filter(|v| v.is_string() || self.is_cons_string(*v))
+                {
+                    // String receiver: enumerable own keys are the indices.
+                    let st = self.value_to_string(sv);
+                    let keys: Vec<Value> = (0..st.chars().count())
+                        .map(|i| Value::string(self.interner.intern(&i.to_string())))
+                        .collect();
+                    self.alloc_array(keys)
                 } else { Value::undefined() }
             }
             "values" => {
@@ -202,11 +243,17 @@ impl Vm {
             "getOwnPropertyDescriptor" => {
                 let first_arg = args.first().copied().unwrap_or(Value::undefined());
                 let key_arg = args.get(1).copied().unwrap_or(Value::undefined());
-                // For symbol keys, use __sym_N__ encoding; otherwise stringify
+                // ToPropertyKey: symbol keys use __sym_N__ encoding; objects
+                // coerce through their own toString observably.
                 let key_str = if key_arg.is_symbol() {
                     format!("__sym_{}__", key_arg.as_symbol_id().unwrap())
                 } else {
-                    self.value_to_string(key_arg)
+                    let prim = if key_arg.is_object() {
+                        self.try_coerce_to_primitive_hint(key_arg, "string")?
+                    } else {
+                        key_arg
+                    };
+                    self.value_to_string(prim)
                 };
                 // Function values keep user-set properties in
                 // fn_property_overrides — core-js inspects descriptors of
@@ -244,6 +291,49 @@ impl Vm {
                         return Ok(Some(Value::object_id(self.heap.allocate(desc))));
                     }
                     return Ok(Some(Value::undefined()));
+                }
+                // String receivers (primitive or wrapper): char-index and
+                // length descriptors.
+                let str_recv: Option<String> = if first_arg.is_string() || self.is_cons_string(first_arg) {
+                    Some(self.value_to_string(first_arg))
+                } else {
+                    first_arg.as_object_id().and_then(|o| self.heap.get(o)).and_then(|o| {
+                        if let ObjectKind::Wrapper(inner) = &o.kind {
+                            if inner.is_string() {
+                                Some(self.interner.resolve(inner.as_string_id()?).to_owned())
+                            } else { None }
+                        } else { None }
+                    })
+                };
+                if let Some(st) = str_recv {
+                    let n = st.chars().count();
+                    let (val, flags): (Option<Value>, u8) = if key_str == "length" {
+                        (Some(Value::int(n as i32)), 0)
+                    } else if let Ok(i) = key_str.parse::<usize>() {
+                        match st.chars().nth(i) {
+                            Some(c) => (Some(self.new_str(&c.to_string())), Property::ENUMERABLE),
+                            None => (None, 0),
+                        }
+                    } else {
+                        (None, 0)
+                    };
+                    if let Some(v) = val {
+                        let mut desc = JsObject::ordinary();
+                        desc.prototype = Some(self.object_prototype);
+                        let vk = self.interner.intern("value");
+                        let wk = self.interner.intern("writable");
+                        let ek = self.interner.intern("enumerable");
+                        let ck = self.interner.intern("configurable");
+                        desc.set_property(vk, v);
+                        desc.set_property(wk, Value::boolean(false));
+                        desc.set_property(ek, Value::boolean(flags & Property::ENUMERABLE != 0));
+                        desc.set_property(ck, Value::boolean(false));
+                        return Ok(Some(Value::object_id(self.heap.allocate(desc))));
+                    }
+                    if first_arg.as_object_id().is_none() {
+                        return Ok(Some(Value::undefined()));
+                    }
+                    // Wrapper: fall through for named props.
                 }
                 if let Some(oid) = first_arg.as_object_id() {
                     let key_id = self.interner.intern(&key_str);
@@ -366,16 +456,30 @@ impl Vm {
                         names.push(Value::string(id));
                     }
                     self.alloc_array(names)
+                } else if let Some(sv) = args.first().copied()
+                    .filter(|v| v.is_string() || self.is_cons_string(*v))
+                {
+                    // String primitive: indices then length.
+                    let st = self.value_to_string(sv);
+                    let mut names: Vec<Value> = (0..st.chars().count())
+                        .map(|i| Value::string(self.interner.intern(&i.to_string())))
+                        .collect();
+                    names.push(Value::string(self.interner.intern("length")));
+                    self.alloc_array(names)
                 } else if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                     let mut seen = std::collections::HashSet::new();
                     let mut names: Vec<Value> = Vec::new();
                     // For arrays, integer indices come first in numeric order,
                     // then the `length` property, then named own properties.
+                    // String wrappers expose their char indices the same way.
                     let array_len = self.heap.get(oid).and_then(|o| {
-                        if let ObjectKind::Array(ref e) = o.kind {
-                            Some(e.len())
-                        } else {
-                            None
+                        match &o.kind {
+                            ObjectKind::Array(e) => Some(e.len()),
+                            ObjectKind::Wrapper(inner) if inner.is_string() => {
+                                let st = self.interner.resolve(inner.as_string_id()?);
+                                Some(st.chars().count())
+                            }
+                            _ => None,
                         }
                     });
                     if let Some(len) = array_len {
@@ -521,6 +625,14 @@ impl Vm {
                 } else if arg.is_function() {
                     // Sentinel functions → Function.prototype
                     Value::object_id(self.function_prototype)
+                } else if arg.is_number() || arg.is_int() {
+                    Value::object_id(self.number_prototype)
+                } else if arg.is_string() || self.is_cons_string(arg) {
+                    Value::object_id(self.string_prototype)
+                } else if arg.is_boolean() {
+                    Value::object_id(self.boolean_prototype)
+                } else if arg.is_symbol() {
+                    Value::object_id(self.symbol_prototype_oid())
                 } else { Value::null() }
             }
             "setPrototypeOf" => {

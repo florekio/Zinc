@@ -4506,12 +4506,26 @@ impl Vm {
                         None
                     };
                     if let Some(s) = string_for_method {
-                        let ascii = self.string_is_ascii(effective_val);
-                        let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                        let result = self.exec_string_method(&s, method_name, &args, ascii);
-                        self.truncate_stack(obj_pos);
-                        self.push(result);
-                        continue;
+                        // Non-string method names on wrapper OBJECTS fall
+                        // through to generic dispatch (hasOwnProperty, …).
+                        let known = matches!(self.interner.resolve(method_name),
+                            "at" | "charAt" | "charCodeAt" | "codePointAt" | "concat" | "endsWith"
+                            | "includes" | "indexOf" | "lastIndexOf" | "localeCompare" | "match"
+                            | "matchAll" | "normalize" | "padEnd" | "padStart" | "repeat"
+                            | "replace" | "replaceAll" | "search" | "slice" | "split"
+                            | "startsWith" | "substr" | "substring" | "toLocaleLowerCase"
+                            | "toLocaleUpperCase" | "toLowerCase" | "toString" | "toUpperCase"
+                            | "trim" | "trimEnd" | "trimStart" | "valueOf" | "anchor" | "big"
+                            | "blink" | "bold" | "fixed" | "fontcolor" | "fontsize" | "italics"
+                            | "link" | "small" | "strike" | "sub" | "sup");
+                        if known || obj_val.as_object_id().is_none() {
+                            let ascii = self.string_is_ascii(effective_val);
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
+                            let result = self.exec_string_method(&s, method_name, &args, ascii);
+                            self.truncate_stack(obj_pos);
+                            self.push(result);
+                            continue;
+                        }
                     }
 
                     // Number primitive methods: (42).toString(16), (3.14).toFixed(2)
@@ -4934,11 +4948,21 @@ impl Vm {
                                 let setter_key = self.interner.intern(&format!("__set_{key}__"));
                                 self.ensure_builtin_proto_method(oid, key_id);
                                 let has = self.heap.get(oid).map(|o| {
-                                    // For arrays, also check element indices
+                                    // For arrays and string wrappers, also
+                                    // check element / char indices.
                                     let array_idx = key.parse::<usize>().ok().and_then(|idx| {
-                                        if let ObjectKind::Array(ref elems) = o.kind {
-                                            if idx < elems.len() { Some(true) } else { None }
-                                        } else { None }
+                                        match &o.kind {
+                                            ObjectKind::Array(elems) => {
+                                                if idx < elems.len() { Some(true) } else { None }
+                                            }
+                                            ObjectKind::Wrapper(inner) if inner.is_string() => {
+                                                let n = inner.as_string_id()
+                                                    .map(|sid| self.interner.resolve(sid).chars().count())
+                                                    .unwrap_or(0);
+                                                if idx < n { Some(true) } else { None }
+                                            }
+                                            _ => None,
+                                        }
                                     }).unwrap_or(false);
                                     array_idx
                                         || o.has_own_property(key_id)
@@ -7644,12 +7668,19 @@ impl Vm {
                                 // through to the generic walk so named enumerable
                                 // properties (defineProperty beyond the dense
                                 // length, accessors) are enumerated too.
-                                let elem_seed: Vec<StringId> =
-                                    if let ObjectKind::Array(ref elems) = o.kind {
+                                let elem_seed: Vec<StringId> = match &o.kind {
+                                    ObjectKind::Array(elems) => {
                                         (0..elems.len()).map(|i| self.interner.intern(&i.to_string())).collect()
-                                    } else {
-                                        Vec::new()
-                                    };
+                                    }
+                                    // String wrappers enumerate their char indices.
+                                    ObjectKind::Wrapper(inner) if inner.is_string() => {
+                                        let n = inner.as_string_id()
+                                            .map(|sid| self.interner.resolve(sid).chars().count())
+                                            .unwrap_or(0);
+                                        (0..n).map(|i| self.interner.intern(&i.to_string())).collect()
+                                    }
+                                    _ => Vec::new(),
+                                };
                                 {
                                     // Object: walk prototype chain. Per spec
                                     // OrdinaryOwnPropertyKeys + EnumerateObjectProperties,
