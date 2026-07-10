@@ -401,6 +401,12 @@ impl Vm {
     /// Get(O, "length") for an array-like, getter-aware, clamped to the
     /// iteration cap so a poisoned length can't spin the VM.
     fn array_like_length(&mut self, oid: crate::runtime::object::ObjectId) -> Result<u64, VmError> {
+        Ok(self.array_like_length_raw(oid)?.min(1_000_000))
+    }
+
+    /// ToLength(Get(O, "length")) without the iteration cap — for RangeError
+    /// checks that need the spec value (ArrayCreate limits).
+    fn array_like_length_raw(&mut self, oid: crate::runtime::object::ObjectId) -> Result<u64, VmError> {
         // Dense arrays without a shadowing named length use the element count.
         let len_key = self.interner.intern("length");
         let (is_array, elems_len, named) = match self.heap.get(oid) {
@@ -454,7 +460,7 @@ impl Vm {
         if n.is_nan() || n <= 0.0 {
             return Ok(0);
         }
-        Ok((n.min(9_007_199_254_740_991.0) as u64).min(1_000_000))
+        Ok(n.min(9_007_199_254_740_991.0) as u64)
     }
 
     /// HasProperty + Get for an array-like index: own accessors, dense
@@ -586,7 +592,18 @@ impl Vm {
         match name {
             "forEach" | "map" | "filter" | "every" | "some"
             | "find" | "findIndex" | "findLast" | "findLastIndex" => {
-                let len = self.array_like_length(oid)?;
+                let len = if name == "map" {
+                    // ArrayCreate(len) rejects lengths beyond 2^32-1.
+                    let raw = self.array_like_length_raw(oid)?;
+                    if raw > 4_294_967_295 {
+                        return Err(VmError::Throw(
+                            self.make_native_error("RangeError", "Invalid array length"),
+                        ));
+                    }
+                    raw.min(1_000_000)
+                } else {
+                    self.array_like_length(oid)?
+                };
                 require_callback(self)?;
                 let mut mapped: Vec<Value> = Vec::new();
                 let mut filtered: Vec<Value> = Vec::new();
@@ -1062,7 +1079,17 @@ impl Vm {
             }
             "indexOf" => {
                 let search = args.first().copied().unwrap_or(Value::undefined());
-                let from_idx = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
+                // Length is checked before ToInteger(fromIndex) per spec.
+                let empty = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.is_empty() } else { true })
+                    .unwrap_or(true);
+                if empty {
+                    return Ok(Value::int(-1));
+                }
+                let from_idx = match args.get(1) {
+                    Some(v) => self.coerce_to_f64(*v)?,
+                    None => 0.0,
+                };
                 if let Some(obj) = self.heap.get(oid)
                     && let ObjectKind::Array(ref elements) = obj.kind {
                         let len = elements.len() as i32;
@@ -1158,10 +1185,16 @@ impl Vm {
                 let elements: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
-                let mut acc = if args.len() > 1 { args[1] } else if !elements.is_empty() { elements[0] } else { Value::undefined() };
+                if args.len() < 2 && elements.is_empty() {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Reduce of empty array with no initial value",
+                    )));
+                }
+                let mut acc = if args.len() > 1 { args[1] } else { elements[0] };
                 let start = if args.len() > 1 { 0 } else { 1 };
                 for (i, elem) in elements.iter().enumerate().skip(start) {
-                    acc = self.call_function(callback, &[acc, *elem, Value::int(i as i32)])?;
+                    acc = self.call_function(callback, &[acc, *elem, Value::int(i as i32), Value::object_id(oid)])?;
                 }
                 Ok(acc)
             }
@@ -1254,12 +1287,15 @@ impl Vm {
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 if elements.is_empty() && args.len() <= 1 {
-                    return Err(VmError::TypeError("reduceRight of empty array with no initial value".into()));
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Reduce of empty array with no initial value",
+                    )));
                 }
                 let mut acc = if args.len() > 1 { args[1] } else { *elements.last().unwrap() };
                 let end = if args.len() > 1 { elements.len() } else { elements.len() - 1 };
                 for i in (0..end).rev() {
-                    acc = self.call_function(callback, &[acc, elements[i], Value::int(i as i32)])?;
+                    acc = self.call_function(callback, &[acc, elements[i], Value::int(i as i32), Value::object_id(oid)])?;
                 }
                 Ok(acc)
             }
@@ -1460,9 +1496,28 @@ impl Vm {
             }
             "lastIndexOf" => {
                 let search = args.first().copied().unwrap_or(Value::undefined());
-                if let Some(obj) = self.heap.get(oid)
+                let len = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() as i64 } else { 0 })
+                    .unwrap_or(0);
+                // Length is checked before ToInteger(fromIndex) per spec.
+                if len == 0 {
+                    return Ok(Value::int(-1));
+                }
+                let from = match args.get(1) {
+                    Some(v) => self.coerce_to_f64(*v)?,
+                    None => (len - 1) as f64,
+                };
+                let start = if from.is_nan() {
+                    -1
+                } else if from < 0.0 {
+                    len + from as i64
+                } else {
+                    (from as i64).min(len - 1)
+                };
+                if start >= 0 && let Some(obj) = self.heap.get(oid)
                     && let ObjectKind::Array(ref elements) = obj.kind {
-                        for i in (0..elements.len()).rev() {
+                        let elements = elements.clone();
+                        for i in (0..=(start as usize).min(elements.len().saturating_sub(1))).rev() {
                             if self.strict_eq(elements[i], search) {
                                 return Ok(Value::int(i as i32));
                             }
