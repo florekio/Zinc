@@ -634,3 +634,520 @@ pub fn validate_js_flags(flags: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+impl Vm {
+    /// Set(this, "lastIndex", n) with real descriptor semantics: accessor
+    /// setters run, setter-less accessors and non-writable data properties
+    /// throw TypeError, plain properties update.
+    pub(crate) fn set_lastindex_checked(&mut self, oid: ObjectId, n: f64) -> Result<(), Value> {
+        let li = self.interner.intern("lastIndex");
+        let gk = self.interner.intern("__get_lastIndex__");
+        let sk = self.interner.intern("__set_lastIndex__");
+        let (setter, has_accessor, named_nonwritable) = match self.heap.get(oid) {
+            Some(o) => (
+                o.get_property(sk).filter(|v| v.is_function()),
+                o.has_own_property(gk) || o.has_own_property(sk),
+                o.get_property_descriptor(li).is_some_and(|p| !p.is_writable()),
+            ),
+            None => (None, false, false),
+        };
+        if let Some(sfn) = setter {
+            return match self.call_function_this(sfn, Value::object_id(oid), &[Value::number(n)]) {
+                Ok(_) => Ok(()),
+                Err(VmError::Throw(v)) => Err(v),
+                Err(e) => Err(self.make_native_error("Error", &format!("{e:?}"))),
+            };
+        }
+        if has_accessor || named_nonwritable {
+            return Err(self.make_native_error(
+                "TypeError",
+                "Cannot assign to read only property 'lastIndex'",
+            ));
+        }
+        if let Some(o) = self.heap.get_mut(oid) {
+            o.set_property(li, Value::number(n));
+        }
+        Ok(())
+    }
+
+    /// ToLength(Get(this, "lastIndex")) with observable getter and valueOf.
+    fn read_lastindex_coerced(&mut self, oid: ObjectId) -> Result<f64, Value> {
+        let v = self.getter_aware_get(oid, "lastIndex")
+            .map_err(|e| match e {
+                VmError::Throw(v) => v,
+                e => self.make_native_error("Error", &format!("{e:?}")),
+            })?
+            .unwrap_or(Value::undefined());
+        let prim = if v.is_object() && !v.is_symbol() {
+            match self.try_coerce_to_primitive_hint(v, "number") {
+                Ok(p) => p,
+                Err(VmError::Throw(t)) => return Err(t),
+                Err(_) => v,
+            }
+        } else {
+            v
+        };
+        Ok(self.to_f64(prim))
+    }
+
+    /// RegExp.prototype[@@replace/@@match/@@search/@@split] — protocol-aware
+    /// front door. Native RegExp receivers surface lastIndex descriptor
+    /// semantics then delegate to the string machinery; other objects run
+    /// the generic RegExpExec protocol (custom `exec`, observable Gets).
+    pub(crate) fn regexp_symbol_method(
+        &mut self,
+        mname: &str,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Value> {
+        let Some(oid) = this.as_object_id() else {
+            return Err(self.make_native_error(
+                "TypeError",
+                "RegExp.prototype method called on incompatible receiver",
+            ));
+        };
+        // ToString(string argument), observable; Symbols throw.
+        let sv = args.first().copied().unwrap_or(Value::undefined());
+        if sv.is_symbol() {
+            return Err(self.make_native_error(
+                "TypeError",
+                "Cannot convert a Symbol value to a string",
+            ));
+        }
+        let prim = if sv.is_object() && !sv.is_symbol() {
+            match self.try_coerce_to_primitive_hint(sv, "string") {
+                Ok(p) => p,
+                Err(VmError::Throw(v)) => return Err(v),
+                Err(_) => sv,
+            }
+        } else {
+            sv
+        };
+        let s = self.value_to_string(prim);
+        let native_flags = self.heap.get(oid).and_then(|o| {
+            if let ObjectKind::RegExp { ref flags, .. } = o.kind { Some(flags.clone()) } else { None }
+        });
+        // @@split runs SpeciesConstructor(this): an own constructor override
+        // is read observably, its @@species fetched and constructed — abrupt
+        // completions propagate (the constructed splitter is approximated by
+        // the native machinery afterwards).
+        if mname == "split" {
+            let ck = self.interner.intern("constructor");
+            let gck = self.interner.intern("__get_constructor__");
+            let has_own_ctor = self.heap.get(oid)
+                .is_some_and(|o| o.has_own_property(ck) || o.has_own_property(gck));
+            if has_own_ctor {
+                let ctor = self.getter_aware_get(oid, "constructor")
+                    .map_err(|e| match e {
+                        VmError::Throw(v) => v,
+                        e => self.make_native_error("Error", &format!("{e:?}")),
+                    })?
+                    .unwrap_or(Value::undefined());
+                let species = if let Some(packed) = ctor.as_function() {
+                    let sk = self.interner.intern("__sym_4__");
+                    self.fn_property_overrides.get(&(packed, sk)).copied().flatten()
+                } else if let Some(coid) = ctor.as_object_id() {
+                    self.getter_aware_get(coid, "__sym_4__")
+                        .map_err(|e| match e {
+                            VmError::Throw(v) => v,
+                            e => self.make_native_error("Error", &format!("{e:?}")),
+                        })?
+                } else {
+                    None
+                };
+                if let Some(sp) = species.filter(|v| !v.is_nullish()) {
+                    let fresh = self.heap.allocate(JsObject::ordinary());
+                    let flags_arg = self.new_str(native_flags.as_deref().unwrap_or(""));
+                    if let Err(VmError::Throw(v)) =
+                        self.call_function_this(sp, Value::object_id(fresh), &[this, flags_arg])
+                    {
+                        return Err(v);
+                    }
+                }
+            }
+        }
+        // A receiver with its OWN exec (data or accessor) uses the generic
+        // RegExpExec protocol even when it is a native RegExp — custom exec
+        // overrides are spec-observable.
+        let has_custom_exec = {
+            let ek = self.interner.intern("exec");
+            let gk = self.interner.intern("__get_exec__");
+            self.heap.get(oid).is_some_and(|o| o.has_own_property(ek) || o.has_own_property(gk))
+        };
+        let repl_is_fn = mname == "replace" && {
+            let r = args.get(1).copied().unwrap_or(Value::undefined());
+            r.is_function()
+                || r.as_object_id().and_then(|o| self.heap.get(o))
+                    .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)))
+        };
+        if let Some(flags) = native_flags.clone().filter(|_| !has_custom_exec && !repl_is_fn) {
+            let global = flags.contains('g');
+            let sticky = flags.contains('y');
+            // Own accessor overrides of the flag properties are observable
+            // Gets per spec (poisoned getters throw before any matching).
+            for prop in ["flags", "global", "unicode", "sticky"] {
+                let gk = self.interner.intern(&format!("__get_{prop}__"));
+                let has_override = self.heap.get(oid).is_some_and(|o| o.has_own_property(gk));
+                if has_override {
+                    let v = self.getter_aware_get(oid, prop)
+                        .map_err(|e| match e {
+                            VmError::Throw(v) => v,
+                            e => self.make_native_error("Error", &format!("{e:?}")),
+                        })?
+                        .unwrap_or(Value::undefined());
+                    if prop == "flags" && v.is_object() && !v.is_symbol()
+                        && let Err(VmError::Throw(t)) = self.try_coerce_to_primitive_hint(v, "string")
+                    {
+                        return Err(t);
+                    }
+                }
+            }
+            // replace: a function replacement routes through the generic
+            // protocol (protected callback calls); an object replacement
+            // coerces observably.
+            if mname == "replace" {
+                let repl = args.get(1).copied().unwrap_or(Value::undefined());
+                let repl_is_fn = repl.is_function()
+                    || repl.as_object_id().and_then(|o| self.heap.get(o))
+                        .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)));
+                if !repl_is_fn && repl.is_object() && !repl.is_symbol()
+                    && let Err(VmError::Throw(t)) = self.try_coerce_to_primitive_hint(repl, "string")
+                {
+                    return Err(t);
+                }
+            }
+            // split: the limit coerces observably before any matching.
+            if mname == "split"
+                && let Some(lim) = args.get(1).copied()
+            {
+                if lim.is_symbol() {
+                    return Err(self.make_native_error(
+                        "TypeError",
+                        "Cannot convert a Symbol value to a number",
+                    ));
+                }
+                if lim.is_object()
+                    && let Err(VmError::Throw(t)) = self.try_coerce_to_primitive_hint(lim, "number")
+                {
+                    return Err(t);
+                }
+            }
+            // Observable lastIndex protocol on the receiver itself.
+            if mname == "search" {
+                let prev = self.read_lastindex_coerced(oid)?;
+                self.set_lastindex_checked(oid, 0.0)?;
+                let ascii = s.is_ascii();
+                let name_id = self.interner.intern(mname);
+                let mut call_args: Vec<Value> = vec![this];
+                call_args.extend(args.iter().skip(1).copied());
+                let r = self.exec_string_method(&s, name_id, &call_args, ascii);
+                self.set_lastindex_checked(oid, prev)?;
+                return Ok(r);
+            }
+            if (global && matches!(mname, "match" | "replace")) || sticky {
+                // Global match/replace reset lastIndex; sticky ops read and
+                // rewrite it — either way the read and the write (with
+                // descriptor checks) are observable.
+                let cur = self.read_lastindex_coerced(oid)?;
+                let target = if global { 0.0 } else { cur };
+                self.set_lastindex_checked(oid, target)?;
+            }
+            let ascii = s.is_ascii();
+            let name_id = self.interner.intern(mname);
+            let mut call_args: Vec<Value> = vec![this];
+            call_args.extend(args.iter().skip(1).copied());
+            return Ok(self.exec_string_method(&s, name_id, &call_args, ascii));
+        }
+        // Generic (non-RegExp) receiver: RegExpExec protocol.
+        let unwrap_throw = |vm: &mut Self, e: VmError| match e {
+            VmError::Throw(v) => v,
+            e => vm.make_native_error("Error", &format!("{e:?}")),
+        };
+        // Observable flags read (ToString runs) for the methods that use it.
+        if matches!(mname, "match" | "replace" | "split") {
+            let fl = self.getter_aware_get(oid, "flags")
+                .map_err(|e| unwrap_throw(self, e))?;
+            if let Some(f) = fl
+                && f.is_object() && !f.is_symbol()
+                && let Err(VmError::Throw(v)) = self.try_coerce_to_primitive_hint(f, "string")
+            {
+                return Err(v);
+            }
+        }
+        // split coerces its limit before running.
+        if mname == "split"
+            && let Some(lim) = args.get(1).copied()
+        {
+            if lim.is_symbol() {
+                return Err(self.make_native_error(
+                    "TypeError",
+                    "Cannot convert a Symbol value to a number",
+                ));
+            }
+            if lim.is_object()
+                && let Err(VmError::Throw(v)) = self.try_coerce_to_primitive_hint(lim, "number")
+            {
+                return Err(v);
+            }
+        }
+        if mname == "search" {
+            let prev = self.read_lastindex_coerced(oid)?;
+            self.set_lastindex_checked(oid, 0.0)?;
+            let result = self.regexp_exec_generic(oid, this, &s)?;
+            self.set_lastindex_checked(oid, prev)?;
+            return if result.is_null() {
+                Ok(Value::number(-1.0))
+            } else if let Some(roid) = result.as_object_id() {
+                let idx = self.getter_aware_get(roid, "index")
+                    .map_err(|e| unwrap_throw(self, e))?
+                    .unwrap_or(Value::undefined());
+                Ok(idx)
+            } else {
+                Ok(Value::number(-1.0))
+            };
+        }
+        // Global comes from native flags or the (already-read) flags string.
+        let global = if let Some(f) = &native_flags {
+            f.contains('g')
+        } else {
+            let fl = self.getter_aware_get(oid, "flags")
+                .map_err(|e| unwrap_throw(self, e))?
+                .unwrap_or(Value::undefined());
+            self.value_to_string(fl).contains('g')
+        };
+        if global && matches!(mname, "match" | "replace") {
+            self.set_lastindex_checked(oid, 0.0)?;
+        }
+        // Exec loop: single-shot for non-global, repeat-until-null (with
+        // observable empty-match lastIndex advancement) for global.
+        let mut results: Vec<Value> = Vec::new();
+        loop {
+            let r = self.regexp_exec_generic(oid, this, &s)?;
+            if r.is_null() {
+                break;
+            }
+            results.push(r);
+            if !global || matches!(mname, "split") {
+                break;
+            }
+            // AdvanceStringIndex on empty matches (observable read + write).
+            let m0 = r.as_object_id()
+                .map(|roid| self.getter_aware_get(roid, "0"))
+                .transpose()
+                .map_err(|e| unwrap_throw(self, e))?
+                .flatten()
+                .unwrap_or(Value::undefined());
+            let m0p = if m0.is_object() && !m0.is_symbol() {
+                match self.try_coerce_to_primitive_hint(m0, "string") {
+                    Ok(p) => p,
+                    Err(VmError::Throw(v)) => return Err(v),
+                    Err(_) => m0,
+                }
+            } else { m0 };
+            if self.value_to_string(m0p).is_empty() {
+                let li = self.read_lastindex_coerced(oid)?;
+                self.set_lastindex_checked(oid, li + 1.0)?;
+                if li + 1.0 > s.len() as f64 {
+                    break;
+                }
+            }
+            if results.len() > 10_000 {
+                break; // runaway custom exec
+            }
+        }
+        let result = results.first().copied().unwrap_or(Value::null());
+        match mname {
+            "match" => {
+                if !global {
+                    return Ok(result);
+                }
+                // Global match: array of ToString(Get(result, "0")).
+                let mut out = Vec::new();
+                for r in &results {
+                    let Some(roid) = r.as_object_id() else { continue };
+                    let m0 = self.getter_aware_get(roid, "0")
+                        .map_err(|e| unwrap_throw(self, e))?
+                        .unwrap_or(Value::undefined());
+                    let m0p = if m0.is_object() && !m0.is_symbol() {
+                        match self.try_coerce_to_primitive_hint(m0, "string") {
+                            Ok(p) => p,
+                            Err(VmError::Throw(v)) => return Err(v),
+                            Err(_) => m0,
+                        }
+                    } else { m0 };
+                    let ms = self.value_to_string(m0p);
+                    out.push(self.new_str(&ms));
+                }
+                if out.is_empty() {
+                    return Ok(Value::null());
+                }
+                Ok(self.alloc_array(out))
+            }
+            "replace" => {
+                if results.is_empty() {
+                    return Ok(self.new_str(&s));
+                }
+                let repl = args.get(1).copied().unwrap_or(Value::undefined());
+                let repl_is_fn = repl.is_function()
+                    || repl.as_object_id().and_then(|o| self.heap.get(o))
+                        .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)));
+                let mut subs: Vec<(usize, String, String)> = Vec::new();
+                for r in results.clone() {
+                    let Some(roid) = r.as_object_id() else { continue };
+                    // Observable reads of the exec result: length (ToLength),
+                    // capture slots, and groups.
+                    let len_v = self.getter_aware_get(roid, "length")
+                        .map_err(|e| unwrap_throw(self, e))?
+                        .unwrap_or(Value::undefined());
+                    let len_p = if len_v.is_object() && !len_v.is_symbol() {
+                        match self.try_coerce_to_primitive_hint(len_v, "number") {
+                            Ok(p) => p,
+                            Err(VmError::Throw(v)) => return Err(v),
+                            Err(_) => len_v,
+                        }
+                    } else { len_v };
+                    let ncaps = self.to_f64(len_p).clamp(0.0, 64.0) as usize;
+                    let mut caps: Vec<Value> = Vec::new();
+                    for ci in 1..ncaps {
+                        let cv = self.getter_aware_get(roid, &ci.to_string())
+                            .map_err(|e| unwrap_throw(self, e))?
+                            .unwrap_or(Value::undefined());
+                        if cv.is_object() && !cv.is_symbol()
+                            && let Err(VmError::Throw(v)) = self.try_coerce_to_primitive_hint(cv, "string")
+                        {
+                            return Err(v);
+                        }
+                        caps.push(cv);
+                    }
+                    let groups_v = self.getter_aware_get(roid, "groups")
+                        .map_err(|e| unwrap_throw(self, e))?
+                        .unwrap_or(Value::undefined());
+                    if groups_v.is_null() {
+                        // ToObject(null) — namedCaptures coercion is abrupt.
+                        return Err(self.make_native_error(
+                            "TypeError",
+                            "Cannot convert null to object",
+                        ));
+                    }
+                    if let Some(goid) = groups_v.as_object_id() {
+                        for key in self.enumerable_own_string_keys(goid) {
+                            let gv = self.getter_aware_get(goid, &key)
+                                .map_err(|e| unwrap_throw(self, e))?
+                                .unwrap_or(Value::undefined());
+                            if gv.is_object() && !gv.is_symbol()
+                                && let Err(VmError::Throw(v)) = self.try_coerce_to_primitive_hint(gv, "string")
+                            {
+                                return Err(v);
+                            }
+                        }
+                    }
+                    let m0 = self.getter_aware_get(roid, "0")
+                        .map_err(|e| unwrap_throw(self, e))?
+                        .unwrap_or(Value::undefined());
+                    let m0p = if m0.is_object() && !m0.is_symbol() {
+                        match self.try_coerce_to_primitive_hint(m0, "string") {
+                            Ok(p) => p,
+                            Err(VmError::Throw(v)) => return Err(v),
+                            Err(_) => m0,
+                        }
+                    } else { m0 };
+                    let matched = self.value_to_string(m0p);
+                    let idx_v = self.getter_aware_get(roid, "index")
+                        .map_err(|e| unwrap_throw(self, e))?
+                        .unwrap_or(Value::undefined());
+                    let idxp = if idx_v.is_object() && !idx_v.is_symbol() {
+                        match self.try_coerce_to_primitive_hint(idx_v, "number") {
+                            Ok(p) => p,
+                            Err(VmError::Throw(v)) => return Err(v),
+                            Err(_) => idx_v,
+                        }
+                    } else { idx_v };
+                    let pos = (self.to_f64(idxp).max(0.0) as usize).min(s.len());
+                    let pos = (0..=pos).rev().find(|p| s.is_char_boundary(*p)).unwrap_or(0);
+                    let repl_str = if repl_is_fn {
+                        let m_id = self.new_str(&matched);
+                        let s_id = self.new_str(&s);
+                        let mut cb_args = vec![m_id];
+                        cb_args.extend(caps.iter().copied());
+                        cb_args.push(Value::number(pos as f64));
+                        cb_args.push(s_id);
+                        let rv = self.call_function_this(repl, Value::undefined(), &cb_args)
+                            .map_err(|e| unwrap_throw(self, e))?;
+                        let rp = if rv.is_object() && !rv.is_symbol() {
+                            match self.try_coerce_to_primitive_hint(rv, "string") {
+                                Ok(p) => p,
+                                Err(VmError::Throw(v)) => return Err(v),
+                                Err(_) => rv,
+                            }
+                        } else { rv };
+                        self.value_to_string(rp)
+                    } else {
+                        let rp = if repl.is_object() && !repl.is_symbol() {
+                            match self.try_coerce_to_primitive_hint(repl, "string") {
+                                Ok(p) => p,
+                                Err(VmError::Throw(v)) => return Err(v),
+                                Err(_) => repl,
+                            }
+                        } else { repl };
+                        self.value_to_string(rp)
+                    };
+                    subs.push((pos, matched, repl_str));
+                }
+                // Build the output left to right; overlapping/regressing
+                // positions keep the untouched text.
+                let mut out = String::new();
+                let mut cursor = 0usize;
+                for (pos, matched, repl_str) in subs {
+                    if pos < cursor {
+                        continue;
+                    }
+                    out.push_str(&s[cursor..pos]);
+                    out.push_str(&repl_str);
+                    let tail = (pos + matched.len()).min(s.len());
+                    cursor = (tail..=s.len()).find(|p| s.is_char_boundary(*p)).unwrap_or(s.len());
+                }
+                out.push_str(&s[cursor..]);
+                Ok(self.new_str(&out))
+            }
+            // Generic @@split approximation: no species machinery — the
+            // observable coercions above ran; return the unsplit string.
+            _ => {
+                let one = self.new_str(&s);
+                Ok(self.alloc_array(vec![one]))
+            }
+        }
+    }
+
+    /// RegExpExec on a generic receiver: Get(this, "exec"), call it when
+    /// callable (result must be Object or null), otherwise TypeError.
+    fn regexp_exec_generic(&mut self, oid: ObjectId, this: Value, s: &str) -> Result<Value, Value> {
+        let exec = self.getter_aware_get(oid, "exec")
+            .map_err(|e| match e {
+                VmError::Throw(v) => v,
+                e => self.make_native_error("Error", &format!("{e:?}")),
+            })?
+            .unwrap_or(Value::undefined());
+        let callable = exec.is_function()
+            || exec.as_object_id().and_then(|o| self.heap.get(o))
+                .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)));
+        if !callable {
+            return Err(self.make_native_error(
+                "TypeError",
+                "Receiver is not a RegExp and has no callable exec",
+            ));
+        }
+        let s_val = self.new_str(s);
+        let r = self.call_function_this(exec, this, &[s_val])
+            .map_err(|e| match e {
+                VmError::Throw(v) => v,
+                e => self.make_native_error("Error", &format!("{e:?}")),
+            })?;
+        if !r.is_null() && r.as_object_id().is_none() {
+            return Err(self.make_native_error(
+                "TypeError",
+                "RegExp exec method returned something other than an Object or null",
+            ));
+        }
+        Ok(r)
+    }
+}

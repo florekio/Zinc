@@ -458,6 +458,31 @@ impl Vm {
                 let val = Value::object_id(heap.allocate(fn_obj));
                 re_proto.define_property(key, Property::with_flags(val, Property::WRITABLE | Property::CONFIGURABLE));
             }
+            // Well-known-symbol methods delegate to the string machinery
+            // with the receiver regexp as the pattern argument.
+            for (mname, sid, len) in [("replace", 8u32, 2i32), ("match", 9, 1), ("search", 10, 1), ("split", 11, 2)] {
+                let mname_owned = mname.to_string();
+                let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                    move |vm: &mut Vm, this: Value, args: &[Value]| -> Result<Value, Value> {
+                        vm.regexp_symbol_method(&mname_owned, this, args)
+                    },
+                );
+                let fn_name = interner.intern(&format!("[Symbol.{mname}]"));
+                let mut fn_obj = JsObject {
+                    properties: Vec::new(),
+                    prototype: None,
+                    kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: fn_name, func }),
+                    marked: false,
+                    extensible: true,
+                };
+                let name_key = interner.intern("name");
+                let len_key = interner.intern("length");
+                fn_obj.define_property(name_key, Property::with_flags(Value::string(fn_name), Property::CONFIGURABLE));
+                fn_obj.define_property(len_key, Property::with_flags(Value::int(len), Property::CONFIGURABLE));
+                let val = Value::object_id(heap.allocate(fn_obj));
+                let key = interner.intern(&format!("__sym_{sid}__"));
+                re_proto.define_property(key, Property::with_flags(val, Property::WRITABLE | Property::CONFIGURABLE));
+            }
             let re_proto_oid = heap.allocate(re_proto);
             func_prototypes.insert(-580i32, re_proto_oid);
         }
@@ -516,6 +541,10 @@ impl Vm {
             Some(interner.intern("Symbol.unscopables")),
             Some(interner.intern("Symbol.asyncIterator")),
             Some(interner.intern("Symbol.matchAll")),
+            Some(interner.intern("Symbol.replace")),
+            Some(interner.intern("Symbol.match")),
+            Some(interner.intern("Symbol.search")),
+            Some(interner.intern("Symbol.split")),
         ];
 
         // Pre-populate fast lookup Vec from all initial globals
@@ -585,7 +614,7 @@ impl Vm {
             json_oid: Some(json_oid),
             symbol_descriptions: sym_descs,
             symbol_registry: std::collections::HashMap::new(),
-            next_symbol_id: 8, // 0-7 are well-known
+            next_symbol_id: 12, // 0-11 are well-known
             sym_iterator: 0,
             sym_has_instance: 1,
             sym_to_primitive: 2,

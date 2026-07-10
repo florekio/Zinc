@@ -829,6 +829,10 @@ impl Vm {
                 "unscopables" => Value::symbol(self.sym_unscopables),
                 "asyncIterator" => Value::symbol(self.sym_async_iterator),
                 "matchAll" => Value::symbol(self.sym_match_all),
+                "replace" => Value::symbol(8),
+                "match" => Value::symbol(9),
+                "search" => Value::symbol(10),
+                "split" => Value::symbol(11),
                 "prototype" => Value::object_id(self.symbol_prototype_oid()),
                 "name" => { let id = self.interner.intern("Symbol"); Value::string(id) }
                 "length" => Value::int(0),
