@@ -4,7 +4,7 @@ A JavaScript engine written from scratch in Rust with an **experimental JIT comp
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**93.0% [Test262](docs/TEST262.md) conformance (14,982 / 16,116 active tests)** | **94 tests** | **~35,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
+**83.9% [Test262](docs/TEST262.md) conformance across language + built-ins (23,217 / 27,658 active tests)** — **96.4% on the language suite alone** | **94 tests** | **~41,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
 
 ![Zinc Playground](web/screenshot.png)
 
@@ -56,35 +56,36 @@ See [JIT.md](docs/JIT.md) for technical details.
 
 | Category | Supported |
 |----------|-----------|
-| **Data types** | Numbers (int + float), strings, booleans, `null`, `undefined`, `NaN`, `Infinity`, Symbol |
+| **Data types** | Numbers (int + float), strings, booleans, `null`, `undefined`, `NaN`, `Infinity`, Symbol, BigInt |
 | **Operators** | `+` `-` `*` `/` `%` `**` `<` `<=` `>` `>=` `==` `===` `!=` `!==` `&&` `\|\|` `!` `??` `&` `\|` `^` `~` `<<` `>>` `>>>` `?:` `typeof` `void` `delete` `++` `--` `+=` `-=` `in` `instanceof` etc. |
 | **Variables** | `var` (with hoisting), `let`, `const` with block scoping and TDZ, const reassignment prevention |
 | **Control flow** | `if`/`else`, `while`, `do-while`, `for`, `for...in`, `for...of`, `switch`/`case`, labeled `break`/`continue` |
-| **Functions** | Declarations, expressions, arrow functions, closures, recursion, default params, rest params, `Function.prototype.call`/`apply`/`bind`, `Function.length`, `Function.name` |
-| **Classes** | `class`, `constructor`, `extends`, `super()`, instance methods, static methods, getters/setters, private fields (`#field`, `#method()`), `new`, prototype chain inheritance |
-| **Objects** | Literals, property get/set, computed properties, getters/setters, `this` binding, prototype chain, spread (`{...obj}`), `Object.keys`/`values`/`entries`/`assign`/`create`/`defineProperty`/`freeze`/`seal`/`is`/`getPrototypeOf`/`setPrototypeOf`/`getOwnPropertyNames`/`getOwnPropertyDescriptor`/`hasOwn` |
-| **Arrays** | Literals, indexed access, spread (`[...arr]`), `.length`, `.push`, `.pop`, `.map`, `.filter`, `.reduce`, `.reduceRight`, `.forEach`, `.find`, `.findIndex`, `.findLast`, `.findLastIndex`, `.some`, `.every`, `.join`, `.indexOf`, `.lastIndexOf`, `.includes`, `.reverse`, `.shift`, `.unshift`, `.splice`, `.slice`, `.concat`, `.sort`, `.fill`, `.copyWithin`, `.flat`, `.flatMap`, `.at`, `.keys`, `.values`, `.entries`, `Array.from`, `Array.of`, `Array.isArray` |
-| **Strings** | 25+ methods: `.charAt`, `.charCodeAt`, `.codePointAt`, `.indexOf`, `.lastIndexOf`, `.includes`, `.startsWith`, `.endsWith`, `.slice`, `.substring`, `.toUpperCase`, `.toLowerCase`, `.trim`, `.trimStart`, `.trimEnd`, `.split`, `.replace`, `.replaceAll`, `.match`, `.search`, `.repeat`, `.padStart`, `.padEnd`, `.concat`, `.at`, `.toString`, `String.fromCharCode`, `String.fromCodePoint` |
-| **Numbers** | `Number.isNaN`, `Number.isFinite`, `Number.isInteger`, `Number.isSafeInteger`, `Number.parseInt`, `Number.parseFloat`, `.toString(radix)`, `.toFixed()`, `.valueOf()` |
-| **Regular expressions** | `/pattern/flags` literals, `.test()`, `.exec()`, `.source`, `.flags`, `.global`; regex-aware `.replace()`, `.match()`, `.search()`, `.split()`, `.replaceAll()` |
+| **Functions** | Declarations, expressions, arrow functions, closures, recursion, default params, rest params, `Function.prototype.call`/`apply`/`bind`, own `name`/`length` with spec descriptor attributes (including built-ins and extracted methods) |
+| **Classes** | `class`, `constructor`, `extends` (including native built-ins: `Array`, `Promise`, `Date`, `Map`, …), `super()`, instance methods, static methods, getters/setters, private fields (`#field`, `#method()`), `new`, prototype chain inheritance |
+| **Objects** | Literals, property get/set, computed properties, getters/setters, `this` binding, prototype chain, spread (`{...obj}`), `Object.keys`/`values`/`entries`/`assign`/`create`/`defineProperty`/`defineProperties`/`freeze`/`seal`/`is`/`getPrototypeOf`/`setPrototypeOf`/`getOwnPropertyNames`/`getOwnPropertySymbols`/`getOwnPropertyDescriptor`/`fromEntries`/`hasOwn` |
+| **Property descriptors** | Full `ValidateAndApplyPropertyDescriptor` semantics: getter-aware `ToPropertyDescriptor` in spec field order, non-configurable redefine rejection, accessor↔data conversion preserving creation order and inherited attributes, `get`/`set: undefined` accessor halves |
+| **Arrays** | Literals, indexed access, spread (`[...arr]`), `.length` (including `defineProperty` resizes), the full iteration/mutation method set (`map`, `filter`, `reduce`, `find*`, `splice`, `copyWithin`, `flat`, `at`, `toSorted`, …), `Array.from`, `Array.of`, `Array.isArray`; **generic array-likes** — `Array.prototype` methods work spec-correctly on any object with `length` + index properties, with observable `ToNumber` coercion and hole semantics |
+| **Strings** | 25+ methods (`charAt` … `padEnd`), `String.fromCharCode`/`fromCodePoint`/`raw`, wrapper objects with spec `length` |
+| **Numbers** | `Number.isNaN`/`isFinite`/`isInteger`/`isSafeInteger`/`parseInt`/`parseFloat`, `MAX_SAFE_INTEGER` & friends, `.toString(radix)`, `.toFixed`/`.toExponential`/`.toPrecision` with spec range errors |
+| **Date** | Full `Date.prototype`: all getters/setters (`setFullYear`/`setHours` families with component-overflow normalization), spec `toString`/`toDateString`/`toTimeString`/`toUTCString`/`toISOString` formats, invalid-date semantics, `Date.parse` (ISO 8601 with offsets and extended years, round-trips its own formats), `Date.now`/`UTC`, `[object Date]` |
+| **Regular expressions** | `/pattern/flags` literals with **early SyntaxError validation** (pattern grammar + flags), ES2025 modifier groups `(?i-m:…)`, `\p{…}` property escapes, `.test()`/`.exec()`, `.source`/`.flags`/`.global`; regex-aware `.replace()`, `.match()`, `.search()`, `.split()`, `.replaceAll()` |
 | **Template literals** | `` `hello ${name}` `` with interpolation and nesting |
-| **Destructuring** | `var {a, b} = obj`, `var [x, y] = arr`, rest elements (`...rest`), default values (`x = 5`), nested patterns, assignment expressions (`[a, b] = [1, 2]`), for-of destructuring |
-| **Optional chaining** | `obj?.prop`, `obj?.[expr]`, `fn?.()` |
-| **Nullish coalescing** | `a ?? b` |
+| **Destructuring** | `var {a, b} = obj`, `var [x, y] = arr`, rest elements, default values, nested patterns, assignment expressions, for-of destructuring |
+| **Optional chaining / nullish** | `obj?.prop`, `obj?.[expr]`, `fn?.()`, `a ?? b` |
 | **Spread** | `[...arr]`, `{...obj}`, `fn(...args)` |
-| **Promises** | `new Promise`, `.then`/`.catch`/`.finally`, `Promise.resolve`/`reject`/`all`/`race`/`allSettled`/`any`, microtask queue |
+| **Promises** | `new Promise` with executor validation and throw-to-rejection, `.then`/`.catch`/`.finally`, extractable statics (`Promise.resolve`/`reject`/`all`/`race`/`allSettled`/`any`), `NewPromiseCapability` semantics for custom constructors, Promise subclassing via `super(executor)`, microtask queue |
 | **Async/await** | `async function`, `await` on promises and values |
-| **Generators** | `function*`, `yield`, `.next(val)`, `.return()`, `.throw()`, `for...of` integration |
-| **Iterators** | `for...of` with array/string/generator iterator protocol |
+| **Generators** | `function*`, `yield`, `yield*`, `.next(val)`, `.return()`, `.throw()`, `for...of` integration, abrupt-completion handling across suspension |
+| **Iterators** | `for...of` with array/string/generator iterator protocol, iterator closing on abrupt loop exits |
 | **Collections** | `Map`, `Set`, `WeakMap`, `WeakSet` with full prototype methods |
-| **Symbols** | `Symbol()`, `Symbol.iterator`, `Symbol.hasInstance`, `Symbol.toPrimitive`, `Symbol.toStringTag` |
-| **Property descriptors** | `writable`, `enumerable`, `configurable` flags, `Object.defineProperty`, `Object.freeze`/`seal` |
-| **Error handling** | `try`/`catch`/`finally`, `throw`, `new Error()`, `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `instanceof` with prototype chain, catch destructuring |
-| **eval()** | Runtime compilation and execution |
+| **Symbols** | `Symbol()`, well-known symbols (`iterator`, `hasInstance`, `toPrimitive`, `toStringTag` — honored by `Object.prototype.toString` — `species`, `asyncIterator`, …), symbol-keyed properties incl. accessors |
+| **Error handling** | `try`/`catch`/`finally`, `throw`, the full `Error` constructor family, `instanceof` with prototype chain, catch destructuring |
+| **eval()** | Runtime compilation and execution, direct-eval scope semantics |
 | **ES Modules** | `import { a } from './mod.js'`, `export`, `export default`, `export * from`, module caching |
-| **JSON** | `JSON.parse` (full recursive descent), `JSON.stringify` |
-| **Math** | `PI`, `E`, `floor`, `ceil`, `round`, `abs`, `sqrt`, `pow`, `max`, `min`, `sin`, `cos`, `tan`, `log`, `random`, etc. |
-| **Globals** | `console.log`/`warn`/`error`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `eval`, `String`, `Number`, `Boolean`, `Array.isArray`, `Object.*` |
+| **JSON** | `JSON.parse` (full recursive descent), `JSON.stringify`, `[object JSON]` |
+| **Math** | Full method set with spec `name`/`length` on every function |
+| **Typed arrays** | `ArrayBuffer`, `DataView`, typed array constructors |
+| **Globals** | `console.*`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `eval`, `encodeURI[Component]`, `decodeURI[Component]`, `globalThis` |
 
 ### Engine Internals
 
@@ -92,14 +93,15 @@ See [JIT.md](docs/JIT.md) for technical details.
 - **~130 bytecode opcodes** with variable-length encoding
 - **Stack-based VM** with call frames, operand stack, and upvalue-based closures
 - **JIT compiler** — hand-written machine code emitter for ARM64 (macOS) and x86-64 (Linux), two compilation modes
-- **Prototype chain** — real `__proto__` traversal for property lookup and class inheritance
-- **Property descriptors** — writable/enumerable/configurable flags on all properties
+- **Prototype chain** — real `__proto__` traversal for property lookup and class inheritance; built-in prototype methods reify lazily into real function objects (visible to `hasOwnProperty` / descriptors) on first extraction
+- **Property descriptors** — writable/enumerable/configurable flags on all properties, spec-shaped define/redefine validation
 - **Pratt parser** with precedence climbing across ~25 levels
 - **Lua-style upvalues** — open (stack) → closed (heap) for proper closure semantics
 - **String interning** — O(1) comparison for all identifiers and property names
 - **Mark-and-sweep GC** — automatic garbage collection with root tracing and slot reuse
 - **Microtask queue** for Promise resolution
-- **Regex caching** — compiled regex patterns cached for reuse
+- **Regex caching + validation** — structural ES-pattern validator (early SyntaxErrors) in front of cached compiled patterns
+- **Runaway-script defenses** — step budget, wall-clock deadline, bounded allocations
 - **WebAssembly build** — runs in the browser via WASM
 
 ## Benchmarks
@@ -132,13 +134,18 @@ bash bench/sunspider/run.sh    # SunSpider benchmarks
 
 ## Test262 Conformance
 
-**93.0%** of tested ECMAScript spec tests pass (14,982 / 16,116 active tests). See [TEST262.md](docs/TEST262.md).
+The conformance runner covers the **language suite plus 32 built-ins suites** (`Array`, `Object`, `String`, `RegExp`, `Promise`, `Date`, `Function`, `Map`/`Set`, `Symbol`, …):
 
-23 categories at **100% pass rate** including: identifiers, expressions/assignmenttargettype, destructuring, future-reserved-words, reserved-words, keywords, expressions/conditional, expressions/logical-not/and/or, statements/block, statements/return, statements/throw, expressions/coalesce, expressions/grouping, expressions/this, expressions/comma, literals/boolean, literals/null, and more.
+- **Full run: 83.9%** (23,217 / 27,658 active tests)
+- **Language suite alone: 96.4%** (15,538 / 16,116) — 23 language categories at 100%
+
+See [TEST262.md](docs/TEST262.md).
 
 ```bash
 git clone --depth 1 https://github.com/nicolo-ribaudo/test262.git
-cargo run --release --bin test262_runner
+cargo run --release --bin test262_runner            # full run (4 parallel workers)
+ZINC_TEST262_JOBS=8 cargo run --release --bin test262_runner   # more parallelism
+cargo run --release --bin test262_runner -- --filter built-ins/Date   # one suite
 ```
 
 ## Architecture
@@ -168,7 +175,7 @@ src/
   parser/              Recursive descent + Pratt expression parser
   ast/                 ~80 AST node types
   compiler/            AST → bytecode compiler + disassembler
-  vm/                  Stack-based VM (core, builtins, promises, JSON, call, map, regexp)
+  vm/                  Stack-based VM (core, builtins, promises, JSON, call, map, regexp, typed arrays)
   jit/                 JIT compiler — ARM64 + x86-64 assemblers, executable memory, pattern matcher
   runtime/             NaN-boxed values, object heap, property descriptors, builtins
   gc/                  Mark-and-sweep GC foundation
@@ -176,15 +183,15 @@ src/
 
 tests/                 94 tests (unit + parser + e2e + JIT)
 bench/                 Micro benchmarks + SunSpider
-tools/                 Test262 conformance runner
+tools/                 Test262 conformance runner (parallel, category-sharded)
 web/                   WASM playground (HTML + compiled WASM)
 ```
 
 ## Stats
 
-- **~35,000 lines** of Rust
+- **~41,000 lines** of Rust
 - **94 tests** passing
-- **93.0%** Test262 conformance (14,982 / 16,116 active tests)
+- **83.9%** Test262 conformance across language + built-ins (23,217 / 27,658 active tests); **96.4%** on the language suite
 - **1.5 MB** WASM binary (includes regex engine)
 - **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation
