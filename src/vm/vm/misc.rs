@@ -575,7 +575,14 @@ impl Vm {
                 && self.heap.get(target_oid).is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)))
             {
                 if has_value {
-                    let n = self.to_f64(value);
+                    // ToNumber runs ToPrimitive observably (objects with
+                    // toString/valueOf, throws propagate).
+                    let prim = if value.is_object() && !value.is_symbol() {
+                        self.try_coerce_to_primitive_hint(value, "number")?
+                    } else {
+                        value
+                    };
+                    let n = self.to_f64(prim);
                     let n32 = n as u32;
                     if !(n.is_finite() && n >= 0.0 && n.fract() == 0.0 && (n32 as f64) == n) {
                         return Err(VmError::Throw(

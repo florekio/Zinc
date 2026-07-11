@@ -275,8 +275,21 @@ impl Vm {
                         (None, false)
                     } else {
                         // Intrinsic name / length descriptors (spec flags:
-                        // writable false, enumerable false, configurable true).
-                        (self.fn_get_own_prop(sentinel, key_id), true)
+                        // writable false, enumerable false, configurable true);
+                        // other statics (Object.keys, Promise.resolve, …)
+                        // resolve through the shared sentinel property GET.
+                        let own = self.fn_get_own_prop(sentinel, key_id);
+                        match own {
+                            Some(v) if key_str == "name" || key_str == "length" => (Some(v), true),
+                            _ => {
+                                let v = self.fn_property_get(sentinel, key_id, first_arg);
+                                if v.is_undefined() {
+                                    (own, true)
+                                } else {
+                                    (Some(v), false)
+                                }
+                            }
+                        }
                     };
                     if let Some(v) = value {
                         let mut desc = JsObject::ordinary();
@@ -343,6 +356,24 @@ impl Vm {
                 }
                 if let Some(oid) = first_arg.as_object_id() {
                     let key_id = self.interner.intern(&key_str);
+                    // The global object proxies misses to the globals map;
+                    // its built-ins get spec global-property descriptors.
+                    if oid == self.global_this_oid
+                        && !self.heap.get(oid).is_some_and(|o| o.has_own_property(key_id))
+                        && let Some(&gv) = self.globals.get(&key_id)
+                    {
+                        let mut desc = JsObject::ordinary();
+                        desc.prototype = Some(self.object_prototype);
+                        let vk = self.interner.intern("value");
+                        let wk = self.interner.intern("writable");
+                        let ek = self.interner.intern("enumerable");
+                        let ck = self.interner.intern("configurable");
+                        desc.set_property(vk, gv);
+                        desc.set_property(wk, Value::boolean(true));
+                        desc.set_property(ek, Value::boolean(false));
+                        desc.set_property(ck, Value::boolean(true));
+                        return Ok(Some(Value::object_id(self.heap.allocate(desc))));
+                    }
                     self.ensure_builtin_proto_method(oid, key_id);
                     // Check for accessor properties first
                     let getter_key_str = format!("__get_{key_str}__");
