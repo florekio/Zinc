@@ -523,8 +523,16 @@ impl Vm {
             Arc::new(Mutex::new((Value::undefined(), Value::undefined())));
         let cap2 = cap.clone();
         let executor: crate::runtime::object::NativeFn =
-            std::sync::Arc::new(move |_vm: &mut Vm, _this: Value, args: &[Value]| {
+            std::sync::Arc::new(move |vm: &mut Vm, _this: Value, args: &[Value]| {
                 let mut g = cap2.lock().unwrap();
+                // GetCapabilitiesExecutor: re-invocation after the slots were
+                // set to non-undefined values throws.
+                if !g.0.is_undefined() || !g.1.is_undefined() {
+                    return Err(vm.make_native_error(
+                        "TypeError",
+                        "Promise executor has already been invoked with non-undefined arguments",
+                    ));
+                }
                 g.0 = args.first().copied().unwrap_or(Value::undefined());
                 g.1 = args.get(1).copied().unwrap_or(Value::undefined());
                 Ok(Value::undefined())
