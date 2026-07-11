@@ -594,6 +594,7 @@ impl Vm {
             if let Some(obj) = self.heap.get_mut(target_oid) {
                 obj.define_property(key_id, Property::with_flags(map_value, flags));
             }
+        }
             // Defining an array index at or beyond the dense length bumps
             // the array's length per ArraySetLength (kept in the shadow
             // property so reads observe it).
@@ -620,7 +621,6 @@ impl Vm {
                     }
                 }
             }
-        }
         Ok(target)
     }
 
@@ -1574,9 +1574,9 @@ impl Vm {
                     if let Some(n) = only.as_number()
                         && n.is_finite() && n.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(&n)
                     {
-                        vec![Value::undefined(); (n as usize).min(1_000_000)]
+                        vec![Value::empty(); (n as usize).min(1_000_000)]
                     } else if let Some(n) = only.as_int() {
-                        if n >= 0 { vec![Value::undefined(); (n as usize).min(1_000_000)] } else { vec![only] }
+                        if n >= 0 { vec![Value::empty(); (n as usize).min(1_000_000)] } else { vec![only] }
                     } else {
                         vec![only]
                     }

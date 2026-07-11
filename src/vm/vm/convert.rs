@@ -173,7 +173,13 @@ impl Vm {
                     }
                     ObjectKind::FlatString { data, .. } => data.to_string(),
                     ObjectKind::Array(elements) => {
-                        let parts: Vec<String> = elements.iter().map(|v| self.value_to_string(*v)).collect();
+                        let parts: Vec<String> = elements.iter().map(|v| {
+                            if v.is_empty_marker() || v.is_undefined() || v.is_null() {
+                                String::new()
+                            } else {
+                                self.value_to_string(*v)
+                            }
+                        }).collect();
                         parts.join(",")
                     }
                     ObjectKind::Wrapper(inner) => self.value_to_string(*inner),

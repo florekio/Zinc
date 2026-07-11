@@ -1285,8 +1285,9 @@ impl<'a> Compiler<'a> {
                         .emit_op_u32(OpCode::SetArrayItem, i as u32, line);
                 }
             } else {
-                // Hole element (e.g. [,]): emit undefined to preserve array length
-                self.chunk.emit_op(OpCode::Undefined, line);
+                // Hole element (e.g. [,]): a real HOLE (empty marker), kept
+                // distinct from undefined so HasProperty/iteration skip it.
+                self.chunk.emit_op(OpCode::PushEmpty, line);
                 self.chunk.emit_op_u32(OpCode::SetArrayItem, i as u32, line);
             }
         }

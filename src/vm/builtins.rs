@@ -484,7 +484,9 @@ impl Vm {
                     o.get_property(key),
                     o.get_property(setter_key).is_some(),
                     if let ObjectKind::Array(ref e) = o.kind {
-                        ((idx as usize) < e.len()).then(|| e[idx as usize])
+                        ((idx as usize) < e.len())
+                            .then(|| e[idx as usize])
+                            .filter(|v| !v.is_empty_marker())
                     } else {
                         None
                     },
@@ -615,7 +617,8 @@ impl Vm {
                     let visits_holes = matches!(name, "find" | "findIndex" | "findLast" | "findLastIndex");
                     let Some(v) = elem.or(visits_holes.then(Value::undefined)) else {
                         if name == "map" {
-                            mapped.push(Value::undefined());
+                            // map preserves holes.
+                            mapped.push(Value::empty());
                         }
                         continue;
                     };
@@ -1002,11 +1005,19 @@ impl Vm {
         let name = self.interner.resolve(method_name).to_owned();
         // Generic receivers (array-likes, arrays with reconfigured index
         // properties) take the spec-shaped path; dense arrays stay fast.
-        let needs_generic = match self.heap.get(oid).map(|o| (matches!(o.kind, ObjectKind::Array(_)), o.properties.is_empty())) {
-            Some((true, true)) => false,
-            Some((true, false)) => self.array_has_index_props(oid),
-            _ => true,
-        };
+        let has_holes = self.heap.get(oid).is_some_and(|o| {
+            if let ObjectKind::Array(ref e) = o.kind {
+                e.iter().any(|v| v.is_empty_marker())
+            } else {
+                false
+            }
+        });
+        let needs_generic = has_holes
+            || match self.heap.get(oid).map(|o| (matches!(o.kind, ObjectKind::Array(_)), o.properties.is_empty())) {
+                Some((true, true)) => false,
+                Some((true, false)) => self.array_has_index_props(oid),
+                _ => true,
+            };
         if needs_generic
             && let Some(v) = self.exec_array_method_generic(oid, &name, args)?
         {
@@ -1045,7 +1056,8 @@ impl Vm {
             "pop" => {
                 if let Some(obj) = self.heap.get_mut(oid)
                     && let ObjectKind::Array(ref mut elements) = obj.kind {
-                        return Ok(elements.pop().unwrap_or(Value::undefined()));
+                        let v = elements.pop().unwrap_or(Value::undefined());
+                        return Ok(if v.is_empty_marker() { Value::undefined() } else { v });
                     }
                 Ok(Value::undefined())
             }
@@ -1064,7 +1076,7 @@ impl Vm {
                         let parts: Vec<String> = elements
                             .iter()
                             .map(|v| {
-                                if v.is_undefined() || v.is_null() {
+                                if v.is_undefined() || v.is_null() || v.is_empty_marker() {
                                     String::new()
                                 } else {
                                     self.value_to_string(*v)
@@ -1132,7 +1144,8 @@ impl Vm {
                 if let Some(obj) = self.heap.get_mut(oid)
                     && let ObjectKind::Array(ref mut elements) = obj.kind
                         && !elements.is_empty() {
-                            return Ok(elements.remove(0));
+                            let v = elements.remove(0);
+                            return Ok(if v.is_empty_marker() { Value::undefined() } else { v });
                         }
                 Ok(Value::undefined())
             }
@@ -1603,7 +1616,13 @@ impl Vm {
                 // Array.prototype.toString is equivalent to join(",")
                 if let Some(obj) = self.heap.get(oid)
                     && let ObjectKind::Array(ref elements) = obj.kind {
-                        let parts: Vec<String> = elements.iter().map(|v| self.value_to_string(*v)).collect();
+                        let parts: Vec<String> = elements.iter().map(|v| {
+                            if v.is_undefined() || v.is_null() || v.is_empty_marker() {
+                                String::new()
+                            } else {
+                                self.value_to_string(*v)
+                            }
+                        }).collect();
                         let result = parts.join(",");
                         let id = self.interner.intern(&result);
                         return Ok(Value::string(id));

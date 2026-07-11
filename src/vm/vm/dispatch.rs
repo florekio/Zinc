@@ -1752,9 +1752,9 @@ impl Vm {
                                 if let Some(n) = only.as_number()
                                     && n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64
                                 {
-                                    vec![Value::undefined(); (n as usize).min(1_000_000)]
+                                    vec![Value::empty(); (n as usize).min(1_000_000)]
                                 } else if let Some(n) = only.as_int() {
-                                    if n >= 0 { vec![Value::undefined(); (n as usize).min(1_000_000)] } else { vec![only] }
+                                    if n >= 0 { vec![Value::empty(); (n as usize).min(1_000_000)] } else { vec![only] }
                                 } else {
                                     vec![only]
                                 }
@@ -2785,12 +2785,21 @@ impl Vm {
                             let key_id = self.interner.intern(&key_str);
                             self.heap.get_property_chain(oid, key_id).is_some()
                         } else if let Some(idx) = key.as_int() {
-                            // Numeric key: check array elements
-                            self.heap.get(oid)
+                            // Numeric key: element present and not a hole;
+                            // otherwise the named/prototype chain decides.
+                            let in_elems = self.heap.get(oid)
                                 .map(|o| if let ObjectKind::Array(ref elems) = o.kind {
-                                    idx >= 0 && (idx as usize) < elems.len()
+                                    idx >= 0
+                                        && (idx as usize) < elems.len()
+                                        && !elems[idx as usize].is_empty_marker()
                                 } else { false })
-                                .unwrap_or(false)
+                                .unwrap_or(false);
+                            in_elems || {
+                                let key_id = self.interner.intern(&idx.to_string());
+                                let gk = self.interner.intern(&format!("__get_{idx}__"));
+                                self.heap.get_property_chain(oid, key_id).is_some()
+                                    || self.heap.get_property_chain(oid, gk).is_some()
+                            }
                         } else {
                             let key_str = self.value_to_string(key);
                             let key_id = self.interner.intern(&key_str);
@@ -2974,6 +2983,7 @@ impl Vm {
                             // (index accessors, named props, prototype).
                             if let Ok(idx) = name_str.parse::<usize>()
                                 && let Some(val) = elements.get(idx).copied()
+                                .filter(|v| !v.is_empty_marker())
                             {
                                 self.push(val);
                                 continue;
@@ -3607,7 +3617,9 @@ impl Vm {
                             if let Some(i) = key.as_int()
                                 && i >= 0
                             {
-                                if let Some(val) = elements.get(i as usize).copied() {
+                                if let Some(val) = elements.get(i as usize).copied()
+                                    .filter(|v| !v.is_empty_marker())
+                                {
                                     self.push(val);
                                     continue;
                                 }
@@ -3617,7 +3629,9 @@ impl Vm {
                                 && n.is_finite()
                                 && n < 4_294_967_295.0
                             {
-                                if let Some(val) = elements.get(n as usize).copied() {
+                                if let Some(val) = elements.get(n as usize).copied()
+                                    .filter(|v| !v.is_empty_marker())
+                                {
                                     self.push(val);
                                     continue;
                                 }
@@ -3634,6 +3648,7 @@ impl Vm {
                                 // Numeric string index: arr["0"]
                                 if let Ok(idx) = name.parse::<usize>()
                                     && let Some(val) = elements.get(idx).copied()
+                                    .filter(|v| !v.is_empty_marker())
                                 {
                                     self.push(val);
                                     continue;
@@ -4697,10 +4712,19 @@ impl Vm {
                         }
                     }
 
-                    // Check for array methods
+                    // Check for array methods; unknown names fall through to
+                    // the generic dispatch (hasOwnProperty, user methods, …).
                     if let Some(oid) = obj_val.as_object_id() {
                         if let Some(obj) = self.heap.get(oid)
-                            && matches!(&obj.kind, ObjectKind::Array(_)) {
+                            && matches!(&obj.kind, ObjectKind::Array(_))
+                            && matches!(self.interner.resolve(method_name),
+                                "join" | "push" | "pop" | "shift" | "unshift" | "indexOf" | "includes"
+                                | "forEach" | "map" | "filter" | "reduce" | "some" | "every" | "find"
+                                | "findIndex" | "findLast" | "findLastIndex" | "slice" | "splice"
+                                | "concat" | "reverse" | "sort" | "flat" | "flatMap" | "fill"
+                                | "copyWithin" | "at" | "keys" | "values" | "entries" | "lastIndexOf"
+                                | "toString" | "toLocaleString" | "reduceRight" | "toReversed"
+                                | "toSorted" | "toSpliced" | "with") {
                                 let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
                                 let result = match self.exec_array_method(oid, method_name, &args) {
                                     Ok(v) => v,
@@ -4953,7 +4977,11 @@ impl Vm {
                                     let array_idx = key.parse::<usize>().ok().and_then(|idx| {
                                         match &o.kind {
                                             ObjectKind::Array(elems) => {
-                                                if idx < elems.len() { Some(true) } else { None }
+                                                if idx < elems.len() && !elems[idx].is_empty_marker() {
+                                                    Some(true)
+                                                } else {
+                                                    None
+                                                }
                                             }
                                             ObjectKind::Wrapper(inner) if inner.is_string() => {
                                                 let n = inner.as_string_id()
@@ -5947,9 +5975,9 @@ impl Vm {
                             if let Some(n) = only.as_number()
                                 && n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64
                             {
-                                vec![Value::undefined(); (n as usize).min(1_000_000)]
+                                vec![Value::empty(); (n as usize).min(1_000_000)]
                             } else if let Some(n) = only.as_int() {
-                                if n >= 0 { vec![Value::undefined(); (n as usize).min(1_000_000)] } else { vec![only] }
+                                if n >= 0 { vec![Value::empty(); (n as usize).min(1_000_000)] } else { vec![only] }
                             } else {
                                 vec![only]
                             }
@@ -6028,7 +6056,7 @@ impl Vm {
                             if let Some(n) = arg.as_number() {
                                 // new Array(length)
                                 let len = n as usize;
-                                JsObject::array(vec![Value::undefined(); len])
+                                JsObject::array(vec![Value::empty(); len])
                             } else {
                                 JsObject::array(vec![arg])
                             }
@@ -6616,7 +6644,8 @@ impl Vm {
                                     elements.push(val);
                                 } else {
                                     while elements.len() <= idx && elements.len() < 1_000_000 {
-                                        elements.push(Value::undefined());
+                                        // Gap slots are HOLES, not undefined.
+                                        elements.push(Value::empty());
                                     }
                                     if idx < elements.len() { elements[idx] = val; }
                                 }
@@ -6641,7 +6670,10 @@ impl Vm {
                     let elems: Vec<Value> = if let Some(src_oid) = source.as_object_id() {
                         match self.heap.get(src_oid).map(|o| std::ptr::from_ref(&o.kind)) {
                             Some(_) => match &self.heap.get(src_oid).unwrap().kind {
-                                ObjectKind::Array(e) => e.clone(),
+                                // Spread iterates: holes densify to undefined.
+                                ObjectKind::Array(e) => e.iter()
+                                    .map(|v| if v.is_empty_marker() { Value::undefined() } else { *v })
+                                    .collect(),
                                 ObjectKind::Set { entries } => entries.clone(),
                                 ObjectKind::Map { entries } => {
                                     // Map yields [k,v] pair arrays
@@ -7670,7 +7702,10 @@ impl Vm {
                                 // length, accessors) are enumerated too.
                                 let elem_seed: Vec<StringId> = match &o.kind {
                                     ObjectKind::Array(elems) => {
-                                        (0..elems.len()).map(|i| self.interner.intern(&i.to_string())).collect()
+                                        elems.iter().enumerate()
+                                            .filter(|(_, v)| !v.is_empty_marker())
+                                            .map(|(i, _)| self.interner.intern(&i.to_string()))
+                                            .collect()
                                     }
                                     // String wrappers enumerate their char indices.
                                     ObjectKind::Wrapper(inner) if inner.is_string() => {
@@ -7962,11 +7997,12 @@ impl Vm {
                                     (self.typed_array_get(src_oid, idx).unwrap_or(Value::undefined()), false)
                                 } else { (Value::undefined(), true) }
                             } else {
-                                // Array iterator
+                                // Array iterator — holes yield undefined.
                                 if let Some(arr_obj) = self.heap.get(src_oid) {
                                     if let ObjectKind::Array(ref elements) = arr_obj.kind {
                                         if idx < elements.len() {
-                                            (elements[idx], false)
+                                            let v = elements[idx];
+                                            (if v.is_empty_marker() { Value::undefined() } else { v }, false)
                                         } else {
                                             (Value::undefined(), true)
                                         }

@@ -94,15 +94,21 @@ impl Vm {
                 } else if let Some(oid) = args.first().and_then(|v| v.as_object_id()) {
                     let is_array = self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Array(_) | ObjectKind::Wrapper(_))).unwrap_or(false);
                     if is_array {
-                        let len = self.heap.get(oid).and_then(|o| match &o.kind {
-                            ObjectKind::Array(e) => Some(e.len()),
+                        // Hole indices are not own properties.
+                        let idxs: Vec<usize> = self.heap.get(oid).map(|o| match &o.kind {
+                            ObjectKind::Array(e) => e.iter().enumerate()
+                                .filter(|(_, v)| !v.is_empty_marker())
+                                .map(|(i, _)| i)
+                                .collect(),
                             ObjectKind::Wrapper(inner) if inner.is_string() => {
-                                let st = self.interner.resolve(inner.as_string_id()?);
-                                Some(st.chars().count())
+                                inner.as_string_id()
+                                    .map(|sid| (0..self.interner.resolve(sid).chars().count()).collect())
+                                    .unwrap_or_default()
                             }
-                            _ => Some(0),
-                        }).unwrap_or(0);
-                        let mut keys: Vec<Value> = (0..len).map(|i| {
+                            _ => Vec::new(),
+                        }).unwrap_or_default();
+                        let len = idxs.last().map(|i| i + 1).unwrap_or(0);
+                        let mut keys: Vec<Value> = idxs.into_iter().map(|i| {
                             let s = self.interner.intern(&i.to_string());
                             Value::string(s)
                         }).collect();
