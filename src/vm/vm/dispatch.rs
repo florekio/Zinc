@@ -1420,7 +1420,14 @@ impl Vm {
                     if func_val.is_function() && func_val.as_function() == Some(-551) {
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                         self.truncate_stack(func_pos);
-                        let result = self.construct_function(&args)?;
+                        let result = match self.construct_function(&args) {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => {
+                                self.handle_throw(v)?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
                         self.push(result);
                         continue;
                     }
@@ -4740,41 +4747,11 @@ impl Vm {
                             "bind" => {
                                 let this_arg = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
                                 let bound_args: Vec<Value> = (1..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                                // Create a bound function object
-                                let func_obj_id = if let Some(oid) = obj_val.as_object_id() { oid }
-                                    else {
-                                        let packed = obj_val.as_function().unwrap();
-                                        if packed < 0 {
-                                            // Native sentinel — wrap as NativeSentinel to preserve dispatch
-                                            let fobj = JsObject {
-                                                properties: Vec::new(), prototype: None,
-                                                kind: ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { sentinel: packed }),
-                                                marked: false, extensible: true,
-                                            };
-                                            self.heap.allocate(fobj)
-                                        } else {
-                                            // User bytecode function — wrap as Bytecode,
-                                            // keeping the FULL packed value (closure_id in
-                                            // the high bits) so the bound function still
-                                            // sees its captured upvalues when called.
-                                            let chunk_only = (packed & 0xFFFF) as usize;
-                                            let name = if chunk_only < self.chunks.len() { self.chunks[chunk_only].name } else { self.interner.intern("<bound>") };
-                                            let fobj = JsObject::function_bytecode(packed as usize, name);
-                                            self.heap.allocate(fobj)
-                                        }
-                                    };
-                                let bound = JsObject {
-                                    properties: Vec::new(), prototype: None,
-                                    kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Bound {
-                                        target: func_obj_id,
-                                        this_val: this_arg,
-                                        args: bound_args,
-                                    }),
-                                    marked: false, extensible: true,
-                                };
-                                let bound_oid = self.heap.allocate(bound);
+                                // Shared with the extracted-bind sentinel: adds
+                                // spec own name ("bound …") and length.
+                                let bound_val = self.make_bound_function(obj_val, this_arg, bound_args);
                                 self.truncate_stack(obj_pos);
-                                self.push(Value::object_id(bound_oid));
+                                self.push(bound_val);
                                 continue;
                             }
                             _ => {} // fall through to other dispatchers
@@ -6112,7 +6089,14 @@ impl Vm {
                     if func_val.is_function() && func_val.as_function() == Some(-551) {
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                         self.truncate_stack(func_pos);
-                        let result = self.construct_function(&args)?;
+                        let result = match self.construct_function(&args) {
+                            Ok(v) => v,
+                            Err(VmError::Throw(v)) => {
+                                self.handle_throw(v)?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
                         self.push(result);
                         continue;
                     }

@@ -98,7 +98,38 @@ impl Vm {
             };
             self.heap.allocate(fobj)
         };
-        let bound = JsObject {
+        // Own name ("bound <target>") and length (target minus bound args)
+        // with spec attributes.
+        let target_name = {
+            let name_key = self.interner.intern("name");
+            if let Some(packed) = target.as_function() {
+                self.fn_get_own_prop(packed, name_key)
+                    .and_then(|v| v.as_string_id())
+                    .map(|sid| self.interner.resolve(sid).to_owned())
+                    .unwrap_or_default()
+            } else {
+                self.heap.get(func_obj_id)
+                    .and_then(|o| o.get_property(name_key))
+                    .and_then(|v| v.as_string_id())
+                    .map(|sid| self.interner.resolve(sid).to_owned())
+                    .unwrap_or_default()
+            }
+        };
+        let target_len = {
+            let len_key = self.interner.intern("length");
+            if let Some(packed) = target.as_function() {
+                self.fn_get_own_prop(packed, len_key)
+                    .and_then(|v| v.as_int().or_else(|| v.as_number().map(|n| n as i32)))
+                    .unwrap_or(0)
+            } else {
+                self.heap.get(func_obj_id)
+                    .and_then(|o| o.get_property(len_key))
+                    .and_then(|v| v.as_int().or_else(|| v.as_number().map(|n| n as i32)))
+                    .unwrap_or(0)
+            }
+        };
+        let n_bound = bound_args.len() as i32;
+        let mut bound = JsObject {
             properties: Vec::new(), prototype: None,
             kind: ObjectKind::Function(FunctionKind::Bound {
                 target: func_obj_id,
@@ -107,6 +138,23 @@ impl Vm {
             }),
             marked: false, extensible: true,
         };
+        let name_key = self.interner.intern("name");
+        let len_key = self.interner.intern("length");
+        let bound_name = self.interner.intern(&format!("bound {target_name}"));
+        bound.define_property(
+            name_key,
+            crate::runtime::object::Property::with_flags(
+                Value::string(bound_name),
+                crate::runtime::object::Property::CONFIGURABLE,
+            ),
+        );
+        bound.define_property(
+            len_key,
+            crate::runtime::object::Property::with_flags(
+                Value::int((target_len - n_bound).max(0)),
+                crate::runtime::object::Property::CONFIGURABLE,
+            ),
+        );
         Value::object_id(self.heap.allocate(bound))
     }
 

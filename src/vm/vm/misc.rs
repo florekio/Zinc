@@ -686,11 +686,27 @@ impl Vm {
         let mut parser = crate::parser::parser::Parser::new(tokens, &src, &mut self.interner);
         let program = parser
             .parse_program()
-            .map_err(|e| VmError::RuntimeError(format!("Function SyntaxError: {e}")))?;
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|prog| {
+                // The parser error-recovers; collected errors still mean the
+                // source is invalid.
+                if parser.errors.is_empty() {
+                    Ok(prog)
+                } else {
+                    Err(format!("{:?}", parser.errors[0]))
+                }
+            })
+            .map_err(|e| {
+                let err = self.make_native_error("SyntaxError", &format!("Invalid function body: {e}"));
+                VmError::Throw(err)
+            })?;
         let compiler = crate::compiler::compiler::Compiler::new(&mut self.interner);
         let chunk = compiler
             .compile_program(&program)
-            .map_err(|e| VmError::RuntimeError(format!("Function CompileError: {e}")))?;
+            .map_err(|e| {
+                let err = self.make_native_error("SyntaxError", &format!("Invalid function body: {e}"));
+                VmError::Throw(err)
+            })?;
         let base_idx = self.chunks.len();
         let mut flat_chunks = Vec::new();
         Vm::flatten_chunk(chunk, &mut flat_chunks);
