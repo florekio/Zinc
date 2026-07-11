@@ -1991,7 +1991,23 @@ impl Vm {
                 else if v.is_undefined() { Value::number(f64::NAN) }
                 else if v.is_string() {
                     let s = self.value_to_string(v);
-                    Value::number(s.trim().parse::<f64>().unwrap_or(f64::NAN))
+                    let t = s.trim();
+                    let parsed = if let Some(rest) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+                        i64::from_str_radix(rest, 2).map(|i| i as f64).unwrap_or(f64::NAN)
+                    } else if let Some(rest) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+                        i64::from_str_radix(rest, 8).map(|i| i as f64).unwrap_or(f64::NAN)
+                    } else if let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                        i64::from_str_radix(rest, 16).map(|i| i as f64).unwrap_or(f64::NAN)
+                    } else if t.is_empty() {
+                        0.0
+                    } else if t == "Infinity" || t == "+Infinity" {
+                        f64::INFINITY
+                    } else if t == "-Infinity" {
+                        f64::NEG_INFINITY
+                    } else {
+                        t.parse::<f64>().unwrap_or(f64::NAN)
+                    };
+                    Value::number(parsed)
                 }
                 else { Value::number(f64::NAN) }
             }
@@ -2162,16 +2178,23 @@ impl Vm {
         let args: Vec<Value> = args.to_vec();
         let result = match mn.as_str() {
                             "toString" => {
-                                let radix = args.first().and_then(|v| v.as_number()).unwrap_or(10.0) as u32;
-                                let s = if radix == 10 {
+                                let radix = match args.first().filter(|v| !v.is_undefined()) {
+                                    Some(v) => {
+                                        let r = self.to_f64(*v).trunc();
+                                        if !(2.0..=36.0).contains(&r) {
+                                            return Err(VmError::Throw(self.make_native_error(
+                                                "RangeError",
+                                                "toString() radix must be between 2 and 36",
+                                            )));
+                                        }
+                                        r as u32
+                                    }
+                                    None => 10,
+                                };
+                                let s = if radix == 10 || !n.is_finite() {
                                     self.value_to_string(effective_val)
-                                } else if n.fract() == 0.0 && n.is_finite() {
-                                    // Integer with non-10 radix
-                                    let i = n as i64;
-                                    if i >= 0 { crate::vm::vm::radix_fmt(i as u64, radix) }
-                                    else { format!("-{}", crate::vm::vm::radix_fmt((-i) as u64, radix)) }
                                 } else {
-                                    self.value_to_string(effective_val)
+                                    crate::vm::vm::f64_to_radix(n, radix)
                                 };
                                 let id = self.interner.intern(&s);
                                 Value::string(id)
@@ -2465,10 +2488,16 @@ impl Vm {
             // Number.prototype.toString / valueOf — unwrap a Number primitive or wrapper.
             -632 | -633 => {
                 let inner = self.unwrap_wrapper_primitive(this_val, |v| v.is_int() || v.is_number());
-                let Some(inner) = inner else { return Ok(Value::undefined()); };
+                let Some(inner) = inner else {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Number.prototype method called on incompatible receiver",
+                    )));
+                };
                 if sentinel == -632 {
-                    let s = self.value_to_string(inner);
-                    Value::string(self.interner.intern(&s))
+                    // Full toString semantics (radix argument included).
+                    let ts = self.interner.intern("toString");
+                    return self.exec_number_method(inner, ts, args);
                 } else {
                     inner
                 }
@@ -2521,6 +2550,22 @@ impl Vm {
     /// primitive is returned as-is.
     pub(crate) fn unwrap_wrapper_primitive(&mut self, this_val: Value, want: fn(Value) -> bool) -> Option<Value> {
         if want(this_val) { return Some(this_val); }
+        // The primordial prototypes carry primitive data slots per spec:
+        // Number.prototype +0, Boolean.prototype false, String.prototype "".
+        if let Some(oid) = this_val.as_object_id() {
+            if oid == self.number_prototype && want(Value::number(0.0)) {
+                return Some(Value::number(0.0));
+            }
+            if oid == self.boolean_prototype && want(Value::boolean(false)) {
+                return Some(Value::boolean(false));
+            }
+            if oid == self.string_prototype {
+                let empty = self.new_str("");
+                if want(empty) {
+                    return Some(empty);
+                }
+            }
+        }
         let oid = this_val.as_object_id()?;
         if let Some(obj) = self.heap.get(oid)
             && let ObjectKind::Wrapper(v) = &obj.kind

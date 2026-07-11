@@ -2113,3 +2113,98 @@ impl Vm {
         i
     }
 }
+
+/// Double → string in an arbitrary radix (2..=36), fraction digits emitted
+/// until the value's ulp is exhausted (V8's DoubleToRadixCString approach),
+/// with final-digit rounding and carry.
+pub(crate) fn f64_to_radix(n: f64, radix: u32) -> String {
+    if n == 0.0 {
+        return "0".to_string();
+    }
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let neg = n < 0.0;
+    let x = n.abs();
+    let int_part = x.trunc();
+    let mut frac = x - int_part;
+    // Integer digits (f64 division loop covers > u64 range too).
+    let int_str = if int_part == 0.0 {
+        "0".to_string()
+    } else if int_part < 9.0e15 {
+        radix_fmt(int_part as u64, radix)
+    } else {
+        let mut i = int_part;
+        let mut v: Vec<u8> = Vec::new();
+        while i >= 1.0 {
+            let d = (i % radix as f64) as usize;
+            v.push(digits[d]);
+            i = (i / radix as f64).trunc();
+        }
+        v.reverse();
+        String::from_utf8(v).unwrap()
+    };
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(int_str.as_bytes());
+    if frac > 0.0 {
+        out.push(b'.');
+        // Stop when we've resolved the double's precision.
+        let mut delta = 0.5 * (x * f64::EPSILON).max(f64::MIN_POSITIVE);
+        let mut budget = 1100usize;
+        loop {
+            frac *= radix as f64;
+            delta *= radix as f64;
+            let mut d = frac.trunc() as usize;
+            frac -= d as f64;
+            if frac < delta || budget == 0 {
+                // Round the final digit and carry left if needed.
+                if frac >= 0.5 && frac + delta > 1.0 - frac {
+                    d += 1;
+                }
+                if d >= radix as usize {
+                    // Carry through emitted digits.
+                    out.push(digits[d - radix as usize]);
+                    let mut i = out.len() - 2;
+                    loop {
+                        if out[i] == b'.' {
+                            if i == 0 {
+                                break;
+                            }
+                            i -= 1;
+                            continue;
+                        }
+                        let pos = digits.iter().position(|&c| c == out[i]).unwrap_or(0);
+                        if pos + 1 < radix as usize {
+                            out[i] = digits[pos + 1];
+                            break;
+                        }
+                        out[i] = b'0';
+                        if i == 0 {
+                            out.insert(0, b'1');
+                            break;
+                        }
+                        i -= 1;
+                    }
+                } else {
+                    out.push(digits[d]);
+                }
+                break;
+            }
+            out.push(digits[d]);
+            budget -= 1;
+        }
+        // Trim trailing zeros and a bare point.
+        while out.last() == Some(&b'0') {
+            out.pop();
+        }
+        if out.last() == Some(&b'.') {
+            out.pop();
+        }
+    }
+    let body = String::from_utf8(out).unwrap();
+    if neg { format!("-{body}") } else { body }
+}

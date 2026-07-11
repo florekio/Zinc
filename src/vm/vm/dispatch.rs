@@ -1739,6 +1739,31 @@ impl Vm {
                         // through to the constructor handler below.
                         if (-536..=-500).contains(&sentinel) && sentinel != -507 {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
+                            // ToNumber(Symbol) throws; ToNumber(object) runs
+                            // ToPrimitive observably (throws propagate).
+                            let mut args = args;
+                            if sentinel == -505 {
+                                if args.first().is_some_and(|v| v.is_symbol()) {
+                                    let err = self.make_native_error(
+                                        "TypeError",
+                                        "Cannot convert a Symbol value to a number",
+                                    );
+                                    self.truncate_stack(func_pos);
+                                    self.handle_throw(err)?;
+                                    continue;
+                                }
+                                if let Some(v) = args.first().copied().filter(|v| v.is_object()) {
+                                    match self.try_coerce_to_primitive_hint(v, "number") {
+                                        Ok(p) => args[0] = p,
+                                        Err(VmError::Throw(t)) => {
+                                            self.truncate_stack(func_pos);
+                                            self.handle_throw(t)?;
+                                            continue;
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                            }
                             let result = self.exec_global_fn(sentinel, &args);
                             self.truncate_stack(func_pos);
                             self.push(result);
@@ -4548,8 +4573,13 @@ impl Vm {
                     };
                     if let Some(s) = string_for_method {
                         // Non-string method names on wrapper OBJECTS fall
-                        // through to generic dispatch (hasOwnProperty, …).
-                        let known = matches!(self.interner.resolve(method_name),
+                        // through to generic dispatch (hasOwnProperty, …),
+                        // as do names shadowed by an OWN property on the
+                        // wrapper (s.toString = Number.prototype.toString).
+                        let own_shadow = obj_val.as_object_id()
+                            .and_then(|o| self.heap.get(o))
+                            .is_some_and(|o| o.has_own_property(method_name));
+                        let known = !own_shadow && matches!(self.interner.resolve(method_name),
                             "at" | "charAt" | "charCodeAt" | "codePointAt" | "concat" | "endsWith"
                             | "includes" | "indexOf" | "lastIndexOf" | "localeCompare" | "match"
                             | "matchAll" | "normalize" | "padEnd" | "padStart" | "repeat"
@@ -4610,8 +4640,13 @@ impl Vm {
                         continue;
                     }
 
-                    // Boolean primitive methods: true.toString()
-                    if effective_val.is_boolean() {
+                    // Boolean primitive methods: true.toString() — own
+                    // properties on wrapper objects shadow the fast path.
+                    if effective_val.is_boolean()
+                        && !obj_val.as_object_id()
+                            .and_then(|o| self.heap.get(o))
+                            .is_some_and(|o| o.has_own_property(method_name))
+                    {
                         let mn = self.interner.resolve(method_name).to_owned();
                         let result = match mn.as_str() {
                             "toString" => {
@@ -4875,9 +4910,11 @@ impl Vm {
                             self.push(result);
                             continue;
                         }
-                        // Check for Date methods
+                        // Check for Date methods — own properties on the
+                        // instance shadow the fast path.
                         if let Some(obj) = self.heap.get(oid)
                             && matches!(obj.kind, ObjectKind::Date(_))
+                            && !obj.has_own_property(method_name)
                         {
                             let mn = self.interner.resolve(method_name).to_owned();
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
@@ -4983,7 +5020,37 @@ impl Vm {
                     }
 
                     // Object.prototype methods (hasOwnProperty, toString, valueOf, etc.)
-                    if let Some(oid) = obj_val.as_object_id() {
+                    // — but an OWN toString/valueOf anywhere before
+                    // Object.prototype (Number.prototype's radix-aware
+                    // toString, user overrides) wins over the inline
+                    // implementations; those dispatch generically below.
+                    let shadowed_inline = if let Some(oid) = obj_val.as_object_id() {
+                        let mn = self.interner.resolve(method_name);
+                        if matches!(mn, "toString" | "valueOf" | "toLocaleString") {
+                            let mut cur = Some(oid);
+                            let mut found = false;
+                            let mut hops = 0;
+                            while let Some(c) = cur {
+                                if c == self.object_prototype || hops > 16 {
+                                    break;
+                                }
+                                if self.heap.get(c).is_some_and(|o| o.has_own_property(method_name)) {
+                                    found = true;
+                                    break;
+                                }
+                                cur = self.heap.get(c).and_then(|o| o.prototype);
+                                hops += 1;
+                            }
+                            found
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if let Some(oid) = obj_val.as_object_id()
+                        && !shadowed_inline
+                    {
                         let mn = self.interner.resolve(method_name).to_owned();
                         match mn.as_str() {
                             "hasOwnProperty" => {
@@ -6092,7 +6159,34 @@ impl Vm {
                                     Value::string(id)
                                 }
                                 -505 => { // Number
-                                    if no_args { Value::number(0.0) } else { Value::number(self.to_f64(arg)) }
+                                    if !no_args && arg.is_symbol() {
+                                        let err = self.make_native_error(
+                                            "TypeError",
+                                            "Cannot convert a Symbol value to a number",
+                                        );
+                                        self.truncate_stack(func_pos);
+                                        self.handle_throw(err)?;
+                                        continue;
+                                    }
+                                    if no_args { Value::number(0.0) } else {
+                                        // Full ToNumber: ToPrimitive runs user
+                                        // valueOf/toString (throws propagate),
+                                        // then numeric string parsing.
+                                        let prim = if arg.is_object() {
+                                            match self.try_coerce_to_primitive_hint(arg, "number") {
+                                                Ok(p) => p,
+                                                Err(VmError::Throw(v)) => {
+                                                    self.truncate_stack(func_pos);
+                                                    self.handle_throw(v)?;
+                                                    continue;
+                                                }
+                                                Err(e) => return Err(e),
+                                            }
+                                        } else {
+                                            arg
+                                        };
+                                        self.exec_global_fn(-505, &[prim])
+                                    }
                                 }
                                 -506 => { // Boolean
                                     if no_args { Value::boolean(false) } else { Value::boolean(arg.to_boolean()) }
