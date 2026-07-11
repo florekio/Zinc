@@ -1316,10 +1316,13 @@ impl Vm {
                 let len = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
                     .unwrap_or(0);
-                let raw_start = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                let raw_start = match args.first() {
+                    Some(v) => self.coerce_to_f64(*v)? as i32,
+                    None => 0,
+                };
                 let start = if raw_start < 0 { (len as i32 + raw_start).max(0) as usize } else { (raw_start as usize).min(len) };
                 let delete_count = if args.len() >= 2 {
-                    (args[1].as_number().unwrap_or(0.0) as i32).max(0) as usize
+                    (self.coerce_to_f64(args[1])? as i32).max(0) as usize
                 } else {
                     len - start
                 };
@@ -1355,8 +1358,14 @@ impl Vm {
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
                 let len = elements.len() as i32;
-                let raw_start = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                let raw_end = args.get(1).and_then(|v| v.as_number()).map(|n| n as i32).unwrap_or(len);
+                let raw_start = match args.first() {
+                    Some(v) => self.coerce_to_f64(*v)? as i32,
+                    None => 0,
+                };
+                let raw_end = match args.get(1).filter(|v| !v.is_undefined()) {
+                    Some(v) => self.coerce_to_f64(*v)? as i32,
+                    None => len,
+                };
                 let start = if raw_start < 0 { (len + raw_start).max(0) as usize } else { raw_start.min(len) as usize };
                 let end = if raw_end < 0 { (len + raw_end).max(0) as usize } else { raw_end.min(len) as usize };
                 let sliced = if start < end { elements[start..end].to_vec() } else { vec![] };

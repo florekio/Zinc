@@ -5219,6 +5219,55 @@ impl Vm {
                                 method_val = Some(rv);
                             }
                         }
+                        // Heap function objects (reified built-ins, NativeFns,
+                        // bound functions) stored as properties are callable
+                        // methods too.
+                        if let Some(mv) = method_val
+                            && !mv.is_function()
+                            && mv.as_object_id().and_then(|o| self.heap.get(o))
+                                .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)))
+                        {
+                            let args_vec: Vec<Value> = (0..argc)
+                                .map(|i| self.stack[obj_pos + 1 + i])
+                                .collect();
+                            let r = self.call_with_async_wrap(mv, obj_val, &args_vec);
+                            let result = match r {
+                                Ok(v) => v,
+                                Err(VmError::Throw(v)) => {
+                                    self.truncate_stack(obj_pos);
+                                    self.handle_throw(v)?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            };
+                            self.truncate_stack(obj_pos);
+                            self.push(result);
+                            continue;
+                        }
+                        // Negative sentinel functions stored as properties
+                        // (extracted built-ins like Object.prototype.toString)
+                        // dispatch through the shared call machinery.
+                        if let Some(mv) = method_val
+                            && let Some(packed) = mv.as_function()
+                            && packed < 0
+                        {
+                            let args_vec: Vec<Value> = (0..argc)
+                                .map(|i| self.stack[obj_pos + 1 + i])
+                                .collect();
+                            let r = self.call_function_this(mv, obj_val, &args_vec);
+                            let result = match r {
+                                Ok(v) => v,
+                                Err(VmError::Throw(v)) => {
+                                    self.truncate_stack(obj_pos);
+                                    self.handle_throw(v)?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            };
+                            self.truncate_stack(obj_pos);
+                            self.push(result);
+                            continue;
+                        }
                         if let Some(mv) = method_val
                             && mv.is_function() {
                                 let packed = mv.as_function().unwrap();
