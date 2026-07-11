@@ -3208,6 +3208,7 @@ impl Vm {
                                 // Extractable static: `var isArray = Array.isArray;`
                                 // (react-dom's reconciler aliases it).
                                 "isArray" => Value::function(-751),
+                                "from" | "of" => self.fn_property_get(sentinel, name_id, obj_val),
                                 // Inherited function methods (hasOwnProperty,
                                 // call, …) via Function.prototype → Object.prototype.
                                 _ => self.heap.get_property_chain(self.function_prototype, name_id)

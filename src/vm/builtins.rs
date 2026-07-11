@@ -404,6 +404,19 @@ impl Vm {
         Ok(self.array_like_length_raw(oid)?.min(1_000_000))
     }
 
+    /// Crate-visible fronts for the array-like protocol (Array.from wrapper).
+    pub(crate) fn array_like_len_public(&mut self, oid: crate::runtime::object::ObjectId) -> Result<u64, VmError> {
+        self.array_like_length(oid)
+    }
+
+    pub(crate) fn array_like_get_public(
+        &mut self,
+        oid: crate::runtime::object::ObjectId,
+        idx: u64,
+    ) -> Result<Option<Value>, VmError> {
+        self.array_like_get(oid, idx)
+    }
+
     /// ToLength(Get(O, "length")) without the iteration cap — for RangeError
     /// checks that need the spec value (ArrayCreate limits).
     fn array_like_length_raw(&mut self, oid: crate::runtime::object::ObjectId) -> Result<u64, VmError> {

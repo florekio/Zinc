@@ -266,6 +266,33 @@ impl Vm {
             self.value_to_string(key_val)
         };
         let key_id = self.interner.intern(&key_str);
+        // Creating a NEW property on a non-extensible object throws.
+        {
+            let gk = self.interner.intern(&format!("__get_{key_str}__"));
+            let sk = self.interner.intern(&format!("__set_{key_str}__"));
+            let (exists, extensible) = match self.heap.get(target_oid) {
+                Some(o) => (
+                    o.has_own_property(key_id)
+                        || o.has_own_property(gk)
+                        || o.has_own_property(sk)
+                        || canonical_array_index(&key_str).is_some_and(|idx| {
+                            if let ObjectKind::Array(ref e) = o.kind {
+                                idx < e.len() && !e[idx].is_empty_marker()
+                            } else {
+                                false
+                            }
+                        }),
+                    o.extensible,
+                ),
+                None => (false, true),
+            };
+            if !exists && !extensible {
+                return Err(VmError::Throw(self.make_native_error(
+                    "TypeError",
+                    &format!("Cannot define property {key_str}, object is not extensible"),
+                )));
+            }
+        }
         let mut flags = Property::ALL;
         let mut value = Value::undefined();
         let mut has_value = false;

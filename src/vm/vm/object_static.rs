@@ -983,6 +983,173 @@ impl Vm {
                 "call" | "apply" | "bind" => obj_val,
                 // Extractable static: `var isArray = Array.isArray;` (react-dom).
                 "isArray" => Value::function(-751),
+                // Extractable Array.from / Array.of, identity-cached. The
+                // wrapper covers arrays, strings, collections, and generic
+                // array-likes with an optional mapFn; the method-call path
+                // keeps the full iterator protocol.
+                "from" | "of" => {
+                    let is_of = name_str == "of";
+                    let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                        move |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
+                            let unwrap_throw = |vm: &mut Vm, e: VmError| match e {
+                                VmError::Throw(v) => v,
+                                e => vm.make_native_error("Error", &format!("{e:?}")),
+                            };
+                            let items: Vec<Value> = if is_of {
+                                args.to_vec()
+                            } else {
+                                let source = args.first().copied().unwrap_or(Value::undefined());
+                                if source.is_nullish() {
+                                    return Err(vm.make_native_error(
+                                        "TypeError",
+                                        "Array.from requires an array-like object",
+                                    ));
+                                }
+                                if source.is_string() || vm.is_cons_string(source) {
+                                    let st = vm.value_to_string(source);
+                                    st.chars().map(|c| vm.new_str(&c.to_string())).collect()
+                                } else if let Some(soid) = source.as_object_id() {
+                                    match vm.heap.get(soid).map(|o| &o.kind) {
+                                        Some(ObjectKind::Array(e)) => e.iter()
+                                            .map(|v| if v.is_empty_marker() { Value::undefined() } else { *v })
+                                            .collect(),
+                                        Some(ObjectKind::Set { entries }) => entries.clone(),
+                                        _ => {
+                                            let len = vm.array_like_len_public(soid)
+                                                .map_err(|e| unwrap_throw(vm, e))?;
+                                            let mut out = Vec::new();
+                                            for i in 0..len {
+                                                let v = vm.array_like_get_public(soid, i)
+                                                    .map_err(|e| unwrap_throw(vm, e))?
+                                                    .unwrap_or(Value::undefined());
+                                                out.push(v);
+                                            }
+                                            out
+                                        }
+                                    }
+                                } else {
+                                    Vec::new()
+                                }
+                            };
+                            // mapFn (Array.from only)
+                            let map_fn = if is_of { None } else { args.get(1).copied().filter(|v| !v.is_undefined()) };
+                            let this_arg = args.get(2).copied().unwrap_or(Value::undefined());
+                            let mut result = Vec::with_capacity(items.len());
+                            for (i, item) in items.into_iter().enumerate() {
+                                let v = if let Some(f) = map_fn {
+                                    vm.call_function_this(f, this_arg, &[item, Value::number(i as f64)])
+                                        .map_err(|e| unwrap_throw(vm, e))?
+                                } else {
+                                    item
+                                };
+                                result.push(v);
+                            }
+                            // A constructor receiver builds via Construct(this,
+                            // [len]) + CreateDataPropertyOrThrow + Set(length) —
+                            // every step's abrupt completion propagates.
+                            let ctor_like = _this.as_function().is_some_and(|p| p >= 0 && p != -507);
+                            if ctor_like {
+                                // The instance links to the constructor's
+                                // .prototype (setters there are observable).
+                                let proto_oid = _this.as_function().and_then(|packed| {
+                                    let pk = vm.interner.intern("prototype");
+                                    vm.fn_property_overrides.get(&(packed, pk)).copied().flatten()
+                                        .and_then(|v| v.as_object_id())
+                                        .or_else(|| vm.func_prototypes.get(&packed).copied())
+                                        .or_else(|| {
+                                            // Create + cache, mirroring Construct.
+                                            let mut proto = JsObject::ordinary();
+                                            proto.prototype = Some(vm.object_prototype);
+                                            let ck = vm.interner.intern("constructor");
+                                            proto.define_property(ck, Property::with_flags(
+                                                _this, Property::WRITABLE | Property::CONFIGURABLE,
+                                            ));
+                                            let po = vm.heap.allocate(proto);
+                                            vm.func_prototypes.insert(packed, po);
+                                            Some(po)
+                                        })
+                                });
+                                let mut fresh_obj = JsObject::ordinary();
+                                fresh_obj.prototype = proto_oid;
+                                let fresh = vm.heap.allocate(fresh_obj);
+                                let ret = vm.call_function_this(
+                                    _this,
+                                    Value::object_id(fresh),
+                                    &[Value::number(result.len() as f64)],
+                                ).map_err(|e| unwrap_throw(vm, e))?;
+                                let target = if ret.as_object_id().is_some() { ret } else { Value::object_id(fresh) };
+                                // Reusable data descriptor {value, all true}.
+                                let mut desc = JsObject::ordinary();
+                                let vk = vm.interner.intern("value");
+                                let wk = vm.interner.intern("writable");
+                                let ek = vm.interner.intern("enumerable");
+                                let ck = vm.interner.intern("configurable");
+                                desc.set_property(wk, Value::boolean(true));
+                                desc.set_property(ek, Value::boolean(true));
+                                desc.set_property(ck, Value::boolean(true));
+                                let desc_oid = vm.heap.allocate(desc);
+                                for (i, v) in result.iter().enumerate() {
+                                    if let Some(d) = vm.heap.get_mut(desc_oid) {
+                                        d.set_property(vk, *v);
+                                    }
+                                    let key_id = vm.interner.intern(&i.to_string());
+                                    vm.object_define_property(&[
+                                        target,
+                                        Value::string(key_id),
+                                        Value::object_id(desc_oid),
+                                    ]).map_err(|e| unwrap_throw(vm, e))?;
+                                }
+                                // Set(target, "length", len, true)
+                                if let Some(toid) = target.as_object_id() {
+                                    let lk = vm.interner.intern("length");
+                                    let sk = vm.interner.intern("__set_length__");
+                                    let gk = vm.interner.intern("__get_length__");
+                                    // Setters anywhere on the chain run (the
+                                    // spec Set walks the prototype chain).
+                                    let (setter, has_acc, nonwritable) = (
+                                        vm.heap.get_property_chain(toid, sk).filter(|v| vm.value_callable(*v)),
+                                        vm.heap.get_property_chain(toid, sk).is_some()
+                                            || vm.heap.get_property_chain(toid, gk).is_some(),
+                                        vm.heap.get(toid)
+                                            .and_then(|o| o.get_property_descriptor(lk))
+                                            .is_some_and(|pr| !pr.is_writable()),
+                                    );
+                                    if let Some(sfn) = setter {
+                                        vm.call_function_this(sfn, target, &[Value::number(result.len() as f64)])
+                                            .map_err(|e| unwrap_throw(vm, e))?;
+                                    } else if has_acc || nonwritable {
+                                        return Err(vm.make_native_error(
+                                            "TypeError",
+                                            "Cannot assign to read only property 'length'",
+                                        ));
+                                    } else if let Some(o) = vm.heap.get_mut(toid) {
+                                        o.set_property(lk, Value::number(result.len() as f64));
+                                    }
+                                }
+                                return Ok(target);
+                            }
+                            Ok(vm.alloc_array(result))
+                        },
+                    );
+                    let mut fn_obj = JsObject {
+                        properties: Vec::new(),
+                        prototype: Some(self.function_prototype),
+                        kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native {
+                            name: name_id,
+                            func,
+                        }),
+                        marked: false,
+                        extensible: true,
+                    };
+                    let name_key = self.interner.intern("name");
+                    let len_key = self.interner.intern("length");
+                    fn_obj.define_property(name_key, Property::with_flags(Value::string(name_id), Property::CONFIGURABLE));
+                    fn_obj.define_property(len_key, Property::with_flags(Value::int(if is_of { 0 } else { 1 }), Property::CONFIGURABLE));
+                    let oid = self.heap.allocate(fn_obj);
+                    let val = Value::object_id(oid);
+                    self.fn_property_overrides.insert((sentinel, name_id), Some(val));
+                    val
+                }
                 // Constructors are functions; inherited methods
                 // (hasOwnProperty, isPrototypeOf, …) resolve through
                 // Function.prototype → Object.prototype. e.g.
