@@ -630,6 +630,81 @@ impl Vm {
         Ok(self.to_f64(p))
     }
 
+    /// Set(O, idx, v) for array-likes: chain setters run; dense arrays grow
+    /// (hole-filled) as needed; other receivers store named properties.
+    fn array_like_set(&mut self, oid: crate::runtime::object::ObjectId, idx: u64, v: Value) -> Result<(), VmError> {
+        let setter_key = self.interner.intern(&format!("__set_{idx}__"));
+        if let Some(sfn) = self.heap.get_property_chain(oid, setter_key)
+            && self.value_callable(sfn)
+        {
+            self.call_function_this(sfn, Value::object_id(oid), &[v])?;
+            return Ok(());
+        }
+        let is_array = self.heap.get(oid).is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)));
+        if is_array && idx < 1_000_000 {
+            if let Some(o) = self.heap.get_mut(oid)
+                && let ObjectKind::Array(ref mut e) = o.kind
+            {
+                while e.len() <= idx as usize {
+                    e.push(Value::empty());
+                }
+                e[idx as usize] = v;
+            }
+            return Ok(());
+        }
+        let key = self.interner.intern(&idx.to_string());
+        if let Some(o) = self.heap.get_mut(oid) {
+            o.set_property(key, v);
+        }
+        Ok(())
+    }
+
+    /// DeletePropertyOrThrow-ish for array-like indices (sort's tail cleanup).
+    fn array_like_delete(&mut self, oid: crate::runtime::object::ObjectId, idx: u64) {
+        let key = self.interner.intern(&idx.to_string());
+        let gk = self.interner.intern(&format!("__get_{idx}__"));
+        let sk = self.interner.intern(&format!("__set_{idx}__"));
+        if let Some(o) = self.heap.get_mut(oid) {
+            o.delete_property(key);
+            o.delete_property(gk);
+            o.delete_property(sk);
+            if let ObjectKind::Array(ref mut e) = o.kind
+                && (idx as usize) < e.len()
+            {
+                e[idx as usize] = Value::empty();
+            }
+        }
+    }
+
+    /// SortCompare: comparator (protected) or default ToString comparison.
+    fn sort_compare_pair(&mut self, a: Value, b: Value, comparator: Option<Value>) -> Result<std::cmp::Ordering, VmError> {
+        use std::cmp::Ordering;
+        if let Some(f) = comparator {
+            let r = self.call_function_this(f, Value::undefined(), &[a, b])?;
+            let n = self.to_f64(r);
+            return Ok(if n < 0.0 {
+                Ordering::Less
+            } else if n > 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            });
+        }
+        let sa = {
+            let p = if a.is_object() && !a.is_symbol() {
+                self.try_coerce_to_primitive_hint(a, "string")?
+            } else { a };
+            self.value_to_string(p)
+        };
+        let sb = {
+            let p = if b.is_object() && !b.is_symbol() {
+                self.try_coerce_to_primitive_hint(b, "string")?
+            } else { b };
+            self.value_to_string(p)
+        };
+        Ok(sa.cmp(&sb))
+    }
+
     /// Whether an array carries reconfigured index properties (accessors or
     /// named data entries) that the dense fast paths would miss.
     fn array_has_index_props(&self, oid: crate::runtime::object::ObjectId) -> bool {
@@ -901,6 +976,47 @@ impl Vm {
                 let mut arr = JsObject::array(out);
                 arr.prototype = Some(self.array_prototype);
                 Ok(Some(Value::object_id(self.heap.allocate(arr))))
+            }
+            "sort" => {
+                let len = self.array_like_length(oid)?;
+                let comparator = args.first().copied().filter(|v| self.value_callable(*v));
+                // Collect: values, undefineds, holes (spec order after sort).
+                let mut present: Vec<Value> = Vec::new();
+                let mut undefs = 0usize;
+                let mut holes = 0usize;
+                for i in 0..len {
+                    match self.array_like_get(oid, i)? {
+                        None => holes += 1,
+                        Some(v) if v.is_undefined() => undefs += 1,
+                        Some(v) => present.push(v),
+                    }
+                }
+                // Insertion sort with an observable comparator.
+                for i in 1..present.len() {
+                    let mut j = i;
+                    while j > 0 {
+                        if self.sort_compare_pair(present[j - 1], present[j], comparator)?
+                            == std::cmp::Ordering::Greater
+                        {
+                            present.swap(j - 1, j);
+                            j -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let n_present = present.len();
+                for (i, v) in present.into_iter().enumerate() {
+                    self.array_like_set(oid, i as u64, v)?;
+                }
+                for i in n_present..n_present + undefs {
+                    self.array_like_set(oid, i as u64, Value::undefined())?;
+                }
+                let _ = holes;
+                for i in (n_present + undefs)..len as usize {
+                    self.array_like_delete(oid, i as u64);
+                }
+                Ok(Some(obj_val))
             }
             _ => Ok(None),
         }
