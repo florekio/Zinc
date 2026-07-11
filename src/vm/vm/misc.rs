@@ -327,11 +327,25 @@ impl Vm {
             let mut desc_has_set = false;
             if let Some(g) = self.getter_aware_get(desc_oid, "get")? {
                 desc_has_get = true;
-                if g.is_function() { new_getter = Some(g); }
+                if self.value_callable(g) {
+                    new_getter = Some(g);
+                } else if !g.is_undefined() {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Getter must be a function",
+                    )));
+                }
             }
-            if let Some(s) = self.getter_aware_get(desc_oid, "set")? {
+            if let Some(sv) = self.getter_aware_get(desc_oid, "set")? {
                 desc_has_set = true;
-                if s.is_function() { new_setter = Some(s); }
+                if self.value_callable(sv) {
+                    new_setter = Some(sv);
+                } else if !sv.is_undefined() {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Setter must be a function",
+                    )));
+                }
             }
             let desc_is_accessor = desc_has_get || desc_has_set;
             let desc_is_data = has_value || present & Property::WRITABLE != 0;

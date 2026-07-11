@@ -1996,6 +1996,31 @@ impl Vm {
                         && let Some(oid) = func_val.as_object_id()
                     {
                         let ctor_key = self.interner.intern("__constructor__");
+                        // Real classes are not callable without `new` —
+                        // TypeError per spec. They're recognized by their
+                        // prototype's __class__ back-pointer; plain dispatcher
+                        // objects with only __constructor__ keep the
+                        // Closure-compiler compat call-through.
+                        let class_key = self.interner.intern("__class__");
+                        let proto_key = self.interner.intern("prototype");
+                        let is_real_class = self.heap.get(oid)
+                            .is_some_and(|o| o.get_property(ctor_key).is_some())
+                            && self.heap.get(oid)
+                                .and_then(|o| o.get_property(proto_key))
+                                .and_then(|v| v.as_object_id())
+                                .and_then(|p| self.heap.get(p))
+                                .and_then(|p| p.get_property(class_key))
+                                .and_then(|v| v.as_object_id())
+                                == Some(oid);
+                        if is_real_class {
+                            let err = self.make_native_error(
+                                "TypeError",
+                                "Class constructor cannot be invoked without 'new'",
+                            );
+                            self.truncate_stack(func_pos);
+                            self.handle_throw(err)?;
+                            continue;
+                        }
                         let ctor_val = self.heap.get(oid)
                             .and_then(|o| o.get_property(ctor_key))
                             .filter(|v| v.is_function());

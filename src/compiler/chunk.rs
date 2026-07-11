@@ -6,7 +6,7 @@ use super::opcode::OpCode;
 bitflags::bitflags! {
     /// Flags describing a compiled chunk's characteristics.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct ChunkFlags: u8 {
+    pub struct ChunkFlags: u16 {
         const STRICT    = 0b0000_0001;
         const GENERATOR = 0b0000_0010;
         const ASYNC     = 0b0000_0100;
@@ -20,6 +20,8 @@ bitflags::bitflags! {
         /// Class field initializer thunk. A direct eval from here may not
         /// reference `arguments` (ClassFieldDefinition early errors).
         const FIELD_INIT = 0b1000_0000;
+        /// Class constructor: calling without `new` is a TypeError.
+        const CLASS_CTOR = 0b1_0000_0000;
     }
 }
 

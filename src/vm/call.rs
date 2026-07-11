@@ -135,6 +135,26 @@ impl Vm {
         // and break Closure-compiled bundles (google.com /search).
         if !func_val.is_function() && let Some(oid) = func_val.as_object_id() {
             let ctor_key = self.interner.intern("__constructor__");
+            // Real classes (prototype carries a __class__ back-pointer) are
+            // not callable without `new`.
+            let class_key = self.interner.intern("__class__");
+            let proto_key = self.interner.intern("prototype");
+            let is_real_class = self.heap.get(oid)
+                .is_some_and(|o| o.get_property(ctor_key).is_some())
+                && self.heap.get(oid)
+                    .and_then(|o| o.get_property(proto_key))
+                    .and_then(|v| v.as_object_id())
+                    .and_then(|p| self.heap.get(p))
+                    .and_then(|p| p.get_property(class_key))
+                    .and_then(|v| v.as_object_id())
+                    == Some(oid);
+            if is_real_class {
+                let err = self.make_native_error(
+                    "TypeError",
+                    "Class constructor cannot be invoked without 'new'",
+                );
+                return Err(VmError::Throw(err));
+            }
             if let Some(ctor) = self.heap.get(oid)
                 .and_then(|o| o.get_property(ctor_key))
                 .filter(|v| v.is_function())
