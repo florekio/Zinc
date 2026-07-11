@@ -601,6 +601,12 @@ impl Vm {
                             entry.1.flags &= !(Property::WRITABLE | Property::CONFIGURABLE);
                         }
                     }
+                // Packed function values track their frozen state in the
+                // override table (they have no heap object to flag).
+                if let Some(packed) = target.as_function() {
+                    let k = self.interner.intern("__frozen__");
+                    self.fn_property_overrides.insert((packed, k), Some(Value::boolean(true)));
+                }
                 target
             }
             "seal" => {
@@ -612,6 +618,10 @@ impl Vm {
                             entry.1.flags &= !Property::CONFIGURABLE;
                         }
                     }
+                if let Some(packed) = target.as_function() {
+                    let k = self.interner.intern("__sealed__");
+                    self.fn_property_overrides.insert((packed, k), Some(Value::boolean(true)));
+                }
                 target
             }
             "isFrozen" => {
@@ -620,6 +630,10 @@ impl Vm {
                         .map(|o| !o.extensible && o.properties.iter().all(|(_, p)| !p.is_writable() && !p.is_configurable()))
                         .unwrap_or(true);
                     Value::boolean(frozen)
+                } else if let Some(packed) = args.first().and_then(|v| v.as_function()) {
+                    // Frozen only if explicitly frozen.
+                    let k = self.interner.intern("__frozen__");
+                    Value::boolean(self.fn_property_overrides.contains_key(&(packed, k)))
                 } else { Value::boolean(true) }
             }
             "isSealed" => {
@@ -628,6 +642,13 @@ impl Vm {
                         .map(|o| !o.extensible && o.properties.iter().all(|(_, p)| !p.is_configurable()))
                         .unwrap_or(true);
                     Value::boolean(sealed)
+                } else if let Some(packed) = args.first().and_then(|v| v.as_function()) {
+                    let ks = self.interner.intern("__sealed__");
+                    let kf = self.interner.intern("__frozen__");
+                    Value::boolean(
+                        self.fn_property_overrides.contains_key(&(packed, ks))
+                            || self.fn_property_overrides.contains_key(&(packed, kf)),
+                    )
                 } else { Value::boolean(true) }
             }
             "is" => {

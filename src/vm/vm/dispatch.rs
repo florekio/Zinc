@@ -6235,11 +6235,37 @@ impl Vm {
 
                     // Handle Object constructor: new Object()
                     if func_val.is_function() && func_val.as_function() == Some(-508) {
-                        let mut obj = JsObject::ordinary();
-                        obj.prototype = Some(self.object_prototype);
-                        let oid = self.heap.allocate(obj);
+                        // new Object(value): objects pass through; primitives
+                        // box to their wrapper with the right prototype;
+                        // null/undefined/no-args make an ordinary object.
+                        let arg = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                        if arg.as_object_id().is_some() {
+                            self.truncate_stack(func_pos);
+                            self.push(arg);
+                            continue;
+                        }
+                        let result = if arg.is_nullish() {
+                            let mut obj = JsObject::ordinary();
+                            obj.prototype = Some(self.object_prototype);
+                            Value::object_id(self.heap.allocate(obj))
+                        } else if arg.is_string() || self.is_cons_string(arg)
+                            || arg.is_number() || arg.is_int() || arg.is_boolean()
+                        {
+                            self.box_primitive(arg)
+                        } else {
+                            // Symbols / functions: box_primitive passes
+                            // through; make an ordinary object for functions.
+                            let boxed = self.box_primitive(arg);
+                            if boxed.as_object_id().is_some() {
+                                boxed
+                            } else {
+                                let mut obj = JsObject::ordinary();
+                                obj.prototype = Some(self.object_prototype);
+                                Value::object_id(self.heap.allocate(obj))
+                            }
+                        };
                         self.truncate_stack(func_pos);
-                        self.push(Value::object_id(oid));
+                        self.push(result);
                         continue;
                     }
 
