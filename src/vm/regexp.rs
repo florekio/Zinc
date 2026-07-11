@@ -840,7 +840,11 @@ impl Vm {
                 let name_id = self.interner.intern(mname);
                 let mut call_args: Vec<Value> = vec![this];
                 call_args.extend(args.iter().skip(1).copied());
-                let r = self.exec_string_method(&s, name_id, &call_args, ascii);
+                let r = self.exec_string_method(&s, name_id, &call_args, ascii)
+                    .map_err(|e| match e {
+                        VmError::Throw(v) => v,
+                        e => self.make_native_error("Error", &format!("{e:?}")),
+                    })?;
                 self.set_lastindex_checked(oid, prev)?;
                 return Ok(r);
             }
@@ -856,7 +860,11 @@ impl Vm {
             let name_id = self.interner.intern(mname);
             let mut call_args: Vec<Value> = vec![this];
             call_args.extend(args.iter().skip(1).copied());
-            return Ok(self.exec_string_method(&s, name_id, &call_args, ascii));
+            return self.exec_string_method(&s, name_id, &call_args, ascii)
+                .map_err(|e| match e {
+                    VmError::Throw(v) => v,
+                    e => self.make_native_error("Error", &format!("{e:?}")),
+                });
         }
         // Generic (non-RegExp) receiver: RegExpExec protocol.
         let unwrap_throw = |vm: &mut Self, e: VmError| match e {

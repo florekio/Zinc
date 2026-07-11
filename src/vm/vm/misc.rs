@@ -1994,7 +1994,11 @@ impl Vm {
                 };
                 let s = vm.value_to_string(prim);
                 let ascii = s.is_ascii();
-                Ok(vm.exec_string_method(&s, name_id, args, ascii))
+                match vm.exec_string_method(&s, name_id, args, ascii) {
+                    Ok(v) => Ok(v),
+                    Err(VmError::Throw(v)) => Err(v),
+                    Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                }
             }),
             Route::Array => std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
                 let Some(this_oid) = this.as_object_id() else {

@@ -245,7 +245,7 @@ impl Vm {
                 };
                 let ascii = self.string_is_ascii(this_value);
                 let mid = self.interner.intern(STRING_METHOD_NAMES[idx]);
-                return Ok(self.exec_string_method(&s, mid, args, ascii));
+                return self.exec_string_method(&s, mid, args, ascii);
             }
         }
         // Native global function sentinels (no this)

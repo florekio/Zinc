@@ -94,7 +94,74 @@ impl Vm {
     }
 
     // ---- String method dispatch ----
-    pub(crate) fn exec_string_method(&mut self, s: &str, method_name: StringId, args: &[Value], ascii: bool) -> Value {
+    pub(crate) fn exec_string_method(&mut self, s: &str, method_name: StringId, args: &[Value], ascii: bool) -> Result<Value, VmError> {
+        let name = self.interner.resolve(method_name).to_owned();
+        match name.as_str() {
+            "repeat" => {
+                let count = match args.first().filter(|v| !v.is_undefined()) {
+                    Some(v) => self.coerce_to_f64(*v)?,
+                    None => 0.0,
+                };
+                if count < 0.0 || !count.is_finite() && count > 0.0 {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "RangeError",
+                        "Invalid count value",
+                    )));
+                }
+                let count = count.max(0.0) as usize;
+                // Bound the result size (matches the padStart cap).
+                if s.len().saturating_mul(count) > 10_000_000 {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "RangeError",
+                        "Invalid string length",
+                    )));
+                }
+                return Ok(self.new_str(&s.repeat(count)));
+            }
+            "normalize" => {
+                if let Some(f) = args.first().filter(|v| !v.is_undefined()) {
+                    let form = self.value_to_string(*f);
+                    if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
+                        return Err(VmError::Throw(self.make_native_error(
+                            "RangeError",
+                            "The normalization form should be one of NFC, NFD, NFKC, NFKD",
+                        )));
+                    }
+                }
+            }
+            "includes" | "startsWith" | "endsWith" => {
+                // A RegExp search argument throws (IsRegExp check).
+                if let Some(a) = args.first()
+                    && a.as_object_id().and_then(|o| self.heap.get(o))
+                        .is_some_and(|o| matches!(o.kind, ObjectKind::RegExp { .. }))
+                {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "First argument must not be a regular expression",
+                    )));
+                }
+            }
+            "charAt" | "charCodeAt" | "codePointAt" | "at" | "indexOf" | "lastIndexOf"
+            | "slice" | "substring" | "substr" | "padStart" | "padEnd" => {
+                // Numeric arguments: Symbols throw, objects coerce observably.
+                for a in args.iter().take(2) {
+                    if a.is_symbol() {
+                        return Err(VmError::Throw(self.make_native_error(
+                            "TypeError",
+                            "Cannot convert a Symbol value to a number",
+                        )));
+                    }
+                    if a.is_object() {
+                        self.try_coerce_to_primitive_hint(*a, "number")?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(self.exec_string_method_inner(s, method_name, args, ascii))
+    }
+
+    fn exec_string_method_inner(&mut self, s: &str, method_name: StringId, args: &[Value], ascii: bool) -> Value {
         let name = self.interner.resolve(method_name).to_owned();
         match name.as_str() {
             "charAt" => {

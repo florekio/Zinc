@@ -4592,7 +4592,15 @@ impl Vm {
                         if known || obj_val.as_object_id().is_none() {
                             let ascii = self.string_is_ascii(effective_val);
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                            let result = self.exec_string_method(&s, method_name, &args, ascii);
+                            let result = match self.exec_string_method(&s, method_name, &args, ascii) {
+                                Ok(v) => v,
+                                Err(VmError::Throw(v)) => {
+                                    self.truncate_stack(obj_pos);
+                                    self.handle_throw(v)?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            };
                             self.truncate_stack(obj_pos);
                             self.push(result);
                             continue;
