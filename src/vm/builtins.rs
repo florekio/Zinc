@@ -1232,6 +1232,17 @@ impl Vm {
         {
             return Ok(v);
         }
+        // sort's comparator must be undefined or callable.
+        if matches!(name.as_str(), "sort" | "toSorted")
+            && let Some(c) = args.first()
+            && !c.is_undefined()
+            && !self.value_callable(*c)
+        {
+            return Err(VmError::Throw(self.make_native_error(
+                "TypeError",
+                "The comparison function must be either a function or undefined",
+            )));
+        }
         // The callback must be callable even on an empty receiver (the dense
         // loops below would never touch it).
         if matches!(
@@ -1275,23 +1286,27 @@ impl Vm {
                     .filter(|v| !v.is_undefined())
                     .map(|v| self.value_to_string(*v))
                     .unwrap_or_else(|| ",".into());
-                if let Some(obj) = self.heap.get(oid)
-                    && let ObjectKind::Array(ref elements) = obj.kind {
+                let elements: Option<Vec<Value>> = self.heap.get(oid).and_then(|o| {
+                    if let ObjectKind::Array(ref e) = o.kind { Some(e.clone()) } else { None }
+                });
+                if let Some(elements) = elements {
                         // Per spec (Array.prototype.join step 7c): undefined,
                         // null, and holes stringify to the empty string — NOT
                         // "undefined"/"null". `Array(n).join(x)` relies on this
                         // to produce a run of separators (a common zero-pad
                         // idiom); rendering holes as "undefined" corrupted it.
-                        let parts: Vec<String> = elements
-                            .iter()
-                            .map(|v| {
-                                if v.is_undefined() || v.is_null() || v.is_empty_marker() {
-                                    String::new()
-                                } else {
-                                    self.value_to_string(*v)
-                                }
-                            })
-                            .collect();
+                        let mut parts: Vec<String> = Vec::with_capacity(elements.len());
+                        for v in &elements {
+                            if v.is_undefined() || v.is_null() || v.is_empty_marker() {
+                                parts.push(String::new());
+                            } else if v.is_object() && !v.is_symbol() {
+                                // ToString runs ToPrimitive observably.
+                                let p = self.try_coerce_to_primitive_hint(*v, "string")?;
+                                parts.push(self.value_to_string(p));
+                            } else {
+                                parts.push(self.value_to_string(*v));
+                            }
+                        }
                         let result = parts.join(&sep);
                         let id = self.interner.intern(&result);
                         return Ok(Value::string(id));
@@ -2821,6 +2836,14 @@ impl Vm {
             return Ok(Value::string(self.interner.intern(&formatted)));
         }
         if let Some(oid) = val.as_object_id() {
+            // Cons/flat strings are string PRIMITIVES that happen to live on
+            // the heap — they coerce to themselves, never via toString.
+            if self.heap.get(oid).is_some_and(|o| matches!(
+                o.kind,
+                ObjectKind::ConsString { .. } | ObjectKind::FlatString { .. }
+            )) {
+                return Ok(val);
+            }
             if let Some(obj) = self.heap.get(oid)
                 && let ObjectKind::Wrapper(inner) = &obj.kind {
                     return Ok(*inner);
@@ -2888,17 +2911,17 @@ impl Vm {
                 let result = self.call_function_this(fn2, val, &[])?;
                 if !result.is_object() || self.is_bigint(result) { return Ok(result); }
             }
-            // Both methods returned objects (or weren't callable in a way that produced
-            // a primitive) — per spec, OrdinaryToPrimitive throws TypeError.
-            if tried_method {
-                let (line, pc, chunk_name) = if let Some(f) = self.frames.last() {
-                    let cn = self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned();
-                    (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip, cn)
-                } else { (0, 0, String::new()) };
-                let msg = format!("Cannot convert object to primitive value (at line {line}, pc {pc}, chunk '{chunk_name}')");
-                let err = self.make_native_error("TypeError", &msg);
-                return Err(super::vm::VmError::Throw(err));
-            }
+            // Neither method produced a primitive (returned objects, were
+            // shadowed with non-callables, or don't exist) — per spec,
+            // OrdinaryToPrimitive throws TypeError.
+            let _ = tried_method;
+            let (line, pc, chunk_name) = if let Some(f) = self.frames.last() {
+                let cn = self.interner.resolve(self.chunks[f.chunk_idx].name).to_owned();
+                (self.chunks[f.chunk_idx].get_line(f.ip as u32), f.ip, cn)
+            } else { (0, 0, String::new()) };
+            let msg = format!("Cannot convert object to primitive value (at line {line}, pc {pc}, chunk '{chunk_name}')");
+            let err = self.make_native_error("TypeError", &msg);
+            return Err(super::vm::VmError::Throw(err));
         }
         Ok(val)
     }

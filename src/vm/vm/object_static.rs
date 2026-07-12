@@ -594,13 +594,22 @@ impl Vm {
             }
             "freeze" => {
                 let target = args.first().copied().unwrap_or(Value::undefined());
-                if let Some(oid) = target.as_object_id()
-                    && let Some(obj) = self.heap.get_mut(oid) {
+                if let Some(oid) = target.as_object_id() {
+                    // Dense array elements have no per-slot flags; a marker
+                    // property records that they froze.
+                    let is_array = self.heap.get(oid)
+                        .is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)));
+                    if let Some(obj) = self.heap.get_mut(oid) {
                         obj.extensible = false;
                         for entry in &mut obj.properties {
                             entry.1.flags &= !(Property::WRITABLE | Property::CONFIGURABLE);
                         }
+                        if is_array {
+                            let mk = self.interner.intern("__frozen_elems__");
+                            obj.define_property(mk, Property::with_flags(Value::boolean(true), 0));
+                        }
                     }
+                }
                 // Packed function values track their frozen state in the
                 // override table (they have no heap object to flag).
                 if let Some(packed) = target.as_function() {

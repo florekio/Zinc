@@ -3983,6 +3983,45 @@ impl Vm {
                             }
                         }
                     }
+                    // Frozen arrays reject element writes (spec: non-writable);
+                    // non-extensible (sealed) arrays reject NEW indices.
+                    if let Some(oid) = obj_val.as_object_id() {
+                        let (is_arr, frozen, extensible, elen) = {
+                            let mk = self.interner.intern("__frozen_elems__");
+                            match self.heap.get(oid) {
+                                Some(o) => (
+                                    matches!(o.kind, ObjectKind::Array(_)),
+                                    o.has_own_property(mk),
+                                    o.extensible,
+                                    if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 },
+                                ),
+                                None => (false, false, true, 0),
+                            }
+                        };
+                        if is_arr {
+                            let widx = key.as_int().filter(|i| *i >= 0).map(|i| i as usize)
+                                .or_else(|| key.as_number()
+                                    .filter(|n| n.fract() == 0.0 && *n >= 0.0 && n.is_finite())
+                                    .map(|n| n as usize));
+                            let blocked = widx.is_some()
+                                && (frozen || (!extensible && widx.is_some_and(|i| i >= elen)));
+                            if blocked {
+                                let in_strict = self.chunks[self.cur_chunk()]
+                                    .flags
+                                    .contains(ChunkFlags::STRICT);
+                                if in_strict {
+                                    let err = self.make_native_error(
+                                        "TypeError",
+                                        "Cannot assign to read only property of frozen array",
+                                    );
+                                    self.handle_throw(err)?;
+                                } else {
+                                    self.push(val);
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(oid) = obj_val.as_object_id()
                         && let Some(obj) = self.heap.get_mut(oid)
                     {
@@ -4419,7 +4458,14 @@ impl Vm {
                     // Host-supplied native function looked up via prototype chain
                     // (registered with Engine::register_host_fn or attached as a
                     // method on a host object). Receiver is bound as `this`.
+                    // Generators skip this: their .next/.return/.throw dispatch
+                    // through the stateful generator arm below, not the
+                    // %IteratorPrototype% helper they now inherit.
+                    let is_generator_recv = obj_val.as_object_id()
+                        .and_then(|o| self.heap.get(o))
+                        .is_some_and(|o| matches!(o.kind, ObjectKind::Generator { .. }));
                     if let Some(mv) = method_val
+                        && !is_generator_recv
                         && let Some(method_oid) = mv.as_object_id()
                     {
                         let native_fn = self.heap.get(method_oid).and_then(|o| {
@@ -6137,6 +6183,19 @@ impl Vm {
                     // new Array(...): construct an Array. Single-numeric-arg form sets length;
                     // otherwise the args become the elements.
                     if func_val.is_function() && func_val.as_function() == Some(-507) {
+                        // ArrayCreate: a single numeric arg must be a valid
+                        // Uint32 length.
+                        if argc == 1 {
+                            let only = self.stack[func_pos + 1];
+                            if let Some(n) = only.as_number().or_else(|| only.as_int().map(|i| i as f64))
+                                && !(n.fract() == 0.0 && (0.0..4_294_967_296.0).contains(&n))
+                            {
+                                let err = self.make_native_error("RangeError", "Invalid array length");
+                                self.truncate_stack(func_pos);
+                                self.handle_throw(err)?;
+                                continue;
+                            }
+                        }
                         let elements: Vec<Value> = if argc == 1 {
                             let only = self.stack[func_pos + 1];
                             if let Some(n) = only.as_number()
@@ -8596,6 +8655,9 @@ impl Vm {
                         saved_args: frame.saved_args,
                         saved_handlers: Vec::new(),
                     };
+                    // Chain to %IteratorPrototype% → Object.prototype so
+                    // toString/ToPrimitive and inherited methods resolve.
+                    gen_obj.prototype = Some(self.iterator_prototype_oid());
                     let gen_oid = self.heap.allocate(gen_obj);
                     // Drop the frame's stack slots (back to func slot).
                     self.truncate_stack(frame.base.saturating_sub(1));
