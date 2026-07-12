@@ -2206,6 +2206,15 @@ impl Vm {
                 }
             }),
             Route::Array => std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
+                // ToObject(this): primitives box (Boolean/Number/String
+                // wrappers are legal array-like receivers).
+                if this.is_nullish() {
+                    return Err(vm.make_native_error(
+                        "TypeError",
+                        "Array.prototype method called on null or undefined",
+                    ));
+                }
+                let this = if this.as_object_id().is_none() { vm.box_primitive(this) } else { this };
                 let Some(this_oid) = this.as_object_id() else {
                     return Err(vm.make_native_error(
                         "TypeError",
