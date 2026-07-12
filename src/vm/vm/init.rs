@@ -742,6 +742,7 @@ impl Vm {
         };
         vm.init_typed_arrays();
         vm.init_date_to_primitive();
+        vm.init_legacy_accessors();
         vm
     }
 

@@ -1107,6 +1107,128 @@ impl Vm {
         }
     }
 
+    /// Annex B.2.2 legacy accessors on Object.prototype:
+    /// __defineGetter__/__defineSetter__/__lookupGetter__/__lookupSetter__.
+    pub(crate) fn init_legacy_accessors(&mut self) {
+        for which in ["__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__"] {
+            let name_id = self.interner.intern(which);
+            let which_owned = which.to_string();
+            let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                move |vm: &mut Vm, this: Value, args: &[Value]| -> Result<Value, Value> {
+                    // ToObject(this): null/undefined throw.
+                    if this.is_nullish() {
+                        return Err(vm.make_native_error(
+                            "TypeError",
+                            &format!("Object.prototype.{which_owned} called on null or undefined"),
+                        ));
+                    }
+                    let is_define = which_owned.starts_with("__define");
+                    let is_getter = which_owned.contains("Getter");
+                    let key_val = args.first().copied().unwrap_or(Value::undefined());
+                    let key_str = if key_val.is_symbol() {
+                        format!("__sym_{}__", key_val.as_symbol_id().unwrap())
+                    } else {
+                        vm.value_to_string(key_val)
+                    };
+                    let half = if is_getter { format!("__get_{key_str}__") } else { format!("__set_{key_str}__") };
+                    let half_id = vm.interner.intern(&half);
+                    if is_define {
+                        let f = args.get(1).copied().unwrap_or(Value::undefined());
+                        if !vm.value_callable(f) {
+                            return Err(vm.make_native_error(
+                                "TypeError",
+                                if is_getter { "Getter must be a function" } else { "Setter must be a function" },
+                            ));
+                        }
+                        let Some(oid) = this.as_object_id() else {
+                            // Primitive receivers: the wrapper is transient; the
+                            // define is unobservable, return undefined.
+                            return Ok(Value::undefined());
+                        };
+                        // Existing non-configurable property → TypeError.
+                        let key_id = vm.interner.intern(&key_str);
+                        let get_id = vm.interner.intern(&format!("__get_{key_str}__"));
+                        let set_id = vm.interner.intern(&format!("__set_{key_str}__"));
+                        let non_config = vm.heap.get(oid).is_some_and(|o| {
+                            [key_id, get_id, set_id].iter().any(|k| {
+                                o.get_property_descriptor(*k).is_some_and(|p| !p.is_configurable())
+                            })
+                        });
+                        if non_config {
+                            return Err(vm.make_native_error(
+                                "TypeError",
+                                &format!("Cannot redefine property: {key_str}"),
+                            ));
+                        }
+                        let extensible = vm.heap.get(oid).map(|o| o.extensible).unwrap_or(true);
+                        let exists = vm.heap.get(oid).is_some_and(|o| {
+                            [key_id, get_id, set_id].iter().any(|k| o.has_own_property(*k))
+                        });
+                        if !exists && !extensible {
+                            return Err(vm.make_native_error(
+                                "TypeError",
+                                &format!("Cannot define property {key_str}, object is not extensible"),
+                            ));
+                        }
+                        if let Some(obj) = vm.heap.get_mut(oid) {
+                            // Converting a data property: drop the data slot.
+                            obj.delete_property(key_id);
+                            obj.define_property(half_id, Property::with_flags(
+                                f,
+                                Property::ENUMERABLE | Property::CONFIGURABLE,
+                            ));
+                        }
+                        Ok(Value::undefined())
+                    } else {
+                        // Private class accessors share the __get_#m__ storage
+                        // but are NOT observable properties.
+                        if key_str.starts_with('#') {
+                            return Ok(Value::undefined());
+                        }
+                        // Lookup: the chain walk stops at the FIRST object that
+                        // owns the property at all (either accessor half or a
+                        // data slot) and reports that level's half — an
+                        // accessor with only the other half yields undefined.
+                        let other_half = if is_getter { format!("__set_{key_str}__") } else { format!("__get_{key_str}__") };
+                        let other_half_id = vm.interner.intern(&other_half);
+                        let key_id = vm.interner.intern(&key_str);
+                        let mut cur = this.as_object_id();
+                        while let Some(oid) = cur {
+                            if let Some(v) = vm.heap.get(oid).and_then(|o| o.get_property(half_id)) {
+                                return Ok(v);
+                            }
+                            let owns = vm.heap.get(oid).is_some_and(|o| {
+                                o.has_own_property(other_half_id) || o.has_own_property(key_id)
+                            });
+                            if owns {
+                                return Ok(Value::undefined());
+                            }
+                            cur = vm.heap.get(oid).and_then(|o| o.prototype);
+                        }
+                        Ok(Value::undefined())
+                    }
+                },
+            );
+            let mut fn_obj = JsObject {
+                properties: Vec::new(),
+                prototype: Some(self.function_prototype),
+                kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
+                marked: false,
+                extensible: true,
+            };
+            let name_key = self.interner.intern("name");
+            let len_key = self.interner.intern("length");
+            let fn_len = if which.starts_with("__define") { 2 } else { 1 };
+            fn_obj.define_property(name_key, Property::with_flags(Value::string(name_id), Property::CONFIGURABLE));
+            fn_obj.define_property(len_key, Property::with_flags(Value::int(fn_len), Property::CONFIGURABLE));
+            let v = Value::object_id(self.heap.allocate(fn_obj));
+            let op = self.object_prototype;
+            if let Some(p) = self.heap.get_mut(op) {
+                p.define_property(name_id, Property::with_flags(v, Property::WRITABLE | Property::CONFIGURABLE));
+            }
+        }
+    }
+
     /// %ThrowTypeError%: the singleton poison-pill accessor for strict-mode
     /// `arguments.callee` (get === set, frozen, non-extensible, name "" /
     /// length 0).

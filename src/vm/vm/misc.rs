@@ -2027,6 +2027,7 @@ impl Vm {
             ("slice", 2), ("split", 2), ("startsWith", 1), ("substr", 2),
             ("substring", 2), ("toLowerCase", 0), ("toString", 0),
             ("toUpperCase", 0), ("trim", 0), ("trimEnd", 0), ("trimStart", 0),
+            ("isWellFormed", 0), ("toWellFormed", 0),
         ];
         const ARRAY_METHODS: &[(&str, i32)] = &[
             ("at", 1), ("concat", 1), ("copyWithin", 2), ("every", 1),

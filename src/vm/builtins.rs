@@ -474,6 +474,10 @@ impl Vm {
                 }
                 self.new_str(&result)
             }
+            // Rust strings are always valid UTF-8, so lone surrogates can't
+            // occur: every string here is well-formed by construction.
+            "isWellFormed" => Value::boolean(true),
+            "toWellFormed" => self.new_str(s),
             "codePointAt" => {
                 let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
                 if ascii {
