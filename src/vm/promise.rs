@@ -279,6 +279,39 @@ impl Vm {
             let resolve_sentinel = Value::function((-1_000_000_000i64 - encoded) as i32);
             let reject_sentinel = Value::function((-1_000_000_000i64 - encoded - 1) as i32);
 
+            // Invoke(nextPromise, "then", ...) is a real Get + Call: an own
+            // "then" override (data or getter) is observable, and abrupt
+            // completions reject the combinator promise and stop iteration.
+            let then_key = self.interner.intern("then");
+            let get_then_key = self.interner.intern("__get_then__");
+            let has_own_then = self.heap.get(resolved_pid).is_some_and(|o| {
+                o.has_own_property(then_key) || o.has_own_property(get_then_key)
+            });
+            if has_own_then {
+                let promise_val = Value::object_id(resolved_pid);
+                let prev_protect = self.protect_throw_depth;
+                self.protect_throw_depth = self.frames.len() + 1;
+                let r = self.getter_aware_get(resolved_pid, "then")
+                    .and_then(|tv| {
+                        let tv = tv.unwrap_or(Value::undefined());
+                        if self.value_callable(tv) {
+                            self.call_function_this(tv, promise_val, &[resolve_sentinel, reject_sentinel])
+                        } else {
+                            let err = self.make_native_error("TypeError", "then is not a function");
+                            Err(VmError::Throw(err))
+                        }
+                    });
+                self.protect_throw_depth = prev_protect;
+                match r {
+                    Ok(_) => {}
+                    Err(VmError::Throw(err)) => {
+                        self.reject_promise(result_pid, err)?;
+                        return Ok(Value::object_id(result_pid));
+                    }
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
             // Attach .then(resolve_cb, reject_cb)
             let then_name = self.interner.intern("then");
             self.exec_promise_method(resolved_pid, then_name, &[resolve_sentinel, reject_sentinel])?;
