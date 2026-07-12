@@ -30,6 +30,43 @@ impl Vm {
             self.exec_promise_method(inner_oid, then_name, &[resolve_sentinel, reject_sentinel])?;
             return Ok(());
         }
+        // Generic thenables: Get(value, "then") is observable (a poisoned
+        // getter rejects); a callable then is invoked with the resolving
+        // functions, adopting the thenable's eventual state.
+        if let Some(inner_oid) = value.as_object_id()
+            && inner_oid != oid
+            && !matches!(self.heap.get(inner_oid).map(|o| &o.kind), Some(ObjectKind::Promise { .. }))
+        {
+            let then_val = match self.getter_aware_get(inner_oid, "then") {
+                Ok(v) => v.unwrap_or(Value::undefined()),
+                Err(VmError::Throw(err)) => {
+                    return self.reject_promise(oid, err);
+                }
+                Err(e) => return Err(e),
+            };
+            if self.value_callable(then_val) {
+                let resolve_sentinel = Value::function(-600_000 - oid.0 as i32);
+                let reject_sentinel = Value::function(-700_000 - oid.0 as i32);
+                let prev = self.protect_throw_depth;
+                self.protect_throw_depth = self.frames.len() + 1;
+                let r = self.call_function_this(then_val, value, &[resolve_sentinel, reject_sentinel]);
+                self.protect_throw_depth = prev;
+                match r {
+                    Ok(_) => {}
+                    Err(VmError::Throw(err)) => {
+                        // A throw AFTER resolve/reject already ran is ignored.
+                        let still_pending = self.heap.get(oid).is_some_and(|o| {
+                            matches!(o.kind, ObjectKind::Promise { state: PromiseState::Pending, .. })
+                        });
+                        if still_pending {
+                            return self.reject_promise(oid, err);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+                return Ok(());
+            }
+        }
         // Transition to Fulfilled
         if let Some(obj) = self.heap.get_mut(oid)
             && let ObjectKind::Promise { state, result, reactions: r, .. } = &mut obj.kind {
@@ -256,10 +293,40 @@ impl Vm {
         };
         let tracker_oid = self.heap.allocate(tracker);
 
+        // Get(C, "resolve") once, observably: a user override of
+        // Promise.resolve is invoked per element (invoke-resolve tests).
+        let resolve_id = self.interner.intern("resolve");
+        let resolve_override = self.fn_property_overrides
+            .get(&(-520, resolve_id))
+            .copied()
+            .flatten()
+            .filter(|v| self.value_callable(*v));
         // For each element, wrap with Promise.resolve and attach callbacks
         for (i, elem) in elements.iter().enumerate() {
             // Promise.resolve(elem)
-            let resolved_pid = if let Some(oid) = elem.as_object_id()
+            let resolved_pid = if let Some(rf) = resolve_override {
+                let prev = self.protect_throw_depth;
+                self.protect_throw_depth = self.frames.len() + 1;
+                let r = self.call_function_this(rf, Value::function(-520), &[*elem]);
+                self.protect_throw_depth = prev;
+                let next = match r {
+                    Ok(v) => v,
+                    Err(VmError::Throw(err)) => {
+                        self.reject_promise(result_pid, err)?;
+                        return Ok(Value::object_id(result_pid));
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let Some(noid) = next.as_object_id()
+                    .filter(|o| matches!(self.heap.get(*o).map(|x| &x.kind), Some(ObjectKind::Promise { .. })))
+                {
+                    noid
+                } else {
+                    let pid = self.allocate_promise();
+                    self.resolve_promise(pid, next)?;
+                    pid
+                }
+            } else if let Some(oid) = elem.as_object_id()
                 && let Some(obj) = self.heap.get(oid)
                     && matches!(&obj.kind, ObjectKind::Promise { .. }) {
                         oid
