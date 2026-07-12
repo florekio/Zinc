@@ -4151,6 +4151,39 @@ impl Vm {
                         if let Some(name_id) = key.as_string_id() {
                             // Check for setter first
                             let name_str = self.interner.resolve(name_id).to_owned();
+                            // arr["length"] = N follows the same ArraySetLength
+                            // path as the literal-key write (truncate/extend,
+                            // shadow bookkeeping) — never a named property.
+                            if name_str == "length"
+                                && self.heap.get(oid).is_some_and(|o| matches!(&o.kind, ObjectKind::Array(_)))
+                            {
+                                let new_len = self.to_f64(val) as usize;
+                                let doomed: Vec<StringId> = self.heap.get(oid)
+                                    .map(|o| o.properties.iter()
+                                        .filter(|(k, _)| {
+                                            let ks = self.interner.resolve(*k);
+                                            ks == "length"
+                                                || ks.parse::<usize>().is_ok_and(|i| i >= new_len)
+                                        })
+                                        .map(|(k, _)| *k)
+                                        .collect())
+                                    .unwrap_or_default();
+                                if let Some(obj) = self.heap.get_mut(oid) {
+                                    obj.properties.retain(|(k, _)| !doomed.contains(k));
+                                    if let ObjectKind::Array(ref mut elements) = obj.kind {
+                                        if new_len <= elements.len() {
+                                            elements.truncate(new_len);
+                                        } else if new_len <= 1_000_000 {
+                                            elements.resize(new_len, Value::undefined());
+                                        } else {
+                                            let lk = self.interner.intern("length");
+                                            obj.define_property(lk, Property::with_flags(Value::number(new_len as f64), Property::WRITABLE));
+                                        }
+                                    }
+                                }
+                                self.push(val);
+                                continue;
+                            }
                             let setter_key = self.interner.intern(&format!("__set_{name_str}__"));
                             if let Some(sfn) = self.heap.get_property_chain(oid, setter_key)
                                 && sfn.is_function() {
@@ -5222,7 +5255,12 @@ impl Vm {
                                             _ => None,
                                         }
                                     }).unwrap_or(false);
+                                    // Arrays and string wrappers own "length".
+                                    let len_own = key == "length"
+                                        && matches!(&o.kind, ObjectKind::Array(_) | ObjectKind::Wrapper(_))
+                                        && !matches!(&o.kind, ObjectKind::Wrapper(inner) if !inner.is_string());
                                     array_idx
+                                        || len_own
                                         || o.has_own_property(key_id)
                                         || o.has_own_property(getter_key)
                                         || o.has_own_property(setter_key)

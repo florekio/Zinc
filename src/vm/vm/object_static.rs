@@ -282,22 +282,23 @@ impl Vm {
                 if let Some(sentinel) = first_arg.as_function() {
                     let key_id = self.interner.intern(&key_str);
                     let deleted = matches!(self.fn_property_overrides.get(&(sentinel, key_id)), Some(None));
-                    let (value, intrinsic) = if let Some(Some(v)) = self.fn_property_overrides.get(&(sentinel, key_id)).copied() {
-                        (Some(v), false)
+                    // Source of the value decides the flags: user override
+                    // (plain assignment) → w/e/c true; intrinsic name/length →
+                    // w false, e false, c true; built-in static (Object.keys,
+                    // Promise.resolve, …) → w true, e false, c true;
+                    // .prototype → all false.
+                    let (value, from_override) = if let Some(Some(v)) = self.fn_property_overrides.get(&(sentinel, key_id)).copied() {
+                        (Some(v), true)
                     } else if deleted {
                         (None, false)
                     } else {
-                        // Intrinsic name / length descriptors (spec flags:
-                        // writable false, enumerable false, configurable true);
-                        // other statics (Object.keys, Promise.resolve, …)
-                        // resolve through the shared sentinel property GET.
                         let own = self.fn_get_own_prop(sentinel, key_id);
                         match own {
-                            Some(v) if key_str == "name" || key_str == "length" => (Some(v), true),
+                            Some(v) if key_str == "name" || key_str == "length" => (Some(v), false),
                             _ => {
                                 let v = self.fn_property_get(sentinel, key_id, first_arg);
                                 if v.is_undefined() {
-                                    (own, true)
+                                    (own, false)
                                 } else {
                                     (Some(v), false)
                                 }
@@ -311,17 +312,13 @@ impl Vm {
                         let writable_key = self.interner.intern("writable");
                         let enumerable_key = self.interner.intern("enumerable");
                         let configurable_key = self.interner.intern("configurable");
-                        // `name`/`length` keep their spec flags (writable
-                        // false, enumerable false, configurable true) even
-                        // when the VALUE came from an override (e.g.
-                        // SetFunctionName on a symbol-keyed function).
-                        let spec_flags = intrinsic || key_str == "name" || key_str == "length";
-                        // Constructor .prototype is non-writable, non-enumerable,
-                        // non-configurable.
+                        // `name`/`length` keep their spec flags even when the
+                        // VALUE came from an override (SetFunctionName).
+                        let spec_flags = key_str == "name" || key_str == "length";
                         let is_proto = key_str == "prototype";
                         desc.set_property(value_key, v);
                         desc.set_property(writable_key, Value::boolean(!spec_flags && !is_proto));
-                        desc.set_property(enumerable_key, Value::boolean(!spec_flags && !is_proto));
+                        desc.set_property(enumerable_key, Value::boolean(from_override && !spec_flags && !is_proto));
                         desc.set_property(configurable_key, Value::boolean(!is_proto));
                         return Ok(Some(Value::object_id(self.heap.allocate(desc))));
                     }

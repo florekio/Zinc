@@ -1913,30 +1913,62 @@ impl Vm {
                 Ok(Value::object_id(iter_oid))
             }
             "hasOwnProperty" => {
-                let key = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let has = if let Ok(idx) = key.parse::<usize>() {
-                    self.heap.get(oid).map(|o| {
-                        if let ObjectKind::Array(ref elems) = o.kind { idx < elems.len() } else { false }
-                    }).unwrap_or(false)
-                } else {
-                    let key_id = self.interner.intern(&key);
-                    self.heap.get(oid).map(|o| o.has_own_property(key_id)).unwrap_or(false)
+                let key = match args.first() {
+                    Some(v) if v.is_symbol() => format!("__sym_{}__", v.as_symbol_id().unwrap()),
+                    Some(v) => self.value_to_string(*v),
+                    None => String::new(),
                 };
+                let key_id = self.interner.intern(&key);
+                let getter_key = self.interner.intern(&format!("__get_{key}__"));
+                let setter_key = self.interner.intern(&format!("__set_{key}__"));
+                self.ensure_builtin_proto_method(oid, key_id);
+                let has = self.heap.get(oid).map(|o| {
+                    let idx_own = key.parse::<usize>().ok().is_some_and(|idx| match &o.kind {
+                        ObjectKind::Array(elems) => idx < elems.len() && !elems[idx].is_empty_marker(),
+                        ObjectKind::Wrapper(inner) if inner.is_string() => {
+                            inner.as_string_id()
+                                .map(|sid| idx < self.interner.resolve(sid).chars().count())
+                                .unwrap_or(false)
+                        }
+                        _ => false,
+                    });
+                    let len_own = key == "length"
+                        && matches!(&o.kind, ObjectKind::Array(_) | ObjectKind::Wrapper(_))
+                        && !matches!(&o.kind, ObjectKind::Wrapper(inner) if !inner.is_string());
+                    idx_own
+                        || len_own
+                        || o.has_own_property(key_id)
+                        || o.has_own_property(getter_key)
+                        || o.has_own_property(setter_key)
+                }).unwrap_or(false);
                 Ok(Value::boolean(has))
             }
             "propertyIsEnumerable" => {
-                let key = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let is_enum = if let Ok(idx) = key.parse::<usize>() {
-                    self.heap.get(oid).map(|o| {
-                        if let ObjectKind::Array(ref elems) = o.kind { idx < elems.len() } else { false }
-                    }).unwrap_or(false)
-                } else {
-                    let key_id = self.interner.intern(&key);
-                    self.heap.get(oid)
-                        .and_then(|o| o.get_property_descriptor(key_id))
-                        .map(|p| p.is_enumerable())
-                        .unwrap_or(false)
+                let key = match args.first() {
+                    Some(v) if v.is_symbol() => format!("__sym_{}__", v.as_symbol_id().unwrap()),
+                    Some(v) => self.value_to_string(*v),
+                    None => String::new(),
                 };
+                let key_id = self.interner.intern(&key);
+                let getter_key = self.interner.intern(&format!("__get_{key}__"));
+                let setter_key = self.interner.intern(&format!("__set_{key}__"));
+                let is_enum = self.heap.get(oid).map(|o| {
+                    let idx_enum = key.parse::<usize>().ok().is_some_and(|idx| match &o.kind {
+                        ObjectKind::Array(elems) => idx < elems.len() && !elems[idx].is_empty_marker(),
+                        ObjectKind::Wrapper(inner) if inner.is_string() => {
+                            inner.as_string_id()
+                                .map(|sid| idx < self.interner.resolve(sid).chars().count())
+                                .unwrap_or(false)
+                        }
+                        _ => false,
+                    });
+                    idx_enum
+                        || o.get_property_descriptor(key_id)
+                            .or_else(|| o.get_property_descriptor(getter_key))
+                            .or_else(|| o.get_property_descriptor(setter_key))
+                            .map(|p| p.is_enumerable())
+                            .unwrap_or(false)
+                }).unwrap_or(false);
                 Ok(Value::boolean(is_enum))
             }
             "isPrototypeOf" => {
