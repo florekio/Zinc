@@ -705,8 +705,18 @@ impl Vm {
                             .unwrap_or(Value::null())
                     }
                 } else if arg.is_function() {
-                    // Sentinel functions → Function.prototype
-                    Value::object_id(self.function_prototype)
+                    // Generator functions chain to %GeneratorFunction.prototype%.
+                    let sentinel = arg.as_function().unwrap();
+                    let chunk_idx = (sentinel & 0xFFFF) as usize;
+                    let is_gen = sentinel >= 0
+                        && chunk_idx < self.chunks.len()
+                        && self.chunks[chunk_idx].flags.contains(crate::compiler::chunk::ChunkFlags::GENERATOR);
+                    if is_gen {
+                        Value::object_id(self.generator_function_proto_oid())
+                    } else {
+                        // Sentinel functions → Function.prototype
+                        Value::object_id(self.function_prototype)
+                    }
                 } else if arg.is_number() || arg.is_int() {
                     Value::object_id(self.number_prototype)
                 } else if arg.is_string() || self.is_cons_string(arg) {

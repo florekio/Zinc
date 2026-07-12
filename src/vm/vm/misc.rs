@@ -766,6 +766,12 @@ impl Vm {
     /// Implements `Function(...)` and `new Function(...)`: concatenates params,
     /// compiles `function(p1,p2,...){ body }`, and returns a callable function value.
     pub(crate) fn construct_function(&mut self, args: &[Value]) -> Result<Value, VmError> {
+        self.construct_function_kind(args, "function")
+    }
+
+    /// Shared Function/GeneratorFunction dynamic compilation; `keyword` is
+    /// "function" or "function*".
+    pub(crate) fn construct_function_kind(&mut self, args: &[Value], keyword: &str) -> Result<Value, VmError> {
         let params_str = if args.len() > 1 {
             args[..args.len() - 1]
                 .iter()
@@ -776,7 +782,7 @@ impl Vm {
             String::new()
         };
         let body_str = args.last().map(|v| self.value_to_string(*v)).unwrap_or_default();
-        let src = format!("return (function({}){{ {} }})", params_str, body_str);
+        let src = format!("return ({}({}){{ {} }})", keyword, params_str, body_str);
 
         // Lex, parse, compile
         let mut lexer = crate::lexer::lexer::Lexer::new(&src, &mut self.interner);

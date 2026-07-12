@@ -2725,6 +2725,26 @@ impl Vm {
                         self.push(Value::boolean(result.to_boolean()));
                         continue;
                     }
+                    // Packed generator fn instanceof the GeneratorFunction
+                    // intrinsic: their conceptual [[Prototype]] is
+                    // %GeneratorFunction.prototype%, which the generic walk
+                    // below can't see (packed fns have no heap proto slot).
+                    if let (Some(packed), Some(gf_proto)) = (obj.as_function(), self.generator_function_proto)
+                        && packed >= 0
+                    {
+                        let chunk_idx = (packed & 0xFFFF) as usize;
+                        if chunk_idx < self.chunks.len()
+                            && self.chunks[chunk_idx].flags.contains(ChunkFlags::GENERATOR)
+                            && let Some(rhs_oid) = constructor.as_object_id()
+                        {
+                            let pk = self.interner.intern("prototype");
+                            let rhs_proto = self.heap.get(rhs_oid).and_then(|o| o.get_property(pk));
+                            if rhs_proto.and_then(|v| v.as_object_id()) == Some(gf_proto) {
+                                self.push(Value::boolean(true));
+                                continue;
+                            }
+                        }
+                    }
                     // RHS must be callable — throw TypeError for non-callables
                     let ctor_key_id = self.interner.intern("__constructor__");
                     let constructor_callable = constructor.is_function()
@@ -6272,6 +6292,31 @@ impl Vm {
                             || (-673..=-660).contains(&packed)
                     } else if let Some(oid) = func_val.as_object_id() {
                         let ctor_key = self.interner.intern("__constructor__");
+                        // The GeneratorFunction intrinsic is a Native fn that
+                        // IS a constructor: new GF(...) compiles source and
+                        // returns the generator function (no ordinary this).
+                        let is_gf_ctor = self.generator_function_proto
+                            .and_then(|p| {
+                                let ck = self.interner.intern("constructor");
+                                self.heap.get(p).and_then(|o| o.get_property(ck))
+                            })
+                            .and_then(|v| v.as_object_id())
+                            == Some(oid);
+                        if is_gf_ctor {
+                            let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
+                            match self.construct_function_kind(&args, "function*") {
+                                Ok(v) => {
+                                    self.truncate_stack(func_pos);
+                                    self.push(v);
+                                }
+                                Err(VmError::Throw(t)) => {
+                                    self.truncate_stack(func_pos);
+                                    self.handle_throw(t)?;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                            continue;
+                        }
                         self.heap.get(oid).map(|o| {
                             // Native fn objects (reified prototype methods,
                             // capability executors, …) are NOT constructors;

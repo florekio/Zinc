@@ -353,6 +353,7 @@ pub struct Vm {
     /// serves property reads and getPrototypeOf.
     pub(crate) iterator_prototype: Option<ObjectId>,
     pub(crate) throw_type_error: Option<Value>,
+    pub(crate) generator_function_proto: Option<ObjectId>,
     /// Singleton Boolean.prototype object
     pub(crate) boolean_prototype: ObjectId,
     /// Singleton Number.prototype object
@@ -1061,6 +1062,54 @@ impl Vm {
         let v = Value::object_id(self.heap.allocate(fn_obj));
         self.throw_type_error = Some(v);
         v
+    }
+
+    /// %GeneratorFunction.prototype%: the [[Prototype]] of every generator
+    /// function, carrying @@toStringTag "GeneratorFunction" and a
+    /// constructor that dynamically compiles `function*` source.
+    pub(crate) fn generator_function_proto_oid(&mut self) -> ObjectId {
+        if let Some(oid) = self.generator_function_proto {
+            return oid;
+        }
+        let mut proto = JsObject::ordinary();
+        proto.prototype = Some(self.function_prototype);
+        let tag_key = self.interner.intern(&format!("__sym_{}__", self.sym_to_string_tag));
+        let tag_val = self.interner.intern("GeneratorFunction");
+        proto.define_property(tag_key, Property::with_flags(Value::string(tag_val), Property::CONFIGURABLE));
+        // %GeneratorFunction%: callable and constructable.
+        let ctor_name = self.interner.intern("GeneratorFunction");
+        let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+            |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
+                match vm.construct_function_kind(args, "function*") {
+                    Ok(v) => Ok(v),
+                    Err(VmError::Throw(t)) => Err(t),
+                    Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                }
+            },
+        );
+        let mut ctor_obj = JsObject {
+            properties: Vec::new(),
+            prototype: Some(self.function_prototype),
+            kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: ctor_name, func }),
+            marked: false,
+            extensible: true,
+        };
+        let name_key = self.interner.intern("name");
+        let len_key = self.interner.intern("length");
+        ctor_obj.define_property(name_key, Property::with_flags(Value::string(ctor_name), Property::CONFIGURABLE));
+        ctor_obj.define_property(len_key, Property::with_flags(Value::int(1), Property::CONFIGURABLE));
+        let proto_oid = self.heap.allocate(proto);
+        // ctor.prototype = %GeneratorFunctionPrototype% (non-writable,
+        // non-enumerable, non-configurable per spec).
+        let proto_key = self.interner.intern("prototype");
+        ctor_obj.define_property(proto_key, Property::with_flags(Value::object_id(proto_oid), 0));
+        let ctor_val = Value::object_id(self.heap.allocate(ctor_obj));
+        let ctor_key = self.interner.intern("constructor");
+        if let Some(p) = self.heap.get_mut(proto_oid) {
+            p.define_property(ctor_key, Property::with_flags(ctor_val, Property::CONFIGURABLE));
+        }
+        self.generator_function_proto = Some(proto_oid);
+        proto_oid
     }
 
     /// Per-kind iterator prototype (%ArrayIteratorPrototype%, …): an object
