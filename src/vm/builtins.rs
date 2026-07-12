@@ -173,10 +173,21 @@ impl Vm {
             "padStart" | "padEnd" => b"NS",
             "localeCompare" => b"S",
             "concat" => b"SSSSSSSS",
+            // P: pattern (RegExps keep the protocol, others ToString);
+            // F: replacement (callables stay raw, others ToString).
+            "replace" | "replaceAll" => b"PF",
+            "split" => b"PN",
             _ => b"",
         };
         let mut cargs: Vec<Value> = args.to_vec();
-        for (i, kind) in arg_spec.iter().enumerate() {
+        // split coerces its limit (ToUint32) BEFORE the separator's ToString.
+        let order: Vec<usize> = if name == "split" && arg_spec.len() == 2 {
+            vec![1, 0]
+        } else {
+            (0..arg_spec.len()).collect()
+        };
+        for i in order {
+            let kind = &arg_spec[i];
             let Some(v) = cargs.get(i).copied() else { break };
             match kind {
                 b'N' => {
@@ -195,6 +206,29 @@ impl Vm {
                         v
                     };
                     cargs[i] = Value::number(self.to_f64(prim));
+                }
+                b'P' | b'F' => {
+                    let is_regexp = *kind == b'P'
+                        && v.as_object_id().and_then(|o| self.heap.get(o))
+                            .is_some_and(|o| matches!(o.kind, ObjectKind::RegExp { .. }));
+                    let is_fn = *kind == b'F' && self.value_callable(v);
+                    if is_regexp || is_fn || v.is_undefined() {
+                        continue;
+                    }
+                    if v.is_symbol() {
+                        return Err(VmError::Throw(self.make_native_error(
+                            "TypeError",
+                            "Cannot convert a Symbol value to a string",
+                        )));
+                    }
+                    let prim = if v.is_object() {
+                        self.try_coerce_to_primitive_hint(v, "string")?
+                    } else {
+                        v
+                    };
+                    let st = self.value_to_string(prim);
+                    let sid = self.interner.intern(&st);
+                    cargs[i] = Value::string(sid);
                 }
                 b'S' => {
                     // undefined stays raw: padStart/padEnd treat an undefined
