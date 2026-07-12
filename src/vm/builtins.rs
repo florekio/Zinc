@@ -3006,6 +3006,9 @@ impl Vm {
                 if !arg.is_null() && !arg.is_undefined() {
                     let prim_key = self.interner.intern("__primitive__");
                     obj.set_property(prim_key, arg);
+                    // Wrapper kind so thisBooleanValue/thisSymbolValue &c.
+                    // unwrap the primitive.
+                    obj.kind = ObjectKind::Wrapper(arg);
                 }
                 // Chain the wrapper to its primitive's prototype so the inherited
                 // valueOf/toString unwrap it (`Object(1) + 0` === 1) and

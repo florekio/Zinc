@@ -948,6 +948,84 @@ impl Vm {
         sp.prototype = Some(self.object_prototype);
         let ctor_key = self.interner.intern("constructor");
         sp.set_property(ctor_key, Value::function(-570));
+        // thisSymbolValue helper shared by the members below.
+        fn sym_id_of(vm: &Vm, this: Value) -> Option<u32> {
+            if let Some(sid) = this.as_symbol_id() {
+                return Some(sid);
+            }
+            this.as_object_id().and_then(|oid| vm.heap.get(oid)).and_then(|o| {
+                if let ObjectKind::Wrapper(inner) = &o.kind {
+                    inner.as_symbol_id()
+                } else {
+                    None
+                }
+            })
+        }
+        // get description
+        let desc_getter_name = self.interner.intern("get description");
+        let dfunc: crate::runtime::object::NativeFn = std::sync::Arc::new(
+            |vm: &mut Vm, this: Value, _args: &[Value]| -> Result<Value, Value> {
+                let Some(sid) = sym_id_of(vm, this) else {
+                    return Err(vm.make_native_error(
+                        "TypeError",
+                        "Symbol.prototype.description requires that 'this' be a Symbol",
+                    ));
+                };
+                Ok(match vm.symbol_descriptions.get(sid as usize).copied().flatten() {
+                    Some(d) => Value::string(d),
+                    None => Value::undefined(),
+                })
+            },
+        );
+        let mut dfn = JsObject {
+            properties: Vec::new(),
+            prototype: Some(self.function_prototype),
+            kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: desc_getter_name, func: dfunc }),
+            marked: false,
+            extensible: true,
+        };
+        let name_key = self.interner.intern("name");
+        let len_key = self.interner.intern("length");
+        dfn.define_property(name_key, Property::with_flags(Value::string(desc_getter_name), Property::CONFIGURABLE));
+        dfn.define_property(len_key, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
+        let dval = Value::object_id(self.heap.allocate(dfn));
+        let getter_key = self.interner.intern("__get_description__");
+        sp.define_property(getter_key, Property::with_flags(dval, Property::CONFIGURABLE));
+        // toString / valueOf with thisSymbolValue receiver checks.
+        for which in ["toString", "valueOf"] {
+            let mname = self.interner.intern(which);
+            let is_tostring = which == "toString";
+            let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                move |vm: &mut Vm, this: Value, _args: &[Value]| -> Result<Value, Value> {
+                    let Some(sid) = sym_id_of(vm, this) else {
+                        return Err(vm.make_native_error(
+                            "TypeError",
+                            "Symbol.prototype method requires that 'this' be a Symbol",
+                        ));
+                    };
+                    if is_tostring {
+                        let d = vm.symbol_descriptions.get(sid as usize).copied().flatten()
+                            .map(|s| vm.interner.resolve(s).to_owned())
+                            .unwrap_or_default();
+                        let out = vm.interner.intern(&format!("Symbol({d})"));
+                        Ok(Value::string(out))
+                    } else {
+                        Ok(Value::symbol(sid))
+                    }
+                },
+            );
+            let mut f = JsObject {
+                properties: Vec::new(),
+                prototype: Some(self.function_prototype),
+                kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: mname, func }),
+                marked: false,
+                extensible: true,
+            };
+            f.define_property(name_key, Property::with_flags(Value::string(mname), Property::CONFIGURABLE));
+            f.define_property(len_key, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
+            let v = Value::object_id(self.heap.allocate(f));
+            sp.define_property(mname, Property::with_flags(v, Property::WRITABLE | Property::CONFIGURABLE));
+        }
         let p = self.heap.allocate(sp);
         self.func_prototypes.insert(-570, p);
         p

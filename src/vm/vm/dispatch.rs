@@ -2034,8 +2034,16 @@ impl Vm {
                             obj.prototype = Some(self.object_prototype);
                             Value::object_id(self.heap.allocate(obj))
                         } else if arg.is_symbol() {
-                            let mut obj = JsObject::ordinary();
-                            obj.prototype = Some(self.object_prototype);
+                            // Symbol wrapper: Wrapper kind + Symbol.prototype
+                            // so thisSymbolValue methods unwrap it.
+                            let proto = self.symbol_prototype_oid();
+                            let mut obj = JsObject {
+                                properties: Vec::new(),
+                                prototype: Some(proto),
+                                kind: ObjectKind::Wrapper(arg),
+                                marked: false,
+                                extensible: true,
+                            };
                             let prim_key = self.interner.intern("__primitive__");
                             obj.set_property(prim_key, arg);
                             Value::object_id(self.heap.allocate(obj))
@@ -3135,6 +3143,41 @@ impl Vm {
                         }
                     }
 
+                    // Symbol primitives read through Symbol.prototype
+                    // (description accessor, reified methods, constructor).
+                    if top.is_symbol() {
+                        self.pop()?;
+                        let name_str = self.interner.resolve(name_id).to_owned();
+                        if name_str == "constructor" {
+                            self.push(Value::function(-570));
+                            continue;
+                        }
+                        let proto = self.symbol_prototype_oid();
+                        if name_str == "description" {
+                            let gk = self.interner.intern("__get_description__");
+                            if let Some(g) = self.heap.get(proto).and_then(|o| o.get_property(gk)) {
+                                let prev = self.protect_throw_depth;
+                                self.protect_throw_depth = self.frames.len() + 1;
+                                let r = self.call_function_this(g, top, &[]);
+                                self.protect_throw_depth = prev;
+                                match r {
+                                    Ok(v) => {
+                                        self.push(v);
+                                        continue;
+                                    }
+                                    Err(VmError::Throw(t)) => {
+                                        self.handle_throw(t)?;
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                        }
+                        let v = self.heap.get_property_chain(proto, name_id)
+                            .unwrap_or(Value::undefined());
+                        self.push(v);
+                        continue;
+                    }
                     // Slow path: special cases
                     let peeked = top;
                     if peeked.is_null() || peeked.is_undefined() {
