@@ -2594,7 +2594,10 @@ impl Vm {
                                         if let ObjectKind::Array(ref mut elems) = obj.kind
                                             && idx < elems.len()
                                         {
-                                            elems[idx] = Value::undefined();
+                                            // A real HOLE: 'in'/hasOwnProperty
+                                            // report absent, index accessors
+                                            // redefined later take effect.
+                                            elems[idx] = Value::empty();
                                         }
                                         if let Some(ts) = tombstone {
                                             obj.define_property(ts, Property::with_flags(Value::boolean(true), 0));
