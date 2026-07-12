@@ -1118,6 +1118,9 @@ impl Vm {
             | (-570, "asyncIterator") | (-570, "matchAll")
             | (-507, "prototype") | (-508, "prototype") | (-551, "prototype")
         )
+        // Built-in constructor .prototype is non-writable across the board
+        // (Promise, Date, the error constructors, collections, …).
+        || (name_str == "prototype" && sentinel < 0 && self.func_prototypes.contains_key(&sentinel))
         // Every function's own `length` and `name` are non-writable (writable:
         // false, configurable: true) per spec — assignment no-ops/throws; only
         // defineProperty (a different path) can change them.

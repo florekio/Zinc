@@ -2691,6 +2691,18 @@ impl Vm {
                 let key_id = self.interner.intern(&key);
                 let getter_key = self.interner.intern(&format!("__get_{key}__"));
                 let setter_key = self.interner.intern(&format!("__set_{key}__"));
+                // Packed function sentinels (TypeError, Array, Math.max, …):
+                // own properties live in metadata/override tables.
+                if let Some(sent) = this_val.as_function().filter(|p| *p < 0) {
+                    if let Some(ov) = self.fn_property_overrides.get(&(sent, key_id)) {
+                        return Ok(Value::boolean(ov.is_some()));
+                    }
+                    let has = match key.as_str() {
+                        "prototype" => self.func_prototypes.contains_key(&sent),
+                        _ => self.fn_get_own_prop(sent, key_id).is_some(),
+                    };
+                    return Ok(Value::boolean(has));
+                }
                 if let Some(oid) = this_val.as_object_id() {
                     let has = self.heap.get(oid).map(|o| {
                         // Array/arguments objects also expose numeric indices and "length"

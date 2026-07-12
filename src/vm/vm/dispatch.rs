@@ -2557,6 +2557,25 @@ impl Vm {
                     } else if obj_val.is_function() {
                         if let Some(key_id) = key.as_string_id() {
                             let sentinel = obj_val.as_function().unwrap();
+                            let key_str = self.interner.resolve(key_id).to_owned();
+                            // Built-in constructor .prototype is non-configurable —
+                            // delete fails (unless a user override replaced it).
+                            if key_str == "prototype"
+                                && sentinel < 0
+                                && self.func_prototypes.contains_key(&sentinel)
+                                && !matches!(self.fn_property_overrides.get(&(sentinel, key_id)), Some(Some(_)))
+                            {
+                                if in_strict {
+                                    let err = self.make_native_error(
+                                        "TypeError",
+                                        "Cannot delete property 'prototype'",
+                                    );
+                                    self.handle_throw(err)?;
+                                    continue;
+                                }
+                                self.push(Value::boolean(false));
+                                continue;
+                            }
                             // Mark the property as deleted so subsequent reads see undefined.
                             // For "name" / "length" the standard descriptor would otherwise
                             // resurface; for other user-set properties this clears them.
@@ -5465,7 +5484,13 @@ impl Vm {
                             let key = if argc > 0 { self.value_to_string(self.stack[obj_pos + 1]) } else { String::new() };
                             let key_id = self.interner.intern(&key);
                             let sentinel = obj_val.as_function().unwrap();
-                            let has = self.fn_get_own_prop(sentinel, key_id).is_some();
+                            let has = if let Some(ov) = self.fn_property_overrides.get(&(sentinel, key_id)) {
+                                ov.is_some()
+                            } else if key == "prototype" && sentinel < 0 {
+                                self.func_prototypes.contains_key(&sentinel)
+                            } else {
+                                self.fn_get_own_prop(sentinel, key_id).is_some()
+                            };
                             self.truncate_stack(obj_pos);
                             self.push(Value::boolean(has));
                             continue;
