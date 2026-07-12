@@ -909,7 +909,7 @@ impl<'a> Compiler<'a> {
         } else {
             self.chunk.emit_op_u16(OpCode::GetLocalWide, iter_slot, line);
         }
-        self.chunk.emit_op(OpCode::IteratorClose, line);
+        self.chunk.emit_op(OpCode::IteratorCloseQuiet, line);
         self.chunk.emit_op(OpCode::Throw, line);
         self.chunk.patch_jump(skip_catch);
 

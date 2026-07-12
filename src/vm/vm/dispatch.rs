@@ -9111,6 +9111,39 @@ impl Vm {
                     }
                 }
 
+                OpCode::IteratorCloseQuiet => {
+                    // IteratorClose for a throw completion: run .return() but
+                    // swallow any inner throw or invalid result — the original
+                    // error (already on its way) wins.
+                    let iter_val = self.pop()?;
+                    if let Some(oid) = iter_val.as_object_id() {
+                        let iter_done_key = self.interner.intern("__iter_done__");
+                        let already_done = self.heap.get_property_chain(oid, iter_done_key)
+                            .map(|v| v.to_boolean())
+                            .unwrap_or(false);
+                        if !already_done {
+                            let is_gen = self.heap.get(oid)
+                                .map(|o| matches!(&o.kind, ObjectKind::Generator { .. }))
+                                .unwrap_or(false);
+                            if is_gen {
+                                let return_name = self.interner.intern("return");
+                                let _ = self.exec_generator_method(oid, return_name, &[Value::undefined()]);
+                            } else {
+                                let return_name = self.interner.intern("return");
+                                let return_fn = self.heap.get_property_chain(oid, return_name);
+                                if let Some(fn_val) = return_fn
+                                    && fn_val.is_function()
+                                {
+                                    let prev_protect = self.protect_throw_depth;
+                                    self.protect_throw_depth = self.frames.len() + 1;
+                                    let _ = self.call_function_this(fn_val, iter_val, &[]);
+                                    self.protect_throw_depth = prev_protect;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 OpCode::IteratorClose => {
                     let iter_val = self.pop()?;
                     if let Some(oid) = iter_val.as_object_id() {
@@ -9162,7 +9195,20 @@ impl Vm {
                                     self.handle_throw(err)?;
                                     continue;
                                 }
-                                let result = self.call_function_this(fn_val, iter_val, &[])?;
+                                // Protected: a throw from .return() propagates
+                                // as a catchable completion of the close.
+                                let prev_protect = self.protect_throw_depth;
+                                self.protect_throw_depth = self.frames.len() + 1;
+                                let r = self.call_function_this(fn_val, iter_val, &[]);
+                                self.protect_throw_depth = prev_protect;
+                                let result = match r {
+                                    Ok(v) => v,
+                                    Err(VmError::Throw(t)) => {
+                                        self.handle_throw(t)?;
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                };
                                 if !result.is_object() && !result.is_function() {
                                     let err = self.make_native_error(
                                         "TypeError",

@@ -336,6 +336,9 @@ pub enum OpCode {
     IteratorClose = 0xD5,
     /// Call .return() on iterator only if done flag is false. Stack: [iter, done] -> []
     IteratorCloseIfNotDone = 0xD6,
+    /// IteratorClose for throw completions: inner throws and invalid
+    /// results from .return() are swallowed (the original error rethrows).
+    IteratorCloseQuiet = 0xD7,
 
     // ---- Generator / Async ----
     /// Yield TOS (suspend generator)
@@ -442,7 +445,7 @@ impl OpCode {
             | 0xB0..=0xB1
             | 0xB8..=0xBF
             | 0xC0..=0xC4
-            | 0xD0..=0xD6
+            | 0xD0..=0xD7
             | 0xD8..=0xDD
             | 0xE0..=0xE5
             | 0xE8..=0xEF
@@ -525,6 +528,7 @@ impl OpCode {
             | OpCode::IteratorValue
             | OpCode::IteratorClose
             | OpCode::IteratorCloseIfNotDone
+            | OpCode::IteratorCloseQuiet
             | OpCode::Yield
             | OpCode::YieldStar
             | OpCode::Await
