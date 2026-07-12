@@ -3776,7 +3776,7 @@ impl Vm {
                                     obj.properties.retain(|(k, _)| *k != lk);
                                     if let ObjectKind::Array(ref mut elements) = obj.kind {
                                         if new_len <= 1_000_000 {
-                                            elements.resize(new_len, Value::undefined());
+                                            elements.resize(new_len, Value::empty());
                                         } else {
                                             obj.define_property(lk, Property::with_flags(Value::number(new_len as f64), Property::WRITABLE));
                                         }
@@ -4430,7 +4430,7 @@ impl Vm {
                                     obj.properties.retain(|(k, _)| *k != lk);
                                     if let ObjectKind::Array(ref mut elements) = obj.kind {
                                         if new_len <= 1_000_000 {
-                                            elements.resize(new_len, Value::undefined());
+                                            elements.resize(new_len, Value::empty());
                                         } else {
                                             obj.define_property(lk, Property::with_flags(Value::number(new_len as f64), Property::WRITABLE));
                                         }
