@@ -135,9 +135,17 @@ impl Vm {
             let m_key = interner.intern(mname);
             let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
                 move |vm: &mut Vm, this: Value, args: &[Value]| -> Result<Value, Value> {
-                    let Some(oid) = this.as_object_id() else {
-                        return Ok(Value::undefined());
-                    };
+                    // thisPromise check: non-Promise receivers throw.
+                    let is_promise = this.as_object_id()
+                        .and_then(|o| vm.heap.get(o))
+                        .is_some_and(|o| matches!(o.kind, ObjectKind::Promise { .. }));
+                    if !is_promise {
+                        return Err(vm.make_native_error(
+                            "TypeError",
+                            "Promise.prototype method called on incompatible receiver",
+                        ));
+                    }
+                    let oid = this.as_object_id().unwrap();
                     let m_id = vm.interner.intern(mname);
                     vm.exec_promise_method(oid, m_id, args).map_err(|e| match e {
                         VmError::Throw(v) => v,
@@ -148,7 +156,7 @@ impl Vm {
                     })
                 },
             );
-            let fobj = JsObject {
+            let mut fobj = JsObject {
                 properties: Vec::new(),
                 prototype: None,
                 kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native {
@@ -158,6 +166,11 @@ impl Vm {
                 marked: false,
                 extensible: true,
             };
+            let name_prop = interner.intern("name");
+            let len_prop = interner.intern("length");
+            let mlen = match mname { "then" => 2, _ => 1 };
+            fobj.define_property(name_prop, Property::with_flags(Value::string(m_key), Property::CONFIGURABLE));
+            fobj.define_property(len_prop, Property::with_flags(Value::int(mlen), Property::CONFIGURABLE));
             let f_oid = heap.allocate(fobj);
             promise_proto.define_property(
                 m_key,
