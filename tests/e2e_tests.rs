@@ -720,11 +720,12 @@ fn test_define_property_on_array_index() {
         "falsefalsefalse"
     );
     // A large *sparse* index must NOT balloon the dense element Vec (that
-    // tripped the execution limit). It falls through to the property-map
-    // path, leaving .length untouched — returns fast instead of hanging.
+    // tripped the execution limit). The value lands in the property map and
+    // .length is tracked via a shadow property per ArraySetLength — the spec
+    // answer, still returned fast instead of hanging.
     assert_eq!(
-        eval("var a=[]; Object.defineProperty(a,5000000,{value:1,writable:true,enumerable:true,configurable:true}); a.length"),
-        "0"
+        eval("var a=[]; Object.defineProperty(a,5000000,{value:1,writable:true,enumerable:true,configurable:true}); a.length+','+a[5000000]+','+(0 in a)"),
+        "5000001,1,false"
     );
 }
 
