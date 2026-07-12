@@ -106,6 +106,7 @@ pub struct Compiler<'a> {
     upvalues: Vec<CompilerUpvalue>,
     scope_depth: u32,
     interner: &'a mut Interner,
+    inherit_strict: bool,
     loops: Vec<LoopCtx>,
     /// Stack of enclosing function scopes, outermost first and the immediate
     /// parent last. Each frame owns that function's locals + upvalues so that
@@ -163,6 +164,12 @@ impl<'a> Compiler<'a> {
     // Construction & entry point
     // ====================================================================
 
+    /// Mark the program strict regardless of directives (direct eval from
+    /// strict code).
+    pub fn set_inherit_strict(&mut self) {
+        self.inherit_strict = true;
+    }
+
     pub fn new(interner: &'a mut Interner) -> Self {
         let script_name = interner.intern("<script>");
         Self {
@@ -171,6 +178,7 @@ impl<'a> Compiler<'a> {
             upvalues: Vec::new(),
             scope_depth: 0,
             interner,
+            inherit_strict: false,
             loops: Vec::new(),
             enclosing_chain: Vec::new(),
             const_globals: std::collections::HashSet::new(),
@@ -195,6 +203,10 @@ impl<'a> Compiler<'a> {
         }
         // Detect "use strict" directive prologue
         if self.has_use_strict_directive(&program.body) {
+            self.chunk.flags |= ChunkFlags::STRICT;
+        }
+        if self.inherit_strict {
+            // Direct eval from strict code compiles as strict.
             self.chunk.flags |= ChunkFlags::STRICT;
         }
         // Hoist var declarations: scan for all `var` in the body and define them as undefined

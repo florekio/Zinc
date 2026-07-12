@@ -1578,7 +1578,13 @@ impl Vm {
                                 continue;
                             }
                         }
-                        let compiler = crate::compiler::compiler::Compiler::new(&mut self.interner);
+                        // Direct eval inherits the caller's strictness.
+                        let caller_strict = direct_eval
+                            && self.chunks[self.cur_chunk()].flags.contains(ChunkFlags::STRICT);
+                        let mut compiler = crate::compiler::compiler::Compiler::new(&mut self.interner);
+                        if caller_strict {
+                            compiler.set_inherit_strict();
+                        }
                         let chunk = match compiler.compile_program(&program) {
                             Ok(c) => c,
                             Err(e) => {
@@ -5132,6 +5138,36 @@ impl Vm {
                             let ctor_key = self.interner.intern("__constructor__");
                             self.heap.get(oid).map(|o| o.get_property(ctor_key).is_some())
                         }).unwrap_or(false);
+                    // A non-callable object whose prototype chain reaches
+                    // Function.prototype still resolves call/apply/bind — the
+                    // methods themselves throw on a non-callable `this`.
+                    if !obj_val.is_function() && !is_class_obj
+                        && matches!(self.interner.resolve(method_name), "call" | "apply" | "bind")
+                        && obj_val.as_object_id().is_some_and(|oid| {
+                            !matches!(self.heap.get(oid).map(|o| &o.kind), Some(ObjectKind::Function(_)))
+                                && {
+                                    let mut cur = self.heap.get(oid).and_then(|o| o.prototype);
+                                    let mut hit = false;
+                                    let mut hops = 0;
+                                    while let Some(p) = cur {
+                                        if p == self.function_prototype { hit = true; break; }
+                                        if hops > 32 { break; }
+                                        hops += 1;
+                                        cur = self.heap.get(p).and_then(|o| o.prototype);
+                                    }
+                                    hit
+                                }
+                        })
+                    {
+                        let mn = self.interner.resolve(method_name).to_owned();
+                        let err = self.make_native_error(
+                            "TypeError",
+                            &format!("Function.prototype.{mn} called on incompatible receiver"),
+                        );
+                        self.truncate_stack(obj_pos);
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     if obj_val.is_function() || is_class_obj || (obj_val.is_object() && obj_val.as_object_id()
                         .and_then(|oid| self.heap.get(oid))
                         .map(|o| matches!(&o.kind, ObjectKind::Function(_)))
@@ -5163,11 +5199,65 @@ impl Vm {
                                 let mut call_args = Vec::new();
                                 if argc > 1 {
                                     let arr_val = self.stack[obj_pos + 2];
-                                    if let Some(arr_oid) = arr_val.as_object_id()
-                                        && let Some(obj) = self.heap.get(arr_oid)
-                                            && let ObjectKind::Array(ref elems) = obj.kind {
-                                                call_args = elems.clone();
+                                    if arr_val.is_null() || arr_val.is_undefined() {
+                                        // CreateListFromArrayLike(undefined) → []
+                                    } else if let Some(arr_oid) = arr_val.as_object_id() {
+                                        if let Some(elems) = self.heap.get(arr_oid).and_then(|o| {
+                                            if let ObjectKind::Array(ref e) = o.kind { Some(e.clone()) } else { None }
+                                        }) {
+                                            call_args = elems.iter()
+                                                .map(|v| if v.is_empty_marker() { Value::undefined() } else { *v })
+                                                .collect();
+                                        } else {
+                                            // Array-like: observable length + index Gets.
+                                            let len_v = match self.getter_aware_get(arr_oid, "length") {
+                                                Ok(v) => v.unwrap_or(Value::undefined()),
+                                                Err(VmError::Throw(t)) => {
+                                                    self.truncate_stack(obj_pos);
+                                                    self.handle_throw(t)?;
+                                                    continue;
+                                                }
+                                                Err(e) => return Err(e),
+                                            };
+                                            let n = (self.to_f64(len_v).max(0.0) as usize).min(65535);
+                                            let mut aborted = false;
+                                            for i in 0..n {
+                                                let v = match self.getter_aware_get(arr_oid, &i.to_string()) {
+                                                    Ok(v) => v.unwrap_or(Value::undefined()),
+                                                    Err(VmError::Throw(t)) => {
+                                                        self.truncate_stack(obj_pos);
+                                                        self.handle_throw(t)?;
+                                                        aborted = true;
+                                                        break;
+                                                    }
+                                                    Err(e) => return Err(e),
+                                                };
+                                                call_args.push(v);
                                             }
+                                            if aborted {
+                                                continue;
+                                            }
+                                        }
+                                    } else if arr_val.is_function() {
+                                        // Functions are objects: array-like via
+                                        // their .length (indices are absent).
+                                        let sentinel = arr_val.as_function().unwrap();
+                                        let len_id = self.interner.intern("length");
+                                        let n = self.fn_get_own_prop(sentinel, len_id)
+                                            .map(|v| self.to_f64(v).max(0.0) as usize)
+                                            .unwrap_or(0)
+                                            .min(65535);
+                                        call_args = vec![Value::undefined(); n];
+                                    } else {
+                                        // Non-object argArray → TypeError.
+                                        let err = self.make_native_error(
+                                            "TypeError",
+                                            "CreateListFromArrayLike called on non-object",
+                                        );
+                                        self.truncate_stack(obj_pos);
+                                        self.handle_throw(err)?;
+                                        continue;
+                                    }
                                 }
                                 self.truncate_stack(obj_pos);
                                 let prev_protect = self.protect_throw_depth;
