@@ -81,7 +81,7 @@ impl Vm {
     /// objects (own name/length, spec attributes) plus buffer/byteLength/
     /// byteOffset accessor getters.
     fn seed_dataview_proto(&mut self, proto_oid: ObjectId) {
-        const TYPES: &[&str] = &["Int8", "Uint8", "Int16", "Uint16", "Int32", "Uint32", "Float32", "Float64"];
+        const TYPES: &[&str] = &["Int8", "Uint8", "Int16", "Uint16", "Int32", "Uint32", "Float32", "Float64", "BigInt64", "BigUint64"];
         for ty in TYPES {
             for (prefix, fn_len) in [("get", 1i32), ("set", 2)] {
                 let mname = format!("{prefix}{ty}");
@@ -335,13 +335,29 @@ impl Vm {
             "Int8" | "Uint8" => 1,
             "Int16" | "Uint16" => 2,
             "Int32" | "Uint32" | "Float32" => 4,
-            "Float64" => 8,
+            "Float64" | "BigInt64" | "BigUint64" => 8,
             _ => return Ok(Value::undefined()),
         };
+        let is_big = matches!(ty, "BigInt64" | "BigUint64");
         // Spec order: ToIndex(requestIndex), then (for set) ToNumber(value),
         // then bounds. Both coercions are observable.
         let idx = self.spec_to_index(args.first().copied().unwrap_or(Value::undefined()))?;
+        let mut big_value: u64 = 0;
         let value = if is_get {
+            0.0
+        } else if is_big {
+            // ToBigInt(value): Numbers throw TypeError (unlike the BigInt()
+            // constructor's NumberToBigInt).
+            let v = args.get(1).copied().unwrap_or(Value::undefined());
+            if v.as_number().is_some() || v.is_int() {
+                let e = self.make_native_error("TypeError", "Cannot convert a Number to a BigInt");
+                return Err(VmError::Throw(e));
+            }
+            let b = self.value_to_bigint(v)?;
+            use num_bigint::BigInt;
+            let modulus = BigInt::from(1u8) << 64u32;
+            let wrapped = ((b % &modulus) + &modulus) % &modulus;
+            big_value = u64::try_from(wrapped).unwrap_or(0);
             0.0
         } else {
             let v = args.get(1).copied().unwrap_or(Value::undefined());
@@ -371,6 +387,15 @@ impl Vm {
             }
             // raw is now little-endian
             let bits = u64::from_le_bytes(raw);
+            if is_big {
+                use num_bigint::BigInt;
+                let b = if ty == "BigInt64" {
+                    BigInt::from(bits as i64)
+                } else {
+                    BigInt::from(bits)
+                };
+                return Ok(self.make_bigint(b));
+            }
             let n: f64 = match ty {
                 "Int8" => (bits as u8) as i8 as f64,
                 "Uint8" => (bits as u8) as f64,
@@ -385,6 +410,7 @@ impl Vm {
             Ok(Value::number(n))
         } else {
             let bits: u64 = match ty {
+                _ if is_big => big_value,
                 "Float32" => (value as f32).to_bits() as u64,
                 "Float64" => value.to_bits(),
                 _ => {
