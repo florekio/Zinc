@@ -506,6 +506,17 @@ impl Vm {
                     }
                 }
             }
+            // Defining an index accessor on an array pokes a HOLE in the
+            // dense slot: reads must route to the getter, not the stale
+            // element.
+            if (desc_has_get || desc_has_set)
+                && let Ok(idx) = key_str.parse::<usize>()
+                && let Some(obj) = self.heap.get_mut(target_oid)
+                && let ObjectKind::Array(ref mut elements) = obj.kind
+                && idx < elements.len()
+            {
+                elements[idx] = Value::empty();
+            }
             // Explicit `get: undefined` / `set: undefined` still creates the
             // accessor half (an accessor property with no functions exists,
             // reads as undefined, and is redefinable with identical halves).

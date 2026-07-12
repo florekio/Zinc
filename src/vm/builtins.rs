@@ -897,6 +897,88 @@ impl Vm {
                 }
                 Ok(Some(v))
             }
+            "toReversed" | "with" | "toSorted" | "toSpliced" => {
+                // Getter-aware copies: index accessors run in order (they may
+                // grow the array mid-iteration; the length snapshot wins).
+                let len = self.array_like_length_raw(oid)?.min(1_000_000) as usize;
+                // with(idx, v) never reads the replaced index.
+                let skip_idx: Option<usize> = if name == "with" {
+                    let l = len as i64;
+                    let raw = args.first().map(|v| self.to_f64(*v)).unwrap_or(0.0) as i64;
+                    let idx = if raw < 0 { l + raw } else { raw };
+                    if idx < 0 || idx >= l {
+                        return Err(VmError::Throw(self.make_native_error("RangeError", "Invalid index")));
+                    }
+                    Some(idx as usize)
+                } else {
+                    None
+                };
+                let mut snap = Vec::with_capacity(len);
+                for i in 0..len {
+                    if skip_idx == Some(i) {
+                        snap.push(Value::undefined());
+                        continue;
+                    }
+                    snap.push(self.array_like_get(oid, i as u64)?.unwrap_or(Value::undefined()));
+                }
+                let out: Vec<Value> = match name {
+                    "toReversed" => snap.into_iter().rev().collect(),
+                    "with" => {
+                        let mut o = snap;
+                        if let Some(i) = skip_idx {
+                            o[i] = args.get(1).copied().unwrap_or(Value::undefined());
+                        }
+                        o
+                    }
+                    "toSorted" => {
+                        let cmp = args.first().copied().unwrap_or(Value::undefined());
+                        if !cmp.is_undefined() && !self.value_callable(cmp) {
+                            return Err(VmError::Throw(self.make_native_error(
+                                "TypeError",
+                                "The comparison function must be either a function or undefined",
+                            )));
+                        }
+                        let mut o = snap;
+                        // Undefineds sort to the end per spec; stable insertion
+                        // sort with the observable comparator.
+                        let cmp_opt = if cmp.is_undefined() { None } else { Some(cmp) };
+                        let n = o.len();
+                        for i in 1..n {
+                            let mut j = i;
+                            while j > 0 {
+                                let ord = self.sort_compare_pair(o[j - 1], o[j], cmp_opt)?;
+                                if ord == std::cmp::Ordering::Greater {
+                                    o.swap(j - 1, j);
+                                    j -= 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        o
+                    }
+                    _ => {
+                        // toSpliced(start, deleteCount, ...items)
+                        let l = len as i64;
+                        let raw = args.first().map(|v| self.to_f64(*v)).unwrap_or(0.0) as i64;
+                        let start = if raw < 0 { (l + raw).max(0) } else { raw.min(l) } as usize;
+                        let dc = if args.is_empty() {
+                            0
+                        } else if args.len() == 1 {
+                            len - start
+                        } else {
+                            (self.to_f64(args[1]) as i64).clamp(0, l - start as i64) as usize
+                        };
+                        let mut o: Vec<Value> = snap[..start].to_vec();
+                        o.extend(args.iter().skip(2).copied());
+                        o.extend(snap[start + dc..].iter().copied());
+                        o
+                    }
+                };
+                let mut arr = JsObject::array(out);
+                arr.prototype = Some(self.array_prototype);
+                Ok(Some(Value::object_id(self.heap.allocate(arr))))
+            }
             "concat" if !recv_is_array => {
                 // Non-array receiver: it joins the result as a single element.
                 let mut out = vec![obj_val];

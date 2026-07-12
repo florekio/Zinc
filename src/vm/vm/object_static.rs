@@ -772,7 +772,29 @@ impl Vm {
                 let target = args.first().copied().unwrap_or(Value::undefined());
                 let key_val = args.get(1).copied().unwrap_or(Value::undefined());
                 if let Some(oid) = target.as_object_id() {
-                    let key_str = self.value_to_string(key_val);
+                    let key_str = if key_val.is_symbol() {
+                        format!("__sym_{}__", key_val.as_symbol_id().unwrap())
+                    } else {
+                        self.value_to_string(key_val)
+                    };
+                    // Array elements / wrapper chars / length are own too.
+                    if let Ok(idx) = key_str.parse::<usize>() {
+                        let idx_own = self.heap.get(oid).is_some_and(|o| match &o.kind {
+                            ObjectKind::Array(e) => idx < e.len() && !e[idx].is_empty_marker(),
+                            ObjectKind::Wrapper(inner) if inner.is_string() => {
+                                inner.as_string_id().map(|sid| idx < self.interner.resolve(sid).chars().count()).unwrap_or(false)
+                            }
+                            _ => false,
+                        });
+                        if idx_own {
+                            return Ok(Some(Value::boolean(true)));
+                        }
+                    }
+                    if key_str == "length"
+                        && self.heap.get(oid).is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)))
+                    {
+                        return Ok(Some(Value::boolean(true)));
+                    }
                     let key_id = self.interner.intern(&key_str);
                     let getter_key = self.interner.intern(&format!("__get_{key_str}__"));
                     let setter_key = self.interner.intern(&format!("__set_{key_str}__"));
