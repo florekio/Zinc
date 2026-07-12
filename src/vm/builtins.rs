@@ -588,7 +588,11 @@ impl Vm {
                 None => (None, None, false, None, None),
             };
             if let Some(gfn) = getter {
-                return self.call_function_this(gfn, receiver, &[]).map(Some);
+                let prev = self.protect_throw_depth;
+                self.protect_throw_depth = self.frames.len() + 1;
+                let r = self.call_function_this(gfn, receiver, &[]);
+                self.protect_throw_depth = prev;
+                return r.map(Some);
             }
             if let Some(v) = data {
                 return Ok(Some(v));
@@ -2894,9 +2898,19 @@ impl Vm {
             )) {
                 return Ok(val);
             }
+            // Wrapper objects: only shortcut when no OWN toString/valueOf
+            // override exists — overrides must run observably.
             if let Some(obj) = self.heap.get(oid)
                 && let ObjectKind::Wrapper(inner) = &obj.kind {
-                    return Ok(*inner);
+                    let inner = *inner;
+                    let ts = self.interner.intern("toString");
+                    let vo = self.interner.intern("valueOf");
+                    let has_override = self.heap.get(oid).is_some_and(|o| {
+                        o.has_own_property(ts) || o.has_own_property(vo)
+                    });
+                    if !has_override {
+                        return Ok(inner);
+                    }
                 }
             // Track whether any method existed so we can distinguish "had no
             // primitive coercion" (return object as-is for back-compat with

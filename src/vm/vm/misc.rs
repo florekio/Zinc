@@ -191,7 +191,13 @@ impl Vm {
             };
             if let Some(g) = g {
                 if self.value_callable(g) {
-                    return self.call_function_this(g, receiver, &[]).map(Some);
+                    // Protect: a throw inside the getter must return to THIS
+                    // native caller, not unwind the JS frames beneath it.
+                    let prev = self.protect_throw_depth;
+                    self.protect_throw_depth = self.frames.len() + 1;
+                    let r = self.call_function_this(g, receiver, &[]);
+                    self.protect_throw_depth = prev;
+                    return r.map(Some);
                 }
                 // Accessor half stored without a callable getter: the
                 // property exists, Get is undefined.
