@@ -398,13 +398,23 @@ impl Vm {
                 proto.define_property(ctor_key, Property::with_flags(Value::function(sentinel), Property::WRITABLE | Property::CONFIGURABLE));
                 for name in names {
                     let key = interner.intern(name);
-                    let fn_obj = JsObject {
+                    let mut fn_obj = JsObject {
                         properties: Vec::new(),
                         prototype: None,
                         kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: key, func: make_delegate(kind, name) }),
                         marked: false,
                         extensible: true,
                     };
+                    // Spec own name/length.
+                    let name_key = interner.intern("name");
+                    let len_key = interner.intern("length");
+                    let mlen: i32 = match *name {
+                        "set" => 2,
+                        "get" | "has" | "delete" | "add" | "forEach" => 1,
+                        _ => 0,
+                    };
+                    fn_obj.define_property(name_key, Property::with_flags(Value::string(key), Property::CONFIGURABLE));
+                    fn_obj.define_property(len_key, Property::with_flags(Value::int(mlen), Property::CONFIGURABLE));
                     let val = Value::object_id(heap.allocate(fn_obj));
                     proto.define_property(key, Property::with_flags(val, Property::WRITABLE | Property::CONFIGURABLE));
                 }

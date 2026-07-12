@@ -3318,13 +3318,18 @@ impl Vm {
                                             Ok(vm.exec_object_assign(args))
                                         }
                                     );
-                                    let fn_obj = JsObject {
+                                    let mut fn_obj = JsObject {
                                         properties: Vec::new(),
                                         prototype: None,
                                         kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
                                         marked: false,
                                         extensible: true,
                                     };
+                                    let nk = self.interner.intern("name");
+                                    let lk = self.interner.intern("length");
+                                    let mlen = if name_str == "defineProperty" { 3 } else { 2 };
+                                    fn_obj.define_property(nk, Property::with_flags(Value::string(name_id), Property::CONFIGURABLE));
+                                    fn_obj.define_property(lk, Property::with_flags(Value::int(mlen), Property::CONFIGURABLE));
                                     let oid = self.heap.allocate(fn_obj);
                                     let val = Value::object_id(oid);
                                     self.fn_property_overrides.insert((-508, name_id), Some(val));
@@ -3340,13 +3345,18 @@ impl Vm {
                                             }
                                         }
                                     );
-                                    let fn_obj = JsObject {
+                                    let mut fn_obj = JsObject {
                                         properties: Vec::new(),
                                         prototype: None,
                                         kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
                                         marked: false,
                                         extensible: true,
                                     };
+                                    let nk = self.interner.intern("name");
+                                    let lk = self.interner.intern("length");
+                                    let mlen = if name_str == "defineProperty" { 3 } else { 2 };
+                                    fn_obj.define_property(nk, Property::with_flags(Value::string(name_id), Property::CONFIGURABLE));
+                                    fn_obj.define_property(lk, Property::with_flags(Value::int(mlen), Property::CONFIGURABLE));
                                     let oid = self.heap.allocate(fn_obj);
                                     let val = Value::object_id(oid);
                                     self.fn_property_overrides.insert((-508, name_id), Some(val));

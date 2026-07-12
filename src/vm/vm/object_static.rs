@@ -15,6 +15,14 @@ impl Vm {
         if !Self::OBJECT_STATIC_NAMES.contains(&name_str.as_str()) {
             return None;
         }
+        // Spec length, captured before name_str moves into the closure.
+        let mlen: i32 = match name_str.as_str() {
+            "assign" => 2,
+            "defineProperty" => 3,
+            "defineProperties" | "create" | "getOwnPropertyDescriptor" | "setPrototypeOf" | "is"
+            | "groupBy" => 2,
+            _ => 1,
+        };
         let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
             move |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
                 match vm.exec_object_static(&name_str, args) {
@@ -27,13 +35,18 @@ impl Vm {
                 }
             },
         );
-        let fn_obj = JsObject {
+        let mut fn_obj = JsObject {
             properties: Vec::new(),
             prototype: None,
             kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
             marked: false,
             extensible: true,
         };
+        // Spec own name/length for the Object statics.
+        let name_key = self.interner.intern("name");
+        let len_key = self.interner.intern("length");
+        fn_obj.define_property(name_key, Property::with_flags(Value::string(name_id), Property::CONFIGURABLE));
+        fn_obj.define_property(len_key, Property::with_flags(Value::int(mlen), Property::CONFIGURABLE));
         let oid = self.heap.allocate(fn_obj);
         let val = Value::object_id(oid);
         self.fn_property_overrides.insert((-508, name_id), Some(val));
