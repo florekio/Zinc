@@ -618,18 +618,16 @@ fn emit_loop_function_fp(chunk: &Chunk) -> Option<JitFunction> {
                 stack_top -= 1;
 
                 let arm_off = asm.offset();
-                if let Some(cmp) = last_cmp.take() {
-                    match cmp {
-                        OpCode::Lt => asm.b_ge(0),
-                        OpCode::Le => asm.b_gt(0),
-                        OpCode::Gt => asm.b_le(0),
-                        OpCode::Ge => asm.b_lt(0),
-                        OpCode::Eq | OpCode::StrictEq => asm.b_ne(0),
-                        OpCode::Ne | OpCode::StrictNe => asm.b_eq(0),
-                        _ => return None,
-                    }
-                } else {
-                    return None; // can't handle non-fused comparisons in FP mode
+                // Can't handle non-fused comparisons in FP mode.
+                let cmp = last_cmp.take()?;
+                match cmp {
+                    OpCode::Lt => asm.b_ge(0),
+                    OpCode::Le => asm.b_gt(0),
+                    OpCode::Gt => asm.b_le(0),
+                    OpCode::Ge => asm.b_lt(0),
+                    OpCode::Eq | OpCode::StrictEq => asm.b_ne(0),
+                    OpCode::Ne | OpCode::StrictNe => asm.b_eq(0),
+                    _ => return None,
                 }
                 forward_patches.push((target_bc, arm_off));
             }
@@ -693,11 +691,7 @@ fn emit_loop_function_fp(chunk: &Chunk) -> Option<JitFunction> {
         let target_arm = bc_to_arm.iter()
             .find(|(bc, _)| *bc == *target_bc)
             .map(|(_, arm)| *arm);
-        if let Some(target) = target_arm {
-            asm.patch_branch(*arm_branch_off, target);
-        } else {
-            return None;
-        }
+        asm.patch_branch(*arm_branch_off, target_arm?);
     }
 
     let mut buffer = ExecutableBuffer::new(asm.code.len().max(4096))?;
@@ -778,8 +772,7 @@ fn emit_loop_function(chunk: &Chunk) -> Option<JitFunction> {
                 let val = if idx < constants.len() {
                     let v = constants[idx];
                     if let Some(i) = v.as_int() { i as i64 }
-                    else if let Some(f) = v.as_number() { f as i64 }
-                    else { return None; }
+                    else { v.as_number()? as i64 }
                 } else { return None; };
                 let r = reg_for(stack_top)?;
                 if (0..=0xFFFF).contains(&val) {
@@ -1000,11 +993,8 @@ fn emit_loop_function(chunk: &Chunk) -> Option<JitFunction> {
         let target_arm = bc_to_arm.iter()
             .find(|(bc, _)| *bc == *target_bc)
             .map(|(_, arm)| *arm);
-        if let Some(target) = target_arm {
-            asm.patch_branch(*arm_branch_off, target);
-        } else {
-            return None; // couldn't resolve jump target
-        }
+        // None: couldn't resolve jump target
+        asm.patch_branch(*arm_branch_off, target_arm?);
     }
 
     let mut buffer = ExecutableBuffer::new(asm.code.len().max(4096))?;
@@ -1251,8 +1241,7 @@ fn emit_loop_function_with_globals(
                 let val = if idx < constants.len() {
                     let v = constants[idx];
                     if let Some(i) = v.as_int() { i as i64 }
-                    else if let Some(f) = v.as_number() { f as i64 }
-                    else { return None; }
+                    else { v.as_number()? as i64 }
                 } else { return None; };
                 let r = reg_for(stack_top)?;
                 if (0..=0xFFFF).contains(&val) {
@@ -1512,11 +1501,7 @@ fn emit_loop_function_with_globals(
         let target_arm = bc_to_arm.iter()
             .find(|(bc, _)| *bc == *target_bc)
             .map(|(_, arm)| *arm);
-        if let Some(target) = target_arm {
-            asm.patch_branch(*arm_off, target);
-        } else {
-            return None;
-        }
+        asm.patch_branch(*arm_off, target_arm?);
     }
 
     // ---- Patch loop-exit jumps to epilogue ----
@@ -1948,19 +1933,17 @@ fn emit_loop_function_fp(chunk: &Chunk) -> Option<JitFunction> {
                 let target_bc = (ip as isize + 3 + offset as isize) as usize;
                 stack_top -= 1;
                 let arm_off = asm.offset();
-                if let Some(cmp) = last_cmp.take() {
-                    // After UCOMISD: use unsigned/carry flags for fp comparisons
-                    match cmp {
-                        OpCode::Lt => asm.b_jae(0),   // inverse of a<b: JAE (CF=0)
-                        OpCode::Le => asm.b_ja(0),    // inverse of a<=b: JA (CF=0,ZF=0)
-                        OpCode::Gt => asm.b_jbe(0),   // inverse of a>b: JBE
-                        OpCode::Ge => asm.b_jb(0),    // inverse of a>=b: JB (CF=1)
-                        OpCode::Eq | OpCode::StrictEq => asm.b_ne(0),
-                        OpCode::Ne | OpCode::StrictNe => asm.b_eq(0),
-                        _ => return None,
-                    }
-                } else {
-                    return None; // non-fused not supported in FP mode
+                // Non-fused not supported in FP mode.
+                let cmp = last_cmp.take()?;
+                // After UCOMISD: use unsigned/carry flags for fp comparisons
+                match cmp {
+                    OpCode::Lt => asm.b_jae(0),   // inverse of a<b: JAE (CF=0)
+                    OpCode::Le => asm.b_ja(0),    // inverse of a<=b: JA (CF=0,ZF=0)
+                    OpCode::Gt => asm.b_jbe(0),   // inverse of a>b: JBE
+                    OpCode::Ge => asm.b_jb(0),    // inverse of a>=b: JB (CF=1)
+                    OpCode::Eq | OpCode::StrictEq => asm.b_ne(0),
+                    OpCode::Ne | OpCode::StrictNe => asm.b_eq(0),
+                    _ => return None,
                 }
                 forward_patches.push((target_bc, arm_off));
             }
@@ -2002,11 +1985,7 @@ fn emit_loop_function_fp(chunk: &Chunk) -> Option<JitFunction> {
         let target_arm = bc_to_arm.iter()
             .find(|(bc, _)| *bc == *target_bc)
             .map(|(_, arm)| *arm);
-        if let Some(target) = target_arm {
-            asm.patch_branch(*arm_branch_off, target);
-        } else {
-            return None;
-        }
+        asm.patch_branch(*arm_branch_off, target_arm?);
     }
 
     let mut buffer = ExecutableBuffer::new(asm.code.len().max(4096))?;
@@ -2057,8 +2036,7 @@ fn emit_loop_function(chunk: &Chunk) -> Option<JitFunction> {
                 let val = if idx < constants.len() {
                     let v = constants[idx];
                     if let Some(i) = v.as_int() { i as i64 }
-                    else if let Some(f) = v.as_number() { f as i64 }
-                    else { return None; }
+                    else { v.as_number()? as i64 }
                 } else { return None; };
                 let r = reg_for(stack_top)?;
                 if (0..=0xFFFF).contains(&val) { asm.movz(r, val as u16); }
@@ -2219,11 +2197,7 @@ fn emit_loop_function(chunk: &Chunk) -> Option<JitFunction> {
         let target_arm = bc_to_arm.iter()
             .find(|(bc, _)| *bc == *target_bc)
             .map(|(_, arm)| *arm);
-        if let Some(target) = target_arm {
-            asm.patch_branch(*arm_branch_off, target);
-        } else {
-            return None;
-        }
+        asm.patch_branch(*arm_branch_off, target_arm?);
     }
 
     let mut buffer = ExecutableBuffer::new(asm.code.len().max(4096))?;
@@ -2288,8 +2262,7 @@ fn emit_loop_function_with_globals(
                 let val = if idx < constants.len() {
                     let v = constants[idx];
                     if let Some(i) = v.as_int() { i as i64 }
-                    else if let Some(f) = v.as_number() { f as i64 }
-                    else { return None; }
+                    else { v.as_number()? as i64 }
                 } else { return None; };
                 let r = reg_for_globals(stack_top)?;
                 if (0..=0xFFFF).contains(&val) { asm.movz(r, val as u16); }
@@ -2506,11 +2479,7 @@ fn emit_loop_function_with_globals(
         let target_arm = bc_to_arm.iter()
             .find(|(bc, _)| *bc == *target_bc)
             .map(|(_, arm)| *arm);
-        if let Some(target) = target_arm {
-            asm.patch_branch(*arm_off, target);
-        } else {
-            return None;
-        }
+        asm.patch_branch(*arm_off, target_arm?);
     }
 
     for arm_off in &epilogue_patches {
