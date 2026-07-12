@@ -1177,6 +1177,8 @@ impl Vm {
         // Built-in constructor .prototype is non-writable across the board
         // (Promise, Date, the error constructors, collections, …).
         || (name_str == "prototype" && sentinel < 0 && self.func_prototypes.contains_key(&sentinel))
+        // Typed-array constructor BYTES_PER_ELEMENT is non-writable.
+        || (name_str == "BYTES_PER_ELEMENT" && crate::vm::typedarray::kind_for_sentinel(sentinel).is_some())
         // Every function's own `length` and `name` are non-writable (writable:
         // false, configurable: true) per spec — assignment no-ops/throws; only
         // defineProperty (a different path) can change them.

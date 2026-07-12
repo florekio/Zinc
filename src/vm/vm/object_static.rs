@@ -315,7 +315,7 @@ impl Vm {
                         // `name`/`length` keep their spec flags even when the
                         // VALUE came from an override (SetFunctionName).
                         let spec_flags = key_str == "name" || key_str == "length";
-                        let is_proto = key_str == "prototype";
+                        let is_proto = key_str == "prototype" || key_str == "BYTES_PER_ELEMENT";
                         desc.set_property(value_key, v);
                         desc.set_property(writable_key, Value::boolean(!spec_flags && !is_proto));
                         desc.set_property(enumerable_key, Value::boolean(from_override && !spec_flags && !is_proto));
@@ -965,6 +965,10 @@ impl Vm {
                 } else {
                     Some(Value::int(0))
                 }
+            }
+            "BYTES_PER_ELEMENT" => {
+                crate::vm::typedarray::kind_for_sentinel(sentinel)
+                    .map(|k| Value::int(k.bytes_per_element() as i32))
             }
             _ => None,
         }

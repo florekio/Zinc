@@ -1336,6 +1336,22 @@ impl Vm {
                     }
 
                     // BigInt(value) — converts to a BigInt (not constructable).
+                    // TypedArray/ArrayBuffer/DataView constructors require `new`
+                    // (super() to them is construction, not a plain call).
+                    if func_val.is_function()
+                        && func_val.as_function().is_some_and(|s| (-672..=-660).contains(&s))
+                        && !self.frames[self.super_frame_idx()].pending_super_call
+                    {
+                        let sentinel = func_val.as_function().unwrap();
+                        let name = Self::sentinel_fn_meta(sentinel).map(|(n, _)| n).unwrap_or("TypedArray");
+                        let err = self.make_native_error(
+                            "TypeError",
+                            &format!("Constructor {name} requires 'new'"),
+                        );
+                        self.truncate_stack(func_pos);
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     if func_val.is_function() && func_val.as_function() == Some(-638) {
                         let arg = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
                         self.truncate_stack(func_pos);
@@ -2595,11 +2611,14 @@ impl Vm {
                         if let Some(key_id) = key.as_string_id() {
                             let sentinel = obj_val.as_function().unwrap();
                             let key_str = self.interner.resolve(key_id).to_owned();
-                            // Built-in constructor .prototype is non-configurable —
-                            // delete fails (unless a user override replaced it).
-                            if key_str == "prototype"
+                            // Built-in constructor .prototype (and typed-array
+                            // BYTES_PER_ELEMENT) are non-configurable — delete
+                            // fails (unless a user override replaced them).
+                            if ((key_str == "prototype"
                                 && sentinel < 0
-                                && self.func_prototypes.contains_key(&sentinel)
+                                && self.func_prototypes.contains_key(&sentinel))
+                                || (key_str == "BYTES_PER_ELEMENT"
+                                    && crate::vm::typedarray::kind_for_sentinel(sentinel).is_some()))
                                 && !matches!(self.fn_property_overrides.get(&(sentinel, key_id)), Some(Some(_)))
                             {
                                 if in_strict {
@@ -3498,6 +3517,13 @@ impl Vm {
                                     .unwrap_or(Value::undefined()),
                             },
                             _ => {
+                                // TypedArray constructor statics.
+                                if name_str == "BYTES_PER_ELEMENT"
+                                    && let Some(kind) = crate::vm::typedarray::kind_for_sentinel(sentinel)
+                                {
+                                    self.push(Value::int(kind.bytes_per_element() as i32));
+                                    continue;
+                                }
                                 // User-defined function properties.
                                 // Arrow functions and strict-mode functions have
                                 // 'caller' and 'arguments' as poison-pill accessors
