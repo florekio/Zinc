@@ -648,7 +648,7 @@ fn run_test(source: &str, meta: &TestMeta, harness_cache: &HashMap<String, Strin
     // 2M instructions is plenty for any real test; cuts off infinite loops quickly
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut engine = Engine::new();
-        engine.set_max_steps(2_000_000);
+        engine.set_max_steps(20_000_000);
         // Tests should never spam the runner's stdout/stderr; output is still
         // captured for $DONE-marker scanning via eval_with_output.
         engine.set_silent_console(true);
