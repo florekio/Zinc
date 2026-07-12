@@ -106,6 +106,13 @@ impl Value {
 
     #[inline]
     pub fn number(n: f64) -> Self {
+        // Canonicalize NaNs: glibc's libm returns NEGATIVE quiet NaNs for
+        // domain errors (0xFFF8_0000_0000_0000), which is exactly the
+        // NaN-boxing tag prefix — an uncanonicalized NaN would masquerade
+        // as a tagged object pointer on Linux.
+        if n.is_nan() {
+            return Self(QNAN);
+        }
         Self(n.to_bits())
     }
 

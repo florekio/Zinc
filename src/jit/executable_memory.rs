@@ -32,6 +32,15 @@ unsafe extern "C" {
     fn pthread_jit_write_protect_np(enabled: i32);
 }
 
+// Non-macOS ARM64 (Linux aarch64): the instruction cache must still be
+// invalidated after writing code — compiler-rt/gcc provide __clear_cache.
+// x86 has coherent icaches and needs nothing.
+#[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
+unsafe extern "C" {
+    #[link_name = "__clear_cache"]
+    fn clear_cache(start: *mut u8, end: *mut u8);
+}
+
 /// A block of memory that is both writable and executable.
 pub struct ExecutableBuffer {
     ptr: *mut u8,
@@ -72,6 +81,8 @@ impl ExecutableBuffer {
                 pthread_jit_write_protect_np(1);
                 sys_icache_invalidate(self.ptr, code.len());
             }
+            #[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
+            clear_cache(self.ptr, self.ptr.add(code.len()));
         }
         self.code_len = code.len();
     }
