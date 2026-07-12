@@ -9909,6 +9909,26 @@ impl Vm {
                     let val = self.pop()?;
                     if let Some(oid) = val.as_object_id() {
                         self.with_stack.push(oid);
+                    } else if !val.is_nullish() && !val.is_function() {
+                        // ToObject on primitives boxes them (with(2) reads
+                        // Number.prototype through the wrapper).
+                        let boxed = self.box_primitive(val);
+                        if let Some(oid) = boxed.as_object_id() {
+                            self.with_stack.push(oid);
+                        } else {
+                            // Symbols/BigInt primitives: bare ordinary wrapper.
+                            let mut o = JsObject::ordinary();
+                            o.prototype = Some(self.object_prototype);
+                            let oid = self.heap.allocate(o);
+                            self.with_stack.push(oid);
+                        }
+                    } else if val.is_function() {
+                        // Packed function: with-scope over a plain object so
+                        // reads fall through to the outer scope.
+                        let mut o = JsObject::ordinary();
+                        o.prototype = Some(self.function_prototype);
+                        let oid = self.heap.allocate(o);
+                        self.with_stack.push(oid);
                     } else {
                         // Per spec, ToObject(null/undefined) throws TypeError.
                         let err = self.make_native_error(
