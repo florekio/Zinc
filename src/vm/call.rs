@@ -274,13 +274,14 @@ impl Vm {
         // Extracted String.prototype methods (sentinels -200 - idx).
         // `this_value` is the receiver string; core-js uncurries these
         // constantly (`b("".slice)`, `b("".charCodeAt)`, ...).
-        if (-224..=-200).contains(&packed) {
+        if (-227..=-200).contains(&packed) {
             const STRING_METHOD_NAMES: &[&str] = &[
                 "charAt", "charCodeAt", "indexOf", "lastIndexOf", "includes",
                 "startsWith", "endsWith", "slice", "substring", "toUpperCase",
                 "toLowerCase", "trim", "trimStart", "trimEnd", "split",
                 "replace", "repeat", "padStart", "padEnd", "concat",
                 "match", "search", "replaceAll", "codePointAt", "at",
+                "localeCompare", "toLocaleLowerCase", "toLocaleUpperCase",
             ];
             let idx = (-200 - packed) as usize;
             if idx < STRING_METHOD_NAMES.len() {

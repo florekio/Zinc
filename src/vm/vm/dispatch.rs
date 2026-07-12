@@ -3174,7 +3174,8 @@ impl Vm {
                             | "split" | "replace" | "repeat"
                             | "padStart" | "padEnd" | "concat"
                             | "match" | "search" | "replaceAll"
-                            | "codePointAt" | "at" => {
+                            | "codePointAt" | "at"
+                            | "localeCompare" | "toLocaleLowerCase" | "toLocaleUpperCase" => {
                                 // Encode: string sentinel = -200 - method_index
                                 let method_idx = match name_str {
                                     "charAt" => 0, "charCodeAt" => 1, "indexOf" => 2,
@@ -3186,6 +3187,8 @@ impl Vm {
                                     "padStart" => 17, "padEnd" => 18, "concat" => 19,
                                     "match" => 20, "search" => 21, "replaceAll" => 22,
                                     "codePointAt" => 23, "at" => 24,
+                                    "localeCompare" => 25, "toLocaleLowerCase" => 26,
+                                    "toLocaleUpperCase" => 27,
                                     _ => 99,
                                 };
                                 self.push(Value::function(-200 - method_idx));
@@ -5728,14 +5731,32 @@ impl Vm {
                     // Per spec, IsConstructor check fires AFTER args are evaluated.
                     // If func_val is neither a function value nor a class-like object,
                     // throw TypeError. (Class objects have a __constructor__ marker.)
-                    let is_constructable = func_val.is_function() || {
-                        if let Some(oid) = func_val.as_object_id() {
-                            let ctor_key = self.interner.intern("__constructor__");
-                            self.heap.get(oid).map(|o| {
-                                matches!(&o.kind, ObjectKind::Function(_))
-                                    || o.get_property(ctor_key).is_some()
-                            }).unwrap_or(false)
-                        } else { false }
+                    let is_constructable = if let Some(packed) = func_val.as_function() {
+                        // Negative sentinels: only actual constructors are
+                        // constructable — prototype/static METHOD sentinels
+                        // (String.prototype.localeCompare, Math.max, …) throw.
+                        packed >= 0
+                            || matches!(packed,
+                                -504 | -505 | -506 | -507 | -508
+                                | -516..=-510 | -520 | -543..=-540
+                                | -550 | -551 | -570 | -580 | -638)
+                            // ArrayBuffer/DataView/typed-array constructors.
+                            || (-673..=-660).contains(&packed)
+                    } else if let Some(oid) = func_val.as_object_id() {
+                        let ctor_key = self.interner.intern("__constructor__");
+                        self.heap.get(oid).map(|o| {
+                            // Native fn objects (reified prototype methods,
+                            // capability executors, …) are NOT constructors;
+                            // bytecode closures and bound functions are.
+                            match &o.kind {
+                                ObjectKind::Function(crate::runtime::object::FunctionKind::Native { .. })
+                                | ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { .. }) => false,
+                                ObjectKind::Function(_) => true,
+                                _ => o.get_property(ctor_key).is_some(),
+                            }
+                        }).unwrap_or(false)
+                    } else {
+                        false
                     };
                     if !is_constructable {
                         // Same location annotation as property-read errors —

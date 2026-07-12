@@ -263,11 +263,24 @@ impl Vm {
                 let result = &s[start..end];
                 self.new_str(result)
             }
-            "toUpperCase" => {
+            "toLocaleUpperCase" | "toUpperCase" => {
                 let result = s.to_uppercase();
                 self.new_str(&result)
             }
-            "toLowerCase" => {
+            "localeCompare" => {
+                // ToString(undefined) is "undefined" — a missing argument
+                // compares like the literal string.
+                let that = args.first()
+                    .map(|v| self.value_to_string(*v))
+                    .unwrap_or_else(|| "undefined".to_string());
+                let ord = match s.cmp(that.as_str()) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                Value::int(ord)
+            }
+            "toLocaleLowerCase" | "toLowerCase" => {
                 let result = s.to_lowercase();
                 self.new_str(&result)
             }

@@ -1915,7 +1915,9 @@ impl Vm {
         const STRING_METHODS: &[(&str, i32)] = &[
             ("at", 1), ("charAt", 1), ("charCodeAt", 1), ("codePointAt", 1),
             ("concat", 1), ("endsWith", 1), ("includes", 1), ("indexOf", 1),
-            ("lastIndexOf", 1), ("match", 1), ("matchAll", 1), ("normalize", 0),
+            ("lastIndexOf", 1), ("localeCompare", 1), ("toLocaleLowerCase", 0),
+            ("toLocaleUpperCase", 0),
+            ("match", 1), ("matchAll", 1), ("normalize", 0),
             ("padEnd", 1), ("padStart", 1), ("repeat", 1), ("replace", 2),
             ("slice", 2), ("split", 2), ("startsWith", 1), ("substr", 2),
             ("substring", 2), ("toLowerCase", 0), ("toString", 0),
