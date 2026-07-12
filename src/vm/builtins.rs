@@ -3081,8 +3081,9 @@ impl Vm {
                 && !tp_fn.is_nullish()
             {
                 // GetMethod(@@toPrimitive): a present-but-not-callable value is a
-                // TypeError (e.g. `{[Symbol.toPrimitive]: 1}`).
-                if !tp_fn.is_function() {
+                // TypeError (e.g. `{[Symbol.toPrimitive]: 1}`). Heap function
+                // objects (Date.prototype[@@toPrimitive]) are callable too.
+                if !self.value_callable(tp_fn) {
                     let err = self.make_native_error("TypeError", "object[Symbol.toPrimitive] is not a function");
                     return Err(super::vm::VmError::Throw(err));
                 }

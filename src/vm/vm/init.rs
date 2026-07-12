@@ -741,6 +741,7 @@ impl Vm {
             fuel_call_counts: HashMap::new(),
         };
         vm.init_typed_arrays();
+        vm.init_date_to_primitive();
         vm
     }
 

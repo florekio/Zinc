@@ -1033,6 +1033,80 @@ impl Vm {
         oid
     }
 
+    /// Date.prototype[@@toPrimitive]: OrdinaryToPrimitive with an explicit
+    /// hint, callable on ANY object receiver, with observable method Gets.
+    pub(crate) fn init_date_to_primitive(&mut self) {
+        let name_id = self.interner.intern("[Symbol.toPrimitive]");
+        let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+            |vm: &mut Vm, this: Value, args: &[Value]| -> Result<Value, Value> {
+                let Some(oid) = this.as_object_id() else {
+                    return Err(vm.make_native_error(
+                        "TypeError",
+                        "Date.prototype[Symbol.toPrimitive] called on a non-object",
+                    ));
+                };
+                let hint_val = args.first().copied().unwrap_or(Value::undefined());
+                let hint = if hint_val.is_string() || vm.is_cons_string(hint_val) {
+                    vm.value_to_string(hint_val)
+                } else {
+                    String::new()
+                };
+                let order: [&str; 2] = match hint.as_str() {
+                    "number" => ["valueOf", "toString"],
+                    "string" | "default" => ["toString", "valueOf"],
+                    _ => {
+                        return Err(vm.make_native_error(
+                            "TypeError",
+                            "Invalid hint: expected \"default\", \"string\", or \"number\"",
+                        ));
+                    }
+                };
+                for m in order {
+                    // Builtin prototype methods (Date valueOf/toString, …)
+                    // materialize lazily — reify before the observable Get.
+                    let m_id = vm.interner.intern(m);
+                    vm.ensure_chain_method(oid, m_id);
+                    let method = match vm.getter_aware_get(oid, m) {
+                        Ok(v) => v.unwrap_or(Value::undefined()),
+                        Err(VmError::Throw(t)) => return Err(t),
+                        Err(e) => return Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                    };
+                    if vm.value_callable(method) {
+                        let prev = vm.protect_throw_depth;
+                        vm.protect_throw_depth = vm.frames.len() + 1;
+                        let r = vm.call_function_this(method, this, &[]);
+                        vm.protect_throw_depth = prev;
+                        match r {
+                            Ok(v) if !v.is_object() || v.is_symbol() || vm.is_cons_string(v) || vm.is_flat_string(v) => return Ok(v),
+                            Ok(_) => {}
+                            Err(VmError::Throw(t)) => return Err(t),
+                            Err(e) => return Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                        }
+                    }
+                }
+                Err(vm.make_native_error("TypeError", "Cannot convert object to primitive value"))
+            },
+        );
+        let mut fn_obj = JsObject {
+            properties: Vec::new(),
+            prototype: Some(self.function_prototype),
+            kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
+            marked: false,
+            extensible: true,
+        };
+        let name_key = self.interner.intern("name");
+        let len_key = self.interner.intern("length");
+        fn_obj.define_property(name_key, Property::with_flags(Value::string(name_id), Property::CONFIGURABLE));
+        fn_obj.define_property(len_key, Property::with_flags(Value::int(1), Property::CONFIGURABLE));
+        let v = Value::object_id(self.heap.allocate(fn_obj));
+        // { writable: false, enumerable: false, configurable: true } per spec.
+        let sym_key = self.interner.intern("__sym_2__");
+        let dp = self.date_prototype;
+        if let Some(p) = self.heap.get_mut(dp) {
+            p.define_property(sym_key, Property::with_flags(v, Property::CONFIGURABLE));
+        }
+    }
+
     /// %ThrowTypeError%: the singleton poison-pill accessor for strict-mode
     /// `arguments.callee` (get === set, frozen, non-extensible, name "" /
     /// length 0).
