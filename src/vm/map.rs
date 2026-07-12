@@ -121,10 +121,13 @@ impl Vm {
     /// Wrap a materialized value list in an iterator: snapshot the items
     /// into a hidden array and walk it with an ArrayIterator carrying the
     /// shared iterator prototype.
-    pub(crate) fn make_key_iterator(&mut self, items: Vec<Value>) -> Value {
+    pub(crate) fn make_tagged_key_iterator(&mut self, items: Vec<Value>, tag: Option<&str>) -> Value {
         let arr = JsObject::array(items);
         let arr_oid = self.heap.allocate(arr);
-        let iter_proto = self.iterator_prototype_oid();
+        let iter_proto = match tag {
+            Some(t) => self.kind_iterator_prototype(t),
+            None => self.iterator_prototype_oid(),
+        };
         let iter = JsObject {
             properties: Vec::new(),
             prototype: Some(iter_proto),
@@ -216,7 +219,7 @@ impl Vm {
                         entries.iter().map(|(k, _)| *k).collect()
                     } else { vec![] })
                     .unwrap_or_default();
-                Ok(self.make_key_iterator(keys))
+                Ok(self.make_tagged_key_iterator(keys, Some("Map")))
             }
             "values" => {
                 let vals: Vec<Value> = self.heap.get(oid)
@@ -224,11 +227,11 @@ impl Vm {
                         entries.iter().map(|(_, v)| *v).collect()
                     } else { vec![] })
                     .unwrap_or_default();
-                Ok(self.make_key_iterator(vals))
+                Ok(self.make_tagged_key_iterator(vals, Some("Map")))
             }
             "entries" => {
                 // Live MapIterator over the map itself, like for..of gets.
-                let iter_proto = self.iterator_prototype_oid();
+                let iter_proto = self.kind_iterator_prototype("Map");
                 let iter = JsObject {
                     properties: Vec::new(),
                     prototype: Some(iter_proto),
@@ -302,7 +305,7 @@ impl Vm {
                 Ok(Value::undefined())
             }
             "values" | "keys" => {
-                let iter_proto = self.iterator_prototype_oid();
+                let iter_proto = self.kind_iterator_prototype("Set");
                 let iter = JsObject {
                     properties: Vec::new(),
                     prototype: Some(iter_proto),
@@ -322,7 +325,7 @@ impl Vm {
                     let pair = JsObject::array(vec![v, v]);
                     pairs.push(Value::object_id(self.heap.allocate(pair)));
                 }
-                Ok(self.make_key_iterator(pairs))
+                Ok(self.make_tagged_key_iterator(pairs, Some("Set")))
             }
             _ => Ok(Value::undefined()),
         }

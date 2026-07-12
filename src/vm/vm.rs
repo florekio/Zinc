@@ -1019,6 +1019,62 @@ impl Vm {
         oid
     }
 
+    /// Per-kind iterator prototype (%ArrayIteratorPrototype%, …): an object
+    /// with [[Prototype]] = %IteratorPrototype%, its own spec-shaped `next`,
+    /// and @@toStringTag `"<tag> Iterator"`. Cached per tag.
+    pub(crate) fn kind_iterator_prototype(&mut self, tag: &str) -> ObjectId {
+        let cache_key = self.interner.intern(&format!("__iterproto_{tag}__"));
+        let base = self.iterator_prototype_oid();
+        if let Some(v) = self.heap.get(base).and_then(|o| o.get_property(cache_key))
+            && let Some(oid) = v.as_object_id()
+        {
+            return oid;
+        }
+        let mut proto = JsObject::ordinary();
+        proto.prototype = Some(base);
+        // Own `next` — same machinery, distinct function identity per kind.
+        let next_id = self.interner.intern("next");
+        let next_fn: crate::runtime::object::NativeFn = std::sync::Arc::new(
+            |vm: &mut Vm, this: Value, _args: &[Value]| -> Result<Value, Value> {
+                let Some(oid) = this.as_object_id() else {
+                    let err = vm.make_native_error("TypeError", "next called on non-iterator");
+                    return Err(err);
+                };
+                match vm.iterator_next_step(oid) {
+                    Ok(v) => Ok(v),
+                    Err(VmError::Throw(v)) => Err(v),
+                    Err(e) => {
+                        let msg = format!("{e:?}");
+                        Err(vm.make_native_error("Error", &msg))
+                    }
+                }
+            },
+        );
+        let mut next_obj = JsObject {
+            properties: Vec::new(),
+            prototype: Some(self.function_prototype),
+            kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: next_id, func: next_fn }),
+            marked: false,
+            extensible: true,
+        };
+        let name_key = self.interner.intern("name");
+        let len_key = self.interner.intern("length");
+        next_obj.define_property(name_key, Property::with_flags(Value::string(next_id), Property::CONFIGURABLE));
+        next_obj.define_property(len_key, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
+        let next_val = Value::object_id(self.heap.allocate(next_obj));
+        proto.define_property(next_id, Property::with_flags(next_val, Property::WRITABLE | Property::CONFIGURABLE));
+        // @@toStringTag: { value: "<tag> Iterator", w: false, e: false, c: true }
+        let tag_key = self.interner.intern(&format!("__sym_{}__", self.sym_to_string_tag));
+        let tag_val = self.interner.intern(&format!("{tag} Iterator"));
+        proto.define_property(tag_key, Property::with_flags(Value::string(tag_val), Property::CONFIGURABLE));
+        let oid = self.heap.allocate(proto);
+        // Cache on %IteratorPrototype% under a hidden non-enumerable key.
+        if let Some(b) = self.heap.get_mut(base) {
+            b.define_property(cache_key, Property::with_flags(Value::object_id(oid), 0));
+        }
+        oid
+    }
+
 
     // ---- Function own-property helpers ------------------------------------
 

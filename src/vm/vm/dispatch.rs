@@ -2493,6 +2493,43 @@ impl Vm {
                         };
                         if let Some(key_id) = resolved_key {
                             let key_str = self.interner.resolve(key_id).to_owned();
+                            // The global object proxies the globals map: built-in
+                            // globals are configurable, so delete removes them
+                            // (undefined/NaN/Infinity are non-configurable).
+                            if oid == self.global_this_oid && self.globals.contains_key(&key_id) {
+                                // Non-configurable bindings (undefined/NaN/…,
+                                // var/function decls marked on globalThis) refuse.
+                                let own_desc = self.heap.get(oid).and_then(|o| o.get_property_descriptor(key_id));
+                                let non_config = matches!(key_str.as_str(), "undefined" | "NaN" | "Infinity" | "globalThis")
+                                    || own_desc.as_ref().is_some_and(|d| !d.is_configurable());
+                                if non_config {
+                                    if in_strict {
+                                        let err = self.make_native_error(
+                                            "TypeError",
+                                            &format!("Cannot delete property '{key_str}'"),
+                                        );
+                                        self.handle_throw(err)?;
+                                        continue;
+                                    }
+                                    self.push(Value::boolean(false));
+                                } else {
+                                    // Remove the binding entirely: globals map,
+                                    // fast-path vec, and the globalThis mirror.
+                                    self.globals.remove(&key_id);
+                                    let idx = key_id.0 as usize;
+                                    if idx < self.globals_vec.len() {
+                                        self.globals_vec[idx] = Value::null();
+                                    }
+                                    self.global_version += 1;
+                                    if let Some(obj) = self.heap.get_mut(oid)
+                                        && let Some(pos) = obj.properties.iter().position(|(k, _)| *k == key_id)
+                                    {
+                                        obj.properties.remove(pos);
+                                    }
+                                    self.push(Value::boolean(true));
+                                }
+                                continue;
+                            }
                             // Array.length is non-configurable per spec — delete returns false.
                             let is_array = self.heap.get(oid)
                                 .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
@@ -3317,6 +3354,10 @@ impl Vm {
                             -520 if matches!(name_str, "resolve" | "reject" | "all" | "race" | "allSettled" | "any") => {
                                 self.fn_property_get(sentinel, name_id, obj_val)
                             }
+                            // Extractable BigInt statics.
+                            -638 if matches!(name_str, "asIntN" | "asUintN") => {
+                                self.fn_property_get(sentinel, name_id, obj_val)
+                            }
                             -505 => match name_str {
                                 "prototype" => Value::object_id(self.number_prototype),
                                 "NaN" => Value::number(f64::NAN),
@@ -3729,6 +3770,17 @@ impl Vm {
                                 self.push(val);
                                 continue;
                             }
+                            // The global object proxies the globals map: writes
+                            // to keys living there update the map, not a shadow
+                            // heap property (delete/hasOwnProperty stay in sync).
+                            if oid == self.global_this_oid
+                                && self.globals.contains_key(&name_id)
+                                && !self.heap.get(oid).is_some_and(|o| o.has_own_property(name_id))
+                            {
+                                self.globals.insert(name_id, val);
+                                self.push(val);
+                                continue;
+                            }
                             if let Some(obj) = self.heap.get_mut(oid) {
                                 // IC: update or insert — record the slot for future fast access
                                 let pos = obj.properties.iter().position(|(k, _)| *k == name_id);
@@ -3914,6 +3966,45 @@ impl Vm {
                         Some(self.value_to_string(obj_val))
                     } else { None };
                     if let Some(s) = string_val_opt {
+                        // @@iterator on a string primitive: a fresh function
+                        // (capturing the string) that makes a String Iterator.
+                        if key.is_symbol() && key.as_symbol_id() == Some(self.sym_iterator) {
+                            let captured = s.clone();
+                            let name_id = self.interner.intern("[Symbol.iterator]");
+                            let func: crate::runtime::object::NativeFn =
+                                std::sync::Arc::new(move |vm: &mut Vm, _this: Value, _args: &[Value]| {
+                                    let chars: Vec<Value> = captured.chars().map(|c| {
+                                        let id = vm.interner.intern(&c.to_string());
+                                        Value::string(id)
+                                    }).collect();
+                                    let mut arr = JsObject::array(chars);
+                                    arr.prototype = Some(vm.array_prototype);
+                                    let arr_oid = vm.heap.allocate(arr);
+                                    let iter_proto = vm.kind_iterator_prototype("String");
+                                    let iter_obj = JsObject {
+                                        properties: Vec::new(),
+                                        prototype: Some(iter_proto),
+                                        kind: ObjectKind::ArrayIterator(arr_oid, 0),
+                                        marked: false,
+                                        extensible: true,
+                                    };
+                                    Ok(Value::object_id(vm.heap.allocate(iter_obj)))
+                                });
+                            let fn_obj = JsObject {
+                                properties: Vec::new(),
+                                prototype: Some(self.function_prototype),
+                                kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
+                                marked: false,
+                                extensible: true,
+                            };
+                            let v = Value::object_id(self.heap.allocate(fn_obj));
+                            self.push(v);
+                            continue;
+                        }
+                        if key.is_symbol() {
+                            self.push(Value::undefined());
+                            continue;
+                        }
                         let ascii = self.string_is_ascii(obj_val);
                         if let Some(i) = key.as_int() {
                             if i >= 0 {
@@ -4286,7 +4377,12 @@ impl Vm {
                                 self.push(val);
                                 continue;
                             }
-                            if let Some(obj) = self.heap.get_mut(oid) {
+                            if oid == self.global_this_oid
+                                && self.globals.contains_key(&name_id)
+                                && !self.heap.get(oid).is_some_and(|o| o.has_own_property(name_id))
+                            {
+                                self.globals.insert(name_id, val);
+                            } else if let Some(obj) = self.heap.get_mut(oid) {
                                 obj.set_property(name_id, val);
                             }
                         } else if key.is_symbol() {
@@ -5497,17 +5593,42 @@ impl Vm {
                         }
                     }
 
-                    // User-set callable property on a function value
-                    // (`f.method = fn; f.method(args)`): invoke the override with `this = f`.
+                    // Callable property on a function value: a user-set
+                    // override (`f.method = fn`) or a lazily-reified static
+                    // (BigInt.asIntN) — both resolve through fn_property_get
+                    // (overrides win) and run with `this = f`. NativeFn
+                    // statics are heap function OBJECTS, so use the callable
+                    // check, not the packed-fn one.
                     if obj_val.is_function() {
                         let sentinel = obj_val.as_function().unwrap();
-                        if let Some(Some(method_fn)) = self.fn_property_overrides.get(&(sentinel, method_name)).copied()
-                            && method_fn.is_function()
-                        {
+                        let method_fn = if let Some(Some(v)) = self.fn_property_overrides.get(&(sentinel, method_name)).copied() {
+                            v
+                        } else if sentinel == -638 {
+                            let mn = self.interner.resolve(method_name).to_owned();
+                            if matches!(mn.as_str(), "asIntN" | "asUintN") {
+                                self.fn_property_get(sentinel, method_name, obj_val)
+                            } else {
+                                Value::undefined()
+                            }
+                        } else {
+                            Value::undefined()
+                        };
+                        if self.value_callable(method_fn) {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();
-                            let result = self.call_function_this(method_fn, obj_val, &args)?;
-                            self.truncate_stack(obj_pos);
-                            self.push(result);
+                            // Route throws through the handler machinery so
+                            // surrounding JS try/catch sees them (extracted
+                            // built-ins like Object.defineProperty throw).
+                            match self.call_function_this(method_fn, obj_val, &args) {
+                                Ok(result) => {
+                                    self.truncate_stack(obj_pos);
+                                    self.push(result);
+                                }
+                                Err(VmError::Throw(v)) => {
+                                    self.truncate_stack(obj_pos);
+                                    self.handle_throw(v)?;
+                                }
+                                Err(e) => return Err(e),
+                            }
                             continue;
                         }
                     }
@@ -8490,7 +8611,7 @@ impl Vm {
                             continue;
                         } else if self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Map { .. })).unwrap_or(false) {
                             // Live Map iterator: holds reference to the original Map
-                            let iter_proto = self.iterator_prototype_oid();
+                            let iter_proto = self.kind_iterator_prototype("Map");
                             let iter_obj = JsObject {
                                 properties: Vec::new(),
                                 prototype: Some(iter_proto),
@@ -8502,7 +8623,7 @@ impl Vm {
                             self.push(Value::object_id(iter_id));
                         } else if self.heap.get(oid).map(|o| matches!(&o.kind, ObjectKind::Set { .. })).unwrap_or(false) {
                             // Live Set iterator: holds reference to the original Set
-                            let iter_proto = self.iterator_prototype_oid();
+                            let iter_proto = self.kind_iterator_prototype("Set");
                             let iter_obj = JsObject {
                                 properties: Vec::new(),
                                 prototype: Some(iter_proto),
@@ -8528,7 +8649,7 @@ impl Vm {
                         let mut arr = JsObject::array(chars);
                 arr.prototype = Some(self.array_prototype);
                         let arr_oid = self.heap.allocate(arr);
-                        let iter_proto = self.iterator_prototype_oid();
+                        let iter_proto = self.kind_iterator_prototype("String");
                         let iter_obj = JsObject {
                             properties: Vec::new(),
                             prototype: Some(iter_proto),

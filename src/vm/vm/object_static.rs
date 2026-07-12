@@ -1107,6 +1107,55 @@ impl Vm {
                 "call" | "apply" | "bind" => obj_val,
                 _ => Value::undefined(),
             },
+            -638 => match name_str.as_str() {
+                // Extractable BigInt statics, identity-cached like Date's.
+                "asIntN" | "asUintN" => {
+                    let signed = name_str == "asIntN";
+                    let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                        move |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
+                            // bits = ToIndex(bits); bigint = ToBigInt(bigint)
+                            let bits_arg = args.first().copied().unwrap_or(Value::undefined());
+                            let bits = match vm.spec_to_index(bits_arg) {
+                                Ok(b) => b,
+                                Err(VmError::Throw(e)) => return Err(e),
+                                Err(_) => return Err(vm.make_native_error("Error", "internal")),
+                            };
+                            let big_arg = args.get(1).copied().unwrap_or(Value::undefined());
+                            let b = match vm.value_to_bigint(big_arg) {
+                                Ok(b) => b,
+                                Err(VmError::Throw(e)) => return Err(e),
+                                Err(_) => return Err(vm.make_native_error("Error", "internal")),
+                            };
+                            use num_bigint::BigInt;
+                            let modulus = BigInt::from(1) << bits;
+                            let mut r = ((b % &modulus) + &modulus) % &modulus;
+                            if signed && bits > 0 && r >= (BigInt::from(1) << (bits - 1)) {
+                                r -= &modulus;
+                            }
+                            Ok(vm.make_bigint(r))
+                        },
+                    );
+                    let fn_obj = JsObject {
+                        properties: Vec::new(),
+                        prototype: None,
+                        kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native {
+                            name: name_id,
+                            func,
+                        }),
+                        marked: false,
+                        extensible: true,
+                    };
+                    let oid = self.heap.allocate(fn_obj);
+                    let val = Value::object_id(oid);
+                    self.fn_property_overrides.insert((sentinel, name_id), Some(val));
+                    val
+                }
+                "name" => { let id = self.interner.intern("BigInt"); Value::string(id) }
+                "length" => Value::int(1),
+                "prototype" => self.func_prototypes.get(&-638).map(|o| Value::object_id(*o)).unwrap_or(Value::undefined()),
+                "call" | "apply" | "bind" => obj_val,
+                _ => Value::undefined(),
+            },
             -570 => match name_str.as_str() {
                 "for" => Value::function(-752),
                 "keyFor" => Value::function(-753),

@@ -1906,7 +1906,7 @@ impl Vm {
                 // later by extending ObjectKind::ArrayIterator with a kind tag.)
                 let iter_obj = JsObject {
                     properties: Vec::new(),
-                    prototype: Some(self.iterator_prototype_oid()),
+                    prototype: Some(self.kind_iterator_prototype("Array")),
                     kind: ObjectKind::ArrayIterator(oid, 0),
                     marked: false,
                     extensible: true,
@@ -2704,6 +2704,13 @@ impl Vm {
                     return Ok(Value::boolean(has));
                 }
                 if let Some(oid) = this_val.as_object_id() {
+                    // The global object proxies misses to the globals map.
+                    if oid == self.global_this_oid
+                        && !self.heap.get(oid).is_some_and(|o| o.has_own_property(key_id))
+                        && self.globals.contains_key(&key_id)
+                    {
+                        return Ok(Value::boolean(true));
+                    }
                     let has = self.heap.get(oid).map(|o| {
                         // Array/arguments objects also expose numeric indices and "length"
                         // as own properties even though they aren't in `properties`.
