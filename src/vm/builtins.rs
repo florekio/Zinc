@@ -1572,6 +1572,28 @@ impl Vm {
                 "The comparison function must be either a function or undefined",
             )));
         }
+        // Array.prototype.toString on a receiver with no callable "join"
+        // (a boxed Boolean/Number) falls back to Object.prototype.toString.
+        let recv_is_arr_ts = self.heap.get(oid)
+            .is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)));
+        if name == "toString" && !recv_is_arr_ts {
+            let join_id = self.interner.intern("join");
+            let has_join = self.heap.get_property_chain(oid, join_id)
+                .is_some_and(|v| self.value_callable(v));
+            if !has_join {
+                let tag = match self.heap.get(oid).map(|o| &o.kind) {
+                    Some(ObjectKind::Wrapper(inner)) => {
+                        if inner.is_string() { "String" }
+                        else if inner.as_bool().is_some() { "Boolean" }
+                        else { "Number" }
+                    }
+                    Some(ObjectKind::Function(_)) => "Function",
+                    _ => "Object",
+                };
+                let id = self.interner.intern(&format!("[object {tag}]"));
+                return Ok(Value::string(id));
+            }
+        }
         // ArraySpeciesCreate runs FIRST for the methods that use it (its
         // constructor/@@species reads and the construction are observable).
         // A Some(target) diverts the dense result into the custom object via
