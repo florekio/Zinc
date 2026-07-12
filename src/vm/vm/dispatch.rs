@@ -1867,7 +1867,14 @@ impl Vm {
                         if sentinel == -750 {
                             // Extracted Object.assign value
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
-                            let result = self.exec_object_assign(&args);
+                            let result = match self.exec_object_assign(&args) {
+                                Ok(v) => v,
+                                Err(VmError::Throw(t)) => {
+                                    self.handle_throw(t)?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            };
                             self.truncate_stack(func_pos);
                             self.push(result);
                             continue;
@@ -3494,7 +3501,11 @@ impl Vm {
                                 "assign" => {
                                     let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
                                         |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
-                                            Ok(vm.exec_object_assign(args))
+                                            match vm.exec_object_assign(args) {
+                                                Ok(v) => Ok(v),
+                                                Err(VmError::Throw(t)) => Err(t),
+                                                Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                                            }
                                         }
                                     );
                                     let mut fn_obj = JsObject {

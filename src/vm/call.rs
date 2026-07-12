@@ -344,7 +344,7 @@ impl Vm {
         }
         if packed == -750 {
             // Extracted Object.assign value
-            return Ok(self.exec_object_assign(args));
+            return self.exec_object_assign(args);
         }
         if packed == -751 {
             // Extracted Array.isArray value

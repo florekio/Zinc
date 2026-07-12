@@ -959,26 +959,129 @@ impl Vm {
     /// Object.assign(target, ...sources) — shared by the CallMethod
     /// dispatch and the extractable `Object.assign` value (sentinel
     /// -750): minified bundles alias `var assign = Object.assign;`.
-    pub(crate) fn exec_object_assign(&mut self, args: &[Value]) -> Value {
+    pub(crate) fn exec_object_assign(&mut self, args: &[Value]) -> Result<Value, VmError> {
         let target = args.first().copied().unwrap_or(Value::undefined());
-        if let Some(target_oid) = target.as_object_id() {
-            for source_val in args.iter().skip(1) {
-                if let Some(src_oid) = source_val.as_object_id() {
-                    let props: Vec<(StringId, Value)> = self.heap.get(src_oid)
-                        .map(|o| o.properties.iter()
-                            .filter(|(k, p)| p.is_enumerable()
-                                && !is_internal_key(self.interner.resolve(*k)))
-                            .map(|&(k, ref p)| (k, p.value)).collect())
-                        .unwrap_or_default();
-                    for (k, v) in props {
-                        if let Some(obj) = self.heap.get_mut(target_oid) {
-                            obj.set_property(k, v);
-                        }
+        let Some(target_oid) = target.as_object_id() else { return Ok(target) };
+        for source_val in args.iter().skip(1) {
+            let src_oid = if let Some(o) = source_val.as_object_id() {
+                o
+            } else if source_val.is_string() || self.is_cons_string(*source_val) {
+                // Primitive strings contribute index properties.
+                let boxed = self.box_primitive(*source_val);
+                let Some(o) = boxed.as_object_id() else { continue };
+                let s = self.value_to_string(*source_val);
+                for (i, c) in s.chars().enumerate() {
+                    let ck = self.interner.intern(&c.to_string());
+                    let ik = self.interner.intern(&i.to_string());
+                    if let Some(t) = self.heap.get_mut(target_oid) {
+                        t.set_property(ik, Value::string(ck));
                     }
+                }
+                let _ = o;
+                continue;
+            } else {
+                continue; // other primitives have no enumerable own props
+            };
+            // Own enumerable keys: accessor halves surface as their key with
+            // an observable getter call; plain data props via their value.
+            let props: Vec<(StringId, String)> = self.heap.get(src_oid)
+                .map(|o| o.properties.iter()
+                    .filter(|(k, p)| p.is_enumerable()
+                        && !is_internal_key(self.interner.resolve(*k)))
+                    .map(|&(k, _)| (k, self.interner.resolve(k).to_owned()))
+                    .collect())
+                .unwrap_or_default();
+            // Getter-only enumerable accessors (stored as __get_X__).
+            let acc_keys: Vec<String> = self.heap.get(src_oid)
+                .map(|o| o.properties.iter()
+                    .filter(|(k, p)| {
+                        let ks = self.interner.resolve(*k);
+                        p.is_enumerable() && ks.starts_with("__get_") && ks.ends_with("__")
+                    })
+                    .map(|(k, _)| {
+                        let ks = self.interner.resolve(*k);
+                        ks["__get_".len()..ks.len() - 2].to_owned()
+                    })
+                    .collect())
+                .unwrap_or_default();
+            let mut ordered: Vec<String> = Vec::new();
+            for (_, ks) in &props {
+                ordered.push(ks.clone());
+            }
+            for ks in &acc_keys {
+                if !ordered.contains(ks) {
+                    ordered.push(ks.clone());
+                }
+            }
+            for ks in ordered {
+                // Get(source, key): getters run, throws propagate.
+                let v = self.getter_aware_get(src_oid, &ks)?.unwrap_or(Value::undefined());
+                // Set(target, key, v, true): setters run; non-writable /
+                // non-extensible targets throw.
+                self.observable_set_or_throw(target_oid, &ks, v)?;
+            }
+            // Array source: dense elements are enumerable own props too.
+            let elems: Option<Vec<Value>> = self.heap.get(src_oid).and_then(|o| {
+                if let ObjectKind::Array(ref e) = o.kind { Some(e.clone()) } else { None }
+            });
+            if let Some(elems) = elems {
+                for (i, v) in elems.iter().enumerate() {
+                    if v.is_empty_marker() { continue; }
+                    self.observable_set_or_throw(target_oid, &i.to_string(), *v)?;
                 }
             }
         }
-        target
+        Ok(target)
+    }
+
+    /// Set(target, key, value, Throw=true): own setters (incl. inherited)
+    /// run; assignment to non-writable properties or new properties on
+    /// non-extensible objects throws TypeError.
+    pub(crate) fn observable_set_or_throw(&mut self, target_oid: ObjectId, key: &str, v: Value) -> Result<(), VmError> {
+        let key_id = self.interner.intern(key);
+        let setter_key = self.interner.intern(&format!("__set_{key}__"));
+        let getter_key = self.interner.intern(&format!("__get_{key}__"));
+        if let Some(sfn) = self.heap.get_property_chain(target_oid, setter_key) {
+            if self.value_callable(sfn) {
+                let prev = self.protect_throw_depth;
+                self.protect_throw_depth = self.frames.len() + 1;
+                let r = self.call_function_this(sfn, Value::object_id(target_oid), &[v]);
+                self.protect_throw_depth = prev;
+                r?;
+                return Ok(());
+            }
+            // Accessor without a callable setter: Set fails.
+            return Err(VmError::Throw(self.make_native_error(
+                "TypeError",
+                &format!("Cannot set property {key} which has only a getter"),
+            )));
+        }
+        if self.heap.get_property_chain(target_oid, getter_key).is_some() {
+            return Err(VmError::Throw(self.make_native_error(
+                "TypeError",
+                &format!("Cannot set property {key} which has only a getter"),
+            )));
+        }
+        let (own_ro, exists, extensible) = self.heap.get(target_oid).map(|o| {
+            let d = o.get_property_descriptor(key_id);
+            (d.as_ref().is_some_and(|p| !p.is_writable()), d.is_some(), o.extensible)
+        }).unwrap_or((false, false, true));
+        if own_ro {
+            return Err(VmError::Throw(self.make_native_error(
+                "TypeError",
+                &format!("Cannot assign to read only property '{key}'"),
+            )));
+        }
+        if !exists && !extensible {
+            return Err(VmError::Throw(self.make_native_error(
+                "TypeError",
+                &format!("Cannot add property {key}, object is not extensible"),
+            )));
+        }
+        if let Some(o) = self.heap.get_mut(target_oid) {
+            o.set_property(key_id, v);
+        }
+        Ok(())
     }
 
     /// Debug aid: ZINC_DISASM_CHUNK=<name> dumps the bytecode of every

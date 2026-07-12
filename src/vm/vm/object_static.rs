@@ -228,7 +228,7 @@ impl Vm {
                         "Cannot convert undefined or null to object",
                     )));
                 }
-                self.exec_object_assign(args)
+                self.exec_object_assign(args)?
             }
             "create" => {
                 let proto = args.first().copied().unwrap_or(Value::undefined());
