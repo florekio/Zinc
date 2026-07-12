@@ -1365,6 +1365,29 @@ impl Vm {
 
                     // RegExp(pattern, flags) — without new, same as new RegExp
                     if func_val.is_function() && func_val.as_function() == Some(-580) {
+                        // Identity shortcut: RegExp(re) with no flags returns
+                        // the SAME object when re.constructor === RegExp.
+                        if argc >= 1 && (argc == 1 || self.stack[func_pos + 2].is_undefined()) {
+                            let a0 = self.stack[func_pos + 1];
+                            if let Some(roid) = a0.as_object_id()
+                                && self.heap.get(roid).is_some_and(|o| matches!(o.kind, ObjectKind::RegExp { .. }))
+                            {
+                                let ck = self.interner.intern("constructor");
+                                let ctor_intact = self.heap.get(roid)
+                                    .and_then(|o| o.get_property(ck))
+                                    .is_none_or(|v| v.as_function() == Some(-580));
+                                // IsRegExp consults @@match: an explicit falsy
+                                // value disqualifies the identity shortcut.
+                                let match_key = self.interner.intern("__sym_9__");
+                                let match_ok = self.heap.get_property_chain(roid, match_key)
+                                    .is_none_or(|v| v.to_boolean());
+                                if ctor_intact && match_ok {
+                                    self.truncate_stack(func_pos);
+                                    self.push(a0);
+                                    continue;
+                                }
+                            }
+                        }
                         // A RegExp source argument copies its pattern (and
                         // flags, unless explicitly overridden).
                         let src_re: Option<(String, String)> = if argc > 0 {
