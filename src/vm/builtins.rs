@@ -859,7 +859,60 @@ impl Vm {
                 )))
             }
         };
+        let recv_is_array = self.heap.get(oid)
+            .is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)));
         match name {
+            // The push/pop/shift/unshift/concat arms below model ToObject'd
+            // primitives and plain array-likes; real arrays (routed here for
+            // holes/accessors) keep their dense semantics downstream.
+            "push" | "unshift" if !recv_is_array => {
+                // Generic push/unshift: read length, write elements, set the
+                // new length, return it (wrapper receivers: writes are
+                // unobservable but the length arithmetic is).
+                let len = self.array_like_length_raw(oid)?;
+                for (i, a) in args.iter().enumerate() {
+                    let idx = if name == "push" { len + i as u64 } else { i as u64 };
+                    self.array_like_set(oid, idx, *a)?;
+                }
+                let n = len + args.len() as u64;
+                let lk = self.interner.intern("length");
+                if let Some(o) = self.heap.get_mut(oid) {
+                    o.set_property(lk, Value::number(n as f64));
+                }
+                Ok(Some(Value::number(n as f64)))
+            }
+            "pop" | "shift" if !recv_is_array => {
+                let len = self.array_like_length_raw(oid)?;
+                let lk = self.interner.intern("length");
+                if len == 0 {
+                    if let Some(o) = self.heap.get_mut(oid) {
+                        o.set_property(lk, Value::int(0));
+                    }
+                    return Ok(Some(Value::undefined()));
+                }
+                let idx = if name == "pop" { len - 1 } else { 0 };
+                let v = self.array_like_get(oid, idx)?.unwrap_or(Value::undefined());
+                if let Some(o) = self.heap.get_mut(oid) {
+                    o.set_property(lk, Value::number((len - 1) as f64));
+                }
+                Ok(Some(v))
+            }
+            "concat" if !recv_is_array => {
+                // Non-array receiver: it joins the result as a single element.
+                let mut out = vec![obj_val];
+                for a in args {
+                    let spread = a.as_object_id().and_then(|ao| self.heap.get(ao)).and_then(|o| {
+                        if let ObjectKind::Array(ref e) = o.kind { Some(e.clone()) } else { None }
+                    });
+                    match spread {
+                        Some(elems) => out.extend(elems),
+                        None => out.push(*a),
+                    }
+                }
+                let mut arr = JsObject::array(out);
+                arr.prototype = Some(self.array_prototype);
+                Ok(Some(Value::object_id(self.heap.allocate(arr))))
+            }
             "forEach" | "map" | "filter" | "every" | "some"
             | "find" | "findIndex" | "findLast" | "findLastIndex" => {
                 let len = if name == "map" {
@@ -1525,6 +1578,23 @@ impl Vm {
         // CreateDataPropertyOrThrow afterwards.
         let receiver_is_array = self.heap.get(oid)
             .is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)));
+        // Mutating methods on frozen arrays / non-writable lengths throw:
+        // they all end with Set(O, "length", ...) against a non-writable
+        // property (even the no-op forms).
+        if receiver_is_array
+            && matches!(name.as_str(), "push" | "pop" | "shift" | "unshift" | "splice")
+        {
+            let fk = self.interner.intern("__frozen_elems__");
+            let rk = self.interner.intern("__len_ro__");
+            let blocked = self.heap.get(oid)
+                .is_some_and(|o| o.has_own_property(fk) || o.has_own_property(rk));
+            if blocked {
+                return Err(VmError::Throw(self.make_native_error(
+                    "TypeError",
+                    &format!("Cannot {name} on an array with a read-only length"),
+                )));
+            }
+        }
         let species_target: Option<Value> = if receiver_is_array && matches!(
             name.as_str(),
             "map" | "filter" | "slice" | "splice" | "concat" | "flat" | "flatMap"
