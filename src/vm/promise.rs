@@ -229,8 +229,9 @@ impl Vm {
                 }
                 CombinatorKind::Any => {
                     // Any with empty array: reject with AggregateError
-                    let msg = self.interner.intern("All promises were rejected");
-                    self.reject_promise(result_pid, Value::string(msg))?;
+                    let msg_id = self.interner.intern("All promises were rejected");
+                    let err = self.make_aggregate_error(vec![], Value::string(msg_id));
+                    self.reject_promise(result_pid, err)?;
                 }
             }
             return Ok(Value::object_id(result_pid));
@@ -420,19 +421,9 @@ impl Vm {
                         && let ObjectKind::PromiseCombinator { errors, .. } = &obj.kind {
                             errors.clone()
                         } else { vec![] };
-                    let err_arr = JsObject::array(errs);
-                    let err_oid = self.heap.allocate(err_arr);
-                    let msg = self.interner.intern("All promises were rejected");
-                    let mut agg = JsObject::ordinary();
-                    let msg_key = self.interner.intern("message");
-                    let errors_key = self.interner.intern("errors");
-                    let name_key = self.interner.intern("name");
-                    let name_val = self.interner.intern("AggregateError");
-                    agg.set_property(msg_key, Value::string(msg));
-                    agg.set_property(errors_key, Value::object_id(err_oid));
-                    agg.set_property(name_key, Value::string(name_val));
-                    let agg_oid = self.heap.allocate(agg);
-                    self.reject_promise(result_promise, Value::object_id(agg_oid))?;
+                    let msg_id = self.interner.intern("All promises were rejected");
+                    let agg = self.make_aggregate_error(errs, Value::string(msg_id));
+                    self.reject_promise(result_promise, agg)?;
                 }
             }
         }
@@ -492,11 +483,17 @@ impl Vm {
         }
         let Some(packed) = this.as_function() else {
             // Function objects (bound/native) pass through the native path;
-            // everything else is a non-constructor receiver.
-            let is_fn_obj = this.as_object_id()
+            // class objects (constructor marker) too — subclass identity is
+            // approximated by the native machinery. Everything else is a
+            // non-constructor receiver.
+            let ctor_key = self.interner.intern("__constructor__");
+            let ok = this.as_object_id()
                 .and_then(|o| self.heap.get(o))
-                .is_some_and(|o| matches!(o.kind, ObjectKind::Function(_)));
-            if is_fn_obj {
+                .is_some_and(|o| {
+                    matches!(o.kind, ObjectKind::Function(_))
+                        || o.get_property(ctor_key).is_some()
+                });
+            if ok {
                 return Ok(None);
             }
             return Err(self.make_native_error(

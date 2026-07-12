@@ -205,6 +205,7 @@ impl Vm {
         for (sentinel, type_name) in [
             (-511i32, "TypeError"), (-512, "RangeError"),
             (-513, "ReferenceError"), (-514, "SyntaxError"), (-515, "EvalError"), (-516, "URIError"),
+            (-539, "AggregateError"),
         ] {
             let mut proto = JsObject::ordinary();
             proto.prototype = Some(error_prototype_oid);
@@ -338,6 +339,8 @@ impl Vm {
         globals.insert(eval_error_name, Value::function(-515));
         let uri_error_name = interner.intern("URIError");
         globals.insert(uri_error_name, Value::function(-516));
+        let agg_error_name = interner.intern("AggregateError");
+        globals.insert(agg_error_name, Value::function(-539));
         let eval_name = interner.intern("eval");
         globals.insert(eval_name, Value::function(-560));
         let symbol_name = interner.intern("Symbol");

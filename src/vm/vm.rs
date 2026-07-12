@@ -544,6 +544,139 @@ impl Vm {
 
     // ---- JS throw / native error helpers ---------------------------------
 
+    /// IterableToList for AggregateError / Promise.any: arrays, Sets and
+    /// strings are the iterables that appear in practice; anything else
+    /// that is not obviously iterable throws a TypeError.
+    pub(crate) fn simple_iterable_to_list(&mut self, v: Value) -> Result<Vec<Value>, crate::vm::VmError> {
+        if let Some(oid) = v.as_object_id()
+            && let Some(obj) = self.heap.get(oid)
+        {
+            match &obj.kind {
+                crate::runtime::object::ObjectKind::Array(elements) => {
+                    return Ok(elements.iter()
+                        .map(|e| if e.is_empty_marker() { Value::undefined() } else { *e })
+                        .collect());
+                }
+                crate::runtime::object::ObjectKind::Set { entries } => {
+                    return Ok(entries.clone());
+                }
+                crate::runtime::object::ObjectKind::ConsString { .. }
+                | crate::runtime::object::ObjectKind::FlatString { .. } => {
+                    let s = self.value_to_string(v);
+                    return Ok(s.chars().map(|c| {
+                        let sid = self.interner.intern(&c.to_string());
+                        Value::string(sid)
+                    }).collect());
+                }
+                _ => {}
+            }
+        }
+        if v.is_string() {
+            let s = self.value_to_string(v);
+            return Ok(s.chars().map(|c| {
+                let sid = self.interner.intern(&c.to_string());
+                Value::string(sid)
+            }).collect());
+        }
+        // Generic objects: run the observable iterator protocol —
+        // @@iterator lookup (getters fire), call it, walk next()/done/value.
+        if let Some(oid) = v.as_object_id() {
+            let method = self.getter_aware_get(oid, "__sym_0__")?.unwrap_or(Value::undefined());
+            if !self.value_callable(method) {
+                let err = self.make_native_error("TypeError", "argument is not iterable");
+                return Err(crate::vm::VmError::Throw(err));
+            }
+            let prev_protect = self.protect_throw_depth;
+            self.protect_throw_depth = self.frames.len() + 1;
+            let result = (|| {
+                let iter = self.call_function_this(method, v, &[])?;
+                let Some(iter_oid) = iter.as_object_id() else {
+                    let err = self.make_native_error("TypeError", "iterator result is not an object");
+                    return Err(crate::vm::VmError::Throw(err));
+                };
+                let mut out = Vec::new();
+                loop {
+                    if out.len() > 1_000_000 {
+                        let err = self.make_native_error("RangeError", "iterable too large");
+                        return Err(crate::vm::VmError::Throw(err));
+                    }
+                    let next = self.getter_aware_get(iter_oid, "next")?.unwrap_or(Value::undefined());
+                    if !self.value_callable(next) {
+                        let err = self.make_native_error("TypeError", "iterator.next is not callable");
+                        return Err(crate::vm::VmError::Throw(err));
+                    }
+                    let res = self.call_function_this(next, iter, &[])?;
+                    let Some(res_oid) = res.as_object_id() else {
+                        let err = self.make_native_error("TypeError", "iterator result is not an object");
+                        return Err(crate::vm::VmError::Throw(err));
+                    };
+                    let done = self.getter_aware_get(res_oid, "done")?.unwrap_or(Value::undefined());
+                    if self.truthy(done) {
+                        break;
+                    }
+                    let val = self.getter_aware_get(res_oid, "value")?.unwrap_or(Value::undefined());
+                    out.push(val);
+                }
+                Ok(out)
+            })();
+            self.protect_throw_depth = prev_protect;
+            return result;
+        }
+        let err = self.make_native_error("TypeError", "argument is not iterable");
+        Err(crate::vm::VmError::Throw(err))
+    }
+
+    /// Construct an AggregateError object: `errors` own property (from the
+    /// already-collected list), optional message, stack, -539 prototype.
+    pub(crate) fn make_aggregate_error(&mut self, errors: Vec<Value>, message_arg: Value) -> Value {
+        match self.try_make_aggregate_error(errors, message_arg) {
+            Ok(v) => v,
+            Err(crate::vm::VmError::Throw(e)) => {
+                let _ = self.handle_throw(e);
+                Value::undefined()
+            }
+            Err(_) => Value::undefined(),
+        }
+    }
+
+    /// AggregateError construction with observable ToString(message).
+    pub(crate) fn try_make_aggregate_error(&mut self, errors: Vec<Value>, mut message_arg: Value) -> Result<Value, crate::vm::VmError> {
+        if message_arg.is_symbol() {
+            let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a string");
+            return Err(crate::vm::VmError::Throw(err));
+        }
+        if message_arg.is_object() {
+            message_arg = self.try_coerce_to_primitive_hint(message_arg, "string")?;
+            if message_arg.is_symbol() {
+                let err = self.make_native_error("TypeError", "Cannot convert a Symbol value to a string");
+                return Err(crate::vm::VmError::Throw(err));
+            }
+        }
+        let mut err = crate::runtime::object::JsObject::ordinary();
+        err.prototype = self.func_prototypes.get(&-539).copied().or(Some(self.object_prototype));
+        let msg = if message_arg.is_undefined() { String::new() } else { self.value_to_string(message_arg) };
+        if !message_arg.is_undefined() {
+            let msg_key = self.interner.intern("message");
+            let msg_id = self.interner.intern(&msg);
+            err.define_property(msg_key, crate::runtime::object::Property::with_flags(
+                Value::string(msg_id),
+                crate::runtime::object::Property::WRITABLE | crate::runtime::object::Property::CONFIGURABLE,
+            ));
+        }
+        let stack_key = self.interner.intern("stack");
+        let stack_id = self.interner.intern(&format!("AggregateError: {msg}"));
+        err.set_property(stack_key, Value::string(stack_id));
+        let mut list_obj = crate::runtime::object::JsObject::array(errors);
+        list_obj.prototype = Some(self.array_prototype);
+        let list = Value::object_id(self.heap.allocate(list_obj));
+        let errors_key = self.interner.intern("errors");
+        err.define_property(errors_key, crate::runtime::object::Property::with_flags(
+            list,
+            crate::runtime::object::Property::WRITABLE | crate::runtime::object::Property::CONFIGURABLE,
+        ));
+        Ok(Value::object_id(self.heap.allocate(err)))
+    }
+
     /// Create a native JS error object with `name` and `message` properties.
     pub(crate) fn make_native_error(&mut self, name: &str, message: &str) -> Value {
         let mut err = crate::runtime::object::JsObject::ordinary();
@@ -552,7 +685,8 @@ impl Vm {
         // Set prototype to the error type's prototype for instanceof checks
         let err_sentinel: i32 = match name {
             "TypeError" => -511, "RangeError" => -512, "ReferenceError" => -513,
-            "SyntaxError" => -514, "EvalError" => -515, "URIError" => -516, _ => -510,
+            "SyntaxError" => -514, "EvalError" => -515, "URIError" => -516,
+            "AggregateError" => -539, _ => -510,
         };
         err.prototype = self.func_prototypes.get(&err_sentinel).copied()
             .or(Some(self.object_prototype));

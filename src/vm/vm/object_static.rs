@@ -893,6 +893,7 @@ impl Vm {
             (-509, "encodeURI", 1), (-517, "decodeURIComponent", 1), (-518, "encodeURIComponent", 1), (-519, "decodeURI", 1),
             (-510, "Error", 1), (-511, "TypeError", 1), (-512, "RangeError", 1), (-513, "ReferenceError", 1),
             (-514, "SyntaxError", 1), (-515, "EvalError", 1), (-516, "URIError", 1),
+            (-539, "AggregateError", 2),
             (-520, "Promise", 1), (-540, "Map", 0), (-541, "Set", 0), (-542, "WeakMap", 0), (-543, "WeakSet", 0),
             (-550, "Date", 7), (-551, "Function", 1), (-560, "eval", 1), (-570, "Symbol", 0),
             (-580, "RegExp", 2), (-638, "BigInt", 1),

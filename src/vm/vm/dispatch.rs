@@ -1648,16 +1648,46 @@ impl Vm {
                         // super() to native error/collection constructors: initialize `this`
                         let super_fi = self.super_frame_idx();
                         let is_super_call = self.frames[super_fi].pending_super_call;
-                        if is_super_call && (-516..=-510).contains(&sentinel) {
+                        if is_super_call && ((-516..=-510).contains(&sentinel) || sentinel == -539) {
                             self.frames[super_fi].pending_super_call = false;
                             let this_val = self.frames[super_fi].this_value;
                             let error_type = match sentinel {
                                 -510 => "Error", -511 => "TypeError", -512 => "RangeError",
                                 -513 => "ReferenceError", -514 => "SyntaxError",
-                                -515 => "EvalError", -516 => "URIError", _ => "Error",
+                                -515 => "EvalError", -516 => "URIError",
+                                -539 => "AggregateError", _ => "Error",
                             };
+                            // AggregateError: super(errors, message) — errors list lands on
+                            // `this`, message is the SECOND argument.
+                            if sentinel == -539 {
+                                let errors_arg = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                                match self.simple_iterable_to_list(errors_arg) {
+                                    Ok(errors) => {
+                                        let mut arr = JsObject::array(errors);
+                                        arr.prototype = Some(self.array_prototype);
+                                        let list = Value::object_id(self.heap.allocate(arr));
+                                        let errors_key = self.interner.intern("errors");
+                                        if let Some(this_oid) = this_val.as_object_id()
+                                            && let Some(obj) = self.heap.get_mut(this_oid)
+                                        {
+                                            obj.define_property(errors_key, Property::with_flags(
+                                                list,
+                                                Property::WRITABLE | Property::CONFIGURABLE,
+                                            ));
+                                        }
+                                    }
+                                    Err(VmError::Throw(err)) => {
+                                        self.truncate_stack(func_pos);
+                                        self.handle_throw(err)?;
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
                             // Per spec, only set "message" if a non-undefined argument was passed.
-                            let msg_arg = if argc > 0 { Some(self.stack[func_pos + 1]) } else { None };
+                            let msg_arg = if sentinel == -539 {
+                                if argc > 1 { Some(self.stack[func_pos + 2]) } else { None }
+                            } else if argc > 0 { Some(self.stack[func_pos + 1]) } else { None };
                             if let Some(this_oid) = this_val.as_object_id()
                                 && let Some(arg) = msg_arg
                                 && !arg.is_undefined()
@@ -1744,7 +1774,7 @@ impl Vm {
                         // `Array(n)` call must CONSTRUCT (spec: Array called
                         // as a function behaves like `new Array`). It falls
                         // through to the constructor handler below.
-                        if (-536..=-500).contains(&sentinel) && sentinel != -507 {
+                        if ((-536..=-500).contains(&sentinel) || sentinel == -539) && sentinel != -507 {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                             // ToNumber(Symbol) throws; ToNumber(object) runs
                             // ToPrimitive observably (throws propagate).
@@ -2824,7 +2854,7 @@ impl Vm {
                                             -510 => "Error", -511 => "TypeError",
                                             -512 => "RangeError", -513 => "ReferenceError",
                                             -514 => "SyntaxError", -515 => "EvalError",
-                                            -516 => "URIError", _ => "",
+                                            -516 => "URIError", -539 => "AggregateError", _ => "",
                                         };
                                         if !ctor_name.is_empty() {
                                             name_val.as_string_id()
@@ -3174,6 +3204,34 @@ impl Vm {
                                     break;
                                 }
                                 cur = self.heap.get(c).and_then(|o| o.prototype);
+                            }
+                        }
+                        // Class statics inherit through extends: a class
+                        // object whose __super__ chain reaches a native
+                        // constructor exposes its statics (P.resolve for
+                        // class P extends Promise).
+                        if val.is_undefined() {
+                            let super_key = self.interner.intern("__super__");
+                            let mut cur_val = self.heap.get(oid).and_then(|o| o.get_property(super_key));
+                            let mut hops = 0;
+                            while let Some(sv) = cur_val {
+                                if hops > 16 {
+                                    break;
+                                }
+                                if let Some(sentinel) = sv.as_function().filter(|p| *p < 0) {
+                                    let v = self.fn_property_get(sentinel, name_id, sv);
+                                    if !v.is_undefined() {
+                                        val = v;
+                                    }
+                                    break;
+                                }
+                                let Some(soid) = sv.as_object_id() else { break };
+                                if let Some(v) = self.heap.get(soid).and_then(|o| o.get_property(name_id)) {
+                                    val = v;
+                                    break;
+                                }
+                                cur_val = self.heap.get(soid).and_then(|o| o.get_property(super_key));
+                                hops += 1;
                             }
                         }
                         self.push(val);
@@ -5380,6 +5438,30 @@ impl Vm {
                         } else {
                             self.heap.get_property_chain(oid, method_name)
                         };
+                        // Class statics inherit through extends (__super__
+                        // chain to a native constructor).
+                        if method_val.is_none() {
+                            let super_key = self.interner.intern("__super__");
+                            let mut cur_val = self.heap.get(oid).and_then(|o| o.get_property(super_key));
+                            let mut hops = 0;
+                            while let Some(sv) = cur_val {
+                                if hops > 16 { break; }
+                                if let Some(sentinel) = sv.as_function().filter(|p| *p < 0) {
+                                    let v = self.fn_property_get(sentinel, method_name, sv);
+                                    if !v.is_undefined() {
+                                        method_val = Some(v);
+                                    }
+                                    break;
+                                }
+                                let Some(soid) = sv.as_object_id() else { break };
+                                if let Some(v) = self.heap.get(soid).and_then(|o| o.get_property(method_name)) {
+                                    method_val = Some(v);
+                                    break;
+                                }
+                                cur_val = self.heap.get(soid).and_then(|o| o.get_property(super_key));
+                                hops += 1;
+                            }
+                        }
                         // If no direct method found, check for a getter (`__get_<name>__`):
                         // call the getter and use its return value as the method to invoke.
                         if method_val.is_none() {
@@ -5919,7 +6001,7 @@ impl Vm {
                         packed >= 0
                             || matches!(packed,
                                 -504 | -505 | -506 | -507 | -508
-                                | -516..=-510 | -520 | -543..=-540
+                                | -516..=-510 | -539 | -520 | -543..=-540
                                 | -550 | -551 | -570 | -580 | -638)
                             // ArrayBuffer/DataView/typed-array constructors.
                             || (-673..=-660).contains(&packed)
@@ -6499,6 +6581,25 @@ impl Vm {
                     // Handle Error constructors
                     if func_val.is_function() {
                         let sentinel = func_val.as_function().unwrap();
+                        if sentinel == -539 {
+                            // new AggregateError(errors, message)
+                            let errors_arg = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                            let msg_arg = if argc > 1 { self.stack[func_pos + 2] } else { Value::undefined() };
+                            match self.simple_iterable_to_list(errors_arg)
+                                .and_then(|errors| self.try_make_aggregate_error(errors, msg_arg))
+                            {
+                                Ok(v) => {
+                                    self.truncate_stack(func_pos);
+                                    self.push(v);
+                                }
+                                Err(VmError::Throw(err)) => {
+                                    self.truncate_stack(func_pos);
+                                    self.handle_throw(err)?;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                            continue;
+                        }
                         if (-516..=-510).contains(&sentinel) {
                             let error_type = match sentinel {
                                 -510 => "Error",
@@ -6606,7 +6707,7 @@ impl Vm {
                                         || matches!(
                                             sentinel,
                                             -540 | -541 | -542 | -543 | -550
-                                                | -507 | -506 | -505 | -504 | -580 | -520
+                                                | -507 | -506 | -505 | -504 | -580 | -520 | -539
                                         )
                                     {
                                         native_super_sentinel = Some(sentinel);
@@ -6808,6 +6909,37 @@ impl Vm {
                         // (mirrors what super() to a native Error sentinel does).
                         // Per spec, "message" descriptor is { writable: true, enumerable: false,
                         // configurable: true } — only created when an argument is provided.
+                        if let Some(-539) = native_super_sentinel
+                            && let Some(this_oid) = this_val.as_object_id()
+                        {
+                            let errors_arg = if argc > 0 { self.stack[func_pos + 1] } else { Value::undefined() };
+                            if let Ok(errors) = self.simple_iterable_to_list(errors_arg) {
+                                let mut arr = JsObject::array(errors);
+                                arr.prototype = Some(self.array_prototype);
+                                let list = Value::object_id(self.heap.allocate(arr));
+                                let errors_key = self.interner.intern("errors");
+                                if let Some(obj) = self.heap.get_mut(this_oid) {
+                                    obj.define_property(errors_key, Property::with_flags(
+                                        list,
+                                        Property::WRITABLE | Property::CONFIGURABLE,
+                                    ));
+                                }
+                            }
+                            if argc > 1 && !self.stack[func_pos + 2].is_undefined() {
+                                let msg = self.value_to_string(self.stack[func_pos + 2]);
+                                let msg_key = self.interner.intern("message");
+                                let msg_id = self.interner.intern(&msg);
+                                let stack_key = self.interner.intern("stack");
+                                let stack_id = self.interner.intern(&format!("AggregateError: {msg}"));
+                                if let Some(obj) = self.heap.get_mut(this_oid) {
+                                    obj.define_property(msg_key, Property::with_flags(
+                                        Value::string(msg_id),
+                                        Property::WRITABLE | Property::CONFIGURABLE,
+                                    ));
+                                    obj.set_property(stack_key, Value::string(stack_id));
+                                }
+                            }
+                        }
                         if let Some(sentinel) = native_super_sentinel
                             && (-516..=-510).contains(&sentinel)
                             && argc > 0
@@ -7893,7 +8025,7 @@ impl Vm {
                                 // Built-in math/global sentinels have no prototype.
                                 let has_default = (-516..=-510).contains(&sentinel)
                                     || matches!(sentinel, -504 | -505 | -506 | -507 | -508 | -520 | -551
-                                        | -540 | -541 | -542 | -543 | -550 | -570 | -580)
+                                        | -540 | -541 | -542 | -543 | -550 | -570 | -580 | -539)
                                     || (-672..=-660).contains(&sentinel) // ArrayBuffer/DataView/TypedArrays
                                     || sentinel >= 0; // user-defined functions auto-allocate
                                 if has_default {

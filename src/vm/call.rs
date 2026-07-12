@@ -298,7 +298,7 @@ impl Vm {
             }
         }
         // Native global function sentinels (no this)
-        if (-536..=-500).contains(&packed) && packed != -507 {
+        if ((-536..=-500).contains(&packed) || packed == -539) && packed != -507 {
             return Ok(self.exec_global_fn(packed, args));
         }
         if packed == -507 {

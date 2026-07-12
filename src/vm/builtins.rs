@@ -2432,6 +2432,20 @@ impl Vm {
                 }
                 Value::object_id(self.heap.allocate(obj))
             }
+            // AggregateError called without `new`: (errors, message)
+            -539 => {
+                match self.simple_iterable_to_list(args.first().copied().unwrap_or(Value::undefined())) {
+                    Ok(errors) => {
+                        let msg = args.get(1).copied().unwrap_or(Value::undefined());
+                        self.make_aggregate_error(errors, msg)
+                    }
+                    Err(VmError::Throw(err)) => {
+                        let _ = self.handle_throw(err);
+                        Value::undefined()
+                    }
+                    Err(_) => Value::undefined(),
+                }
+            }
             // Error constructors called without `new`
             -516..=-510 => {
                 let error_type = match sentinel {
