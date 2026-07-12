@@ -70,6 +70,9 @@ impl<'a> Compiler<'a> {
     }
 
     pub(super) fn compile_number(&mut self, n: &NumberLiteral) -> Result<(), String> {
+        if n.legacy_octal && self.chunk.flags.contains(crate::compiler::chunk::ChunkFlags::STRICT) {
+            return Err("SyntaxError: Octal literals are not allowed in strict mode".into());
+        }
         let line = n.span.start;
         let v = n.value;
         if v == 0.0 && !v.is_sign_negative() {
@@ -91,6 +94,9 @@ impl<'a> Compiler<'a> {
     }
 
     pub(super) fn compile_string_lit(&mut self, s: &StringLiteral) -> Result<(), String> {
+        if s.legacy_octal && self.chunk.flags.contains(crate::compiler::chunk::ChunkFlags::STRICT) {
+            return Err("SyntaxError: Octal escape sequences are not allowed in strict mode".into());
+        }
         let idx = self.chunk.add_constant(Value::string(s.value));
         self.chunk.emit_op_u16(OpCode::Const, idx, s.span.start);
         Ok(())
@@ -174,6 +180,12 @@ impl<'a> Compiler<'a> {
 
         // delete needs special handling per target type.
         if u.operator == UnaryOperator::Delete {
+            // Strict early error: delete of a plain identifier.
+            if matches!(&u.argument, Expression::Identifier(_))
+                && self.chunk.flags.contains(crate::compiler::chunk::ChunkFlags::STRICT)
+            {
+                return Err("SyntaxError: Delete of an unqualified identifier in strict mode".into());
+            }
             return self.compile_delete(&u.argument, line);
         }
 

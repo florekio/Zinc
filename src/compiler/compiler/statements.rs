@@ -1441,6 +1441,9 @@ impl<'a> Compiler<'a> {
     }
 
     pub(super) fn compile_with(&mut self, w: &WithStatement) -> Result<(), String> {
+        if self.chunk.flags.contains(crate::compiler::chunk::ChunkFlags::STRICT) {
+            return Err("SyntaxError: 'with' statements are not allowed in strict mode".into());
+        }
         let line = w.span.start;
         self.compile_expr(&w.object)?;
         self.chunk.emit_op(OpCode::WithEnter, line);

@@ -324,6 +324,9 @@ pub enum Expression {
 #[derive(Debug, Clone)]
 pub struct NumberLiteral {
     pub value: f64,
+    /// Annex B legacy octal (or 08/09 noctal) form — a strict-mode
+    /// SyntaxError, detected at compile time once strictness is known.
+    pub legacy_octal: bool,
     pub span: Span,
 }
 
@@ -338,6 +341,9 @@ pub struct BigIntLiteral {
 #[derive(Debug, Clone)]
 pub struct StringLiteral {
     pub value: StringId,
+    /// Contains a legacy octal escape (\0 followed by digits, \1-\7) —
+    /// a strict-mode SyntaxError.
+    pub legacy_octal: bool,
     pub span: Span,
 }
 

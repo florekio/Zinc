@@ -486,14 +486,20 @@ impl<'a> Compiler<'a> {
         // Record binding names for direct-eval-in-parameter early errors.
         let mut pnames: Vec<StringId> = Vec::new();
         for p in params { collect_pattern_names(p, &mut pnames); }
-        // Strict functions reject eval/arguments as parameter names — checked
-        // BEFORE the artificial `arguments` entry below joins the list.
+        // Strict functions reject eval/arguments as parameter names and
+        // duplicate parameters — checked BEFORE the artificial `arguments`
+        // entry below joins the list.
         if flags.contains(ChunkFlags::STRICT) {
-            for pn in &pnames {
+            for (i, pn) in pnames.iter().enumerate() {
                 let n = self.interner.resolve(*pn);
                 if n == "eval" || n == "arguments" {
                     return Err(format!(
                         "SyntaxError: unexpected parameter named '{n}' in strict mode"
+                    ));
+                }
+                if pnames[..i].contains(pn) {
+                    return Err(format!(
+                        "SyntaxError: duplicate parameter name '{n}' not allowed in strict mode"
                     ));
                 }
             }

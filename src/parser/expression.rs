@@ -360,7 +360,12 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
             let span = p.current().span;
             p.advance();
             let value = p.parse_number(&text);
-            Ok(Expression::NumberLiteral(NumberLiteral { value, span }))
+            // Legacy octal (0 + octal digits) and "noctal" (leading 0 with
+            // an 8/9 digit) integers are strict-mode early errors.
+            let legacy_octal = text.len() > 1
+                && text.starts_with('0')
+                && text.bytes().all(|b| b.is_ascii_digit());
+            Ok(Expression::NumberLiteral(NumberLiteral { value, legacy_octal, span }))
         }
         TokenKind::BigInt => {
             let text = p.current_text().to_owned();
@@ -377,7 +382,28 @@ fn parse_prefix(p: &mut Parser) -> ParseResult<Expression> {
             let span = p.current().span;
             p.advance();
             let value = p.parse_string_value(&text);
-            Ok(Expression::StringLiteral(StringLiteral { value, span }))
+            // Octal escape sequences (\1-\7, or \0 followed by a digit)
+            // are strict-mode early errors. \0 alone (NUL) is fine; \8 and
+            // \9 are also rejected in strict code.
+            let inner = &text[1..text.len().saturating_sub(1)];
+            let mut legacy_octal = false;
+            let bytes = inner.as_bytes();
+            let mut i = 0;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'\\' {
+                    let c = bytes[i + 1];
+                    if (b'1'..=b'9').contains(&c)
+                        || (c == b'0' && i + 2 < bytes.len() && bytes[i + 2].is_ascii_digit())
+                    {
+                        legacy_octal = true;
+                        break;
+                    }
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            Ok(Expression::StringLiteral(StringLiteral { value, legacy_octal, span }))
         }
         TokenKind::True => {
             let span = p.current().span;
