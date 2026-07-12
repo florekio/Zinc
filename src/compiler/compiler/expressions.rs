@@ -231,6 +231,7 @@ impl<'a> Compiler<'a> {
 
         match &u.argument {
             Expression::Identifier(id) => {
+                self.check_strict_restricted(id.name, "update target")?;
                 // Inside a `with` body, ++/-- must resolve its reference once
                 // and write back through it (see compound assignment).
                 if self.ident_needs_with_ref(id.name) {
@@ -359,6 +360,7 @@ impl<'a> Compiler<'a> {
         let line = a.span.start;
         match &a.left {
             AssignmentTarget::Identifier(id) => {
+                self.check_strict_restricted(id.name, "assignment target")?;
                 if a.operator == AssignmentOperator::Assign {
                     if Self::is_anonymous_fn_def(&a.right) {
                         self.pending_function_name = Some(id.name);

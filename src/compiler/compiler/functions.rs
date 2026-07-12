@@ -7,6 +7,19 @@ impl<'a> Compiler<'a> {
     pub(super) fn compile_function_decl(&mut self, f: &FunctionDeclaration) -> Result<(), String> {
         let name = f.id.unwrap_or_else(|| self.interner.intern("<anonymous>"));
         let line = f.span.start;
+        // Strict early error: functions named eval/arguments (own directive
+        // counts too).
+        if self.chunk.flags.contains(ChunkFlags::STRICT)
+            || self.class_depth > 0
+            || self.has_use_strict_directive(&f.body.body)
+        {
+            let n = self.interner.resolve(name);
+            if n == "eval" || n == "arguments" {
+                return Err(format!(
+                    "SyntaxError: unexpected function named '{n}' in strict mode"
+                ));
+            }
+        }
 
         // At function scope, reserve the local slot BEFORE compiling the body so
         // the function is in scope for itself — recursion (`function e(){…e()…}`)
@@ -473,6 +486,18 @@ impl<'a> Compiler<'a> {
         // Record binding names for direct-eval-in-parameter early errors.
         let mut pnames: Vec<StringId> = Vec::new();
         for p in params { collect_pattern_names(p, &mut pnames); }
+        // Strict functions reject eval/arguments as parameter names — checked
+        // BEFORE the artificial `arguments` entry below joins the list.
+        if flags.contains(ChunkFlags::STRICT) {
+            for pn in &pnames {
+                let n = self.interner.resolve(*pn);
+                if n == "eval" || n == "arguments" {
+                    return Err(format!(
+                        "SyntaxError: unexpected parameter named '{n}' in strict mode"
+                    ));
+                }
+            }
+        }
         let has_param_exprs = params.iter().any(|p| matches!(p,
             Pattern::Assignment(_) | Pattern::Array(_) | Pattern::Object(_) | Pattern::Rest(_)));
         if has_param_exprs {
@@ -895,6 +920,18 @@ impl<'a> Compiler<'a> {
     }
 
     pub(super) fn compile_function_expr(&mut self, f: &FunctionExpression) -> Result<(), String> {
+        if let Some(id) = f.id
+            && (self.chunk.flags.contains(ChunkFlags::STRICT)
+                || self.class_depth > 0
+                || self.has_use_strict_directive(&f.body.body))
+        {
+            let n = self.interner.resolve(id);
+            if n == "eval" || n == "arguments" {
+                return Err(format!(
+                    "SyntaxError: unexpected function named '{n}' in strict mode"
+                ));
+            }
+        }
         let name = f.id
             .or_else(|| self.pending_function_name.take())
             .unwrap_or_else(|| self.interner.intern("<anonymous>"));

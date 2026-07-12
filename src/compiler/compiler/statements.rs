@@ -57,6 +57,7 @@ impl<'a> Compiler<'a> {
             match &declarator.id {
                 Pattern::Identifier(id) => {
                     let name = id.name;
+                    self.check_strict_restricted(name, "binding")?;
                     let line = declarator.span.start;
 
                     if let Some(init) = &declarator.init {
@@ -387,6 +388,11 @@ impl<'a> Compiler<'a> {
             ForInOfLeft::Pattern(Pattern::Identifier(id)) => Some(id.name),
             _ => None,
         };
+        // Bare-identifier loop heads are assignments: strict early error for
+        // eval/arguments targets.
+        if is_bare && let Some(n) = var_name {
+            self.check_strict_restricted(n, "assignment target")?;
+        }
         let mut local_slot: Option<u8> = None;
         let mut is_global = false;
         if let Some(name) = var_name {
@@ -1325,6 +1331,7 @@ impl<'a> Compiler<'a> {
             self.begin_scope();
             match &handler.param {
                 Some(Pattern::Identifier(id)) => {
+                    self.check_strict_restricted(id.name, "catch parameter")?;
                     if self.scope_depth > 0 {
                         self.add_local(id.name);
                         self.mark_initialized();

@@ -248,6 +248,18 @@ impl<'a> Compiler<'a> {
                     && let Some(name) = f.id
                 {
                     let line = f.span.start;
+                    // Strict early error (mirrors compile_function_decl): the
+                    // hoist pass bypasses that entry point.
+                    if self.chunk.flags.contains(ChunkFlags::STRICT)
+                        || self.has_use_strict_directive(&f.body.body)
+                    {
+                        let n = self.interner.resolve(name);
+                        if n == "eval" || n == "arguments" {
+                            return Err(format!(
+                                "SyntaxError: unexpected function named '{n}' in strict mode"
+                            ));
+                        }
+                    }
                     let child_chunk = self.compile_function_body(name, &f.params, &f.body, f.is_async, f.is_generator)?;
                     let chunk_idx = self.chunk.child_chunks.len() as u16;
                     let upvalue_descs = child_chunk.upvalue_descriptors.clone();
@@ -460,6 +472,20 @@ impl<'a> Compiler<'a> {
     // ---- import (stub) ----
 
 
+
+    /// Strict-mode early error: `eval` and `arguments` are not valid
+    /// assignment targets or binding names in strict code.
+    pub(super) fn check_strict_restricted(&self, name: StringId, what: &str) -> Result<(), String> {
+        if self.chunk.flags.contains(crate::compiler::chunk::ChunkFlags::STRICT) {
+            let n = self.interner.resolve(name);
+            if n == "eval" || n == "arguments" {
+                return Err(format!(
+                    "SyntaxError: unexpected {what} named '{n}' in strict mode"
+                ));
+            }
+        }
+        Ok(())
+    }
 
     /// Check if the body starts with a "use strict" directive prologue.
     fn has_use_strict_directive(&self, body: &[Statement]) -> bool {
