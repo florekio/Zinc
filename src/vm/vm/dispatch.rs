@@ -5788,6 +5788,108 @@ impl Vm {
                         }
                     }
 
+                    // Map.groupBy(items, cb): group into a real Map with
+                    // SameValueZero keys.
+                    if obj_val.is_function() && obj_val.as_function() == Some(-540)
+                        && self.interner.resolve(method_name) == "groupBy"
+                    {
+                        let items = if argc > 0 { self.stack[obj_pos + 1] } else { Value::undefined() };
+                        let cb = if argc > 1 { self.stack[obj_pos + 2] } else { Value::undefined() };
+                        if items.is_nullish() || !self.value_callable(cb) {
+                            let err = self.make_native_error(
+                                "TypeError",
+                                "Map.groupBy requires an iterable and a callback",
+                            );
+                            self.truncate_stack(obj_pos);
+                            self.handle_throw(err)?;
+                            continue;
+                        }
+                        let elems: Vec<Value> = if let Some(ioid) = items.as_object_id() {
+                            match self.heap.get(ioid).map(|o| &o.kind) {
+                                Some(ObjectKind::Array(e)) => e.iter()
+                                    .map(|v| if v.is_empty_marker() { Value::undefined() } else { *v })
+                                    .collect(),
+                                Some(ObjectKind::Set { entries }) => entries.clone(),
+                                _ => {
+                                    let len = match self.array_like_len_public(ioid) {
+                                        Ok(l) => l,
+                                        Err(VmError::Throw(v)) => {
+                                            self.truncate_stack(obj_pos);
+                                            self.handle_throw(v)?;
+                                            continue;
+                                        }
+                                        Err(e) => return Err(e),
+                                    };
+                                    let mut out = Vec::new();
+                                    let mut threw = false;
+                                    for i in 0..len {
+                                        match self.array_like_get_public(ioid, i) {
+                                            Ok(v) => out.push(v.unwrap_or(Value::undefined())),
+                                            Err(VmError::Throw(v)) => {
+                                                self.truncate_stack(obj_pos);
+                                                self.handle_throw(v)?;
+                                                threw = true;
+                                                break;
+                                            }
+                                            Err(e) => return Err(e),
+                                        }
+                                    }
+                                    if threw { continue; }
+                                    out
+                                }
+                            }
+                        } else if items.is_string() || self.is_cons_string(items) {
+                            let st = self.value_to_string(items);
+                            st.chars().map(|c| self.new_str(&c.to_string())).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let mut entries: Vec<(Value, Value)> = Vec::new();
+                        let mut threw = false;
+                        for (i, item) in elems.into_iter().enumerate() {
+                            let k = match self.call_function_this(cb, Value::undefined(), &[item, Value::number(i as f64)]) {
+                                Ok(k) => k,
+                                Err(VmError::Throw(v)) => {
+                                    self.truncate_stack(obj_pos);
+                                    self.handle_throw(v)?;
+                                    threw = true;
+                                    break;
+                                }
+                                Err(e) => return Err(e),
+                            };
+                            // SameValueZero key match
+                            let found = entries.iter().position(|(ek, _)| {
+                                *ek == k || (self.to_f64(*ek).is_nan() && self.to_f64(k).is_nan()
+                                    && (ek.is_number() || ek.is_int()) && (k.is_number() || k.is_int()))
+                            });
+                            match found {
+                                Some(pos) => {
+                                    let aid = entries[pos].1.as_object_id().unwrap();
+                                    if let Some(o) = self.heap.get_mut(aid)
+                                        && let ObjectKind::Array(ref mut e) = o.kind {
+                                            e.push(item);
+                                        }
+                                }
+                                None => {
+                                    let a = self.alloc_array(vec![item]);
+                                    entries.push((k, a));
+                                }
+                            }
+                        }
+                        if threw { continue; }
+                        let map_obj = JsObject {
+                            properties: Vec::new(),
+                            prototype: self.func_prototypes.get(&-540).copied(),
+                            kind: ObjectKind::Map { entries },
+                            marked: false,
+                            extensible: true,
+                        };
+                        let moid = self.heap.allocate(map_obj);
+                        self.truncate_stack(obj_pos);
+                        self.push(Value::object_id(moid));
+                        continue;
+                    }
+
                     // Check for Promise static methods (Promise.resolve/reject)
                     if obj_val.is_function() && obj_val.as_function() == Some(-520) {
                         let args: Vec<Value> = (0..argc).map(|i| self.stack[obj_pos + 1 + i]).collect();

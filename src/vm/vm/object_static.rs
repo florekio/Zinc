@@ -316,10 +316,13 @@ impl Vm {
                         // when the VALUE came from an override (e.g.
                         // SetFunctionName on a symbol-keyed function).
                         let spec_flags = intrinsic || key_str == "name" || key_str == "length";
+                        // Constructor .prototype is non-writable, non-enumerable,
+                        // non-configurable.
+                        let is_proto = key_str == "prototype";
                         desc.set_property(value_key, v);
-                        desc.set_property(writable_key, Value::boolean(!spec_flags));
-                        desc.set_property(enumerable_key, Value::boolean(!spec_flags));
-                        desc.set_property(configurable_key, Value::boolean(true));
+                        desc.set_property(writable_key, Value::boolean(!spec_flags && !is_proto));
+                        desc.set_property(enumerable_key, Value::boolean(!spec_flags && !is_proto));
+                        desc.set_property(configurable_key, Value::boolean(!is_proto));
                         return Ok(Some(Value::object_id(self.heap.allocate(desc))));
                     }
                     return Ok(Some(Value::undefined()));
@@ -789,6 +792,70 @@ impl Vm {
                 let mut arr = JsObject::array(syms);
                 arr.prototype = Some(self.array_prototype);
                 Value::object_id(self.heap.allocate(arr))
+            }
+            "groupBy" => {
+                let items = args.first().copied().unwrap_or(Value::undefined());
+                let cb = args.get(1).copied().unwrap_or(Value::undefined());
+                if items.is_nullish() || !self.value_callable(cb) {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Object.groupBy requires an iterable and a callback",
+                    )));
+                }
+                let elems: Vec<Value> = if let Some(ioid) = items.as_object_id() {
+                    match self.heap.get(ioid).map(|o| &o.kind) {
+                        Some(ObjectKind::Array(e)) => e.iter()
+                            .map(|v| if v.is_empty_marker() { Value::undefined() } else { *v })
+                            .collect(),
+                        Some(ObjectKind::Set { entries }) => entries.clone(),
+                        _ => {
+                            let len = self.array_like_len_public(ioid)?;
+                            let mut out = Vec::new();
+                            for i in 0..len {
+                                out.push(self.array_like_get_public(ioid, i)?.unwrap_or(Value::undefined()));
+                            }
+                            out
+                        }
+                    }
+                } else if items.is_string() || self.is_cons_string(items) {
+                    let st = self.value_to_string(items);
+                    st.chars().map(|c| self.new_str(&c.to_string())).collect()
+                } else {
+                    Vec::new()
+                };
+                let mut groups = JsObject::ordinary();
+                groups.prototype = None; // null-prototype result per spec
+                let groups_oid = self.heap.allocate(groups);
+                for (i, item) in elems.into_iter().enumerate() {
+                    let k = self.call_function_this(cb, Value::undefined(), &[item, Value::number(i as f64)])?;
+                    let key_str = if k.is_symbol() {
+                        format!("__sym_{}__", k.as_symbol_id().unwrap())
+                    } else {
+                        let p = if k.is_object() {
+                            self.try_coerce_to_primitive_hint(k, "string")?
+                        } else { k };
+                        self.value_to_string(p)
+                    };
+                    let kid = self.interner.intern(&key_str);
+                    let arr = self.heap.get(groups_oid)
+                        .and_then(|o| o.get_property(kid))
+                        .and_then(|v| v.as_object_id());
+                    match arr {
+                        Some(aid) => {
+                            if let Some(o) = self.heap.get_mut(aid)
+                                && let ObjectKind::Array(ref mut e) = o.kind {
+                                    e.push(item);
+                                }
+                        }
+                        None => {
+                            let a = self.alloc_array(vec![item]);
+                            if let Some(o) = self.heap.get_mut(groups_oid) {
+                                o.set_property(kid, a);
+                            }
+                        }
+                    }
+                }
+                Value::object_id(groups_oid)
             }
             "fromEntries" => {
                 // Object.fromEntries(iterable)
