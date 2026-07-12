@@ -2145,26 +2145,76 @@ impl Vm {
         match sentinel {
             -500 => { // parseInt
                 let s = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let radix = args.get(1).and_then(|v| v.as_number()).unwrap_or(10.0) as u32;
-                let s = s.trim();
-                let (s, neg) = if let Some(stripped) = s.strip_prefix('-') { (stripped, true) } else if let Some(stripped) = s.strip_prefix('+') { (stripped, false) } else { (s, false) };
-                let s = if radix == 16 { s.strip_prefix("0x").or(s.strip_prefix("0X")).unwrap_or(s) } else { s };
-                // Parse digits for the given radix
-                let mut result = 0i64;
+                let radix_arg = args.get(1)
+                    .map(|v| self.to_f64(*v))
+                    .filter(|n| !n.is_nan())
+                    .map(|n| n as i64)
+                    .unwrap_or(0);
+                let s = s.trim_start();
+                let (s, neg) = if let Some(stripped) = s.strip_prefix('-') { (stripped, true) }
+                    else if let Some(stripped) = s.strip_prefix('+') { (stripped, false) }
+                    else { (s, false) };
+                // Radix 0/undefined: auto-detect 16 via 0x prefix, else 10.
+                let (s, radix) = if radix_arg == 0 || radix_arg == 16 {
+                    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                        (rest, 16u32)
+                    } else {
+                        (s, if radix_arg == 0 { 10 } else { 16 })
+                    }
+                } else {
+                    if !(2..=36).contains(&radix_arg) {
+                        return Value::number(f64::NAN);
+                    }
+                    (s, radix_arg as u32)
+                };
+                // Longest valid-digit prefix, accumulated in f64 (parseInt
+                // handles arbitrarily long digit strings).
+                let mut result = 0f64;
                 let mut found = false;
                 for c in s.chars() {
-                    let d = c.to_digit(radix);
-                    if let Some(d) = d { result = result * radix as i64 + d as i64; found = true; }
-                    else { break; }
+                    match c.to_digit(radix) {
+                        Some(d) => {
+                            result = result * radix as f64 + d as f64;
+                            found = true;
+                        }
+                        None => break,
+                    }
                 }
                 if !found { return Value::number(f64::NAN); }
-                let result = if neg { -result } else { result };
-                Value::number(result as f64)
+                Value::number(if neg { -result } else { result })
             }
             -501 => { // parseFloat
                 let s = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
-                let s = s.trim();
-                Value::number(s.parse::<f64>().unwrap_or(f64::NAN))
+                let t = s.trim_start();
+                // Longest prefix matching StrDecimalLiteral:
+                // [+-]? (Infinity | digits[.digits?][eE[+-]?digits] | .digits[eE...])
+                let b: Vec<char> = t.chars().collect();
+                let mut i = 0usize;
+                if i < b.len() && (b[i] == '+' || b[i] == '-') { i += 1; }
+                let after_sign = i;
+                if t[after_sign..].starts_with("Infinity") {
+                    let v = if b.first() == Some(&'-') { f64::NEG_INFINITY } else { f64::INFINITY };
+                    return Value::number(v);
+                }
+                let mut saw_digit = false;
+                while i < b.len() && b[i].is_ascii_digit() { i += 1; saw_digit = true; }
+                if i < b.len() && b[i] == '.' {
+                    i += 1;
+                    while i < b.len() && b[i].is_ascii_digit() { i += 1; saw_digit = true; }
+                }
+                if !saw_digit { return Value::number(f64::NAN); }
+                let mantissa_end = i;
+                let mut exp_end = i;
+                if i < b.len() && (b[i] == 'e' || b[i] == 'E') {
+                    let mut j = i + 1;
+                    if j < b.len() && (b[j] == '+' || b[j] == '-') { j += 1; }
+                    let ds = j;
+                    while j < b.len() && b[j].is_ascii_digit() { j += 1; }
+                    if j > ds { exp_end = j; }
+                }
+                let end = exp_end.max(mantissa_end);
+                let prefix: String = b[..end].iter().collect();
+                Value::number(prefix.parse::<f64>().unwrap_or(f64::NAN))
             }
             -502 => { // isNaN
                 let n = args.first().and_then(|v| v.as_number()).unwrap_or(f64::NAN);
