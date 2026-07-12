@@ -4028,6 +4028,25 @@ impl Vm {
                                 }
                             let mut val = self.heap.get_property_chain(oid, name_id)
                                 .unwrap_or(Value::undefined());
+                            // Builtin prototype methods materialize lazily —
+                            // computed access reifies like the dot path.
+                            if val.is_undefined() {
+                                let mut cur = Some(oid);
+                                while let Some(c) = cur {
+                                    if (c == self.string_prototype
+                                        || c == self.array_prototype
+                                        || c == self.object_prototype
+                                        || c == self.number_prototype
+                                        || c == self.boolean_prototype
+                                        || c == self.date_prototype)
+                                        && let Some(v) = self.reify_builtin_proto_method(c, name_id)
+                                    {
+                                        val = v;
+                                        break;
+                                    }
+                                    cur = self.heap.get(c).and_then(|o| o.prototype);
+                                }
+                            }
                             // globalThis proxies misses to the globals map
                             // (same as the dot-access path) — core-js reads
                             // primordials as `global[name]`.

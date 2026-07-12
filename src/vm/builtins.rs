@@ -2220,7 +2220,7 @@ impl Vm {
                 let mut i = self.to_f64(idx_val) as i32;
                 if i < 0 { i += len; }
                 if i < 0 || i >= len {
-                    return Err(VmError::RuntimeError("RangeError: Invalid index".into()));
+                    return Err(VmError::Throw(self.make_native_error("RangeError", "Invalid index")));
                 }
                 elements[i as usize] = val;
                 let mut arr = JsObject::array(elements);
