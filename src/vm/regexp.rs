@@ -484,15 +484,29 @@ pub fn validate_js_pattern(pattern: &str, unicode: bool) -> Result<(), String> {
                     }
                     match b[i + 2] {
                         ':' | '=' | '!' => i += 3,
-                        // Modifier groups (?ims-ims:...) — ES2025.
+                        // Modifier groups (?ims-ims:...) — ES2025. Repeats
+                        // (within or across the add/remove lists) are errors.
                         'i' | 'm' | 's' | '-' => {
+                            let mut seen = [false; 3];
+                            let mark = |seen: &mut [bool; 3], c: char| -> bool {
+                                let idx = match c { 'i' => 0, 'm' => 1, _ => 2 };
+                                if seen[idx] { return false; }
+                                seen[idx] = true;
+                                true
+                            };
                             let mut j = i + 2;
                             while j < n && matches!(b[j], 'i' | 'm' | 's') {
+                                if !mark(&mut seen, b[j]) {
+                                    return Err("repeated modifier".into());
+                                }
                                 j += 1;
                             }
                             if j < n && b[j] == '-' {
                                 j += 1;
                                 while j < n && matches!(b[j], 'i' | 'm' | 's') {
+                                    if !mark(&mut seen, b[j]) {
+                                        return Err("repeated modifier".into());
+                                    }
                                     j += 1;
                                 }
                             }
@@ -538,6 +552,7 @@ pub fn validate_js_pattern(pattern: &str, unicode: bool) -> Result<(), String> {
                     j += 1;
                 }
                 let mut closed = false;
+                let class_start = j;
                 while j < n {
                     match b[j] {
                         '\\' => j += 2,
@@ -545,7 +560,26 @@ pub fn validate_js_pattern(pattern: &str, unicode: bool) -> Result<(), String> {
                             closed = true;
                             break;
                         }
-                        _ => j += 1,
+                        _ => {
+                            // Plain char-to-char range: reject out-of-order
+                            // bounds ([b-a]). Escapes and edge '-' are literal.
+                            if b[j] == '-'
+                                && j > class_start
+                                && j + 1 < n
+                                && b[j + 1] != ']'
+                                && b[j - 1] != '\\'
+                                // The previous atom must be a PLAIN char, not
+                                // the tail of an escape like [\b-A].
+                                && !(j >= 2 && b[j - 2] == '\\')
+                            {
+                                let lo = b[j - 1];
+                                let hi = b[j + 1];
+                                if lo != '\\' && hi != '\\' && (lo as u32) > (hi as u32) {
+                                    return Err("range out of order in character class".into());
+                                }
+                            }
+                            j += 1;
+                        }
                     }
                 }
                 if !closed {
