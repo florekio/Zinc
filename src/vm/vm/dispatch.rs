@@ -4997,8 +4997,14 @@ impl Vm {
                         self.string_recv_kinds[bucket] += 1;
                     }
                     // Fast path: charAt/charCodeAt/substr on an interned ASCII
-                    // receiver, avoiding the full-receiver clone below.
-                    if let Some(rid) = effective_val.as_string_id() {
+                    // receiver, avoiding the full-receiver clone below. Only
+                    // when every present argument is ALREADY numeric — other
+                    // types need the observable coercion in the generic path.
+                    let fast_args_ok = (0..argc.min(2)).all(|i| {
+                        let v = self.stack[obj_pos + 1 + i];
+                        v.as_number().is_some() || v.is_undefined()
+                    });
+                    if fast_args_ok && let Some(rid) = effective_val.as_string_id() {
                         let arg0 = (argc >= 1).then(|| self.stack[obj_pos + 1].as_number()).flatten();
                         let arg1 = (argc >= 2).then(|| self.stack[obj_pos + 2].as_number()).flatten();
                         if let Some(result) = self.try_fast_string_index_method(rid, method_name, arg0, arg1) {

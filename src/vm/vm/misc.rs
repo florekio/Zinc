@@ -2110,11 +2110,17 @@ impl Vm {
         let func: crate::runtime::object::NativeFn = match route {
             Route::String => std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
                 // RequireObjectCoercible: String.prototype methods reject
-                // null/undefined receivers.
+                // null/undefined receivers; ToString(Symbol) throws.
                 if this.is_nullish() {
                     return Err(vm.make_native_error(
                         "TypeError",
                         "String.prototype method called on null or undefined",
+                    ));
+                }
+                if this.is_symbol() {
+                    return Err(vm.make_native_error(
+                        "TypeError",
+                        "Cannot convert a Symbol value to a string",
                     ));
                 }
                 // ToString(this): object receivers run their toString

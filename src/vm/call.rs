@@ -285,6 +285,27 @@ impl Vm {
             ];
             let idx = (-200 - packed) as usize;
             if idx < STRING_METHOD_NAMES.len() {
+                // RequireObjectCoercible + ToString(this): null/undefined and
+                // Symbol receivers throw; objects coerce observably.
+                if this_value.is_nullish() {
+                    let err = self.make_native_error(
+                        "TypeError",
+                        "String.prototype method called on null or undefined",
+                    );
+                    return Err(VmError::Throw(err));
+                }
+                if this_value.is_symbol() {
+                    let err = self.make_native_error(
+                        "TypeError",
+                        "Cannot convert a Symbol value to a string",
+                    );
+                    return Err(VmError::Throw(err));
+                }
+                let this_value = if this_value.is_object() && !self.is_cons_string(this_value) && !self.is_flat_string(this_value) {
+                    self.try_coerce_to_primitive_hint(this_value, "string")?
+                } else {
+                    this_value
+                };
                 let s = if self.is_cons_string(this_value) {
                     self.flatten_cons_to_string(this_value)
                 } else if let Some(sid) = this_value.as_string_id() {

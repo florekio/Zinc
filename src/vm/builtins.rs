@@ -141,24 +141,68 @@ impl Vm {
                     )));
                 }
             }
-            "charAt" | "charCodeAt" | "codePointAt" | "at" | "indexOf" | "lastIndexOf"
-            | "slice" | "substring" | "substr" | "padStart" | "padEnd" => {
-                // Numeric arguments: Symbols throw, objects coerce observably.
-                for a in args.iter().take(2) {
-                    if a.is_symbol() {
+            _ => {}
+        }
+        // Observable argument coercion, in spec order: 'N' = ToNumber
+        // (Symbols throw, objects run ToPrimitive, result replaces the arg),
+        // 'S' = ToString likewise. Undefined stays undefined for 'N' (the
+        // spec defaults differ per method) but stringifies for 'S'.
+        let arg_spec: &[u8] = match name.as_str() {
+            "charAt" | "charCodeAt" | "codePointAt" | "at" => b"N",
+            "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith" => b"SN",
+            "slice" | "substring" | "substr" => b"NN",
+            "padStart" | "padEnd" => b"NS",
+            "localeCompare" => b"S",
+            "concat" => b"SSSSSSSS",
+            _ => b"",
+        };
+        let mut cargs: Vec<Value> = args.to_vec();
+        for (i, kind) in arg_spec.iter().enumerate() {
+            let Some(v) = cargs.get(i).copied() else { break };
+            match kind {
+                b'N' => {
+                    if v.is_undefined() {
+                        continue;
+                    }
+                    if v.is_symbol() {
                         return Err(VmError::Throw(self.make_native_error(
                             "TypeError",
                             "Cannot convert a Symbol value to a number",
                         )));
                     }
-                    if a.is_object() {
-                        self.try_coerce_to_primitive_hint(*a, "number")?;
-                    }
+                    let prim = if v.is_object() {
+                        self.try_coerce_to_primitive_hint(v, "number")?
+                    } else {
+                        v
+                    };
+                    cargs[i] = Value::number(self.to_f64(prim));
                 }
+                b'S' => {
+                    // undefined stays raw: padStart/padEnd treat an undefined
+                    // filler as " ", while indexOf's inner ToString still
+                    // yields "undefined" for it.
+                    if v.is_undefined() {
+                        continue;
+                    }
+                    if v.is_symbol() {
+                        return Err(VmError::Throw(self.make_native_error(
+                            "TypeError",
+                            "Cannot convert a Symbol value to a string",
+                        )));
+                    }
+                    let prim = if v.is_object() {
+                        self.try_coerce_to_primitive_hint(v, "string")?
+                    } else {
+                        v
+                    };
+                    let st = self.value_to_string(prim);
+                    let sid = self.interner.intern(&st);
+                    cargs[i] = Value::string(sid);
+                }
+                _ => {}
             }
-            _ => {}
         }
-        Ok(self.exec_string_method_inner(s, method_name, args, ascii))
+        Ok(self.exec_string_method_inner(s, method_name, &cargs, ascii))
     }
 
     fn exec_string_method_inner(&mut self, s: &str, method_name: StringId, args: &[Value], ascii: bool) -> Value {
