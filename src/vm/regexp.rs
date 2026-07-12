@@ -149,11 +149,40 @@ impl Vm {
                     .first()
                     .map(|v| self.value_to_string(*v))
                     .unwrap_or_default();
-                let (re, _global) = self.regex_cache.get_or_compile(&pattern, &flags)
+                let (re, global) = self.regex_cache.get_or_compile(&pattern, &flags)
                     .map_err(VmError::RuntimeError)?;
-                // fancy-regex matching is fallible (backtrack limit);
-                // treat a blown limit as "no match" rather than a throw.
-                Ok(Value::boolean(re.is_match(&input).unwrap_or(false)))
+                // test() shares exec's lastIndex protocol for global/sticky
+                // regexes (read, anchor sticky matches, advance/reset).
+                let sticky = flags.contains('y');
+                let stateful = global || sticky;
+                let li_key = self.interner.intern("lastIndex");
+                let start = if stateful {
+                    self.heap.get_property_chain(oid, li_key)
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0)
+                        .max(0.0) as usize
+                } else {
+                    0
+                };
+                let caps_opt = if start > input.len() {
+                    None
+                } else {
+                    re.captures_from_pos(&input, start).ok().flatten()
+                };
+                let caps_opt = match caps_opt {
+                    Some(c) if sticky && c.get(0).map(|m| m.start()) != Some(start) => None,
+                    other => other,
+                };
+                if stateful {
+                    let next = match &caps_opt {
+                        Some(c) => c.get(0).map(|m| m.end()).unwrap_or(start) as i32,
+                        None => 0,
+                    };
+                    if let Some(o) = self.heap.get_mut(oid) {
+                        o.set_property(li_key, Value::int(next));
+                    }
+                }
+                Ok(Value::boolean(caps_opt.is_some()))
             }
             "exec" => {
                 let input = args
@@ -888,15 +917,35 @@ impl Vm {
             if mname == "search" {
                 let prev = self.read_lastindex_coerced(oid)?;
                 self.set_lastindex_checked(oid, 0.0)?;
-                let ascii = s.is_ascii();
-                let name_id = self.interner.intern(mname);
-                let mut call_args: Vec<Value> = vec![this];
-                call_args.extend(args.iter().skip(1).copied());
-                let r = self.exec_string_method(&s, name_id, &call_args, ascii)
-                    .map_err(|e| match e {
-                        VmError::Throw(v) => v,
-                        e => self.make_native_error("Error", &format!("{e:?}")),
-                    })?;
+                let r = if sticky {
+                    // Sticky anchors at lastIndex (0 here): route through the
+                    // native exec so the anchor applies.
+                    let exec_id = self.interner.intern("exec");
+                    let sv = self.new_str(&s);
+                    let res = self.exec_regexp_method(oid, exec_id, &[sv])
+                        .map_err(|e| match e {
+                            VmError::Throw(v) => v,
+                            e => self.make_native_error("Error", &format!("{e:?}")),
+                        })?;
+                    if res.is_null() {
+                        Value::number(-1.0)
+                    } else if let Some(roid) = res.as_object_id() {
+                        let ik = self.interner.intern("index");
+                        self.heap.get(roid).and_then(|o| o.get_property(ik)).unwrap_or(Value::number(-1.0))
+                    } else {
+                        Value::number(-1.0)
+                    }
+                } else {
+                    let ascii = s.is_ascii();
+                    let name_id = self.interner.intern(mname);
+                    let mut call_args: Vec<Value> = vec![this];
+                    call_args.extend(args.iter().skip(1).copied());
+                    self.exec_string_method(&s, name_id, &call_args, ascii)
+                        .map_err(|e| match e {
+                            VmError::Throw(v) => v,
+                            e => self.make_native_error("Error", &format!("{e:?}")),
+                        })?
+                };
                 self.set_lastindex_checked(oid, prev)?;
                 return Ok(r);
             }
@@ -907,6 +956,49 @@ impl Vm {
                 let cur = self.read_lastindex_coerced(oid)?;
                 let target = if global { 0.0 } else { cur };
                 self.set_lastindex_checked(oid, target)?;
+            }
+            // Non-global sticky match/replace anchor at lastIndex: run the
+            // native exec (which enforces the anchor and advances lastIndex)
+            // instead of the free-searching string method.
+            if sticky && !global && matches!(mname, "match" | "replace") {
+                let exec_id = self.interner.intern("exec");
+                let sv = self.new_str(&s);
+                let res = self.exec_regexp_method(oid, exec_id, &[sv])
+                    .map_err(|e| match e {
+                        VmError::Throw(v) => v,
+                        e => self.make_native_error("Error", &format!("{e:?}")),
+                    })?;
+                if mname == "match" {
+                    return Ok(res);
+                }
+                // replace (string replacement; fn replacements took the
+                // generic path earlier).
+                if res.is_null() {
+                    return Ok(self.new_str(&s));
+                }
+                let (m_str, m_idx) = if let Some(roid) = res.as_object_id() {
+                    let ik = self.interner.intern("index");
+                    let idx = self.heap.get(roid).and_then(|o| o.get_property(ik))
+                        .and_then(|v| v.as_number().or_else(|| v.as_int().map(|i| i as f64)))
+                        .unwrap_or(0.0) as usize;
+                    let m0 = self.heap.get(roid).and_then(|o| {
+                        if let ObjectKind::Array(ref e) = o.kind { e.first().copied() } else { None }
+                    }).unwrap_or(Value::undefined());
+                    (self.value_to_string(m0), idx)
+                } else {
+                    (String::new(), 0)
+                };
+                let repl = args.get(1).copied().unwrap_or(Value::undefined());
+                let repl_str = self.value_to_string(repl);
+                // $-substitutions in the replacement template.
+                let repl_str = repl_str.replace("$&", &m_str);
+                let char_offsets: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+                let byte_idx = char_offsets.get(m_idx).copied().unwrap_or(s.len());
+                let mut out = String::with_capacity(s.len());
+                out.push_str(&s[..byte_idx]);
+                out.push_str(&repl_str);
+                out.push_str(&s[byte_idx + m_str.len()..]);
+                return Ok(self.new_str(&out));
             }
             let ascii = s.is_ascii();
             let name_id = self.interner.intern(mname);

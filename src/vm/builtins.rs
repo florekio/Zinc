@@ -141,6 +141,25 @@ impl Vm {
                     )));
                 }
             }
+            "replace" | "match" | "search" => {
+                // A sticky non-global regexp argument anchors at lastIndex —
+                // semantics the plain string machinery can't express. Route
+                // through the @@-method protocol (which runs native exec).
+                if let Some(a0) = args.first()
+                    && let Some(roid) = a0.as_object_id()
+                    && let Some(fl) = self.heap.get(roid).and_then(|o| {
+                        if let ObjectKind::RegExp { ref flags, .. } = o.kind { Some(flags.clone()) } else { None }
+                    })
+                    && fl.contains('y')
+                    && !fl.contains('g')
+                {
+                    let sv = self.new_str(s);
+                    let mut margs = vec![sv];
+                    margs.extend(args.iter().skip(1).copied());
+                    let a0 = *a0;
+                    return self.regexp_symbol_method(&name, a0, &margs).map_err(VmError::Throw);
+                }
+            }
             _ => {}
         }
         // Observable argument coercion, in spec order: 'N' = ToNumber
