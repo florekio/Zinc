@@ -640,6 +640,17 @@ impl Vm {
                 if let Some(len) = arr_len
                     && idx <= len
                 {
+                    // Appending (idx == len) grows length — rejected when the
+                    // length is non-writable.
+                    if idx == len {
+                        let ro_key = self.interner.intern("__len_ro__");
+                        if self.heap.get(target_oid).is_some_and(|o| o.has_own_property(ro_key)) {
+                            return Err(VmError::Throw(self.make_native_error(
+                                "TypeError",
+                                "Cannot add property, array length is not writable",
+                            )));
+                        }
+                    }
                     if let Some(obj) = self.heap.get_mut(target_oid)
                         && let ObjectKind::Array(ref mut elements) = obj.kind
                     {
@@ -801,6 +812,13 @@ impl Vm {
                 };
                 let effective = shadow.unwrap_or(elems_len as f64);
                 if is_arr && (idx as f64) >= effective {
+                    let ro_key = self.interner.intern("__len_ro__");
+                    if self.heap.get(target_oid).is_some_and(|o| o.has_own_property(ro_key)) {
+                        return Err(VmError::Throw(self.make_native_error(
+                            "TypeError",
+                            "Cannot add property, array length is not writable",
+                        )));
+                    }
                     let lk = self.interner.intern("length");
                     if let Some(o) = self.heap.get_mut(target_oid) {
                         o.define_property(

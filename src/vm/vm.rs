@@ -1107,6 +1107,42 @@ impl Vm {
         }
     }
 
+    /// JSON.parse / JSON.stringify as real function properties (descriptor
+    /// tests read them via getOwnPropertyDescriptor).
+    pub(crate) fn init_json_methods(&mut self) {
+        let json_name = self.interner.intern("JSON");
+        let Some(json_oid) = self.globals.get(&json_name).and_then(|v| v.as_object_id()) else { return };
+        for (mname, mlen) in [("parse", 2i32), ("stringify", 3)] {
+            let name_id = self.interner.intern(mname);
+            let m = mname.to_string();
+            let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                move |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
+                    let mid = vm.interner.intern(&m);
+                    match vm.exec_json_method(mid, args) {
+                        Ok(v) => Ok(v),
+                        Err(VmError::Throw(t)) => Err(t),
+                        Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                    }
+                },
+            );
+            let mut fn_obj = JsObject {
+                properties: Vec::new(),
+                prototype: Some(self.function_prototype),
+                kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
+                marked: false,
+                extensible: true,
+            };
+            let name_key = self.interner.intern("name");
+            let len_key = self.interner.intern("length");
+            fn_obj.define_property(name_key, Property::with_flags(Value::string(name_id), Property::CONFIGURABLE));
+            fn_obj.define_property(len_key, Property::with_flags(Value::int(mlen), Property::CONFIGURABLE));
+            let v = Value::object_id(self.heap.allocate(fn_obj));
+            if let Some(o) = self.heap.get_mut(json_oid) {
+                o.define_property(name_id, Property::with_flags(v, Property::WRITABLE | Property::CONFIGURABLE));
+            }
+        }
+    }
+
     /// Annex B.2.2 legacy accessors on Object.prototype:
     /// __defineGetter__/__defineSetter__/__lookupGetter__/__lookupSetter__.
     pub(crate) fn init_legacy_accessors(&mut self) {
