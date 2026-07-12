@@ -335,7 +335,7 @@ impl Vm {
             return Ok(self.exec_symbol_key_for(args));
         }
         // Math method sentinels (-700 to -726)
-        if (-726..=-700).contains(&packed) {
+        if (-734..=-700).contains(&packed) {
             return Ok(self.exec_math_sentinel(packed, args));
         }
         // Date() called as function (not constructor) returns current date string

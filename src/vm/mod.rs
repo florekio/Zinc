@@ -1,6 +1,7 @@
 #[allow(clippy::module_inception)]
 pub mod vm;
 mod builtins;
+pub(crate) use builtins::uri_escapes_valid as builtins_uri_escapes_valid;
 mod call;
 mod embed;
 mod json;

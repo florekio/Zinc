@@ -248,6 +248,8 @@ impl Vm {
             ("sign", -716), ("cbrt", -717), ("hypot", -718), ("atan2", -719),
             ("atan", -720), ("asin", -721), ("acos", -722), ("tan", -723),
             ("clz32", -724), ("imul", -725), ("fround", -726),
+            ("log1p", -727), ("expm1", -728), ("sinh", -729), ("cosh", -730),
+            ("tanh", -731), ("asinh", -732), ("acosh", -733), ("atanh", -734),
         ] {
             let k = interner.intern(name);
             math_obj.define_property(k, Property::with_flags(Value::function(sentinel), Property::WRITABLE | Property::CONFIGURABLE));

@@ -2054,6 +2054,14 @@ impl Vm {
             -705 => a0.round(),
             -706 => a0.sqrt(),
             -707 => { if a0.abs() == 1.0 && a1.is_infinite() { f64::NAN } else { a0.powf(a1) } },
+            -727 => a0.ln_1p(),
+            -728 => a0.exp_m1(),
+            -729 => a0.sinh(),
+            -730 => a0.cosh(),
+            -731 => a0.tanh(),
+            -732 => a0.asinh(),
+            -733 => a0.acosh(),
+            -734 => a0.atanh(),
             -708 => { // max
                 if args.is_empty() { return Value::number(f64::NEG_INFINITY); }
                 let mut m = f64::NEG_INFINITY;
@@ -2887,6 +2895,33 @@ impl Vm {
 /// `%XX` byte escapes are collected and interpreted as UTF-8; a malformed or
 /// truncated escape is left verbatim (lenient — see call site). Non-escape
 /// characters pass through unchanged.
+/// URIError validation for decodeURI[Component]: every '%' must introduce
+/// two hex digits and the decoded byte sequence must be well-formed UTF-8
+/// (surrogate code points are invalid).
+pub(crate) fn uri_escapes_valid(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return false;
+            }
+            let h1 = (bytes[i + 1] as char).to_digit(16);
+            let h2 = (bytes[i + 2] as char).to_digit(16);
+            match (h1, h2) {
+                (Some(a), Some(b)) => decoded.push(((a << 4) | b) as u8),
+                _ => return false,
+            }
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    std::str::from_utf8(&decoded).is_ok()
+}
+
 fn percent_decode_utf8(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());

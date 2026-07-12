@@ -1771,6 +1771,18 @@ impl Vm {
                                     }
                                 }
                             }
+                            // decodeURI[Component]: malformed escapes throw URIError.
+                            if matches!(sentinel, -517 | -519)
+                                && let Some(v) = args.first()
+                            {
+                                let st = self.value_to_string(*v);
+                                if !crate::vm::builtins_uri_escapes_valid(&st) {
+                                    let err = self.make_native_error("URIError", "URI malformed");
+                                    self.truncate_stack(func_pos);
+                                    self.handle_throw(err)?;
+                                    continue;
+                                }
+                            }
                             let result = self.exec_global_fn(sentinel, &args);
                             self.truncate_stack(func_pos);
                             self.push(result);
@@ -1828,7 +1840,7 @@ impl Vm {
                             self.push(result);
                             continue;
                         }
-                        if (-726..=-700).contains(&sentinel) {
+                        if (-734..=-700).contains(&sentinel) {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
                             let result = self.exec_math_sentinel(sentinel, &args);
                             self.truncate_stack(func_pos);
