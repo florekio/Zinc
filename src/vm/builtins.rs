@@ -438,17 +438,28 @@ impl Vm {
                 // string length; a dense multi-GB fill would OOM the process.
                 let target_len = (args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize)
                     .min(1_000_000);
-                let pad = args.get(1).map(|v| self.value_to_string(*v)).unwrap_or_else(|| " ".into());
+                let pad = args.get(1)
+                    .filter(|v| !v.is_undefined())
+                    .map(|v| self.value_to_string(*v))
+                    .unwrap_or_else(|| " ".into());
+                // Pad math is in UTF-16-ish char units, not bytes — byte
+                // truncation split multibyte fillers mid-char (panic).
+                let s_chars = s.chars().count();
                 // An empty filler pads nothing (spec: return the string as-is)
                 // — without this check the fill loop below never terminates.
-                if pad.is_empty() || s.len() >= target_len {
+                if pad.is_empty() || s_chars >= target_len {
                     return self.new_str(s);
                 }
-                let mut fill = String::with_capacity(target_len - s.len() + pad.len());
-                while fill.len() < target_len - s.len() {
-                    fill.push_str(&pad);
+                let need = target_len - s_chars;
+                let mut fill = String::with_capacity(need + pad.len());
+                let mut filled = 0;
+                'outer: loop {
+                    for c in pad.chars() {
+                        if filled == need { break 'outer; }
+                        fill.push(c);
+                        filled += 1;
+                    }
                 }
-                fill.truncate(target_len - s.len());
                 let result = if name == "padStart" {
                     format!("{fill}{s}")
                 } else {
@@ -1681,6 +1692,7 @@ impl Vm {
                 let target = if raw_target < 0 { (len + raw_target).max(0) as usize } else { raw_target.min(len) as usize };
                 let start = if raw_start < 0 { (len + raw_start).max(0) as usize } else { raw_start.min(len) as usize };
                 let end = if raw_end < 0 { (len + raw_end).max(0) as usize } else { raw_end.min(len) as usize };
+                let end = end.max(start);
                 if let Some(obj) = self.heap.get_mut(oid)
                     && let ObjectKind::Array(ref mut elems) = obj.kind {
                         let copy: Vec<Value> = elements[start..end].to_vec();
@@ -2538,12 +2550,42 @@ impl Vm {
                             }
                             "valueOf" => effective_val,
                             "toFixed" => {
-                                let digits = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                                let s = format!("{:.prec$}", n, prec = digits);
+                                let d = args.first()
+                                    .filter(|v| !v.is_undefined())
+                                    .map(|v| self.to_f64(*v).trunc())
+                                    .unwrap_or(0.0);
+                                if !(0.0..=100.0).contains(&d) {
+                                    return Err(VmError::Throw(self.make_native_error(
+                                        "RangeError",
+                                        "toFixed() digits argument must be between 0 and 100",
+                                    )));
+                                }
+                                let s = if n.is_nan() {
+                                    "NaN".to_string()
+                                } else if n.is_infinite() {
+                                    (if n > 0.0 { "Infinity" } else { "-Infinity" }).to_string()
+                                } else if n.abs() >= 1e21 {
+                                    self.value_to_string(effective_val)
+                                } else {
+                                    format!("{:.prec$}", n, prec = d as usize)
+                                };
                                 let id = self.interner.intern(&s);
                                 Value::string(id)
                             }
                             "toPrecision" => {
+                                // Spec: NaN/Infinity receivers stringify BEFORE
+                                // the precision range check.
+                                if args.first().is_some_and(|a| !a.is_undefined()) && !n.is_finite() {
+                                    let s = if n.is_nan() {
+                                        "NaN".to_string()
+                                    } else if n > 0.0 {
+                                        "Infinity".to_string()
+                                    } else {
+                                        "-Infinity".to_string()
+                                    };
+                                    let id = self.interner.intern(&s);
+                                    return Ok(Value::string(id));
+                                }
                                 // ToIntegerOrInfinity(precision) must land in
                                 // [1, 100] — NaN and non-numbers coerce to 0
                                 // and throw RangeError.
@@ -2582,7 +2624,30 @@ impl Vm {
                                 Value::string(id)
                             }
                             "toExponential" => {
-                                let digits = args.first().and_then(|v| v.as_number()).map(|d| d as usize);
+                                // Spec order: f = ToIntegerOrInfinity(digits);
+                                // NaN receiver returns "NaN" before the range
+                                // check; Infinity likewise.
+                                if n.is_nan() {
+                                    let id = self.interner.intern("NaN");
+                                    return Ok(Value::string(id));
+                                }
+                                if n.is_infinite() {
+                                    let id = self.interner.intern(if n > 0.0 { "Infinity" } else { "-Infinity" });
+                                    return Ok(Value::string(id));
+                                }
+                                if let Some(v) = args.first().filter(|v| !v.is_undefined()) {
+                                    let d = self.to_f64(*v).trunc();
+                                    if !(0.0..=100.0).contains(&d) {
+                                        return Err(VmError::Throw(self.make_native_error(
+                                            "RangeError",
+                                            "toExponential() argument must be between 0 and 100",
+                                        )));
+                                    }
+                                }
+                                let digits = args.first()
+                                    .filter(|v| !v.is_undefined())
+                                    .and_then(|v| v.as_number())
+                                    .map(|d| (d.trunc().clamp(0.0, 100.0)) as usize);
                                 let s = if n == 0.0 {
                                     let decimals = digits.unwrap_or(0);
                                     if decimals == 0 { "0e+0".to_string() }
