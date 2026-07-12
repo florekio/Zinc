@@ -339,7 +339,8 @@ impl Vm {
                         Some(self.alloc_array(matches))
                     }
                 } else {
-                    // Return single match result (like exec)
+                    // Return single match result (like exec), including the
+                    // spec .index and .input properties.
                     match re.captures(s).ok().flatten() {
                         Some(caps) => {
                             let mut elements = Vec::new();
@@ -351,7 +352,24 @@ impl Vm {
                                     elements.push(Value::undefined());
                                 }
                             }
-                            Some(self.alloc_array(elements))
+                            let start = caps.get(0).map(|m| m.start()).unwrap_or(0);
+                            // char index, not byte index
+                            let char_index = s[..start].chars().count();
+                            let arr_val = self.alloc_array(elements);
+                            if let Some(aid) = arr_val.as_object_id()
+                                && let Some(o) = self.heap.get_mut(aid)
+                            {
+                                let ik = self.interner.intern("index");
+                                o.set_property(ik, Value::int(char_index as i32));
+                            }
+                            let input_id = self.interner.intern(s);
+                            if let Some(aid) = arr_val.as_object_id()
+                                && let Some(o) = self.heap.get_mut(aid)
+                            {
+                                let nk = self.interner.intern("input");
+                                o.set_property(nk, Value::string(input_id));
+                            }
+                            Some(arr_val)
                         }
                         None => Some(Value::null()),
                     }

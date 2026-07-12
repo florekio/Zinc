@@ -401,6 +401,24 @@ impl Vm {
                 if let Some(result) = self.exec_string_regex_method(s, &name, args) {
                     return result;
                 }
+                // Non-RegExp pattern: coerce to a RegExp source per spec
+                // (match/search build RegExp(pattern)).
+                let pat = match args.first().filter(|v| !v.is_undefined()) {
+                    // The string IS the pattern (RegExp(pattern)) — verbatim.
+                    Some(v) => self.value_to_string(*v),
+                    None => String::new(),
+                };
+                let re_obj = JsObject {
+                    properties: Vec::new(),
+                    prototype: self.func_prototypes.get(&-580).copied(),
+                    kind: ObjectKind::RegExp { pattern: pat, flags: String::new() },
+                    marked: false,
+                    extensible: true,
+                };
+                let roid = self.heap.allocate(re_obj);
+                if let Some(result) = self.exec_string_regex_method(s, &name, &[Value::object_id(roid)]) {
+                    return result;
+                }
                 Value::null()
             }
             "matchAll" => {
