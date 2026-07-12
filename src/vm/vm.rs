@@ -717,9 +717,20 @@ impl Vm {
         let info = match iter_info {
             Some(i) => i,
             None => {
-                // Not a known iterator kind — caller (e.g. CallMethod) shouldn't reach
-                // here for known kinds. Return done=true as a safe fallback.
-                return self.make_iter_result(Value::undefined(), true);
+                // Generators resume through their own machinery; keep the
+                // silent done=true fallback for them. Anything else is an
+                // incompatible receiver per spec (%MapIteratorPrototype%.next
+                // .call({}) must throw).
+                let is_gen = self.heap.get(iter_oid)
+                    .is_some_and(|o| matches!(o.kind, ObjectKind::Generator { .. }));
+                if is_gen {
+                    return self.make_iter_result(Value::undefined(), true);
+                }
+                let err = self.make_native_error(
+                    "TypeError",
+                    "Iterator next called on incompatible receiver",
+                );
+                return Err(VmError::Throw(err));
             }
         };
         let (value, done) = if info.2 {

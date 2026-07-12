@@ -420,6 +420,12 @@ impl Vm {
                     fn_obj.define_property(len_key, Property::with_flags(Value::int(mlen), Property::CONFIGURABLE));
                     let val = Value::object_id(heap.allocate(fn_obj));
                     proto.define_property(key, Property::with_flags(val, Property::WRITABLE | Property::CONFIGURABLE));
+                    // @@iterator aliases the default iteration method
+                    // (Map → entries, Set → values), same function object.
+                    if (*name == "entries" && sentinel == -540) || (*name == "values" && sentinel == -541) {
+                        let sym_key = interner.intern("__sym_0__");
+                        proto.define_property(sym_key, Property::with_flags(val, Property::WRITABLE | Property::CONFIGURABLE));
+                    }
                 }
                 let proto_oid = heap.allocate(proto);
                 func_prototypes.insert(sentinel, proto_oid);
