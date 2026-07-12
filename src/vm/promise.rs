@@ -294,13 +294,39 @@ impl Vm {
         let tracker_oid = self.heap.allocate(tracker);
 
         // Get(C, "resolve") once, observably: a user override of
-        // Promise.resolve is invoked per element (invoke-resolve tests).
+        // Promise.resolve — data property or accessor — is read exactly once
+        // and invoked per element (invoke-resolve tests).
         let resolve_id = self.interner.intern("resolve");
-        let resolve_override = self.fn_property_overrides
-            .get(&(-520, resolve_id))
+        let resolve_getter_id = self.interner.intern("__get_resolve__");
+        let resolve_override = if let Some(Some(g)) = self.fn_property_overrides
+            .get(&(-520, resolve_getter_id))
             .copied()
-            .flatten()
-            .filter(|v| self.value_callable(*v));
+        {
+            if self.value_callable(g) {
+                let prev = self.protect_throw_depth;
+                self.protect_throw_depth = self.frames.len() + 1;
+                let r = self.call_function_this(g, Value::function(-520), &[]);
+                self.protect_throw_depth = prev;
+                match r {
+                    Ok(v) if self.value_callable(v) => Some(v),
+                    Ok(_) => None,
+                    Err(VmError::Throw(err)) => {
+                        let pid = self.allocate_promise();
+                        self.reject_promise(pid, err)?;
+                        return Ok(Value::object_id(pid));
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                None
+            }
+        } else {
+            self.fn_property_overrides
+                .get(&(-520, resolve_id))
+                .copied()
+                .flatten()
+                .filter(|v| self.value_callable(*v))
+        };
         // For each element, wrap with Promise.resolve and attach callbacks
         for (i, elem) in elements.iter().enumerate() {
             // Promise.resolve(elem)

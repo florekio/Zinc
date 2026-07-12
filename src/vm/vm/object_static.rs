@@ -985,6 +985,18 @@ impl Vm {
         if let Some(ov) = self.fn_property_overrides.get(&(sentinel, key)) {
             return *ov; // None = deleted, Some(v) = overridden
         }
+        // Promise resolving/combinator element functions (deep negative
+        // encodings): anonymous, length 1.
+        if sentinel <= -600_000 {
+            match key_str.as_str() {
+                "name" => {
+                    let sid = self.interner.intern("");
+                    return Some(Value::string(sid));
+                }
+                "length" => return Some(Value::int(1)),
+                _ => return None,
+            }
+        }
         // Fall back to defaults
         let chunk_idx = (sentinel & 0xFFFF) as usize;
         match key_str.as_str() {
