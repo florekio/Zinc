@@ -6,19 +6,20 @@ Run with: `cargo run --release --bin test262_runner`
 
 ## Results
 
-**93.0% pass rate** — 14,982 of 16,116 active tests pass (2,989 tests skipped).
+**90.0% pass rate** — 25,316 of 28,119 active tests pass (4,878 tests skipped).
 
-An earlier round had briefly dropped to 90.0% when silent assertion no-ops
-were fixed (`assert.sameValue` / `assert.throws` weren't actually invoked on a
-function value with user-set properties, so tests "passed" by inaction),
-exposing thousands of previously-hidden latent bugs. Those have since been
-worked through — strict-mode property writes / deletes, derived-class
-missing-super, eager generator parameters, iterator-close protocol,
-computed-key class methods, `__proto__: val` literals, global/sticky
-`RegExp.exec` `lastIndex`, computed property writes onto function values
-(`fn[k] = v`), and nested `for-in` iterator aliasing — bringing the rate to
-93.0%. Remaining failures are concentrated in eval-time strict early errors,
-private-field brand checks, completion-value semantics, and TDZ for params.
+The runner now covers the **language suite plus 32 built-ins suites**
+(`Array`, `Object`, `String`, `RegExp`, `Promise`, `Date`, `Function`,
+`Map`/`Set`, `Symbol`, typed arrays, …) — nearly 3x the scope of earlier
+releases, which measured the language suite alone (currently at 96.4%).
+Remaining failures are concentrated in strict-mode early errors, deep
+observable protocols (Promise species/capability edge cases, RegExp lookahead
+grammar), and documented-unsupported features: `Proxy`, `Reflect` methods,
+cross-realm tests, and lone surrogates.
+
+Category tables below are from the earlier language-only run and remain
+representative of the language suite; per-suite failure counts live in the
+runner's failure log (`cargo run --release --bin test262_runner -- -o failures.log`).
 
 ### Perfect Scores (100%)
 
