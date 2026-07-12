@@ -58,8 +58,14 @@ impl Vm {
 
     // ---- JSON.parse: simple recursive descent ----
     pub(crate) fn json_parse(&mut self, input: &str) -> Result<Value, String> {
-        let input = input.trim();
-        let (val, _) = json_parse_value(input, &mut self.heap, &mut self.interner)?;
+        // JSON whitespace is exactly TAB/LF/CR/space; anything else (\v,
+        // NBSP, ...) outside a string is a syntax error, as is trailing
+        // content after the value.
+        let input = json_trim(input);
+        let (val, rest) = json_parse_value(input, &mut self.heap, &mut self.interner)?;
+        if !json_trim(rest).is_empty() {
+            return Err("Unexpected token after JSON value".into());
+        }
         Ok(val)
     }
 
@@ -225,7 +231,7 @@ impl Vm {
 }
 
 fn json_parse_value<'s>(s: &'s str, heap: &mut ObjectHeap, interner: &mut Interner) -> Result<(Value, &'s str), String> {
-    let s = s.trim_start();
+    let s = json_trim_start(s);
     if s.is_empty() { return Err("unexpected end of JSON".into()); }
     match s.as_bytes()[0] {
         b'"' => json_parse_string(s, interner),
@@ -239,18 +245,72 @@ fn json_parse_value<'s>(s: &'s str, heap: &mut ObjectHeap, interner: &mut Intern
     }
 }
 
+/// JSON whitespace: exactly TAB, LF, CR, space.
+fn json_trim(s: &str) -> &str {
+    s.trim_matches([' ', '\t', '\n', '\r'].as_slice())
+}
+
+fn json_trim_start(s: &str) -> &str {
+    s.trim_start_matches([' ', '\t', '\n', '\r'].as_slice())
+}
+
 fn json_parse_string<'s>(s: &'s str, interner: &mut Interner) -> Result<(Value, &'s str), String> {
+    if !s.starts_with('"') {
+        return Err("expected string".into());
+    }
     let s = &s[1..];
     let mut result = String::new();
     let mut chars = s.char_indices();
     while let Some((i, c)) = chars.next() {
         match c {
             '"' => { let id = interner.intern(&result); return Ok((Value::string(id), &s[i + 1..])); }
-            '\\' => { if let Some((_, esc)) = chars.next() { match esc {
-                '"' => result.push('"'), '\\' => result.push('\\'), '/' => result.push('/'),
-                'n' => result.push('\n'), 'r' => result.push('\r'), 't' => result.push('\t'),
-                _ => { result.push('\\'); result.push(esc); }
-            }}}
+            '\\' => {
+                let Some((_, esc)) = chars.next() else { return Err("unterminated escape".into()) };
+                match esc {
+                    '"' => result.push('"'),
+                    '\\' => result.push('\\'),
+                    '/' => result.push('/'),
+                    'n' => result.push('\n'),
+                    'r' => result.push('\r'),
+                    't' => result.push('\t'),
+                    'b' => result.push('\u{8}'),
+                    'f' => result.push('\u{c}'),
+                    'u' => {
+                        let mut code: u32 = 0;
+                        for _ in 0..4 {
+                            let Some((_, h)) = chars.next() else { return Err("bad \\u escape".into()) };
+                            let d = h.to_digit(16).ok_or_else(|| "bad \\u escape".to_string())?;
+                            code = code * 16 + d;
+                        }
+                        // Surrogate pair: combine when a low surrogate follows.
+                        if (0xD800..0xDC00).contains(&code) {
+                            let mut la = chars.clone();
+                            if let (Some((_, '\\')), Some((_, 'u'))) = (la.next(), la.next()) {
+                                let mut low: u32 = 0;
+                                let mut ok = true;
+                                for _ in 0..4 {
+                                    match la.next().and_then(|(_, h)| h.to_digit(16)) {
+                                        Some(d) => low = low * 16 + d,
+                                        None => { ok = false; break; }
+                                    }
+                                }
+                                if ok && (0xDC00..0xE000).contains(&low) {
+                                    chars = la;
+                                    let combined = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                                    result.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
+                                    continue;
+                                }
+                            }
+                            // Lone surrogate: not representable; substitute.
+                            result.push('\u{FFFD}');
+                            continue;
+                        }
+                        result.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                    }
+                    _ => return Err(format!("invalid escape \\{esc}")),
+                }
+            }
+            c if (c as u32) < 0x20 => return Err("control character in string".into()),
             _ => result.push(c),
         }
     }
@@ -261,9 +321,32 @@ fn json_parse_number(s: &str) -> Result<(Value, &str), String> {
     let mut end = 0;
     let b = s.as_bytes();
     if end < b.len() && b[end] == b'-' { end += 1; }
+    // Integer part: 0, or [1-9] digits — leading zeros are a syntax error.
+    let int_start = end;
     while end < b.len() && b[end].is_ascii_digit() { end += 1; }
-    if end < b.len() && b[end] == b'.' { end += 1; while end < b.len() && b[end].is_ascii_digit() { end += 1; } }
-    if end < b.len() && (b[end] == b'e' || b[end] == b'E') { end += 1; if end < b.len() && (b[end] == b'+' || b[end] == b'-') { end += 1; } while end < b.len() && b[end].is_ascii_digit() { end += 1; } }
+    if end == int_start {
+        return Err("invalid number".into());
+    }
+    if end - int_start > 1 && b[int_start] == b'0' {
+        return Err("leading zeros are not allowed".into());
+    }
+    if end < b.len() && b[end] == b'.' {
+        end += 1;
+        let frac_start = end;
+        while end < b.len() && b[end].is_ascii_digit() { end += 1; }
+        if end == frac_start {
+            return Err("missing fraction digits".into());
+        }
+    }
+    if end < b.len() && (b[end] == b'e' || b[end] == b'E') {
+        end += 1;
+        if end < b.len() && (b[end] == b'+' || b[end] == b'-') { end += 1; }
+        let exp_start = end;
+        while end < b.len() && b[end].is_ascii_digit() { end += 1; }
+        if end == exp_start {
+            return Err("missing exponent digits".into());
+        }
+    }
     let n: f64 = s[..end].parse().map_err(|_| "invalid number".to_string())?;
     Ok((Value::number(n), &s[end..]))
 }
@@ -271,17 +354,17 @@ fn json_parse_number(s: &str) -> Result<(Value, &str), String> {
 fn json_parse_object<'s>(s: &'s str, heap: &mut ObjectHeap, interner: &mut Interner) -> Result<(Value, &'s str), String> {
     let mut s = &s[1..];
     let mut obj = JsObject::ordinary();
-    s = s.trim_start();
+    s = json_trim_start(s);
     if let Some(rest) = s.strip_prefix('}') { let oid = heap.allocate(obj); return Ok((Value::object_id(oid), rest)); }
     loop {
-        s = s.trim_start();
+        s = json_trim_start(s);
         let (key, rest) = json_parse_string(s, interner)?;
-        s = rest.trim_start();
+        s = json_trim_start(rest);
         if let Some(rest) = s.strip_prefix(':') { s = rest; } else { return Err("expected ':'".into()); }
         let (val, rest) = json_parse_value(s, heap, interner)?;
         s = rest;
         if let Some(kid) = key.as_string_id() { obj.set_property(kid, val); }
-        s = s.trim_start();
+        s = json_trim_start(s);
         if let Some(rest) = s.strip_prefix(',') { s = rest; continue; }
         if let Some(rest) = s.strip_prefix('}') { s = rest; break; }
         return Err("expected ',' or '}'".into());
@@ -293,12 +376,12 @@ fn json_parse_object<'s>(s: &'s str, heap: &mut ObjectHeap, interner: &mut Inter
 fn json_parse_array<'s>(s: &'s str, heap: &mut ObjectHeap, interner: &mut Interner) -> Result<(Value, &'s str), String> {
     let mut s = &s[1..];
     let mut elems = Vec::new();
-    s = s.trim_start();
+    s = json_trim_start(s);
     if let Some(rest) = s.strip_prefix(']') { let o = JsObject::array(elems); let oid = heap.allocate(o); return Ok((Value::object_id(oid), rest)); }
     loop {
         let (val, rest) = json_parse_value(s, heap, interner)?;
         s = rest; elems.push(val);
-        s = s.trim_start();
+        s = json_trim_start(s);
         if let Some(rest) = s.strip_prefix(',') { s = rest; continue; }
         if let Some(rest) = s.strip_prefix(']') { s = rest; break; }
         return Err("expected ',' or ']'".into());
