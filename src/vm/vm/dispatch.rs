@@ -2129,6 +2129,21 @@ impl Vm {
                     }
                     // Constructor return semantics: if the return value is not an object,
                     // return `this` instead (per ES spec, [[Construct]] step 13).
+                    // Derived constructors are stricter: a non-undefined
+                    // primitive return is a TypeError.
+                    if frame.is_derived_ctor
+                        && !result.is_undefined()
+                        && !result.is_object()
+                        && !result.is_function()
+                    {
+                        self.frames.push(frame);
+                        let err = self.make_native_error(
+                            "TypeError",
+                            "Derived constructors may only return object or undefined",
+                        );
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     if frame.is_constructor && !result.is_object() && !result.is_function() {
                         result = frame.this_value;
                     }
