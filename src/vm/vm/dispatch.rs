@@ -3247,7 +3247,11 @@ impl Vm {
                         if let Some(gfn) = getter_fn
                             && self.value_callable(gfn)
                         {
-                            let result = self.call_function_this(gfn, obj_val, &[])?;
+                            let result = match self.call_function_this(gfn, obj_val, &[]) {
+                                Ok(v) => v,
+                                Err(VmError::Throw(t)) => { self.handle_throw(t)?; continue; }
+                                Err(e) => return Err(e),
+                            };
                             self.push(result);
                             continue;
                         }
@@ -3607,7 +3611,11 @@ impl Vm {
                             && self.value_callable(gfn)
                         {
                             let this_val = self.box_primitive(obj_val);
-                            let result = self.call_function_this(gfn, this_val, &[])?;
+                            let result = match self.call_function_this(gfn, this_val, &[]) {
+                                Ok(v) => v,
+                                Err(VmError::Throw(t)) => { self.handle_throw(t)?; continue; }
+                                Err(e) => return Err(e),
+                            };
                             self.push(result);
                             continue;
                         }
@@ -3939,7 +3947,11 @@ impl Vm {
                             let getter_key = self.interner.intern(&getter_key_str);
                             if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
                                 && self.value_callable(gfn) {
-                                    let result = self.call_function_this(gfn, obj_val, &[])?;
+                                    let result = match self.call_function_this(gfn, obj_val, &[]) {
+                                        Ok(v) => v,
+                                        Err(VmError::Throw(t)) => { self.handle_throw(t)?; continue; }
+                                        Err(e) => return Err(e),
+                                    };
                                     self.push(result);
                                     continue;
                                 }
@@ -3977,7 +3989,11 @@ impl Vm {
                             if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
                                 && self.value_callable(gfn)
                             {
-                                let result = self.call_function_this(gfn, obj_val, &[])?;
+                                let result = match self.call_function_this(gfn, obj_val, &[]) {
+                                    Ok(v) => v,
+                                    Err(VmError::Throw(t)) => { self.handle_throw(t)?; continue; }
+                                    Err(e) => return Err(e),
+                                };
                                 self.push(result);
                                 continue;
                             }
@@ -4497,7 +4513,11 @@ impl Vm {
                         // Check for private getter (__get_#name__)
                         let getter_fn = self.heap.get_property_chain(oid, getter_key);
                         if let Some(gfn) = getter_fn && self.value_callable(gfn) {
-                            let result = self.call_function_this(gfn, obj_val, &[])?;
+                            let result = match self.call_function_this(gfn, obj_val, &[]) {
+                                Ok(v) => v,
+                                Err(VmError::Throw(t)) => { self.handle_throw(t)?; continue; }
+                                Err(e) => return Err(e),
+                            };
                             self.push(result);
                         } else {
                             // If a private setter exists but no getter, the field is an

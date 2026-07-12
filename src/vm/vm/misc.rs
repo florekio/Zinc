@@ -1873,6 +1873,14 @@ impl Vm {
                             | crate::runtime::object::Property::CONFIGURABLE,
                     ),
                 );
+            } else {
+                // Strict arguments: callee is the %ThrowTypeError% poison
+                // accessor (get === set, non-enumerable, non-configurable).
+                let tte = self.throw_type_error_fn();
+                let get_key = self.interner.intern("__get_callee__");
+                let set_key = self.interner.intern("__set_callee__");
+                arr.define_property(get_key, crate::runtime::object::Property::with_flags(tte, 0));
+                arr.define_property(set_key, crate::runtime::object::Property::with_flags(tte, 0));
             }
             let oid = self.heap.allocate(arr);
             self.frames[frame_idx].arguments_oid = Some(oid);

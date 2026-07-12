@@ -352,6 +352,7 @@ pub struct Vm {
     /// `.next()` CALLS still dispatch on ObjectKind first; this object
     /// serves property reads and getPrototypeOf.
     pub(crate) iterator_prototype: Option<ObjectId>,
+    pub(crate) throw_type_error: Option<Value>,
     /// Singleton Boolean.prototype object
     pub(crate) boolean_prototype: ObjectId,
     /// Singleton Number.prototype object
@@ -1028,6 +1029,38 @@ impl Vm {
         let oid = self.heap.allocate(proto);
         self.iterator_prototype = Some(oid);
         oid
+    }
+
+    /// %ThrowTypeError%: the singleton poison-pill accessor for strict-mode
+    /// `arguments.callee` (get === set, frozen, non-extensible, name "" /
+    /// length 0).
+    pub(crate) fn throw_type_error_fn(&mut self) -> Value {
+        if let Some(v) = self.throw_type_error {
+            return v;
+        }
+        let name_id = self.interner.intern("");
+        let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+            |vm: &mut Vm, _this: Value, _args: &[Value]| -> Result<Value, Value> {
+                Err(vm.make_native_error(
+                    "TypeError",
+                    "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+                ))
+            },
+        );
+        let mut fn_obj = JsObject {
+            properties: Vec::new(),
+            prototype: Some(self.function_prototype),
+            kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
+            marked: false,
+            extensible: false,
+        };
+        let name_key = self.interner.intern("name");
+        let len_key = self.interner.intern("length");
+        fn_obj.define_property(name_key, Property::with_flags(Value::string(name_id), 0));
+        fn_obj.define_property(len_key, Property::with_flags(Value::int(0), 0));
+        let v = Value::object_id(self.heap.allocate(fn_obj));
+        self.throw_type_error = Some(v);
+        v
     }
 
     /// Per-kind iterator prototype (%ArrayIteratorPrototype%, …): an object

@@ -709,6 +709,7 @@ impl Vm {
             array_prototype,
             promise_prototype,
             iterator_prototype: None,
+            throw_type_error: None,
             boolean_prototype,
             number_prototype,
             date_prototype,
