@@ -240,6 +240,17 @@ impl Vm {
     fn exec_promise_combinator(&mut self, kind: CombinatorKind, args: &[Value]) -> Result<Value, VmError> {
         // GetIterator(iterable): abrupt completions (non-iterables, poisoned
         // @@iterator) REJECT the returned promise rather than throwing.
+        // Get(C, "resolve") + IsCallable happen BEFORE GetIterator: a
+        // non-callable Promise.resolve rejects without touching the iterable.
+        let resolve_id_pre = self.interner.intern("resolve");
+        if let Some(Some(ov)) = self.fn_property_overrides.get(&(-520, resolve_id_pre)).copied()
+            && !self.value_callable(ov)
+        {
+            let err = self.make_native_error("TypeError", "Promise.resolve is not a function");
+            let pid = self.allocate_promise();
+            self.reject_promise(pid, err)?;
+            return Ok(Value::object_id(pid));
+        }
         let iterable = args.first().copied().unwrap_or(Value::undefined());
         let elements: Vec<Value> = match self.simple_iterable_to_list(iterable) {
             Ok(list) => list,
