@@ -235,6 +235,11 @@ impl Vm {
         let barrier = self.heap.get(oid).and_then(|o| o.properties.iter()
             .filter_map(|(k, p)| {
                 let ks = self.interner.resolve(*k);
+                // Accessor halves live under __get_N__ / __set_N__.
+                let ks = ks.strip_prefix("__get_")
+                    .or_else(|| ks.strip_prefix("__set_"))
+                    .and_then(|t| t.strip_suffix("__"))
+                    .unwrap_or(ks);
                 canon(ks).filter(|i| *i >= req && *i < cur_len && !p.is_configurable())
             })
             .max());
@@ -414,6 +419,17 @@ impl Vm {
                 return Err(VmError::Throw(self.make_native_error(
                     "TypeError",
                     "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
+                )));
+            }
+            // Array length is a non-configurable DATA property: accessor
+            // redefinition always rejects.
+            if desc_is_accessor
+                && key_str == "length"
+                && self.heap.get(target_oid).is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)))
+            {
+                return Err(VmError::Throw(self.make_native_error(
+                    "TypeError",
+                    "Cannot redefine property: length",
                 )));
             }
 
@@ -641,6 +657,21 @@ impl Vm {
             if key_str == "length"
                 && self.heap.get(target_oid).is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)))
             {
+                // length is a data property; accessor descriptors reject.
+                let has_acc_field = desc_val.as_object_id().is_some_and(|doid| {
+                    self.heap.get(doid).is_some_and(|o| {
+                        let gk = self.interner.get("get");
+                        let sk = self.interner.get("set");
+                        gk.is_some_and(|k| o.has_own_property(k))
+                            || sk.is_some_and(|k| o.has_own_property(k))
+                    })
+                });
+                if has_acc_field {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Cannot redefine property: length",
+                    )));
+                }
                 let ro_key = self.interner.intern("__len_ro__");
                 let len_ro = self.heap.get(target_oid).is_some_and(|o| o.has_own_property(ro_key));
                 // length is non-configurable and non-enumerable; a descriptor
