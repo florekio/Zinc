@@ -2729,19 +2729,28 @@ impl Vm {
                     // intrinsic: their conceptual [[Prototype]] is
                     // %GeneratorFunction.prototype%, which the generic walk
                     // below can't see (packed fns have no heap proto slot).
-                    if let (Some(packed), Some(gf_proto)) = (obj.as_function(), self.generator_function_proto)
+                    if let Some(packed) = obj.as_function()
                         && packed >= 0
                     {
                         let chunk_idx = (packed & 0xFFFF) as usize;
                         if chunk_idx < self.chunks.len()
-                            && self.chunks[chunk_idx].flags.contains(ChunkFlags::GENERATOR)
                             && let Some(rhs_oid) = constructor.as_object_id()
                         {
-                            let pk = self.interner.intern("prototype");
-                            let rhs_proto = self.heap.get(rhs_oid).and_then(|o| o.get_property(pk));
-                            if rhs_proto.and_then(|v| v.as_object_id()) == Some(gf_proto) {
-                                self.push(Value::boolean(true));
-                                continue;
+                            let flags = self.chunks[chunk_idx].flags;
+                            let intrinsic = if flags.contains(ChunkFlags::GENERATOR) {
+                                self.generator_function_proto
+                            } else if flags.contains(ChunkFlags::ASYNC) {
+                                self.async_function_proto
+                            } else {
+                                None
+                            };
+                            if let Some(proto) = intrinsic {
+                                let pk = self.interner.intern("prototype");
+                                let rhs_proto = self.heap.get(rhs_oid).and_then(|o| o.get_property(pk));
+                                if rhs_proto.and_then(|v| v.as_object_id()) == Some(proto) {
+                                    self.push(Value::boolean(true));
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -3547,6 +3556,39 @@ impl Vm {
                                 {
                                     self.push(Value::int(kind.bytes_per_element() as i32));
                                     continue;
+                                }
+                                // Generator/async functions: .constructor is the
+                                // intrinsic; async fns expose NO .prototype.
+                                if sentinel >= 0 {
+                                    let chunk_idx = (sentinel & 0xFFFF) as usize;
+                                    if chunk_idx < self.chunks.len() {
+                                        let flags = self.chunks[chunk_idx].flags;
+                                        if name_str == "constructor"
+                                            && !self.fn_property_overrides.contains_key(&(sentinel, name_id))
+                                        {
+                                            let proto = if flags.contains(ChunkFlags::GENERATOR) {
+                                                Some(self.generator_function_proto_oid())
+                                            } else if flags.contains(ChunkFlags::ASYNC) {
+                                                Some(self.async_function_proto_oid())
+                                            } else {
+                                                None
+                                            };
+                                            if let Some(p) = proto {
+                                                let ck = self.interner.intern("constructor");
+                                                let v = self.heap.get(p).and_then(|o| o.get_property(ck)).unwrap_or(Value::undefined());
+                                                self.push(v);
+                                                continue;
+                                            }
+                                        }
+                                        if name_str == "prototype"
+                                            && flags.contains(ChunkFlags::ASYNC)
+                                            && !flags.contains(ChunkFlags::GENERATOR)
+                                            && !self.fn_property_overrides.contains_key(&(sentinel, name_id))
+                                        {
+                                            self.push(Value::undefined());
+                                            continue;
+                                        }
+                                    }
                                 }
                                 // User-defined function properties.
                                 // Arrow functions and strict-mode functions have
@@ -6295,16 +6337,23 @@ impl Vm {
                         // The GeneratorFunction intrinsic is a Native fn that
                         // IS a constructor: new GF(...) compiles source and
                         // returns the generator function (no ordinary this).
-                        let is_gf_ctor = self.generator_function_proto
-                            .and_then(|p| {
-                                let ck = self.interner.intern("constructor");
-                                self.heap.get(p).and_then(|o| o.get_property(ck))
-                            })
-                            .and_then(|v| v.as_object_id())
-                            == Some(oid);
-                        if is_gf_ctor {
+                        let ck = self.interner.intern("constructor");
+                        let intrinsic_kw = if self.generator_function_proto
+                            .and_then(|p| self.heap.get(p).and_then(|o| o.get_property(ck)))
+                            .and_then(|v| v.as_object_id()) == Some(oid)
+                        {
+                            Some("function*")
+                        } else if self.async_function_proto
+                            .and_then(|p| self.heap.get(p).and_then(|o| o.get_property(ck)))
+                            .and_then(|v| v.as_object_id()) == Some(oid)
+                        {
+                            Some("async function")
+                        } else {
+                            None
+                        };
+                        if let Some(kw) = intrinsic_kw {
                             let args: Vec<Value> = (0..argc).map(|i| self.stack[func_pos + 1 + i]).collect();
-                            match self.construct_function_kind(&args, "function*") {
+                            match self.construct_function_kind(&args, kw) {
                                 Ok(v) => {
                                     self.truncate_stack(func_pos);
                                     self.push(v);

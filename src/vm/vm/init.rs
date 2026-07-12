@@ -711,6 +711,7 @@ impl Vm {
             iterator_prototype: None,
             throw_type_error: None,
             generator_function_proto: None,
+            async_function_proto: None,
             boolean_prototype,
             number_prototype,
             date_prototype,

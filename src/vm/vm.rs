@@ -354,6 +354,7 @@ pub struct Vm {
     pub(crate) iterator_prototype: Option<ObjectId>,
     pub(crate) throw_type_error: Option<Value>,
     pub(crate) generator_function_proto: Option<ObjectId>,
+    pub(crate) async_function_proto: Option<ObjectId>,
     /// Singleton Boolean.prototype object
     pub(crate) boolean_prototype: ObjectId,
     /// Singleton Number.prototype object
@@ -1068,19 +1069,28 @@ impl Vm {
     /// function, carrying @@toStringTag "GeneratorFunction" and a
     /// constructor that dynamically compiles `function*` source.
     pub(crate) fn generator_function_proto_oid(&mut self) -> ObjectId {
-        if let Some(oid) = self.generator_function_proto {
+        self.dynamic_fn_proto_oid("GeneratorFunction", "function*")
+    }
+
+    pub(crate) fn async_function_proto_oid(&mut self) -> ObjectId {
+        self.dynamic_fn_proto_oid("AsyncFunction", "async function")
+    }
+
+    fn dynamic_fn_proto_oid(&mut self, tag: &'static str, keyword: &'static str) -> ObjectId {
+        let cache = if tag == "GeneratorFunction" { self.generator_function_proto } else { self.async_function_proto };
+        if let Some(oid) = cache {
             return oid;
         }
         let mut proto = JsObject::ordinary();
         proto.prototype = Some(self.function_prototype);
         let tag_key = self.interner.intern(&format!("__sym_{}__", self.sym_to_string_tag));
-        let tag_val = self.interner.intern("GeneratorFunction");
+        let tag_val = self.interner.intern(tag);
         proto.define_property(tag_key, Property::with_flags(Value::string(tag_val), Property::CONFIGURABLE));
-        // %GeneratorFunction%: callable and constructable.
-        let ctor_name = self.interner.intern("GeneratorFunction");
+        // The intrinsic constructor: callable and constructable.
+        let ctor_name = self.interner.intern(tag);
         let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
-            |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
-                match vm.construct_function_kind(args, "function*") {
+            move |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
+                match vm.construct_function_kind(args, keyword) {
                     Ok(v) => Ok(v),
                     Err(VmError::Throw(t)) => Err(t),
                     Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
@@ -1108,7 +1118,11 @@ impl Vm {
         if let Some(p) = self.heap.get_mut(proto_oid) {
             p.define_property(ctor_key, Property::with_flags(ctor_val, Property::CONFIGURABLE));
         }
-        self.generator_function_proto = Some(proto_oid);
+        if tag == "GeneratorFunction" {
+            self.generator_function_proto = Some(proto_oid);
+        } else {
+            self.async_function_proto = Some(proto_oid);
+        }
         proto_oid
     }
 

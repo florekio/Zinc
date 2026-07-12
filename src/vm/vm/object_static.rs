@@ -693,6 +693,16 @@ impl Vm {
             "getPrototypeOf" => {
                 let arg = args.first().copied().unwrap_or(Value::undefined());
                 if let Some(oid) = arg.as_object_id() {
+                    // %GeneratorFunction%/%AsyncFunction% are subclasses of
+                    // Function: their [[Prototype]] is %Function% itself.
+                    let ck = self.interner.intern("constructor");
+                    let is_intrinsic_ctor = [self.generator_function_proto, self.async_function_proto]
+                        .iter()
+                        .any(|p| p.and_then(|po| self.heap.get(po).and_then(|o| o.get_property(ck)))
+                            .and_then(|v| v.as_object_id()) == Some(oid));
+                    if is_intrinsic_ctor {
+                        return Ok(Some(Value::function(-551)));
+                    }
                     // Class/function objects get Function.prototype as their proto
                     let is_fn_obj = self.heap.get(oid)
                         .map(|o| matches!(&o.kind, ObjectKind::Function(_)))
@@ -708,11 +718,15 @@ impl Vm {
                     // Generator functions chain to %GeneratorFunction.prototype%.
                     let sentinel = arg.as_function().unwrap();
                     let chunk_idx = (sentinel & 0xFFFF) as usize;
-                    let is_gen = sentinel >= 0
-                        && chunk_idx < self.chunks.len()
-                        && self.chunks[chunk_idx].flags.contains(crate::compiler::chunk::ChunkFlags::GENERATOR);
-                    if is_gen {
+                    let flags = if sentinel >= 0 && chunk_idx < self.chunks.len() {
+                        self.chunks[chunk_idx].flags
+                    } else {
+                        crate::compiler::chunk::ChunkFlags::empty()
+                    };
+                    if flags.contains(crate::compiler::chunk::ChunkFlags::GENERATOR) {
                         Value::object_id(self.generator_function_proto_oid())
+                    } else if flags.contains(crate::compiler::chunk::ChunkFlags::ASYNC) {
+                        Value::object_id(self.async_function_proto_oid())
                     } else {
                         // Sentinel functions → Function.prototype
                         Value::object_id(self.function_prototype)
