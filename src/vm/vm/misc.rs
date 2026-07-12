@@ -295,15 +295,20 @@ impl Vm {
             // `defineProperty(Ctor, 'prototype', {writable:false})` — must
             // keep the existing value; clobbering it with undefined
             // poisoned `.prototype` of wrapped constructors.
-            let value = desc_val.as_object_id().and_then(|doid| {
-                let value_key = self.interner.intern("value");
-                let get_key = self.interner.intern("get");
-                self.heap.get_property_chain(doid, value_key)
-                    .or_else(|| self.heap.get_property_chain(doid, get_key)
-                        .filter(|v| !v.is_undefined()))
-            });
-            if let Some(value) = value {
+            let value_key = self.interner.intern("value");
+            let get_key = self.interner.intern("get");
+            let data_val = desc_val.as_object_id()
+                .and_then(|doid| self.heap.get_property_chain(doid, value_key));
+            let getter_val = desc_val.as_object_id()
+                .and_then(|doid| self.heap.get_property_chain(doid, get_key))
+                .filter(|v| !v.is_undefined());
+            if let Some(value) = data_val {
                 self.fn_property_overrides.insert((sentinel, key_id), Some(value));
+            } else if let Some(g) = getter_val {
+                // Accessor define on a builtin: keep the getter under the
+                // __get_<key>__ convention so reads can distinguish it.
+                let getter_id = self.interner.intern(&format!("__get_{key_str}__"));
+                self.fn_property_overrides.insert((sentinel, getter_id), Some(g));
             }
             return Ok(target);
         }

@@ -1247,6 +1247,182 @@ impl Vm {
     }
 
     // ---- Array method dispatch ----
+    /// IsConstructor approximation for JS values reachable from native code.
+    pub(crate) fn is_constructor_value(&self, v: Value) -> bool {
+        if let Some(packed) = v.as_function() {
+            if packed >= 0 {
+                let chunk_idx = (packed & 0xFFFF) as usize;
+                if chunk_idx < self.chunks.len() {
+                    let flags = self.chunks[chunk_idx].flags;
+                    return !(flags.contains(crate::compiler::chunk::ChunkFlags::GENERATOR)
+                        || flags.contains(crate::compiler::chunk::ChunkFlags::ARROW)
+                        || flags.contains(crate::compiler::chunk::ChunkFlags::ASYNC)
+                        || flags.contains(crate::compiler::chunk::ChunkFlags::METHOD));
+                }
+                return true;
+            }
+            return matches!(packed,
+                -508..=-504 | -516..=-510 | -539 | -520 | -543..=-540 | -550 | -551 | -570 | -580 | -638)
+                || (-673..=-660).contains(&packed);
+        }
+        if let Some(o) = v.as_object_id().and_then(|oid| self.heap.get(oid)) {
+            let ctor_key = self.interner.get("__constructor__");
+            return match &o.kind {
+                ObjectKind::Function(crate::runtime::object::FunctionKind::Native { .. })
+                | ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { .. }) => false,
+                ObjectKind::Function(_) => true,
+                _ => ctor_key.is_some_and(|ck| o.get_property(ck).is_some()),
+            };
+        }
+        false
+    }
+
+    /// OrdinaryConstruct from native code: fresh `this` chained to
+    /// C.prototype, call, object return overrides `this`.
+    pub(crate) fn construct_from_native(&mut self, ctor: Value, args: &[Value]) -> Result<Value, VmError> {
+        let proto_key = self.interner.intern("prototype");
+        let proto_val = if let Some(packed) = ctor.as_function() {
+            self.fn_property_get(packed, proto_key, ctor)
+        } else if let Some(o) = ctor.as_object_id().and_then(|oid| self.heap.get(oid)) {
+            o.get_property(proto_key).unwrap_or(Value::undefined())
+        } else {
+            Value::undefined()
+        };
+        let proto_oid = proto_val.as_object_id().unwrap_or(self.object_prototype);
+        let mut this_obj = crate::runtime::object::JsObject::ordinary();
+        this_obj.prototype = Some(proto_oid);
+        let this_val = Value::object_id(self.heap.allocate(this_obj));
+        let prev = self.protect_throw_depth;
+        self.protect_throw_depth = self.frames.len() + 1;
+        let r = self.call_function_this(ctor, this_val, args);
+        self.protect_throw_depth = prev;
+        let result = r?;
+        Ok(if result.is_object() && !result.is_symbol() { result } else { this_val })
+    }
+
+    /// ArraySpeciesCreate: observable constructor/@@species reads; None means
+    /// "default" (dense array fast path — no custom constructor in play).
+    pub(crate) fn array_species_create(&mut self, oid: crate::runtime::object::ObjectId, len: usize) -> Result<Option<Value>, VmError> {
+        // Fast path: no own "constructor" on the array → default machinery.
+        let ctor_key = self.interner.intern("constructor");
+        let get_ctor_key = self.interner.intern("__get_constructor__");
+        let has_own_ctor = self.heap.get(oid).is_some_and(|o| {
+            o.has_own_property(ctor_key) || o.has_own_property(get_ctor_key)
+        });
+        if !has_own_ctor {
+            return Ok(None);
+        }
+        let c = self.getter_aware_get(oid, "constructor")?.unwrap_or(Value::undefined());
+        // Type(C) is Object → C = Get(C, @@species) (null → undefined).
+        let c = if let Some(coid) = c.as_object_id() {
+            let sp = self.getter_aware_get(coid, "__sym_4__")?.unwrap_or(Value::undefined());
+            if sp.is_null() { Value::undefined() } else { sp }
+        } else if c.is_function() {
+            // The intrinsic Array constructor (its @@species returns itself
+            // unless overridden — data override or accessor half).
+            if c.as_function() == Some(-507) {
+                let getter_id = self.interner.intern("__get___sym_4___");
+                let sid = self.interner.intern("__sym_4__");
+                if let Some(Some(g)) = self.fn_property_overrides.get(&(-507, getter_id)).copied() {
+                    if self.value_callable(g) {
+                        let prev = self.protect_throw_depth;
+                        self.protect_throw_depth = self.frames.len() + 1;
+                        let r = self.call_function_this(g, c, &[]);
+                        self.protect_throw_depth = prev;
+                        let sp = r?;
+                        if sp.is_null() { Value::undefined() } else { sp }
+                    } else {
+                        Value::undefined()
+                    }
+                } else {
+                    match self.fn_property_overrides.get(&(-507, sid)).copied() {
+                        Some(Some(v)) => v,
+                        Some(None) => Value::undefined(),
+                        None => Value::undefined(),
+                    }
+                }
+            } else {
+                c
+            }
+        } else {
+            c
+        };
+        if c.is_undefined() {
+            return Ok(None);
+        }
+        if c.is_function() && c.as_function() == Some(-507) {
+            return Ok(None);
+        }
+        if !self.is_constructor_value(c) {
+            let err = self.make_native_error("TypeError", "constructor property is not a constructor");
+            return Err(VmError::Throw(err));
+        }
+        let target = self.construct_from_native(c, &[Value::number(len as f64)])?;
+        Ok(Some(target))
+    }
+
+    /// CreateDataPropertyOrThrow for species targets.
+    pub(crate) fn create_data_property_or_throw(&mut self, target: Value, key: &str, v: Value) -> Result<(), VmError> {
+        let Some(toid) = target.as_object_id() else {
+            let err = self.make_native_error("TypeError", "Cannot create property on non-object");
+            return Err(VmError::Throw(err));
+        };
+        let key_id = self.interner.intern(key);
+        let get_id = self.interner.intern(&format!("__get_{key}__"));
+        let set_id = self.interner.intern(&format!("__set_{key}__"));
+        let (exists, non_config, frozen_elem, extensible, is_arr, dense_len) = {
+            let Some(o) = self.heap.get(toid) else {
+                return Ok(());
+            };
+            let idx = key.parse::<usize>().ok();
+            let is_arr = matches!(o.kind, ObjectKind::Array(_));
+            let dense_len = if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 };
+            let in_dense = is_arr && idx.is_some_and(|i| i < dense_len);
+            let exists = o.has_own_property(key_id) || o.has_own_property(get_id) || o.has_own_property(set_id) || in_dense;
+            let non_config = [key_id, get_id, set_id].iter().any(|k| {
+                o.get_property_descriptor(*k).is_some_and(|p| !p.is_configurable())
+            });
+            let fk = self.interner.get("__frozen_elems__");
+            let frozen = fk.is_some_and(|f| o.has_own_property(f));
+            (exists, non_config, frozen, o.extensible, is_arr, dense_len)
+        };
+        if (exists && non_config) || frozen_elem {
+            let err = self.make_native_error("TypeError", &format!("Cannot redefine property: {key}"));
+            return Err(VmError::Throw(err));
+        }
+        if !exists && !extensible {
+            let err = self.make_native_error("TypeError", &format!("Cannot add property {key}, object is not extensible"));
+            return Err(VmError::Throw(err));
+        }
+        if is_arr && let Ok(idx) = key.parse::<usize>() {
+            if let Some(o) = self.heap.get_mut(toid)
+                && let ObjectKind::Array(ref mut e) = o.kind
+            {
+                if idx < e.len() {
+                    e[idx] = v;
+                } else if idx == e.len() {
+                    e.push(v);
+                } else if idx <= 1_000_000 {
+                    e.resize(idx, Value::empty());
+                    e.push(v);
+                } else {
+                    o.set_property(key_id, v);
+                }
+            }
+            let _ = dense_len;
+            return Ok(());
+        }
+        if let Some(o) = self.heap.get_mut(toid) {
+            o.define_property(key_id, crate::runtime::object::Property::with_flags(
+                v,
+                crate::runtime::object::Property::WRITABLE
+                    | crate::runtime::object::Property::ENUMERABLE
+                    | crate::runtime::object::Property::CONFIGURABLE,
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn exec_array_method(&mut self, oid: crate::runtime::object::ObjectId, method_name: StringId, args: &[Value]) -> Result<Value, VmError> {
         let name = self.interner.resolve(method_name).to_owned();
         // Generic receivers (array-likes, arrays with reconfigured index
@@ -1280,6 +1456,61 @@ impl Vm {
                 "The comparison function must be either a function or undefined",
             )));
         }
+        // ArraySpeciesCreate runs FIRST for the methods that use it (its
+        // constructor/@@species reads and the construction are observable).
+        // A Some(target) diverts the dense result into the custom object via
+        // CreateDataPropertyOrThrow afterwards.
+        let receiver_is_array = self.heap.get(oid)
+            .is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)));
+        let species_target: Option<Value> = if receiver_is_array && matches!(
+            name.as_str(),
+            "map" | "filter" | "slice" | "splice" | "concat" | "flat" | "flatMap"
+        ) {
+            let len = self.heap.get(oid)
+                .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
+                .unwrap_or(0);
+            let species_len: usize = match name.as_str() {
+                "map" => len,
+                "slice" => {
+                    // count = max(final - k, 0) with relative indices.
+                    let rel = |v: Option<&Value>, dflt: i64| -> i64 {
+                        v.filter(|x| !x.is_undefined())
+                            .and_then(|x| x.as_number().or_else(|| x.as_int().map(|i| i as f64)))
+                            .map(|f| f as i64)
+                            .unwrap_or(dflt)
+                    };
+                    let l = len as i64;
+                    let start = rel(args.first(), 0);
+                    let end = rel(args.get(1), l);
+                    let k = if start < 0 { (l + start).max(0) } else { start.min(l) };
+                    let fin = if end < 0 { (l + end).max(0) } else { end.min(l) };
+                    (fin - k).max(0) as usize
+                }
+                "splice" => {
+                    let l = len as i64;
+                    let start = args.first()
+                        .and_then(|x| x.as_number().or_else(|| x.as_int().map(|i| i as f64)))
+                        .map(|f| f as i64)
+                        .unwrap_or(0);
+                    let actual_start = if start < 0 { (l + start).max(0) } else { start.min(l) };
+                    if args.is_empty() {
+                        0
+                    } else if args.len() == 1 {
+                        (l - actual_start) as usize
+                    } else {
+                        let dc = args.get(1)
+                            .and_then(|x| x.as_number().or_else(|| x.as_int().map(|i| i as f64)))
+                            .map(|f| f as i64)
+                            .unwrap_or(0);
+                        dc.clamp(0, l - actual_start) as usize
+                    }
+                }
+                _ => 0,
+            };
+            self.array_species_create(oid, species_len)?
+        } else {
+            None
+        };
         // The callback must be callable even on an empty receiver (the dense
         // loops below would never touch it).
         if matches!(
@@ -1299,7 +1530,7 @@ impl Vm {
                 )));
             }
         }
-        match name.as_str() {
+        let result = match name.as_str() {
             "push" => {
                 if let Some(obj) = self.heap.get_mut(oid)
                     && let ObjectKind::Array(ref mut elements) = obj.kind {
@@ -2006,7 +2237,49 @@ impl Vm {
                 Ok(Value::string(id))
             }
             _ => Ok(Value::undefined()),
+        };
+        let result = result?;
+        // Species divert: copy the dense result into the constructed target
+        // via CreateDataPropertyOrThrow, then set length where the spec does.
+        if let Some(target) = species_target {
+            if let Some(roid) = result.as_object_id()
+                && let Some(elems) = self.heap.get(roid).and_then(|o| {
+                    if let ObjectKind::Array(ref e) = o.kind { Some(e.clone()) } else { None }
+                })
+            {
+                for (i, v) in elems.iter().enumerate() {
+                    if v.is_empty_marker() {
+                        continue;
+                    }
+                    self.create_data_property_or_throw(target, &i.to_string(), *v)?;
+                }
+                // slice/splice/concat/flat/flatMap Set(A, "length"); map and
+                // filter leave length to the writes.
+                if matches!(name.as_str(), "slice" | "splice" | "concat" | "flat" | "flatMap")
+                    && let Some(toid) = target.as_object_id()
+                {
+                    let n = elems.len();
+                    let is_real_array = self.heap.get(toid)
+                        .is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)));
+                    if is_real_array {
+                        if let Some(o) = self.heap.get_mut(toid)
+                            && let ObjectKind::Array(ref mut e) = o.kind
+                            && e.len() > n
+                        {
+                            e.truncate(n);
+                        }
+                    } else {
+                        let lk = self.interner.intern("length");
+                        if let Some(o) = self.heap.get_mut(toid) {
+                            o.set_property(lk, Value::number(n as f64));
+                        }
+                    }
+                }
+                return Ok(target);
+            }
+            return Ok(result);
         }
+        Ok(result)
     }
 
     /// Helper to flatten an array to a given depth.

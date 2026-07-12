@@ -93,6 +93,11 @@ impl Interner {
         id
     }
 
+    /// Look up an already-interned string without inserting it.
+    pub fn get(&self, s: &str) -> Option<StringId> {
+        self.map.get(s).copied()
+    }
+
     /// Resolve a StringId back to its string.
     pub fn resolve(&self, id: StringId) -> &str {
         &self.strings[id.0 as usize]
