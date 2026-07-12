@@ -351,6 +351,13 @@ impl Vm {
         let mut has_value = false;
         let mut present: u8 = 0;
         let mut prior_accessor_flags: Option<u8> = None;
+        // ToPropertyDescriptor: the descriptor must be an object.
+        if desc_val.as_object_id().is_none() && !desc_val.is_function() {
+            return Err(VmError::Throw(self.make_native_error(
+                "TypeError",
+                "Property description must be an object",
+            )));
+        }
         if let Some(desc_oid) = desc_val.as_object_id() {
             // ToPropertyDescriptor: fields read via Get (getters run) in
             // spec order — enumerable, configurable, value, writable, get, set.
@@ -402,6 +409,13 @@ impl Vm {
             }
             let desc_is_accessor = desc_has_get || desc_has_set;
             let desc_is_data = has_value || present & Property::WRITABLE != 0;
+            // A descriptor may not mix data and accessor fields.
+            if desc_is_accessor && desc_is_data {
+                return Err(VmError::Throw(self.make_native_error(
+                    "TypeError",
+                    "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
+                )));
+            }
 
             // ValidateAndApplyPropertyDescriptor: an existing
             // non-configurable property rejects incompatible redefines.
