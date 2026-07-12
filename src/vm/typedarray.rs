@@ -52,6 +52,7 @@ impl Vm {
         self.func_prototypes.insert(SENT_DATAVIEW, dv_proto_oid);
         let dv_name = self.interner.intern("DataView");
         self.globals.insert(dv_name, Value::function(SENT_DATAVIEW));
+        self.seed_dataview_proto(dv_proto_oid);
 
         // Each typed array constructor + prototype.
         for kind in TA_KINDS {
@@ -74,6 +75,83 @@ impl Vm {
         let ctor_key = self.interner.intern("constructor");
         proto.define_property(ctor_key, Property::with_flags(
             Value::function(sentinel), Property::WRITABLE | Property::CONFIGURABLE));
+    }
+
+    /// Seed DataView.prototype: the 16 get*/set* methods as real function
+    /// objects (own name/length, spec attributes) plus buffer/byteLength/
+    /// byteOffset accessor getters.
+    fn seed_dataview_proto(&mut self, proto_oid: ObjectId) {
+        const TYPES: &[&str] = &["Int8", "Uint8", "Int16", "Uint16", "Int32", "Uint32", "Float32", "Float64"];
+        for ty in TYPES {
+            for (prefix, fn_len) in [("get", 1i32), ("set", 2)] {
+                let mname = format!("{prefix}{ty}");
+                let name_id = self.interner.intern(&mname);
+                let m = mname.clone();
+                let func: crate::runtime::object::NativeFn =
+                    std::sync::Arc::new(move |vm: &mut Vm, this: Value, args: &[Value]| {
+                        match vm.exec_dataview_method(this, &m, args) {
+                            Ok(v) => Ok(v),
+                            Err(VmError::Throw(v)) => Err(v),
+                            Err(e) => Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                        }
+                    });
+                let mut fn_obj = JsObject {
+                    properties: Vec::new(),
+                    prototype: Some(self.function_prototype),
+                    kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
+                    marked: false,
+                    extensible: true,
+                };
+                let name_key = self.interner.intern("name");
+                let len_key = self.interner.intern("length");
+                fn_obj.define_property(name_key, Property::with_flags(Value::string(name_id), Property::CONFIGURABLE));
+                fn_obj.define_property(len_key, Property::with_flags(Value::int(fn_len), Property::CONFIGURABLE));
+                let f_oid = self.heap.allocate(fn_obj);
+                if let Some(proto) = self.heap.get_mut(proto_oid) {
+                    proto.define_property(name_id, Property::with_flags(
+                        Value::object_id(f_oid), Property::WRITABLE | Property::CONFIGURABLE));
+                }
+            }
+        }
+        // Accessor getters: get buffer / get byteLength / get byteOffset.
+        for acc in ["buffer", "byteLength", "byteOffset"] {
+            let getter_name = format!("get {acc}");
+            let getter_name_id = self.interner.intern(&getter_name);
+            let acc_owned = acc.to_string();
+            let func: crate::runtime::object::NativeFn =
+                std::sync::Arc::new(move |vm: &mut Vm, this: Value, _args: &[Value]| {
+                    let dv = this.as_object_id().and_then(|oid| vm.heap.get(oid).and_then(|o| {
+                        if let ObjectKind::DataView { buffer, byte_offset, byte_length } = o.kind {
+                            Some((buffer, byte_offset, byte_length))
+                        } else { None }
+                    }));
+                    let Some((buffer, off, len)) = dv else {
+                        return Err(vm.make_native_error("TypeError", "DataView accessor called on incompatible receiver"));
+                    };
+                    Ok(match acc_owned.as_str() {
+                        "buffer" => Value::object_id(buffer),
+                        "byteLength" => Value::int(len as i32),
+                        _ => Value::int(off as i32),
+                    })
+                });
+            let mut fn_obj = JsObject {
+                properties: Vec::new(),
+                prototype: Some(self.function_prototype),
+                kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: getter_name_id, func }),
+                marked: false,
+                extensible: true,
+            };
+            let name_key = self.interner.intern("name");
+            let len_key = self.interner.intern("length");
+            fn_obj.define_property(name_key, Property::with_flags(Value::string(getter_name_id), Property::CONFIGURABLE));
+            fn_obj.define_property(len_key, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
+            let f_oid = self.heap.allocate(fn_obj);
+            let getter_key = self.interner.intern(&format!("__get_{acc}__"));
+            if let Some(proto) = self.heap.get_mut(proto_oid) {
+                proto.define_property(getter_key, Property::with_flags(
+                    Value::object_id(f_oid), Property::CONFIGURABLE));
+            }
+        }
     }
 
     /// Allocate an ArrayBuffer of `byte_len` zeroed bytes.
@@ -216,6 +294,119 @@ impl Vm {
             return self.interner.resolve(id).parse::<usize>().ok();
         }
         None
+    }
+
+    /// ToIndex: observable ToNumber, then integer validation (negative,
+    /// non-finite and >2^53-1 throw RangeError).
+    pub(crate) fn spec_to_index(&mut self, v: Value) -> Result<usize, VmError> {
+        if v.is_undefined() {
+            return Ok(0);
+        }
+        let n = self.coerce_to_f64(v)?;
+        let n = if n.is_nan() { 0.0 } else { n.trunc() };
+        if n < 0.0 || !n.is_finite() || n > 9_007_199_254_740_991.0 {
+            let e = self.make_native_error("RangeError", "Invalid index");
+            return Err(VmError::Throw(e));
+        }
+        Ok(n as usize)
+    }
+
+    /// GetViewValue / SetViewValue for every DataView get*/set* method.
+    pub(crate) fn exec_dataview_method(&mut self, this: Value, method: &str, args: &[Value]) -> Result<Value, VmError> {
+        let dv = this.as_object_id().and_then(|oid| self.heap.get(oid).and_then(|o| {
+            if let ObjectKind::DataView { buffer, byte_offset, byte_length } = o.kind {
+                Some((buffer, byte_offset, byte_length))
+            } else {
+                None
+            }
+        }));
+        let Some((buffer, view_off, view_len)) = dv else {
+            let e = self.make_native_error("TypeError", "DataView method called on incompatible receiver");
+            return Err(VmError::Throw(e));
+        };
+        let (is_get, ty) = if let Some(t) = method.strip_prefix("get") {
+            (true, t)
+        } else if let Some(t) = method.strip_prefix("set") {
+            (false, t)
+        } else {
+            return Ok(Value::undefined());
+        };
+        let size: usize = match ty {
+            "Int8" | "Uint8" => 1,
+            "Int16" | "Uint16" => 2,
+            "Int32" | "Uint32" | "Float32" => 4,
+            "Float64" => 8,
+            _ => return Ok(Value::undefined()),
+        };
+        // Spec order: ToIndex(requestIndex), then (for set) ToNumber(value),
+        // then bounds. Both coercions are observable.
+        let idx = self.spec_to_index(args.first().copied().unwrap_or(Value::undefined()))?;
+        let value = if is_get {
+            0.0
+        } else {
+            let v = args.get(1).copied().unwrap_or(Value::undefined());
+            if v.is_symbol() {
+                let e = self.make_native_error("TypeError", "Cannot convert a Symbol value to a number");
+                return Err(VmError::Throw(e));
+            }
+            self.coerce_to_f64(v)?
+        };
+        let little = {
+            let li = if is_get { 1 } else { 2 };
+            args.get(li).map(|v| self.truthy(*v)).unwrap_or(false)
+        };
+        if idx.checked_add(size).is_none_or(|end| end > view_len) {
+            let e = self.make_native_error("RangeError", "Offset is outside the bounds of the DataView");
+            return Err(VmError::Throw(e));
+        }
+        let start = view_off + idx;
+        if is_get {
+            let bytes: Vec<u8> = match self.heap.get(buffer).map(|o| &o.kind) {
+                Some(ObjectKind::ArrayBuffer(b)) => b[start..start + size].to_vec(),
+                _ => vec![0; size],
+            };
+            let mut raw = [0u8; 8];
+            for (i, b) in bytes.iter().enumerate() {
+                raw[if little { i } else { size - 1 - i }] = *b;
+            }
+            // raw is now little-endian
+            let bits = u64::from_le_bytes(raw);
+            let n: f64 = match ty {
+                "Int8" => (bits as u8) as i8 as f64,
+                "Uint8" => (bits as u8) as f64,
+                "Int16" => (bits as u16) as i16 as f64,
+                "Uint16" => (bits as u16) as f64,
+                "Int32" => (bits as u32) as i32 as f64,
+                "Uint32" => (bits as u32) as f64,
+                "Float32" => f32::from_bits(bits as u32) as f64,
+                "Float64" => f64::from_bits(bits),
+                _ => 0.0,
+            };
+            Ok(Value::number(n))
+        } else {
+            let bits: u64 = match ty {
+                "Float32" => (value as f32).to_bits() as u64,
+                "Float64" => value.to_bits(),
+                _ => {
+                    // Integer types wrap modulo 2^bits (ToInt8/ToUint8/…).
+                    if value.is_finite() {
+                        let m = value.trunc() as i128;
+                        m.rem_euclid(1i128 << (size * 8)) as u64
+                    } else {
+                        0
+                    }
+                }
+            };
+            let le = bits.to_le_bytes();
+            if let Some(obj) = self.heap.get_mut(buffer)
+                && let ObjectKind::ArrayBuffer(ref mut b) = obj.kind
+            {
+                for i in 0..size {
+                    b[start + i] = le[if little { i } else { size - 1 - i }];
+                }
+            }
+            Ok(Value::undefined())
+        }
     }
 
     pub(crate) fn typed_array_len(&self, oid: ObjectId) -> Option<usize> {

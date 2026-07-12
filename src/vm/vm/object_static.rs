@@ -899,6 +899,12 @@ impl Vm {
             (-530, "isNaN", 1), (-531, "isFinite", 1), (-532, "isInteger", 1), (-533, "isSafeInteger", 1),
             (-534, "fromCharCode", 1), (-535, "fromCodePoint", 1), (-536, "raw", 1),
             (-751, "isArray", 1), (-752, "for", 1), (-753, "keyFor", 1),
+            // ArrayBuffer/DataView/typed-array constructors (-660..-672).
+            (-660, "ArrayBuffer", 1), (-661, "DataView", 1),
+            (-662, "Int8Array", 3), (-663, "Uint8Array", 3), (-664, "Uint8ClampedArray", 3),
+            (-665, "Int16Array", 3), (-666, "Uint16Array", 3), (-667, "Int32Array", 3),
+            (-668, "Uint32Array", 3), (-669, "Float32Array", 3), (-670, "Float64Array", 3),
+            (-671, "BigInt64Array", 3), (-672, "BigUint64Array", 3),
             (-630, "toString", 0), (-631, "valueOf", 0), (-632, "toString", 1),
             (-633, "valueOf", 0), (-634, "toString", 0), (-635, "valueOf", 0),
             (-590, "hasOwnProperty", 1), (-591, "propertyIsEnumerable", 1),

@@ -224,6 +224,18 @@ const CATEGORIES: &[&str] = &[
     "built-ins/isNaN", "built-ins/isFinite", "built-ins/parseInt", "built-ins/parseFloat",
     "built-ins/eval", "built-ins/encodeURI", "built-ins/decodeURI",
     "built-ins/encodeURIComponent", "built-ins/decodeURIComponent",
+
+    // Phase-4 additions: typed arrays, BigInt, iterator prototypes, misc
+    "built-ins/ArrayBuffer", "built-ins/DataView",
+    "built-ins/TypedArray", "built-ins/TypedArrayConstructors",
+    "built-ins/BigInt",
+    "built-ins/ArrayIteratorPrototype", "built-ins/MapIteratorPrototype",
+    "built-ins/SetIteratorPrototype", "built-ins/StringIteratorPrototype",
+    "built-ins/RegExpStringIteratorPrototype",
+    "built-ins/GeneratorFunction", "built-ins/AsyncFunction",
+    "built-ins/ThrowTypeError",
+    "language/literals/regexp", "language/literals/bigint",
+    "language/expressions/new.target", "language/statements/debugger",
 ];
 
 fn main() {

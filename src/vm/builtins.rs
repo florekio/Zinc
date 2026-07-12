@@ -655,7 +655,7 @@ impl Vm {
     /// ToNumber that runs user valueOf/toString (ordinary `to_f64` is
     /// non-mutating and can't) — index arguments coerce observably per spec.
     /// Symbols throw TypeError.
-    fn coerce_to_f64(&mut self, v: Value) -> Result<f64, VmError> {
+    pub(crate) fn coerce_to_f64(&mut self, v: Value) -> Result<f64, VmError> {
         if v.is_symbol() {
             return Err(VmError::Throw(self.make_native_error(
                 "TypeError",

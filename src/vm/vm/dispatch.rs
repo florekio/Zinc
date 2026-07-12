@@ -6210,8 +6210,32 @@ impl Vm {
                                 self.truncate_stack(func_pos); self.handle_throw(e)?; continue;
                             };
                             let blen = if let Some(ObjectKind::ArrayBuffer(b)) = self.heap.get(buf_oid).map(|o| &o.kind) { b.len() } else { 0 };
-                            let off = if argc > 1 { self.to_f64(self.stack[func_pos + 2]) as usize } else { 0 };
-                            let len = if argc > 2 && !self.stack[func_pos + 3].is_undefined() { self.to_f64(self.stack[func_pos + 3]) as usize } else { blen.saturating_sub(off) };
+                            // ToIndex(byteOffset) / ToIndex(byteLength): negative,
+                            // non-finite or out-of-buffer values throw RangeError.
+                            let off_arg = if argc > 1 { self.stack[func_pos + 2] } else { Value::undefined() };
+                            let off = match self.spec_to_index(off_arg) {
+                                Ok(v) => v,
+                                Err(VmError::Throw(e)) => { self.truncate_stack(func_pos); self.handle_throw(e)?; continue; }
+                                Err(e) => return Err(e),
+                            };
+                            if off > blen {
+                                let e = self.make_native_error("RangeError", "Start offset is outside the bounds of the buffer");
+                                self.truncate_stack(func_pos); self.handle_throw(e)?; continue;
+                            }
+                            let len_arg = if argc > 2 { self.stack[func_pos + 3] } else { Value::undefined() };
+                            let len = if len_arg.is_undefined() {
+                                blen - off
+                            } else {
+                                match self.spec_to_index(len_arg) {
+                                    Ok(v) => v,
+                                    Err(VmError::Throw(e)) => { self.truncate_stack(func_pos); self.handle_throw(e)?; continue; }
+                                    Err(e) => return Err(e),
+                                }
+                            };
+                            if off.checked_add(len).is_none_or(|end| end > blen) {
+                                let e = self.make_native_error("RangeError", "Invalid DataView length");
+                                self.truncate_stack(func_pos); self.handle_throw(e)?; continue;
+                            }
                             let proto = self.func_prototypes.get(&crate::vm::typedarray::SENT_DATAVIEW).copied();
                             let obj = JsObject { properties: Vec::new(), prototype: proto,
                                 kind: ObjectKind::DataView { buffer: buf_oid, byte_offset: off, byte_length: len }, marked: false, extensible: true };
