@@ -3575,33 +3575,47 @@ impl Vm {
                                 .map(|o| matches!(&o.kind, ObjectKind::Array(_)))
                                 .unwrap_or(false);
                             if is_array {
+                                let ro_key = self.interner.intern("__len_ro__");
+                                if self.heap.get(oid).is_some_and(|o| o.has_own_property(ro_key)) {
+                                    let in_strict = self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT);
+                                    if in_strict {
+                                        let err = self.make_native_error(
+                                            "TypeError",
+                                            "Cannot assign to read only property 'length' of object",
+                                        );
+                                        self.handle_throw(err)?;
+                                    } else {
+                                        self.push(val);
+                                    }
+                                    continue;
+                                }
                                 let new_len = self.to_f64(val) as usize;
-                                // Named index properties at or beyond the new
-                                // length are deleted; any shadow length is
-                                // superseded by this assignment.
-                                let doomed: Vec<StringId> = self.heap.get(oid)
-                                    .map(|o| o.properties.iter()
-                                        .filter(|(k, _)| {
-                                            let ks = self.interner.resolve(*k);
-                                            ks == "length"
-                                                || ks.parse::<usize>().is_ok_and(|i| i >= new_len)
-                                        })
-                                        .map(|(k, _)| *k)
-                                        .collect())
-                                    .unwrap_or_default();
-                                if let Some(obj) = self.heap.get_mut(oid) {
-                                    // Raw removal: the shadow length and the
-                                    // truncated indices go away regardless of
-                                    // configurable flags (internal bookkeeping,
-                                    // not a user delete).
-                                    obj.properties.retain(|(k, _)| !doomed.contains(k));
+                                let dense_len = self.heap.get(oid).map(|o| {
+                                    if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 }
+                                }).unwrap_or(0);
+                                if new_len <= dense_len {
+                                    // Shrink stops at non-configurable indices
+                                    // (silent in sloppy code, throws in strict).
+                                    if !self.array_shrink_length(oid, new_len) {
+                                        let in_strict = self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT);
+                                        if in_strict {
+                                            let err = self.make_native_error(
+                                                "TypeError",
+                                                "Cannot delete property of array while setting length",
+                                            );
+                                            self.handle_throw(err)?;
+                                            continue;
+                                        }
+                                    }
+                                } else if let Some(obj) = self.heap.get_mut(oid) {
+                                    let lk = self.interner.intern("length");
+                                    // Raw removal: the shadow length is internal
+                                    // bookkeeping, not a user delete.
+                                    obj.properties.retain(|(k, _)| *k != lk);
                                     if let ObjectKind::Array(ref mut elements) = obj.kind {
-                                        if new_len <= elements.len() {
-                                            elements.truncate(new_len);
-                                        } else if new_len <= 1_000_000 {
+                                        if new_len <= 1_000_000 {
                                             elements.resize(new_len, Value::undefined());
                                         } else {
-                                            let lk = self.interner.intern("length");
                                             obj.define_property(lk, Property::with_flags(Value::number(new_len as f64), Property::WRITABLE));
                                         }
                                     }
@@ -4157,26 +4171,47 @@ impl Vm {
                             if name_str == "length"
                                 && self.heap.get(oid).is_some_and(|o| matches!(&o.kind, ObjectKind::Array(_)))
                             {
+                                let ro_key = self.interner.intern("__len_ro__");
+                                if self.heap.get(oid).is_some_and(|o| o.has_own_property(ro_key)) {
+                                    let chunk_idx = self.cur_chunk();
+                                    let in_strict = self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT);
+                                    if in_strict {
+                                        let err = self.make_native_error(
+                                            "TypeError",
+                                            "Cannot assign to read only property 'length' of object",
+                                        );
+                                        self.handle_throw(err)?;
+                                    } else {
+                                        self.push(val);
+                                    }
+                                    continue;
+                                }
                                 let new_len = self.to_f64(val) as usize;
-                                let doomed: Vec<StringId> = self.heap.get(oid)
-                                    .map(|o| o.properties.iter()
-                                        .filter(|(k, _)| {
-                                            let ks = self.interner.resolve(*k);
-                                            ks == "length"
-                                                || ks.parse::<usize>().is_ok_and(|i| i >= new_len)
-                                        })
-                                        .map(|(k, _)| *k)
-                                        .collect())
-                                    .unwrap_or_default();
-                                if let Some(obj) = self.heap.get_mut(oid) {
-                                    obj.properties.retain(|(k, _)| !doomed.contains(k));
+                                let dense_len = self.heap.get(oid).map(|o| {
+                                    if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 }
+                                }).unwrap_or(0);
+                                if new_len <= dense_len {
+                                    if !self.array_shrink_length(oid, new_len) {
+                                        let chunk_idx = self.cur_chunk();
+                                        let in_strict = self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT);
+                                        if in_strict {
+                                            let err = self.make_native_error(
+                                                "TypeError",
+                                                "Cannot delete property of array while setting length",
+                                            );
+                                            self.handle_throw(err)?;
+                                            continue;
+                                        }
+                                    }
+                                } else if let Some(obj) = self.heap.get_mut(oid) {
+                                    let lk = self.interner.intern("length");
+                                    // Raw removal: the shadow length is internal
+                                    // bookkeeping, not a user delete.
+                                    obj.properties.retain(|(k, _)| *k != lk);
                                     if let ObjectKind::Array(ref mut elements) = obj.kind {
-                                        if new_len <= elements.len() {
-                                            elements.truncate(new_len);
-                                        } else if new_len <= 1_000_000 {
+                                        if new_len <= 1_000_000 {
                                             elements.resize(new_len, Value::undefined());
                                         } else {
-                                            let lk = self.interner.intern("length");
                                             obj.define_property(lk, Property::with_flags(Value::number(new_len as f64), Property::WRITABLE));
                                         }
                                     }

@@ -437,9 +437,11 @@ impl Vm {
                             let en_key = self.interner.intern("enumerable");
                             let cf_key = self.interner.intern("configurable");
                             if key_str == "length" {
+                                let ro_key = self.interner.intern("__len_ro__");
+                                let len_ro = self.heap.get(oid).is_some_and(|o| o.has_own_property(ro_key));
                                 let mut desc = JsObject::ordinary();
                                 desc.set_property(val_key, Value::int(len as i32));
-                                desc.set_property(wr_key, Value::boolean(true));
+                                desc.set_property(wr_key, Value::boolean(!len_ro));
                                 desc.set_property(en_key, Value::boolean(false));
                                 desc.set_property(cf_key, Value::boolean(false));
                                 Value::object_id(self.heap.allocate(desc))

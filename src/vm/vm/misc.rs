@@ -218,6 +218,48 @@ impl Vm {
         Ok(None)
     }
 
+    /// ArraySetLength shrink: remove named index props and dense elements
+    /// from the top down, stopping at the first non-configurable index.
+    /// Returns true when the full shrink to `req` succeeded.
+    pub(crate) fn array_shrink_length(&mut self, oid: ObjectId, req: usize) -> bool {
+        fn canon(s: &str) -> Option<usize> {
+            if s == "0" { return Some(0); }
+            if s.is_empty() || s.as_bytes()[0] == b'0' || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            s.parse::<u64>().ok().filter(|&n| n < (u32::MAX as u64)).map(|n| n as usize)
+        }
+        let cur_len = self.heap.get(oid).map(|o| {
+            if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 }
+        }).unwrap_or(0);
+        let barrier = self.heap.get(oid).and_then(|o| o.properties.iter()
+            .filter_map(|(k, p)| {
+                let ks = self.interner.resolve(*k);
+                canon(ks).filter(|i| *i >= req && *i < cur_len && !p.is_configurable())
+            })
+            .max());
+        let stop = barrier.map(|b| b + 1).unwrap_or(req);
+        let len_key = self.interner.intern("length");
+        let doomed: Vec<StringId> = self.heap.get(oid)
+            .map(|o| o.properties.iter()
+                .filter(|(k, _)| {
+                    *k == len_key || {
+                        let ks = self.interner.resolve(*k);
+                        canon(ks).is_some_and(|i| i >= stop)
+                    }
+                })
+                .map(|(k, _)| *k)
+                .collect())
+            .unwrap_or_default();
+        if let Some(obj) = self.heap.get_mut(oid) {
+            obj.properties.retain(|(k, _)| !doomed.contains(k));
+            if let ObjectKind::Array(ref mut elements) = obj.kind {
+                elements.truncate(stop);
+            }
+        }
+        barrier.is_none()
+    }
+
     pub(crate) fn object_define_property(&mut self, args: &[Value]) -> Result<Value, VmError> {
         // A canonical array index per ECMAScript: the string is the decimal
         // form of a non-negative integer < 2^32-1, with no leading zeros
@@ -580,6 +622,26 @@ impl Vm {
             if key_str == "length"
                 && self.heap.get(target_oid).is_some_and(|o| matches!(o.kind, ObjectKind::Array(_)))
             {
+                let ro_key = self.interner.intern("__len_ro__");
+                let len_ro = self.heap.get(target_oid).is_some_and(|o| o.has_own_property(ro_key));
+                // length is non-configurable and non-enumerable; a descriptor
+                // asking otherwise is rejected by ValidateAndApply.
+                if (present & Property::CONFIGURABLE != 0 && flags & Property::CONFIGURABLE != 0)
+                    || (present & Property::ENUMERABLE != 0 && flags & Property::ENUMERABLE != 0)
+                {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Cannot redefine property: length",
+                    )));
+                }
+                // Non-writable length: can't be made writable again, and
+                // can't change value.
+                if len_ro && present & Property::WRITABLE != 0 && flags & Property::WRITABLE != 0 {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Cannot redefine property: length",
+                    )));
+                }
                 if has_value {
                     // ToNumber runs ToPrimitive observably (objects with
                     // toString/valueOf, throws propagate).
@@ -596,9 +658,19 @@ impl Vm {
                         ));
                     }
                     let req = n32 as usize;
-                    let cur_len = self.heap.get(target_oid).map(|o| {
-                        if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 }
-                    }).unwrap_or(0);
+                    let (cur_len, shadow_len) = self.heap.get(target_oid).map(|o| {
+                        let dense = if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 };
+                        let sh = o.get_property(key_id)
+                            .and_then(|v| v.as_number().or_else(|| v.as_int().map(|i| i as f64)));
+                        (dense, sh)
+                    }).unwrap_or((0, None));
+                    let effective_len = shadow_len.map(|f| f as usize).unwrap_or(cur_len);
+                    if len_ro && req != effective_len {
+                        return Err(VmError::Throw(self.make_native_error(
+                            "TypeError",
+                            "Cannot assign to read only property 'length' of object",
+                        )));
+                    }
                     if req > cur_len {
                         // Growing creates HOLES, which dense storage can't
                         // represent (undefined-filling would fabricate own
@@ -610,12 +682,25 @@ impl Vm {
                                 Property::with_flags(Value::number(n32 as f64), Property::WRITABLE),
                             );
                         }
-                    } else if let Some(obj) = self.heap.get_mut(target_oid)
-                        && let ObjectKind::Array(ref mut elements) = obj.kind
-                    {
-                        elements.truncate(req);
-                        obj.delete_property(key_id); // drop any stale shadow
+                    } else if !self.array_shrink_length(target_oid, req) {
+                        // A non-configurable index stopped the shrink: length
+                        // lands at barrier+1 and the define reports failure.
+                        // writable:false still applies on failure, per spec.
+                        if present & Property::WRITABLE != 0 && flags & Property::WRITABLE == 0
+                            && let Some(obj) = self.heap.get_mut(target_oid)
+                        {
+                            obj.define_property(ro_key, Property::with_flags(Value::boolean(true), 0));
+                        }
+                        return Err(VmError::Throw(self.make_native_error(
+                            "TypeError",
+                            "Cannot delete property of array while setting length",
+                        )));
                     }
+                }
+                if present & Property::WRITABLE != 0 && flags & Property::WRITABLE == 0
+                    && let Some(obj) = self.heap.get_mut(target_oid)
+                {
+                    obj.define_property(ro_key, Property::with_flags(Value::boolean(true), 0));
                 }
                 return Ok(target);
             }
