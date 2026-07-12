@@ -201,14 +201,17 @@ impl Vm {
 
     /// Implement Promise.all, race, allSettled, any
     fn exec_promise_combinator(&mut self, kind: CombinatorKind, args: &[Value]) -> Result<Value, VmError> {
-        // Extract the iterable (first arg, expected to be an array)
+        // GetIterator(iterable): abrupt completions (non-iterables, poisoned
+        // @@iterator) REJECT the returned promise rather than throwing.
         let iterable = args.first().copied().unwrap_or(Value::undefined());
-        let elements: Vec<Value> = if let Some(oid) = iterable.as_object_id()
-            && let Some(obj) = self.heap.get(oid)
-                && let ObjectKind::Array(ref elems) = obj.kind {
-                    elems.clone()
-                } else {
-            vec![]
+        let elements: Vec<Value> = match self.simple_iterable_to_list(iterable) {
+            Ok(list) => list,
+            Err(VmError::Throw(err)) => {
+                let pid = self.allocate_promise();
+                self.reject_promise(pid, err)?;
+                return Ok(Value::object_id(pid));
+            }
+            Err(e) => return Err(e),
         };
 
         // Create result promise
