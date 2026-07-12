@@ -259,6 +259,14 @@ impl<'a> Compiler<'a> {
                     .emit_op_u16(OpCode::GetLocalWide, slot as u16, line);
             }
             if let Some(pos) = guard { self.chunk.patch_jump(pos); }
+        } else if self.interner.resolve(name) == "arguments"
+            && !self.chunk.flags.contains(crate::compiler::chunk::ChunkFlags::ARROW)
+        {
+            // Every non-arrow function has its OWN `arguments` binding: an
+            // outer `var arguments` must not be captured as an upvalue.
+            self.chunk.uses_arguments = true;
+            let idx = self.make_string_constant(name);
+            self.chunk.emit_op_u16(OpCode::GetGlobal, idx, line);
         } else if let Some(uv_idx) = self.resolve_upvalue(name) {
             let guard = (self.with_depth > 0)
                 .then(|| self.emit_with_guard(OpCode::WithGetCheck, name, line));
