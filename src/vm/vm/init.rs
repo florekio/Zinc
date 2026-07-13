@@ -18,7 +18,7 @@ impl Vm {
         Self::flatten_chunk(chunk, &mut chunks);
 
         let mut heap = ObjectHeap::new();
-        let mut func_prototypes: HashMap<i32, ObjectId> = HashMap::new();
+        let mut func_prototypes: HashMap<i64, ObjectId> = HashMap::new();
 
         // Create Object.prototype singleton (root of all prototype chains)
         let mut obj_proto = JsObject::ordinary();
@@ -59,7 +59,7 @@ impl Vm {
         let mut arr_proto = JsObject::ordinary();
         arr_proto.prototype = Some(object_prototype);
         for (name, sentinel) in [
-            ("join", -600i32), ("push", -601), ("pop", -602), ("shift", -603),
+            ("join", -600i64), ("push", -601), ("pop", -602), ("shift", -603),
             ("unshift", -604), ("indexOf", -605), ("includes", -606), ("forEach", -607),
             ("map", -608), ("filter", -609), ("reduce", -610), ("some", -611),
             ("every", -612), ("find", -613), ("findIndex", -614), ("slice", -615),
@@ -88,7 +88,7 @@ impl Vm {
         let bool_vo_key = interner.intern("valueOf");
         bool_proto.define_property(bool_vo_key, Property::with_flags(Value::function(-631), Property::WRITABLE | Property::CONFIGURABLE));
         let boolean_prototype = heap.allocate(bool_proto);
-        func_prototypes.insert(-506i32, boolean_prototype);
+        func_prototypes.insert(-506i64, boolean_prototype);
 
         // Create Number.prototype (prototype = Object.prototype)
         let mut num_proto = JsObject::ordinary();
@@ -99,7 +99,7 @@ impl Vm {
         let num_vo_key = interner.intern("valueOf");
         num_proto.define_property(num_vo_key, Property::with_flags(Value::function(-633), Property::WRITABLE | Property::CONFIGURABLE));
         let number_prototype = heap.allocate(num_proto);
-        func_prototypes.insert(-505i32, number_prototype);
+        func_prototypes.insert(-505i64, number_prototype);
 
         // Create Date.prototype (prototype = Object.prototype). Methods are
         // reified lazily via reify_builtin_proto_method.
@@ -107,7 +107,7 @@ impl Vm {
         date_proto.prototype = Some(object_prototype);
         date_proto.define_property(ctor_key, Property::with_flags(Value::function(-550), Property::WRITABLE | Property::CONFIGURABLE));
         let date_prototype = heap.allocate(date_proto);
-        func_prototypes.insert(-550i32, date_prototype);
+        func_prototypes.insert(-550i64, date_prototype);
 
         // Create String.prototype (prototype = Object.prototype)
         let mut str_proto = JsObject::ordinary();
@@ -118,7 +118,7 @@ impl Vm {
         let str_vo_key = interner.intern("valueOf");
         str_proto.define_property(str_vo_key, Property::with_flags(Value::function(-635), Property::WRITABLE | Property::CONFIGURABLE));
         let string_prototype = heap.allocate(str_proto);
-        func_prototypes.insert(-504i32, string_prototype);
+        func_prototypes.insert(-504i64, string_prototype);
 
         // Create Promise.prototype (prototype = Object.prototype). The actual
         // .then/.catch/.finally methods are dispatched specially in CallMethod
@@ -181,7 +181,7 @@ impl Vm {
             );
         }
         let promise_prototype = heap.allocate(promise_proto);
-        func_prototypes.insert(-520i32, promise_prototype);
+        func_prototypes.insert(-520i64, promise_prototype);
 
         // Create Error.prototype objects so subclasses inherit `name`
         // First create Error.prototype itself
@@ -199,11 +199,11 @@ impl Vm {
         let err_tostr_key = interner.intern("toString");
         error_proto.define_property(err_tostr_key, Property::with_flags(Value::function(-598), Property::WRITABLE | Property::CONFIGURABLE));
         let error_prototype_oid = heap.allocate(error_proto);
-        func_prototypes.insert(-510i32, error_prototype_oid);
+        func_prototypes.insert(-510i64, error_prototype_oid);
 
         // Create derived error prototypes with prototype = Error.prototype
         for (sentinel, type_name) in [
-            (-511i32, "TypeError"), (-512, "RangeError"),
+            (-511i64, "TypeError"), (-512, "RangeError"),
             (-513, "ReferenceError"), (-514, "SyntaxError"), (-515, "EvalError"), (-516, "URIError"),
             (-539, "AggregateError"),
         ] {
@@ -255,7 +255,7 @@ impl Vm {
         math_obj.define_property(sqrt1_2_name, Property::with_flags(Value::number(std::f64::consts::FRAC_1_SQRT_2), 0));
         // Math methods as sentinel functions (-700 range)
         for (name, sentinel) in [
-            ("sin", -700i32), ("cos", -701), ("abs", -702), ("floor", -703),
+            ("sin", -700i64), ("cos", -701), ("abs", -702), ("floor", -703),
             ("ceil", -704), ("round", -705), ("sqrt", -706), ("pow", -707),
             ("max", -708), ("min", -709), ("exp", -710), ("log", -711),
             ("log2", -712), ("log10", -713), ("random", -714), ("trunc", -715),
@@ -393,9 +393,9 @@ impl Vm {
                     }
                 })
             };
-            let seed = |sentinel: i32, kind: u8, names: &[&str],
+            let seed = |sentinel: i64, kind: u8, names: &[&str],
                             heap: &mut ObjectHeap, interner: &mut Interner,
-                            func_prototypes: &mut HashMap<i32, ObjectId>| {
+                            func_prototypes: &mut HashMap<i64, ObjectId>| {
                 let mut proto = JsObject::ordinary();
                 proto.prototype = Some(object_prototype);
                 proto.define_property(ctor_key, Property::with_flags(Value::function(sentinel), Property::WRITABLE | Property::CONFIGURABLE));
@@ -518,7 +518,7 @@ impl Vm {
                 re_proto.define_property(key, Property::with_flags(val, Property::WRITABLE | Property::CONFIGURABLE));
             }
             let re_proto_oid = heap.allocate(re_proto);
-            func_prototypes.insert(-580i32, re_proto_oid);
+            func_prototypes.insert(-580i64, re_proto_oid);
             // Flag accessors are GETTERS on the prototype per spec —
             // getOwnPropertyDescriptor(RegExp.prototype, "global").get is a
             // real function; non-RegExp receivers throw TypeError, and the

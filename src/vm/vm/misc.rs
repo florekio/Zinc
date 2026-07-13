@@ -902,7 +902,7 @@ impl Vm {
         self.maybe_disasm_chunks(&flat_chunks);
         self.chunks.extend(flat_chunks);
         // Run the outer wrapper to evaluate the function expression
-        let wrapper_fn = Value::function(base_idx as i32);
+        let wrapper_fn = Value::function(base_idx as i64);
         let result = self.call_function(wrapper_fn, &[])?;
         Ok(result)
     }
@@ -1739,7 +1739,7 @@ impl Vm {
         if let Some(packed) = method_val.as_function()
             && packed >= 0
         {
-            let cid = ((packed as u32) >> 16) as usize;
+            let cid = Value::fn_closure_id(packed);
             if cid != 0 {
                 let mut env = vec![class_oid];
                 if let Some(existing) = self.closure_private_env.get(&cid) {
@@ -1799,7 +1799,7 @@ impl Vm {
             .and_then(|f| self.stack.get(f.base - 1))
             .and_then(|v| v.as_function())
             .filter(|p| *p >= 0)
-            .map(|p| ((p as u32) >> 16) as usize)
+            .map(|p| Value::fn_closure_id(p))
             .filter(|cid| *cid != 0)
             .and_then(|cid| self.closure_private_env.get(&cid).cloned());
         let Some(env) = env else { return true };
@@ -1908,7 +1908,7 @@ impl Vm {
     /// Internal kind for `this` when a class extends a native built-in:
     /// mirrors what `new Builtin(...args)` would produce. Used by both the
     /// explicit super(...) path and the implicit default constructor.
-    pub(crate) fn native_subclass_kind(&mut self, sentinel: i32, args: &[Value]) -> Option<ObjectKind> {
+    pub(crate) fn native_subclass_kind(&mut self, sentinel: i64, args: &[Value]) -> Option<ObjectKind> {
         match sentinel {
             // Array
             -507 => {
@@ -2056,7 +2056,7 @@ impl Vm {
                 arr.define_property(
                     callee_key,
                     crate::runtime::object::Property::with_flags(
-                        Value::function(chunk_idx as i32),
+                        Value::function(chunk_idx as i64),
                         crate::runtime::object::Property::WRITABLE
                             | crate::runtime::object::Property::CONFIGURABLE,
                     ),
@@ -2225,7 +2225,7 @@ impl Vm {
         ];
         // Object.prototype methods route through their exec_native_method
         // sentinels; Boolean.prototype through -630/-631.
-        const OBJECT_METHODS: &[(&str, i32, i32)] = &[
+        const OBJECT_METHODS: &[(&str, i32, i64)] = &[
             ("hasOwnProperty", 1, -590), ("propertyIsEnumerable", 1, -591),
             ("toString", 0, -592), ("valueOf", 0, -593),
             ("isPrototypeOf", 1, -594),
@@ -2234,7 +2234,7 @@ impl Vm {
             ("toString", 1), ("toLocaleString", 0), ("valueOf", 0),
             ("toFixed", 1), ("toExponential", 1), ("toPrecision", 1),
         ];
-        const BOOLEAN_METHODS: &[(&str, i32, i32)] =
+        const BOOLEAN_METHODS: &[(&str, i32, i64)] =
             &[("toString", 0, -630), ("valueOf", 0, -631)];
         const DATE_METHODS: &[(&str, i32)] = &[
             ("getTime", 0), ("valueOf", 0), ("getFullYear", 0), ("getUTCFullYear", 0),
@@ -2255,10 +2255,10 @@ impl Vm {
         enum Route {
             String,
             Array,
-            Sentinel(i32),
+            Sentinel(i64),
             /// Sentinel dispatch behind a RequireObjectCoercible check
             /// (Object.prototype.toLocaleString → this.toString()).
-            CoercibleSentinel(i32),
+            CoercibleSentinel(i64),
             Number,
             Date,
         }

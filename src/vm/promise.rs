@@ -25,8 +25,8 @@ impl Vm {
                 .is_some_and(|o| matches!(o.kind, ObjectKind::Promise { .. }))
         {
             let then_name = self.interner.intern("then");
-            let resolve_sentinel = Value::function(-600_000 - oid.0 as i32);
-            let reject_sentinel = Value::function(-700_000 - oid.0 as i32);
+            let resolve_sentinel = Value::function(-600_000 - oid.0 as i64);
+            let reject_sentinel = Value::function(-700_000 - oid.0 as i64);
             self.exec_promise_method(inner_oid, then_name, &[resolve_sentinel, reject_sentinel])?;
             return Ok(());
         }
@@ -45,8 +45,8 @@ impl Vm {
                 Err(e) => return Err(e),
             };
             if self.value_callable(then_val) {
-                let resolve_sentinel = Value::function(-600_000 - oid.0 as i32);
-                let reject_sentinel = Value::function(-700_000 - oid.0 as i32);
+                let resolve_sentinel = Value::function(-600_000 - oid.0 as i64);
+                let reject_sentinel = Value::function(-700_000 - oid.0 as i64);
                 let prev = self.protect_throw_depth;
                 self.protect_throw_depth = self.frames.len() + 1;
                 let r = self.call_function_this(then_val, value, &[resolve_sentinel, reject_sentinel]);
@@ -180,7 +180,7 @@ impl Vm {
                     };
                     let tracker_oid = self.heap.allocate(tracker);
                     self.pending_combinators.push(tracker_oid);
-                    let fulfill_sentinel = Value::function(-1_100_000 - tracker_oid.0 as i32);
+                    let fulfill_sentinel = Value::function(-1_100_000 - tracker_oid.0 as i64);
 
                     // Create reject sentinel: calls callback then propagates original reason
                     let tracker2 = JsObject {
@@ -191,7 +191,7 @@ impl Vm {
                         extensible: true,
                     };
                     let tracker2_oid = self.heap.allocate(tracker2);
-                    let reject_sentinel = Value::function(-1_200_000 - tracker2_oid.0 as i32);
+                    let reject_sentinel = Value::function(-1_200_000 - tracker2_oid.0 as i64);
 
                     self.exec_promise_method(oid, then_name, &[fulfill_sentinel, reject_sentinel])
                 } else {
@@ -382,8 +382,8 @@ impl Vm {
             // range and Promise.all silently misrouted its callbacks
             // (resolve decoded as reject for a different tracker).
             let encoded = tracker_oid.0 as i64 * 2048 + i as i64 * 2;
-            let resolve_sentinel = Value::function((-1_000_000_000i64 - encoded) as i32);
-            let reject_sentinel = Value::function((-1_000_000_000i64 - encoded - 1) as i32);
+            let resolve_sentinel = Value::function((-1_000_000_000i64 - encoded) as i64);
+            let reject_sentinel = Value::function((-1_000_000_000i64 - encoded - 1) as i64);
 
             // Invoke(nextPromise, "then", ...) is a real Get + Call: an own
             // "then" override (data or getter) is observable, and abrupt
@@ -652,7 +652,7 @@ impl Vm {
                 "Promise capability constructor is not a constructor",
             ));
         }
-        let chunk_idx = (packed & 0xFFFF) as usize;
+        let chunk_idx = Value::fn_chunk_idx(packed);
         if chunk_idx < self.chunks.len() && self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW) {
             return Err(self.make_native_error(
                 "TypeError",

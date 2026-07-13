@@ -8,9 +8,9 @@ use crate::runtime::value::Value;
 use super::vm::{Vm, VmError};
 
 /// Constructor sentinels. ArrayBuffer/DataView plus the 11 typed-array kinds.
-pub(crate) const SENT_ARRAYBUFFER: i32 = -660;
-pub(crate) const SENT_DATAVIEW: i32 = -661;
-const TA_SENTINEL_BASE: i32 = -662; // Int8Array .. BigUint64Array, in TA_KINDS order
+pub(crate) const SENT_ARRAYBUFFER: i64 = -660;
+pub(crate) const SENT_DATAVIEW: i64 = -661;
+const TA_SENTINEL_BASE: i64 = -662; // Int8Array .. BigUint64Array, in TA_KINDS order
 
 const TA_KINDS: [TypedArrayKind; 11] = [
     TypedArrayKind::Int8, TypedArrayKind::Uint8, TypedArrayKind::Uint8Clamped,
@@ -19,12 +19,12 @@ const TA_KINDS: [TypedArrayKind; 11] = [
     TypedArrayKind::BigInt64, TypedArrayKind::BigUint64,
 ];
 
-pub(crate) fn sentinel_for_kind(kind: TypedArrayKind) -> i32 {
+pub(crate) fn sentinel_for_kind(kind: TypedArrayKind) -> i64 {
     let idx = TA_KINDS.iter().position(|&k| k == kind).unwrap();
-    TA_SENTINEL_BASE - idx as i32
+    TA_SENTINEL_BASE - idx as i64
 }
 
-pub(crate) fn kind_for_sentinel(sentinel: i32) -> Option<TypedArrayKind> {
+pub(crate) fn kind_for_sentinel(sentinel: i64) -> Option<TypedArrayKind> {
     if sentinel > TA_SENTINEL_BASE { return None; }
     let idx = (TA_SENTINEL_BASE - sentinel) as usize;
     TA_KINDS.get(idx).copied()
@@ -71,7 +71,7 @@ impl Vm {
         }
     }
 
-    fn define_ctor_on_proto(&mut self, proto: &mut JsObject, sentinel: i32) {
+    fn define_ctor_on_proto(&mut self, proto: &mut JsObject, sentinel: i64) {
         let ctor_key = self.interner.intern("constructor");
         proto.define_property(ctor_key, Property::with_flags(
             Value::function(sentinel), Property::WRITABLE | Property::CONFIGURABLE));

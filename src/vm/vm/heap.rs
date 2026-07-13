@@ -92,8 +92,8 @@ impl Vm {
                                     // Adopt the inner promise's state: when it
                                     // settles, forward to result_promise.
                                     let then_name = self.interner.intern("then");
-                                    let resolve_sentinel = Value::function(-600_000 - result_promise.0 as i32);
-                                    let reject_sentinel = Value::function(-700_000 - result_promise.0 as i32);
+                                    let resolve_sentinel = Value::function(-600_000 - result_promise.0 as i64);
+                                    let reject_sentinel = Value::function(-700_000 - result_promise.0 as i64);
                                     self.exec_promise_method(inner_oid, then_name, &[resolve_sentinel, reject_sentinel])?;
                                 } else {
                                     self.resolve_promise(result_promise, result)?;

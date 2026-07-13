@@ -811,7 +811,7 @@ impl Vm {
                             .and_then(|f| self.stack.get(f.base - 1))
                             .and_then(|v| v.as_function())
                             .filter(|p| *p >= 0)
-                            .map(|p| ((p as u32) >> 16) as usize)
+                            .map(|p| Value::fn_closure_id(p))
                             .filter(|cid| *cid != 0)
                             .and_then(|cid| self.closure_arrow_args.get(&cid).copied());
                         let v = match captured {
@@ -1076,8 +1076,8 @@ impl Vm {
 
                     if func_val.is_function() {
                         let packed = func_val.as_function().unwrap();
-                        let closure_id = ((packed as u32) >> 16) as usize;
-                        let chunk_idx = (packed & 0xFFFF) as usize;
+                        let closure_id = Value::fn_closure_id(packed);
+                        let chunk_idx = Value::fn_chunk_idx(packed);
 
                         if chunk_idx >= 1 && chunk_idx < self.chunks.len() {
                             // Pad missing arguments with undefined
@@ -1555,7 +1555,7 @@ impl Vm {
                                         .and_then(|f| self.stack.get(f.base - 1))
                                         .and_then(|v| v.as_function())
                                         .filter(|p| *p >= 0)
-                                        .map(|p| ((p as u32) >> 16) as usize)
+                                        .map(|p| Value::fn_closure_id(p))
                                         .filter(|cid| *cid != 0)
                                         .and_then(|cid| self.closure_private_env.get(&cid).cloned())
                                 } else {
@@ -1640,29 +1640,25 @@ impl Vm {
                         self.maybe_disasm_chunks(&flat_chunks);
                         self.chunks.extend(flat_chunks);
                         // Execute inheriting the current `this` binding (spec requirement)
-                        let mut eval_fn = Value::function(base_idx as i32);
+                        let mut eval_fn = Value::function(base_idx as i64);
                         // Direct eval also runs in the caller's private-name
                         // environment (`eval("this.#m")` inside a method sees the
                         // class's #m). Allocate a closure identity for this eval
                         // body and copy the caller's chain onto it.
-                        if direct_eval && base_idx <= 0xFFFF {
+                        if direct_eval && base_idx as i64 <= crate::runtime::value::FN_CHUNK_MASK {
                             let caller_env = self.frames.last()
                                 .filter(|f| f.base > 0)
                                 .and_then(|f| self.stack.get(f.base - 1))
                                 .and_then(|v| v.as_function())
                                 .filter(|p| *p >= 0)
-                                .map(|p| ((p as u32) >> 16) as usize)
+                                .map(|p| Value::fn_closure_id(p))
                                 .filter(|cid| *cid != 0)
                                 .and_then(|cid| self.closure_private_env.get(&cid).cloned());
                             if let Some(env) = caller_env {
                                 let cid = self.closure_upvalues.len();
-                                if cid <= 0x7FFF {
-                                    self.closure_upvalues.push(Vec::new());
-                                    self.closure_private_env.insert(cid, env);
-                                    eval_fn = Value::function(
-                                        ((cid as i32) << 16) | (base_idx as i32 & 0xFFFF),
-                                    );
-                                }
+                                self.closure_upvalues.push(Vec::new());
+                                self.closure_private_env.insert(cid, env);
+                                eval_fn = Value::function(Value::pack_closure(cid, base_idx));
                             }
                         }
                         let current_this = self.frames.last().map(|f| f.this_value).unwrap_or(Value::undefined());
@@ -1791,8 +1787,8 @@ impl Vm {
                                         reactions: Vec::new(),
                                     };
                                 }
-                                let resolve_val = Value::function(-600_000 - this_oid.0 as i32);
-                                let reject_val = Value::function(-700_000 - this_oid.0 as i32);
+                                let resolve_val = Value::function(-600_000 - this_oid.0 as i64);
+                                let reject_val = Value::function(-700_000 - this_oid.0 as i64);
                                 match self.call_function(executor, &[resolve_val, reject_val]) {
                                     Ok(_) => {}
                                     Err(VmError::Throw(v)) => { self.reject_promise(this_oid, v)?; }
@@ -1982,7 +1978,7 @@ impl Vm {
                             let target_fn = self.heap.get(target_oid).and_then(|o| {
                                 match &o.kind {
                                     ObjectKind::Function(crate::runtime::object::FunctionKind::Bytecode { chunk_idx, .. }) => {
-                                        Some(Value::function(*chunk_idx as i32))
+                                        Some(Value::function(*chunk_idx as i64))
                                     }
                                     ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { sentinel }) => {
                                         Some(Value::function(*sentinel))
@@ -2049,7 +2045,7 @@ impl Vm {
                             Value::object_id(self.heap.allocate(obj))
                         } else {
                             // Boolean/Number/String wrapper
-                            let wrapper_sentinel = if arg.as_bool().is_some() { -506i32 }
+                            let wrapper_sentinel = if arg.as_bool().is_some() { -506i64 }
                                 else if arg.is_number() || arg.is_int() { -505 }
                                 else { -504 };
                             let mut obj = JsObject::ordinary();
@@ -2779,7 +2775,7 @@ impl Vm {
                     if let Some(packed) = obj.as_function()
                         && packed >= 0
                     {
-                        let chunk_idx = (packed & 0xFFFF) as usize;
+                        let chunk_idx = Value::fn_chunk_idx(packed);
                         if chunk_idx < self.chunks.len()
                             && let Some(rhs_oid) = constructor.as_object_id()
                         {
@@ -3085,7 +3081,7 @@ impl Vm {
                             // `prototype` exists on constructible functions
                             // only — arrows and methods have none.
                             let has_proto = if sentinel >= 0 {
-                                let chunk_idx = (sentinel & 0xFFFF) as usize;
+                                let chunk_idx = Value::fn_chunk_idx(sentinel);
                                 chunk_idx < self.chunks.len()
                                     && !self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW)
                                     && !self.chunks[chunk_idx].flags.contains(ChunkFlags::METHOD)
@@ -3303,8 +3299,8 @@ impl Vm {
                         if let Some(obj) = self.heap.get(oid)
                             && matches!(&obj.kind, ObjectKind::Array(_))
                         {
-                            let proto_sentinel = match name_str {
-                                "join" => Some(-600i32), "push" => Some(-601), "pop" => Some(-602),
+                            let proto_sentinel: Option<i64> = match name_str {
+                                "join" => Some(-600i64), "push" => Some(-601), "pop" => Some(-602),
                                 "shift" => Some(-603), "unshift" => Some(-604), "indexOf" => Some(-605),
                                 "includes" => Some(-606), "forEach" => Some(-607), "map" => Some(-608),
                                 "filter" => Some(-609), "reduce" => Some(-610), "some" => Some(-611),
@@ -3646,7 +3642,7 @@ impl Vm {
                                 // Generator/async functions: .constructor is the
                                 // intrinsic; async fns expose NO .prototype.
                                 if sentinel >= 0 {
-                                    let chunk_idx = (sentinel & 0xFFFF) as usize;
+                                    let chunk_idx = Value::fn_chunk_idx(sentinel);
                                     if chunk_idx < self.chunks.len() {
                                         let flags = self.chunks[chunk_idx].flags;
                                         if name_str == "constructor"
@@ -3681,7 +3677,7 @@ impl Vm {
                                 // 'caller' and 'arguments' as poison-pill accessors
                                 // that throw TypeError on access.
                                 if matches!(name_str, "caller" | "arguments") && sentinel >= 0 {
-                                    let chunk_idx = (sentinel & 0xFFFF) as usize;
+                                    let chunk_idx = Value::fn_chunk_idx(sentinel);
                                     let is_restricted = chunk_idx < self.chunks.len()
                                         && (self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW)
                                             || self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT));
@@ -3702,7 +3698,7 @@ impl Vm {
                                             let mut proto = JsObject::ordinary();
                                             proto.prototype = Some(self.object_prototype);
                                             // Generator functions get a plain empty prototype.
-                                            let chunk_idx = (sentinel & 0xFFFF) as usize;
+                                            let chunk_idx = Value::fn_chunk_idx(sentinel);
                                             let is_gen = chunk_idx < self.chunks.len()
                                                 && self.chunks[chunk_idx].flags.contains(ChunkFlags::GENERATOR);
                                             if !is_gen {
@@ -4968,13 +4964,13 @@ impl Vm {
                         // out of the hook array.
                         enum MethodFnKind {
                             Bound(crate::runtime::object::ObjectId, Value, Vec<Value>),
-                            Direct(i32),
+                            Direct(i64),
                         }
                         let kind_call = self.heap.get(method_oid).and_then(|o| match &o.kind {
                             ObjectKind::Function(crate::runtime::object::FunctionKind::Bound { target, this_val, args }) =>
                                 Some(MethodFnKind::Bound(*target, *this_val, args.clone())),
                             ObjectKind::Function(crate::runtime::object::FunctionKind::Bytecode { chunk_idx, .. }) =>
-                                Some(MethodFnKind::Direct(*chunk_idx as i32)),
+                                Some(MethodFnKind::Direct(*chunk_idx as i64)),
                             ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { sentinel }) =>
                                 Some(MethodFnKind::Direct(*sentinel)),
                             _ => None,
@@ -4986,7 +4982,7 @@ impl Vm {
                                 MethodFnKind::Bound(target_oid, this_val, bound_args) => {
                                     let target_fn = self.heap.get(target_oid).and_then(|o| match &o.kind {
                                         ObjectKind::Function(crate::runtime::object::FunctionKind::Bytecode { chunk_idx, .. }) =>
-                                            Some(Value::function(*chunk_idx as i32)),
+                                            Some(Value::function(*chunk_idx as i64)),
                                         ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { sentinel }) =>
                                             Some(Value::function(*sentinel)),
                                         _ => None,
@@ -6047,8 +6043,8 @@ impl Vm {
                         if let Some(mv) = method_val
                             && mv.is_function() {
                                 let packed = mv.as_function().unwrap();
-                                let _closure_id = ((packed as u32) >> 16) as usize;
-                                let chunk_idx = (packed & 0xFFFF) as usize;
+                                let _closure_id = Value::fn_closure_id(packed);
+                                let chunk_idx = Value::fn_chunk_idx(packed);
                                 if chunk_idx >= 1 && chunk_idx < self.chunks.len() {
                                     // Async methods: route through call_with_async_wrap
                                     // so the body runs synchronously and its result is
@@ -6597,7 +6593,7 @@ impl Vm {
                     if func_val.is_function() {
                         let packed = func_val.as_function().unwrap();
                         if packed > 0 {
-                            let chunk_idx = (packed & 0xFFFF) as usize;
+                            let chunk_idx = Value::fn_chunk_idx(packed);
                             if chunk_idx < self.chunks.len() {
                                 let flags = self.chunks[chunk_idx].flags;
                                 if flags.contains(ChunkFlags::GENERATOR)
@@ -6633,8 +6629,8 @@ impl Vm {
                         }
                         let pid = self.allocate_promise();
                         // Create resolve/reject sentinels
-                        let resolve_val = Value::function(-600_000 - pid.0 as i32);
-                        let reject_val = Value::function(-700_000 - pid.0 as i32);
+                        let resolve_val = Value::function(-600_000 - pid.0 as i64);
+                        let reject_val = Value::function(-700_000 - pid.0 as i64);
                         // Call the executor; an abrupt completion rejects the promise.
                         match self.call_function(executor, &[resolve_val, reject_val]) {
                             Ok(_) => {}
@@ -7237,7 +7233,7 @@ impl Vm {
                             // Get or create the prototype from the cache
                             new_obj.prototype = Some(proto_oid);
                         } else {
-                            let chunk_idx = (packed & 0xFFFF) as usize;
+                            let chunk_idx = Value::fn_chunk_idx(packed);
                             if chunk_idx < self.chunks.len() {
                                 let mut proto = JsObject::ordinary();
                                 proto.prototype = Some(self.object_prototype);
@@ -7273,7 +7269,7 @@ impl Vm {
                         let mut ctor_owner_oid = class_oid;
                         // Native-error super: when extending Error/TypeError/etc., ctor_val
                         // is the sentinel itself; we'll handle it specially below.
-                        let mut native_super_sentinel: Option<i32> = None;
+                        let mut native_super_sentinel: Option<i64> = None;
                         if ctor_val.is_none() {
                             // Default constructor for derived classes: walk __super__ chain.
                             let mut cur_val: Option<Value> = self.heap.get(class_oid)
@@ -7448,8 +7444,8 @@ impl Vm {
                                 // this avoids.)
                                 self.stack[func_pos] = cv;
                                 let packed = cv.as_function().unwrap();
-                                let closure_id = ((packed as u32) >> 16) as usize;
-                                let chunk_idx = (packed & 0xFFFF) as usize;
+                                let closure_id = Value::fn_closure_id(packed);
+                                let chunk_idx = Value::fn_chunk_idx(packed);
                                 if chunk_idx >= 1 && chunk_idx < self.chunks.len() {
                                     let mut argc = argc;
                                     let expected = self.chunks[chunk_idx].param_count as usize;
@@ -7584,8 +7580,8 @@ impl Vm {
                                     reactions: Vec::new(),
                                 };
                             }
-                            let resolve_fn = Value::function(-600_000 - this_oid.0 as i32);
-                            let reject_fn = Value::function(-700_000 - this_oid.0 as i32);
+                            let resolve_fn = Value::function(-600_000 - this_oid.0 as i64);
+                            let reject_fn = Value::function(-700_000 - this_oid.0 as i64);
                             let prev_protect = self.protect_throw_depth;
                             self.protect_throw_depth = self.frames.len() + 1;
                             let r = self.call_function_this(executor, Value::undefined(), &[resolve_fn, reject_fn]);
@@ -7606,8 +7602,8 @@ impl Vm {
 
                     if func_val.is_function() {
                         let packed = func_val.as_function().unwrap();
-                        let closure_id = ((packed as u32) >> 16) as usize;
-                        let chunk_idx = (packed & 0xFFFF) as usize;
+                        let closure_id = Value::fn_closure_id(packed);
+                        let chunk_idx = Value::fn_chunk_idx(packed);
 
                         if chunk_idx >= 1 && chunk_idx < self.chunks.len() {
                             let upvalues = if closure_id < self.closure_upvalues.len() {
@@ -7721,7 +7717,7 @@ impl Vm {
                     // Now call construct logic manually for user functions
                     if func_val.is_function() {
                         let packed = func_val.as_function().unwrap();
-                        let chunk_idx = (packed & 0xFFFF) as usize;
+                        let chunk_idx = Value::fn_chunk_idx(packed);
                         if chunk_idx > 0 && chunk_idx < self.chunks.len() {
                             // Create new object with prototype linkage
                             let mut new_obj = JsObject::ordinary();
@@ -8070,7 +8066,7 @@ impl Vm {
                         if val.is_function() && key.is_symbol() {
                             let sym_id = key.as_symbol_id().unwrap() as usize;
                             let sentinel = val.as_function().unwrap();
-                            let chunk_idx = (sentinel & 0xFFFF) as usize;
+                            let chunk_idx = Value::fn_chunk_idx(sentinel);
                             let is_anon = if chunk_idx > 0 && chunk_idx < self.chunks.len() {
                                 let n = self.interner.resolve(self.chunks[chunk_idx].name).to_owned();
                                 n.is_empty() || n.starts_with('<')
@@ -8261,7 +8257,7 @@ impl Vm {
                         && let Some(parent_packed) = callee.as_function()
                         && parent_packed >= 0
                     {
-                        let parent_cid = ((parent_packed as u32) >> 16) as usize;
+                        let parent_cid = Value::fn_closure_id(parent_packed);
                         if parent_cid != 0
                             && let Some(env) = self.closure_private_env.get(&parent_cid)
                         {
@@ -8285,7 +8281,7 @@ impl Vm {
                     // Use a special encoding: negative int where abs value encodes both
                     // Actually let's use a simpler approach: store as two values
                     // Or better: pack closure_id << 16 | chunk_idx
-                    let packed = ((closure_id as i32) << 16) | (abs_idx as i32 & 0xFFFF);
+                    let packed = Value::pack_closure(closure_id, abs_idx);
                     self.push(Value::function(packed));
                 }
 
@@ -8298,7 +8294,7 @@ impl Vm {
                     let current = self.cur_chunk();
                     let abs_idx = self.chunks[current].children.get(child_rel_idx).copied()
                         .unwrap_or(current + 1 + child_rel_idx);
-                    self.push(Value::function(abs_idx as i32));
+                    self.push(Value::function(abs_idx as i64));
                 }
 
                 OpCode::Class => {
@@ -8363,7 +8359,7 @@ impl Vm {
                                     // Store constructor on the class object itself
                                     // Also update `length` from constructor's formal_length
                                     let formal_length = if let Some(packed) = method_val.as_function() {
-                                        let chunk_idx = (packed & 0xFFFF) as usize;
+                                        let chunk_idx = Value::fn_chunk_idx(packed);
                                         if chunk_idx < self.chunks.len() {
                                             self.chunks[chunk_idx].formal_length as i32
                                         } else { 0 }
@@ -9401,8 +9397,8 @@ impl Vm {
                             && tf.is_function()
                         {
                             let pid = self.allocate_promise();
-                            let resolve_fn = Value::function(-600_000 - pid.0 as i32);
-                            let reject_fn = Value::function(-700_000 - pid.0 as i32);
+                            let resolve_fn = Value::function(-600_000 - pid.0 as i64);
+                            let reject_fn = Value::function(-700_000 - pid.0 as i64);
                             let prev_protect = self.protect_throw_depth;
                             self.protect_throw_depth = self.frames.len() + 1;
                             let r = self.call_function_this(tf, awaited, &[resolve_fn, reject_fn]);
@@ -9731,7 +9727,7 @@ impl Vm {
                             self.globals.keys().copied().collect();
 
                         // Execute module using call_function (globals are shared)
-                        let module_fn = Value::function(base_idx as i32);
+                        let module_fn = Value::function(base_idx as i64);
                         let _ = self.call_function(module_fn, &[]);
 
                         // Copy newly-defined globals to exports object

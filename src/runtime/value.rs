@@ -61,6 +61,11 @@ const TAG_FUNCTION: u64 = NANBOX | (0b111 << 48);
 // stored bytes are always valid UTF-8 (we never split a multibyte char).
 /// Payload bit marking a TAG_STRING value as inline rather than an interned id.
 const STR_INLINE_FLAG: u64 = 1 << 47;
+
+/// Function-value packing: low FN_CHUNK_BITS bits carry the chunk index,
+/// the rest of the (sign-extended 48-bit) payload carries the closure id.
+pub const FN_CHUNK_BITS: u32 = 20;
+pub const FN_CHUNK_MASK: i64 = (1 << FN_CHUNK_BITS) - 1;
 const STR_INLINE_LEN_SHIFT: u64 = 44;
 const STR_INLINE_LEN_MASK: u64 = 0b111 << 44;
 /// Maximum number of UTF-8 bytes that fit in an inline string.
@@ -163,10 +168,38 @@ impl Value {
         Self(TAG_SYMBOL | id as u64)
     }
 
-    /// Create a function reference value (packed closure_id << 16 | chunk_idx).
+    /// Create a function reference value. `packed` is a signed 48-bit
+    /// quantity stored sign-extended-from-bit-47 in the payload:
+    /// negative values are native-builtin sentinels, non-negative values
+    /// pack `closure_id << FN_CHUNK_BITS | chunk_idx` (see the helpers
+    /// below). The old 32-bit `closure_id << 16 | chunk_idx` layout
+    /// overflowed into the sentinel space at 32 768 closures — a number
+    /// a single heavy page (DDG SERP: ~100 accessor closures per DOM
+    /// wrapper) crosses mid-load.
     #[inline]
-    pub fn function(packed: i32) -> Self {
-        Self(TAG_FUNCTION | (packed as u32 as u64))
+    pub fn function(packed: i64) -> Self {
+        debug_assert!((-(1 << 47)..(1 << 47)).contains(&packed));
+        Self(TAG_FUNCTION | (packed as u64 & PAYLOAD_MASK))
+    }
+
+    /// Pack a closure reference. chunk_idx gets FN_CHUNK_BITS bits
+    /// (1 M chunks), closure_id the remaining 27 (134 M closures).
+    #[inline]
+    pub fn pack_closure(closure_id: usize, chunk_idx: usize) -> i64 {
+        debug_assert!(chunk_idx as i64 <= FN_CHUNK_MASK);
+        ((closure_id as i64) << FN_CHUNK_BITS) | (chunk_idx as i64 & FN_CHUNK_MASK)
+    }
+
+    /// closure_id half of a non-negative packed function value.
+    #[inline]
+    pub fn fn_closure_id(packed: i64) -> usize {
+        (packed >> FN_CHUNK_BITS) as usize
+    }
+
+    /// chunk_idx half of a non-negative packed function value.
+    #[inline]
+    pub fn fn_chunk_idx(packed: i64) -> usize {
+        (packed & FN_CHUNK_MASK) as usize
     }
 
     /// Create a Value from an ObjectId (stored in the object tag slot).
@@ -351,11 +384,13 @@ impl Value {
         }
     }
 
-    /// Extract the packed function value (closure_id << 16 | chunk_idx).
+    /// Extract the packed function value: sign-extend the 48-bit
+    /// payload (negative = builtin sentinel, non-negative = closure
+    /// packed via `pack_closure`).
     #[inline]
-    pub fn as_function(&self) -> Option<i32> {
+    pub fn as_function(&self) -> Option<i64> {
         if self.is_function() {
-            Some((self.0 & 0xFFFF_FFFF) as u32 as i32)
+            Some(((self.0 & PAYLOAD_MASK) as i64) << 16 >> 16)
         } else {
             None
         }

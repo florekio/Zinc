@@ -345,7 +345,7 @@ pub struct Vm {
     /// Regex compilation cache
     pub(crate) regex_cache: crate::vm::regexp::RegexCache,
     /// Function prototype cache: maps packed function value → prototype ObjectId
-    pub(crate) func_prototypes: HashMap<i32, ObjectId>,
+    pub(crate) func_prototypes: HashMap<i64, ObjectId>,
     /// Singleton Object.prototype object
     pub(crate) object_prototype: ObjectId,
     /// Singleton Function.prototype object
@@ -396,7 +396,7 @@ pub struct Vm {
     pub(crate) sym_async_iterator: u32,
     pub(crate) sym_match_all: u32,
     /// Per-function property overrides/deletions: key = (sentinel, StringId), None = deleted, Some(v) = overridden.
-    pub(crate) fn_property_overrides: HashMap<(i32, StringId), Option<Value>>,
+    pub(crate) fn_property_overrides: HashMap<(i64, StringId), Option<Value>>,
     /// Dynamic exclusion buffer for object rest destructuring with computed keys.
     pub(crate) computed_exclusions: Vec<Value>,
     /// Fuel counter: instructions executed (incremented in 1024-step chunks).
@@ -697,7 +697,7 @@ impl Vm {
         let name_sid = self.interner.intern(name);
         let msg_sid  = self.interner.intern(message);
         // Set prototype to the error type's prototype for instanceof checks
-        let err_sentinel: i32 = match name {
+        let err_sentinel: i64 = match name {
             "TypeError" => -511, "RangeError" => -512, "ReferenceError" => -513,
             "SyntaxError" => -514, "EvalError" => -515, "URIError" => -516,
             "AggregateError" => -539, _ => -510,
@@ -896,6 +896,24 @@ impl Vm {
         self.heap.allocate(p)
     }
 
+    /// Format the live frame chain (innermost first) for the
+    /// uncaught-throw diagnostic: `name (source:line)` per frame.
+    fn snapshot_backtrace(&self) -> Vec<String> {
+        self.frames
+            .iter()
+            .rev()
+            .take(24)
+            .map(|f| {
+                let chunk = &self.chunks[f.chunk_idx];
+                let name = self.interner.resolve(chunk.name);
+                let name = if name.is_empty() { "<anonymous>" } else { name };
+                let line = chunk.get_line(f.ip as u32);
+                let src = self.interner.resolve(chunk.source_name);
+                format!("{name} ({src}:{line})")
+            })
+            .collect()
+    }
+
     pub(crate) fn handle_throw(&mut self, val: Value) -> Result<(), VmError> {
         // Protected nested call (e.g. valueOf during a comparison opcode):
         // if the handler that would catch this throw lives in a frame strictly
@@ -905,9 +923,19 @@ impl Vm {
             && let Some(handler) = self.exc_handlers.last()
             && handler.frame_idx + 1 < self.protect_throw_depth
         {
+            // Snapshot here too: the nested frames are unwound before the
+            // calling opcode re-throws, so waiting for the no-handler branch
+            // would lose the innermost (most useful) part of the chain.
+            // First snapshot wins — it's the deepest.
+            if self.last_uncaught_backtrace.is_none() {
+                self.last_uncaught_backtrace = Some(self.snapshot_backtrace());
+            }
             return Err(VmError::Throw(val));
         }
         if let Some(handler) = self.exc_handlers.pop() {
+            // The throw is caught by JS — a pending snapshot from the
+            // protect branch must not attach to a later uncaught error.
+            self.last_uncaught_backtrace = None;
             for frame in self.frames.iter().skip(handler.frame_idx + 1) {
                 if let Some(gid) = frame.generator_id
                     && let Some(obj) = self.heap.get_mut(gid)
@@ -928,22 +956,11 @@ impl Vm {
         } else {
             // No handler: snapshot the call chain now — the frames are the
             // only record of where the throw came from, and they're gone by
-            // the time the embedder sees the error.
-            let bt: Vec<String> = self
-                .frames
-                .iter()
-                .rev()
-                .take(24)
-                .map(|f| {
-                    let chunk = &self.chunks[f.chunk_idx];
-                    let name = self.interner.resolve(chunk.name);
-                    let name = if name.is_empty() { "<anonymous>" } else { name };
-                    let line = chunk.get_line(f.ip as u32);
-                    let src = self.interner.resolve(chunk.source_name);
-                    format!("{name} ({src}:{line})")
-                })
-                .collect();
-            self.last_uncaught_backtrace = Some(bt);
+            // the time the embedder sees the error. A snapshot from the
+            // protect branch is deeper than this one; don't overwrite it.
+            if self.last_uncaught_backtrace.is_none() {
+                self.last_uncaught_backtrace = Some(self.snapshot_backtrace());
+            }
             // Bubble up the actual exception value. Outer code (e.g. the engine
             // entry point or the async-function wrapper) decides whether to
             // stringify it or use it as-is for promise rejection.
@@ -1604,7 +1621,7 @@ impl Vm {
     /// (stored, or a silent non-strict no-op).
     fn write_fn_property(
         &mut self,
-        sentinel: i32,
+        sentinel: i64,
         name_id: StringId,
         val: Value,
         in_strict: bool,
@@ -1636,7 +1653,7 @@ impl Vm {
             return None; // non-strict: silent no-op
         }
         if matches!(name_str.as_str(), "caller" | "arguments") && sentinel >= 0 {
-            let chunk_idx = (sentinel & 0xFFFF) as usize;
+            let chunk_idx = Value::fn_chunk_idx(sentinel);
             let is_restricted = chunk_idx < self.chunks.len()
                 && (self.chunks[chunk_idx].flags.contains(ChunkFlags::ARROW)
                     || self.chunks[chunk_idx].flags.contains(ChunkFlags::STRICT));

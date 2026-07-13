@@ -1483,7 +1483,7 @@ impl Vm {
     pub(crate) fn is_constructor_value(&self, v: Value) -> bool {
         if let Some(packed) = v.as_function() {
             if packed >= 0 {
-                let chunk_idx = (packed & 0xFFFF) as usize;
+                let chunk_idx = Value::fn_chunk_idx(packed);
                 if chunk_idx < self.chunks.len() {
                     let flags = self.chunks[chunk_idx].flags;
                     return !(flags.contains(crate::compiler::chunk::ChunkFlags::GENERATOR)
@@ -2684,7 +2684,7 @@ impl Vm {
     }
 
     // ---- Math sentinel dispatch (-700 to -726) ----
-    pub(crate) fn exec_math_sentinel(&mut self, sentinel: i32, args: &[Value]) -> Value {
+    pub(crate) fn exec_math_sentinel(&mut self, sentinel: i64, args: &[Value]) -> Value {
         let a0 = args.first().map(|v| self.to_f64(*v)).unwrap_or(f64::NAN);
         let a1 = args.get(1).map(|v| self.to_f64(*v)).unwrap_or(f64::NAN);
         let result = match sentinel {
@@ -2755,7 +2755,7 @@ impl Vm {
     }
 
     // ---- Global function dispatch ----
-    pub(crate) fn exec_global_fn(&mut self, sentinel: i32, args: &[Value]) -> Value {
+    pub(crate) fn exec_global_fn(&mut self, sentinel: i64, args: &[Value]) -> Value {
         match sentinel {
             -500 => { // parseInt
                 let s = args.first().map(|v| self.value_to_string(*v)).unwrap_or_default();
@@ -3230,7 +3230,7 @@ impl Vm {
     /// Execute a native method sentinel that requires `this` context.
     /// Sentinels -590 to -599: Object.prototype / Function.prototype methods.
     /// Sentinels -600 to -629: Array.prototype methods.
-    pub(crate) fn exec_native_method(&mut self, sentinel: i32, this_val: Value, args: &[Value]) -> Result<Value, VmError> {
+    pub(crate) fn exec_native_method(&mut self, sentinel: i64, this_val: Value, args: &[Value]) -> Result<Value, VmError> {
         let result = match sentinel {
             -590 => { // Object.prototype.hasOwnProperty — also checks __get_X__/__set_X__
                 let key_val = args.first().copied().unwrap_or(Value::undefined());

@@ -33,7 +33,7 @@ impl Vm {
         args: &[Value],
     ) -> Result<Value, VmError> {
         if let Some(packed) = func_val.as_function() {
-            let chunk_idx = (packed & 0xFFFF) as usize;
+            let chunk_idx = Value::fn_chunk_idx(packed);
             if packed >= 0
                 && chunk_idx >= 1
                 && chunk_idx < self.chunks.len()
@@ -83,7 +83,7 @@ impl Vm {
             } else {
                 // Keep the FULL packed value (closure id in the high
                 // bits) so the bound function sees its upvalues.
-                let chunk_only = (packed & 0xFFFF) as usize;
+                let chunk_only = Value::fn_chunk_idx(packed);
                 let name = if chunk_only < self.chunks.len() { self.chunks[chunk_only].name } else { self.interner.intern("<bound>") };
                 let fobj = JsObject::function_bytecode(packed as usize, name);
                 self.heap.allocate(fobj)
@@ -219,13 +219,13 @@ impl Vm {
             use crate::runtime::object::FunctionKind as FK;
             enum Unwrapped {
                 Bound(crate::runtime::object::ObjectId, Value, Vec<Value>),
-                Direct(i32),
+                Direct(i64),
             }
             let unwrapped = self.heap.get(oid).and_then(|o| match &o.kind {
                 crate::runtime::object::ObjectKind::Function(FK::Bound { target, this_val, args }) =>
                     Some(Unwrapped::Bound(*target, *this_val, args.clone())),
                 crate::runtime::object::ObjectKind::Function(FK::Bytecode { chunk_idx, .. }) =>
-                    Some(Unwrapped::Direct(*chunk_idx as i32)),
+                    Some(Unwrapped::Direct(*chunk_idx as i64)),
                 crate::runtime::object::ObjectKind::Function(FK::NativeSentinel { sentinel }) =>
                     Some(Unwrapped::Direct(*sentinel)),
                 _ => None,
@@ -428,8 +428,8 @@ impl Vm {
             // Reject: bubble the rejection by returning Throw.
             return Err(VmError::Throw(val));
         }
-        let closure_id = ((packed as u32) >> 16) as usize;
-        let chunk_idx = (packed & 0xFFFF) as usize;
+        let closure_id = Value::fn_closure_id(packed);
+        let chunk_idx = Value::fn_chunk_idx(packed);
         if chunk_idx < 1 || chunk_idx >= self.chunks.len() {
             return Ok(Value::undefined());
         }

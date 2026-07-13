@@ -469,7 +469,7 @@ impl Vm {
                             let mut proto = JsObject::ordinary();
                             proto.prototype = Some(self.object_prototype);
                             // Generator functions get a plain empty prototype.
-                            let chunk_idx = (sentinel & 0xFFFF) as usize;
+                            let chunk_idx = Value::fn_chunk_idx(sentinel);
                             let is_gen = chunk_idx < self.chunks.len()
                                 && self.chunks[chunk_idx].flags.contains(ChunkFlags::GENERATOR);
                             if !is_gen {
@@ -717,7 +717,7 @@ impl Vm {
                 } else if arg.is_function() {
                     // Generator functions chain to %GeneratorFunction.prototype%.
                     let sentinel = arg.as_function().unwrap();
-                    let chunk_idx = (sentinel & 0xFFFF) as usize;
+                    let chunk_idx = Value::fn_chunk_idx(sentinel);
                     let flags = if sentinel >= 0 && chunk_idx < self.chunks.len() {
                         self.chunks[chunk_idx].flags
                     } else {
@@ -931,8 +931,8 @@ impl Vm {
 
     /// Spec `name`/`length` for the well-known negative sentinels (global
     /// constructors, global functions, extractable statics, Math methods).
-    pub(crate) fn sentinel_fn_meta(sentinel: i32) -> Option<(&'static str, i32)> {
-        const T: &[(i32, &str, i32)] = &[
+    pub(crate) fn sentinel_fn_meta(sentinel: i64) -> Option<(&'static str, i32)> {
+        const T: &[(i64, &str, i32)] = &[
             (-500, "parseInt", 2), (-501, "parseFloat", 1), (-502, "isNaN", 1), (-503, "isFinite", 1),
             (-504, "String", 1), (-505, "Number", 1), (-506, "Boolean", 1), (-507, "Array", 1), (-508, "Object", 1),
             (-509, "encodeURI", 1), (-517, "decodeURIComponent", 1), (-518, "encodeURIComponent", 1), (-519, "decodeURI", 1),
@@ -979,7 +979,7 @@ impl Vm {
 
     /// Get a function's own property value, consulting the override table.
     /// Returns None if the property doesn't exist (or was deleted).
-    pub(crate) fn fn_get_own_prop(&mut self, sentinel: i32, key: StringId) -> Option<Value> {
+    pub(crate) fn fn_get_own_prop(&mut self, sentinel: i64, key: StringId) -> Option<Value> {
         let key_str = self.interner.resolve(key).to_owned();
         // Check the override table first
         if let Some(ov) = self.fn_property_overrides.get(&(sentinel, key)) {
@@ -998,7 +998,7 @@ impl Vm {
             }
         }
         // Fall back to defaults
-        let chunk_idx = (sentinel & 0xFFFF) as usize;
+        let chunk_idx = Value::fn_chunk_idx(sentinel);
         match key_str.as_str() {
             "name" => {
                 if chunk_idx > 0 && chunk_idx < self.chunks.len() {
@@ -1035,7 +1035,7 @@ impl Vm {
     /// Comprehensive property lookup on a function-sentinel value (e.g. Number.POSITIVE_INFINITY,
     /// Symbol.iterator, fn.prototype). Returns the resolved value (Value::undefined() if missing).
     /// Used by both dot- and bracket-access paths.
-    pub(crate) fn fn_property_get(&mut self, sentinel: i32, name_id: StringId, obj_val: Value) -> Value {
+    pub(crate) fn fn_property_get(&mut self, sentinel: i64, name_id: StringId, obj_val: Value) -> Value {
         if let Some(ov) = self.fn_property_overrides.get(&(sentinel, name_id)).copied() {
             return ov.unwrap_or(Value::undefined());
         }
@@ -1466,7 +1466,7 @@ impl Vm {
                         proto.prototype = Some(self.object_prototype);
                         // Generator functions' prototypes are plain empty objects per
                         // spec (`function* f(){}.prototype` has no own properties).
-                        let chunk_idx = (sentinel & 0xFFFF) as usize;
+                        let chunk_idx = Value::fn_chunk_idx(sentinel);
                         let is_gen = chunk_idx < self.chunks.len()
                             && self.chunks[chunk_idx].flags.contains(ChunkFlags::GENERATOR);
                         if !is_gen {
