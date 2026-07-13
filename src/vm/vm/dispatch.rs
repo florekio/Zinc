@@ -4262,9 +4262,19 @@ impl Vm {
                     // BEFORE ToPropertyKey runs on the key.
                     if obj_val.is_null() || obj_val.is_undefined() {
                         let kind = if obj_val.is_null() { "null" } else { "undefined" };
+                        // Best-effort key description for the message; a
+                        // primitive key is safe to stringify without
+                        // re-entering user code.
+                        let key_desc = if let Some(sid) = key.as_string_id() {
+                            format!(" (setting '{}')", self.interner.resolve(sid))
+                        } else if key.is_int() || key.is_number() {
+                            format!(" (setting '{}')", self.to_f64(key))
+                        } else {
+                            String::new()
+                        };
                         let err = self.make_native_error(
                             "TypeError",
-                            &format!("Cannot set properties of {kind}"),
+                            &format!("Cannot set properties of {kind}{key_desc}"),
                         );
                         self.handle_throw(err)?;
                         continue;
