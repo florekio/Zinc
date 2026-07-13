@@ -701,6 +701,7 @@ impl Vm {
             jit_functions: HashMap::new(),
             output: Vec::new(),
             silent_console: false,
+            last_uncaught_backtrace: None,
             module_cache: HashMap::new(),
             module_dir: None,
             regex_cache: crate::vm::regexp::RegexCache::new(),

@@ -166,7 +166,24 @@ impl Vm {
     /// ```ignore
     /// let result = vm.host_call(callback, &[arg])?;
     /// ```
+    /// The JS call chain of the most recent uncaught throw (innermost frame
+    /// first), snapshotted by `handle_throw` when no catch handler exists.
+    /// Formatted one frame per line as `    at name (source:line)`.
+    /// Consumed on read so a stale trace never attaches to a later error.
+    pub fn take_uncaught_backtrace(&mut self) -> Option<String> {
+        self.last_uncaught_backtrace.take().map(|frames| {
+            frames
+                .iter()
+                .map(|f| format!("    at {f}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+
     pub fn host_call(&mut self, func_val: Value, args: &[Value]) -> Result<Value, Value> {
+        // A promise rejection inside an earlier call also snapshots a
+        // backtrace; drop it so an Err from THIS call can't pick it up.
+        self.last_uncaught_backtrace = None;
         match self.call_function(func_val, args) {
             Ok(v) => Ok(v),
             Err(VmError::Throw(reason)) => Err(reason),
@@ -183,6 +200,7 @@ impl Vm {
         this_value: Value,
         args: &[Value],
     ) -> Result<Value, Value> {
+        self.last_uncaught_backtrace = None;
         match self.call_function_this(func_val, this_value, args) {
             Ok(v) => Ok(v),
             Err(VmError::Throw(reason)) => Err(reason),

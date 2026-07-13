@@ -333,6 +333,11 @@ pub struct Vm {
     /// to stdout/stderr. Used by the test262 runner to keep $DONE markers off
     /// the orchestrator's pipes.
     pub silent_console: bool,
+    /// JS call chain (innermost first, "name (source:line)") of the most
+    /// recent throw that found no catch handler, snapshotted in
+    /// `handle_throw` before the frames unwind. The embedder consumes it
+    /// via `take_uncaught_backtrace` to attach to its uncaught-error report.
+    pub(crate) last_uncaught_backtrace: Option<Vec<String>>,
     /// Module cache: maps module path → exports ObjectId
     pub(crate) module_cache: HashMap<String, ObjectId>,
     /// Base directory for resolving relative module imports
@@ -921,6 +926,24 @@ impl Vm {
             self.frames.last_mut().unwrap().ip = handler.catch_target as usize;
             Ok(())
         } else {
+            // No handler: snapshot the call chain now — the frames are the
+            // only record of where the throw came from, and they're gone by
+            // the time the embedder sees the error.
+            let bt: Vec<String> = self
+                .frames
+                .iter()
+                .rev()
+                .take(24)
+                .map(|f| {
+                    let chunk = &self.chunks[f.chunk_idx];
+                    let name = self.interner.resolve(chunk.name);
+                    let name = if name.is_empty() { "<anonymous>" } else { name };
+                    let line = chunk.get_line(f.ip as u32);
+                    let src = self.interner.resolve(chunk.source_name);
+                    format!("{name} ({src}:{line})")
+                })
+                .collect();
+            self.last_uncaught_backtrace = Some(bt);
             // Bubble up the actual exception value. Outer code (e.g. the engine
             // entry point or the async-function wrapper) decides whether to
             // stringify it or use it as-is for promise rejection.
