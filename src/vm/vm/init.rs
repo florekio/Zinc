@@ -676,6 +676,7 @@ impl Vm {
             exc_handlers: Vec::new(),
             protect_throw_depth: 0,
             microtask_queue: Vec::new(),
+            pending_combinators: Vec::new(),
             host_roots: Vec::new(),
             with_stack: Vec::new(),
             closure_withs: std::collections::HashMap::new(),

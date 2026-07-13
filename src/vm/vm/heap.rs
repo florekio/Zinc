@@ -133,6 +133,29 @@ impl Vm {
     pub fn collect_gc(&mut self) {
         let mut roots: Vec<ObjectId> = Vec::new();
 
+        // Root 0: live promise combinators. Their trackers are only reachable
+        // via oids encoded into sentinel function values (untraceable), so root
+        // them explicitly. Drop any whose result promise has already settled
+        // (or whose tracker is gone) so the list can't grow without bound.
+        let live_combinators: Vec<ObjectId> = std::mem::take(&mut self.pending_combinators)
+            .into_iter()
+            .filter(|&t| {
+                let result_promise = match self.heap.get(t).map(|o| &o.kind) {
+                    Some(ObjectKind::PromiseCombinator { result_promise, .. }) => *result_promise,
+                    _ => return false,
+                };
+                matches!(
+                    self.heap.get(result_promise).map(|o| &o.kind),
+                    Some(ObjectKind::Promise {
+                        state: crate::runtime::object::PromiseState::Pending,
+                        ..
+                    })
+                )
+            })
+            .collect();
+        roots.extend(live_combinators.iter().copied());
+        self.pending_combinators = live_combinators;
+
         // Root 1: stack
         for val in &self.stack {
             if let Some(oid) = trace_value(*val) { roots.push(oid); }

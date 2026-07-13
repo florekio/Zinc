@@ -258,6 +258,12 @@ pub struct Vm {
     /// expectations are met.
     pub(crate) protect_throw_depth: usize,
     pub(crate) microtask_queue: Vec<Microtask>,
+    /// Live `Promise.all`/`race`/`allSettled`/`any` tracker objects. They're
+    /// only reachable via oids encoded into resolve/reject sentinels (function
+    /// values, invisible to the tracer), so they must be rooted here until the
+    /// combinator settles — otherwise GC collects the tracker mid-flight and
+    /// the resolve callback fails with "invalid combinator".
+    pub(crate) pending_combinators: Vec<ObjectId>,
     /// Heap objects the embedder holds across VM re-entries (e.g. a
     /// pending promise it will settle from `host_promise_resolve`
     /// once an async operation finishes). Treated as GC roots until

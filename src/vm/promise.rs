@@ -179,6 +179,7 @@ impl Vm {
                         extensible: true,
                     };
                     let tracker_oid = self.heap.allocate(tracker);
+                    self.pending_combinators.push(tracker_oid);
                     let fulfill_sentinel = Value::function(-1_100_000 - tracker_oid.0 as i32);
 
                     // Create reject sentinel: calls callback then propagates original reason
@@ -303,6 +304,7 @@ impl Vm {
             extensible: true,
         };
         let tracker_oid = self.heap.allocate(tracker);
+        self.pending_combinators.push(tracker_oid);
 
         // Get(C, "resolve") once, observably: a user override of
         // Promise.resolve — data property or accessor — is read exactly once
@@ -426,9 +428,11 @@ impl Vm {
 
     /// Handle a combinator resolve callback (sentinel in -800_000 range)
     pub(crate) fn handle_combinator_resolve(&mut self, tracker_oid: ObjectId, index: usize, value: Value) -> Result<(), VmError> {
-        // Read current state
+        // Read current state. A missing tracker means the combinator already
+        // settled and was reclaimed — a late input resolution is a no-op (the
+        // result promise's fate is already fixed), not an error.
         let (kind, _remaining, result_promise) = {
-            let obj = self.heap.get(tracker_oid).ok_or_else(|| VmError::RuntimeError("invalid combinator".into()))?;
+            let Some(obj) = self.heap.get(tracker_oid) else { return Ok(()) };
             if let ObjectKind::PromiseCombinator { kind, remaining, result_promise, .. } = &obj.kind {
                 (*kind, *remaining, *result_promise)
             } else {
@@ -499,8 +503,9 @@ impl Vm {
 
     /// Handle a combinator reject callback (sentinel in -900_000 range)
     pub(crate) fn handle_combinator_reject(&mut self, tracker_oid: ObjectId, index: usize, reason: Value) -> Result<(), VmError> {
+        // Missing tracker → combinator already settled + reclaimed; ignore.
         let (kind, _remaining, result_promise) = {
-            let obj = self.heap.get(tracker_oid).ok_or_else(|| VmError::RuntimeError("invalid combinator".into()))?;
+            let Some(obj) = self.heap.get(tracker_oid) else { return Ok(()) };
             if let ObjectKind::PromiseCombinator { kind, remaining, result_promise, .. } = &obj.kind {
                 (*kind, *remaining, *result_promise)
             } else {
