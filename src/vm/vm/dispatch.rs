@@ -8095,19 +8095,64 @@ impl Vm {
                 OpCode::ObjectSpread => {
                     let source = self.pop()?;
                     let target = self.peek()?;
-                    // Copy enumerable own properties from source to target
+                    // CopyDataProperties: enumerable own properties copy as
+                    // DATA properties — getters run (throws propagate) and the
+                    // result is a plain value. Accessor halves become the key.
                     if let Some(src_oid) = source.as_object_id() {
-                        let props: Vec<(StringId, Value)> = self.heap.get(src_oid)
-                            .map(|o| o.properties.iter()
-                                .filter(|(_, p)| p.is_enumerable())
-                                .map(|&(k, ref p)| (k, p.value))
-                                .collect())
-                            .unwrap_or_default();
-                        if let Some(tgt_oid) = target.as_object_id() {
-                            for (key, val) in props {
-                                if let Some(tgt) = self.heap.get_mut(tgt_oid) {
-                                    tgt.set_property(key, val);
+                        let mut keys: Vec<String> = Vec::new();
+                        if let Some(o) = self.heap.get(src_oid) {
+                            for (k, p) in &o.properties {
+                                if !p.is_enumerable() {
+                                    continue;
                                 }
+                                let ks = self.interner.resolve(*k);
+                                if let Some(t) = ks.strip_prefix("__get_").and_then(|t| t.strip_suffix("__")) {
+                                    if !keys.contains(&t.to_string()) {
+                                        keys.push(t.to_string());
+                                    }
+                                    continue;
+                                }
+                                if ks.starts_with("__set_") && ks.ends_with("__") {
+                                    continue;
+                                }
+                                if ks.starts_with("__") && ks.ends_with("__") && !ks.starts_with("__sym_") {
+                                    continue;
+                                }
+                                keys.push(ks.to_owned());
+                            }
+                        }
+                        // Array sources spread their dense elements too.
+                        let elems: Option<Vec<Value>> = self.heap.get(src_oid).and_then(|o| {
+                            if let ObjectKind::Array(ref e) = o.kind { Some(e.clone()) } else { None }
+                        });
+                        if let Some(tgt_oid) = target.as_object_id() {
+                            if let Some(elems) = elems {
+                                for (i, v) in elems.iter().enumerate() {
+                                    if v.is_empty_marker() { continue; }
+                                    let ik = self.interner.intern(&i.to_string());
+                                    if let Some(tgt) = self.heap.get_mut(tgt_oid) {
+                                        tgt.set_property(ik, *v);
+                                    }
+                                }
+                            }
+                            let mut aborted = false;
+                            for ks in keys {
+                                let v = match self.getter_aware_get(src_oid, &ks) {
+                                    Ok(v) => v.unwrap_or(Value::undefined()),
+                                    Err(VmError::Throw(t)) => {
+                                        self.handle_throw(t)?;
+                                        aborted = true;
+                                        break;
+                                    }
+                                    Err(e) => return Err(e),
+                                };
+                                let key_id = self.interner.intern(&ks);
+                                if let Some(tgt) = self.heap.get_mut(tgt_oid) {
+                                    tgt.set_property(key_id, v);
+                                }
+                            }
+                            if aborted {
+                                continue;
                             }
                         }
                     }
