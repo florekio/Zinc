@@ -3463,7 +3463,12 @@ impl Vm {
             // Boolean.prototype.toString / valueOf — unwrap a Boolean primitive or wrapper.
             -630 | -631 => {
                 let inner = self.unwrap_wrapper_primitive(this_val, |v| v.is_boolean());
-                let Some(inner) = inner else { return Ok(Value::undefined()); };
+                let Some(inner) = inner else {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Boolean.prototype method called on incompatible receiver",
+                    )));
+                };
                 if sentinel == -630 {
                     let s = if inner.to_boolean() { "true" } else { "false" };
                     Value::string(self.interner.intern(s))
