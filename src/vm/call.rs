@@ -130,7 +130,9 @@ impl Vm {
         };
         let n_bound = bound_args.len() as i32;
         let mut bound = JsObject {
-            properties: Vec::new(), prototype: None,
+            // Chain to Function.prototype so inherited members (call/apply,
+            // the caller/arguments poison accessors) resolve.
+            properties: Vec::new(), prototype: Some(self.function_prototype),
             kind: ObjectKind::Function(FunctionKind::Bound {
                 target: func_obj_id,
                 this_val: bound_this,

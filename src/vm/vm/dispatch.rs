@@ -3347,23 +3347,62 @@ impl Vm {
                             self.push(val);
                             continue;
                         }
-                        // Check for getter
+                        // Accessor-aware chain walk: the FIRST object owning
+                        // the key (data slot or either accessor half) decides —
+                        // an own setter-only accessor shadows inherited getters.
                         let getter_key_str = format!("__get_{}__", name_str);
                         let getter_key = self.interner.intern(&getter_key_str);
-                        let getter_fn = self.heap.get_property_chain(oid, getter_key);
-                        if let Some(gfn) = getter_fn
-                            && self.value_callable(gfn)
+                        let setter_key = self.interner.intern(&format!("__set_{}__", name_str));
+                        let mut owner_getter: Option<Value> = None;
+                        let mut owner_data: Option<Value> = None;
+                        let mut setter_only = false;
                         {
-                            let result = match self.call_function_this(gfn, obj_val, &[]) {
-                                Ok(v) => v,
-                                Err(VmError::Throw(t)) => { self.handle_throw(t)?; continue; }
-                                Err(e) => return Err(e),
-                            };
-                            self.push(result);
+                            let mut cur = Some(oid);
+                            let mut hops = 0;
+                            while let Some(c) = cur {
+                                if let Some(o) = self.heap.get(c) {
+                                    let g = o.get_property(getter_key);
+                                    let d = o.get_property(name_id);
+                                    let st = o.has_own_property(setter_key);
+                                    if let Some(g) = g {
+                                        owner_getter = Some(g);
+                                        break;
+                                    }
+                                    if let Some(d) = d {
+                                        owner_data = Some(d);
+                                        break;
+                                    }
+                                    if st {
+                                        setter_only = true;
+                                        break;
+                                    }
+                                    cur = o.prototype;
+                                } else {
+                                    break;
+                                }
+                                hops += 1;
+                                if hops > 64 { break; }
+                            }
+                        }
+                        if let Some(gfn) = owner_getter {
+                            if self.value_callable(gfn) {
+                                let result = match self.call_function_this(gfn, obj_val, &[]) {
+                                    Ok(v) => v,
+                                    Err(VmError::Throw(t)) => { self.handle_throw(t)?; continue; }
+                                    Err(e) => return Err(e),
+                                };
+                                self.push(result);
+                                continue;
+                            }
+                            // get: undefined accessor reads as undefined.
+                            self.push(Value::undefined());
                             continue;
                         }
-                        let mut val = self.heap.get_property_chain(oid, name_id)
-                            .unwrap_or(Value::undefined());
+                        if setter_only {
+                            self.push(Value::undefined());
+                            continue;
+                        }
+                        let mut val = owner_data.unwrap_or(Value::undefined());
                         // globalThis proxies misses to the globals map so
                         // `globalThis.Array` / `global[name]` resolve the
                         // engine builtins — core-js reads every primordial
@@ -3867,7 +3906,7 @@ impl Vm {
                         let getter_key = self.interner.intern(&format!("__get_{name_str}__"));
                         let has_getter = self.heap.get_property_chain(oid, getter_key).is_some();
                         if let Some(sfn) = setter_fn
-                            && sfn.is_function()
+                            && self.value_callable(sfn)
                         {
                             // Protect the call so any throw bubbles back to us
                             // rather than being caught by an outer try block
@@ -4553,7 +4592,7 @@ impl Vm {
                             }
                             let setter_key = self.interner.intern(&format!("__set_{name_str}__"));
                             if let Some(sfn) = self.heap.get_property_chain(oid, setter_key)
-                                && sfn.is_function() {
+                                && self.value_callable(sfn) {
                                     let prev_protect = self.protect_throw_depth;
                                     self.protect_throw_depth = self.frames.len() + 1;
                                     let r = self.call_function_this(sfn, obj_val, &[val]);
@@ -4703,7 +4742,7 @@ impl Vm {
                             // If a private setter exists but no getter, the field is an
                             // accessor without a getter — PrivateGet must throw TypeError.
                             let setter_fn = self.heap.get_property_chain(oid, setter_key);
-                            if let Some(sfn) = setter_fn && sfn.is_function() {
+                            if let Some(sfn) = setter_fn && self.value_callable(sfn) {
                                 self.throw_type_error(&format!(
                                     "Cannot read private accessor {name_str} with only a setter"
                                 ))?;
@@ -4761,7 +4800,7 @@ impl Vm {
                         }
                         // Check for private setter (__set_#name__)
                         let setter_fn = self.heap.get_property_chain(oid, setter_key);
-                        if let Some(sfn) = setter_fn && sfn.is_function() {
+                        if let Some(sfn) = setter_fn && self.value_callable(sfn) {
                             let prev_protect = self.protect_throw_depth;
                             self.protect_throw_depth = self.frames.len() + 1;
                             let r = self.call_function_this(sfn, obj_val, &[value]);

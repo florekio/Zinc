@@ -747,6 +747,7 @@ impl Vm {
         vm.init_legacy_accessors();
         vm.init_json_methods();
         vm.init_string_iterator();
+        vm.init_function_restricted();
         vm
     }
 

@@ -1389,6 +1389,23 @@ impl Vm {
         }
     }
 
+    /// Function.prototype caller/arguments: restricted-property poison
+    /// accessors (%ThrowTypeError%). Packed functions resolve these through
+    /// their own dispatch arm; this covers heap function objects (bound
+    /// functions, natives).
+    pub(crate) fn init_function_restricted(&mut self) {
+        let tte = self.throw_type_error_fn();
+        let fp = self.function_prototype;
+        for prop in ["caller", "arguments"] {
+            let gk = self.interner.intern(&format!("__get_{prop}__"));
+            let sk = self.interner.intern(&format!("__set_{prop}__"));
+            if let Some(p) = self.heap.get_mut(fp) {
+                p.define_property(gk, Property::with_flags(tte, Property::CONFIGURABLE));
+                p.define_property(sk, Property::with_flags(tte, Property::CONFIGURABLE));
+            }
+        }
+    }
+
     /// String.prototype[@@iterator]: stringify the receiver and hand back a
     /// String Iterator (wrappers and primitives both route here).
     pub(crate) fn init_string_iterator(&mut self) {
