@@ -1799,7 +1799,7 @@ impl Vm {
             .and_then(|f| self.stack.get(f.base - 1))
             .and_then(|v| v.as_function())
             .filter(|p| *p >= 0)
-            .map(|p| Value::fn_closure_id(p))
+            .map(Value::fn_closure_id)
             .filter(|cid| *cid != 0)
             .and_then(|cid| self.closure_private_env.get(&cid).cloned());
         let Some(env) = env else { return true };

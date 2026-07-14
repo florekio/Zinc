@@ -391,7 +391,7 @@ impl Vm {
         // Promise combinator (Promise.all/race/allSettled/any) callbacks.
         // Mirrors the inline Call opcode encoding so microtask drain can route.
         if packed <= -1_000_000_000 && packed > -2_100_000_000 {
-            let encoded = (-1_000_000_000i64 - packed as i64) as u32;
+            let encoded = (-1_000_000_000i64 - packed) as u32;
             let tracker_oid = crate::runtime::object::ObjectId(encoded / 2048);
             let index = ((encoded % 2048) / 2) as usize;
             let is_reject = encoded & 1 == 1;

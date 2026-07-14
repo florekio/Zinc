@@ -281,6 +281,42 @@ impl Vm {
                 // 'asyncDispose').enumerable`).
                 if let Some(sentinel) = first_arg.as_function() {
                     let key_id = self.interner.intern(&key_str);
+                    // @@species is an ACCESSOR: { get "get [Symbol.species]",
+                    // set: undefined, enumerable: false, configurable: true }.
+                    if key_str == "__sym_4__"
+                        && matches!(sentinel, -507 | -540 | -541 | -520 | -580 | -660)
+                        && !self.fn_property_overrides.contains_key(&(sentinel, key_id))
+                    {
+                        let gname = self.interner.intern("get [Symbol.species]");
+                        let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+                            |_vm: &mut Vm, this: Value, _args: &[Value]| -> Result<Value, Value> {
+                                Ok(this)
+                            },
+                        );
+                        let mut fn_obj = JsObject {
+                            properties: Vec::new(),
+                            prototype: Some(self.function_prototype),
+                            kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: gname, func }),
+                            marked: false,
+                            extensible: true,
+                        };
+                        let nk = self.interner.intern("name");
+                        let lk = self.interner.intern("length");
+                        fn_obj.define_property(nk, Property::with_flags(Value::string(gname), Property::CONFIGURABLE));
+                        fn_obj.define_property(lk, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
+                        let gv = Value::object_id(self.heap.allocate(fn_obj));
+                        let mut desc = JsObject::ordinary();
+                        desc.prototype = Some(self.object_prototype);
+                        let get_key = self.interner.intern("get");
+                        let set_key = self.interner.intern("set");
+                        let en_key = self.interner.intern("enumerable");
+                        let cf_key = self.interner.intern("configurable");
+                        desc.set_property(get_key, gv);
+                        desc.set_property(set_key, Value::undefined());
+                        desc.set_property(en_key, Value::boolean(false));
+                        desc.set_property(cf_key, Value::boolean(true));
+                        return Ok(Some(Value::object_id(self.heap.allocate(desc))));
+                    }
                     let deleted = matches!(self.fn_property_overrides.get(&(sentinel, key_id)), Some(None));
                     // Source of the value decides the flags: user override
                     // (plain assignment) → w/e/c true; intrinsic name/length →
@@ -1040,6 +1076,12 @@ impl Vm {
             return ov.unwrap_or(Value::undefined());
         }
         let name_str = self.interner.resolve(name_id).to_owned();
+        // @@species on the species-carrying constructors returns `this`.
+        if name_str == "__sym_4__"
+            && matches!(sentinel, -507 | -540 | -541 | -520 | -580 | -660)
+        {
+            return obj_val;
+        }
         match sentinel {
             -505 => match name_str.as_str() {
                 "prototype" => Value::object_id(self.number_prototype),

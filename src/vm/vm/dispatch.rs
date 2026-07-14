@@ -811,7 +811,7 @@ impl Vm {
                             .and_then(|f| self.stack.get(f.base - 1))
                             .and_then(|v| v.as_function())
                             .filter(|p| *p >= 0)
-                            .map(|p| Value::fn_closure_id(p))
+                            .map(Value::fn_closure_id)
                             .filter(|cid| *cid != 0)
                             .and_then(|cid| self.closure_arrow_args.get(&cid).copied());
                         let v = match captured {
@@ -1275,7 +1275,7 @@ impl Vm {
                         }
                         // Promise combinator callbacks (see promise.rs encoding).
                         if s <= -1_000_000_000 && s > -2_100_000_000 {
-                            let encoded = (-1_000_000_000i64 - s as i64) as u32;
+                            let encoded = (-1_000_000_000i64 - s) as u32;
                             let tracker_oid = ObjectId(encoded / 2048);
                             let index = ((encoded % 2048) / 2) as usize;
                             let is_reject = encoded & 1 == 1;
@@ -1555,7 +1555,7 @@ impl Vm {
                                         .and_then(|f| self.stack.get(f.base - 1))
                                         .and_then(|v| v.as_function())
                                         .filter(|p| *p >= 0)
-                                        .map(|p| Value::fn_closure_id(p))
+                                        .map(Value::fn_closure_id)
                                         .filter(|cid| *cid != 0)
                                         .and_then(|cid| self.closure_private_env.get(&cid).cloned())
                                 } else {
@@ -1651,7 +1651,7 @@ impl Vm {
                                 .and_then(|f| self.stack.get(f.base - 1))
                                 .and_then(|v| v.as_function())
                                 .filter(|p| *p >= 0)
-                                .map(|p| Value::fn_closure_id(p))
+                                .map(Value::fn_closure_id)
                                 .filter(|cid| *cid != 0)
                                 .and_then(|cid| self.closure_private_env.get(&cid).cloned());
                             if let Some(env) = caller_env {
@@ -4243,13 +4243,20 @@ impl Vm {
                             }
                         }
                     }
-                    // Function bracket access: delegate to dot-access helper for consistency.
-                    if obj_val.is_function()
-                        && let Some(key_id) = key.as_string_id() {
-                        let sentinel = obj_val.as_function().unwrap();
-                        let result = self.fn_property_get(sentinel, key_id, obj_val);
-                        self.push(result);
-                        continue;
+                    // Function bracket access: delegate to dot-access helper for
+                    // consistency; symbol keys map to their __sym_N__ storage.
+                    if obj_val.is_function() {
+                        let key_id = if key.is_symbol() {
+                            Some(self.interner.intern(&format!("__sym_{}__", key.as_symbol_id().unwrap())))
+                        } else {
+                            key.as_string_id()
+                        };
+                        if let Some(key_id) = key_id {
+                            let sentinel = obj_val.as_function().unwrap();
+                            let result = self.fn_property_get(sentinel, key_id, obj_val);
+                            self.push(result);
+                            continue;
+                        }
                     }
                     self.push(Value::undefined());
                 }
@@ -6733,7 +6740,16 @@ impl Vm {
                                     } else if !arg.is_null() && !arg.is_undefined() {
                                         match self.collect_iterable(arg) {
                                             Ok(Some(items)) => items,
-                                            Ok(None) => Vec::new(),
+                                            Ok(None) => {
+                                                // Non-iterable argument.
+                                                let err = self.make_native_error(
+                                                    "TypeError",
+                                                    "argument is not iterable",
+                                                );
+                                                self.truncate_stack(func_pos);
+                                                self.handle_throw(err)?;
+                                                continue;
+                                            }
                                             Err(VmError::Throw(v)) => {
                                                 self.truncate_stack(func_pos);
                                                 self.handle_throw(v)?;
@@ -6818,7 +6834,16 @@ impl Vm {
                                     } else if !arg.is_null() && !arg.is_undefined() {
                                         match self.collect_iterable(arg) {
                                             Ok(Some(items)) => items,
-                                            Ok(None) => Vec::new(),
+                                            Ok(None) => {
+                                                // Non-iterable argument.
+                                                let err = self.make_native_error(
+                                                    "TypeError",
+                                                    "argument is not iterable",
+                                                );
+                                                self.truncate_stack(func_pos);
+                                                self.handle_throw(err)?;
+                                                continue;
+                                            }
                                             Err(VmError::Throw(v)) => {
                                                 self.truncate_stack(func_pos);
                                                 self.handle_throw(v)?;
@@ -6862,7 +6887,16 @@ impl Vm {
                                     } else if !arg.is_null() && !arg.is_undefined() {
                                         match self.collect_iterable(arg) {
                                             Ok(Some(items)) => items,
-                                            Ok(None) => Vec::new(),
+                                            Ok(None) => {
+                                                // Non-iterable argument.
+                                                let err = self.make_native_error(
+                                                    "TypeError",
+                                                    "argument is not iterable",
+                                                );
+                                                self.truncate_stack(func_pos);
+                                                self.handle_throw(err)?;
+                                                continue;
+                                            }
                                             Err(VmError::Throw(v)) => {
                                                 self.truncate_stack(func_pos);
                                                 self.handle_throw(v)?;

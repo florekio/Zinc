@@ -4,3 +4,5 @@
 .playwright-mcp/
 test262/
 failures*.log
+target-linux-amd64/
+target-linux-arm64/

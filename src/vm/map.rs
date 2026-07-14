@@ -22,7 +22,11 @@ impl Vm {
         if !iter_fn.is_function() && iter_fn.as_object_id().is_none() {
             return Ok(None);
         }
-        let iter = self.call_function_this(iter_fn, val, &[])?;
+        let prev_protect = self.protect_throw_depth;
+        self.protect_throw_depth = self.frames.len() + 1;
+        let iter_r = self.call_function_this(iter_fn, val, &[]);
+        self.protect_throw_depth = prev_protect;
+        let iter = iter_r?;
         let next_key = self.interner.intern("next");
         let Some(ioid) = iter.as_object_id() else { return Ok(None) };
         let Some(next_fn) = self.heap.get_property_chain(ioid, next_key) else {
@@ -33,8 +37,35 @@ impl Vm {
         let mut out = Vec::new();
         // Hard cap: a protocol-driven loop over a hostile/buggy iterator
         // must not hang the browser.
+        let iter_is_gen = self.heap.get(ioid)
+            .is_some_and(|o| matches!(o.kind, ObjectKind::Generator { .. }));
         for _ in 0..1_000_000usize {
-            let step = self.call_function_this(next_fn, iter, &[])?;
+            let step = if iter_is_gen {
+                // Generators resume through their own machinery — the shared
+                // %IteratorPrototype%.next would report done immediately.
+                // Resume + nested run until the generator frame unwinds.
+                match self.generator_resume(ioid, Value::undefined())? {
+                    crate::vm::generator::GeneratorAction::Done(_) => {
+                        return Ok(Some(out));
+                    }
+                    crate::vm::generator::GeneratorAction::Resumed => {
+                        let depth = self.frames.len();
+                        let prev_protect = self.protect_throw_depth;
+                        self.protect_throw_depth = depth;
+                        let r = self.run_until(depth - 1);
+                        self.protect_throw_depth = prev_protect;
+                        // Yield RETURNS the {value, done} result from the
+                        // nested run (it does not push it for this caller).
+                        r?
+                    }
+                }
+            } else {
+                let prev_protect = self.protect_throw_depth;
+                self.protect_throw_depth = self.frames.len() + 1;
+                let step_r = self.call_function_this(next_fn, iter, &[]);
+                self.protect_throw_depth = prev_protect;
+                step_r?
+            };
             let Some(soid) = step.as_object_id() else { break };
             let done = self.heap.get(soid)
                 .and_then(|o| o.get_property(done_key))
