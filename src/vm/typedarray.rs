@@ -60,6 +60,49 @@ impl Vm {
             let mut proto = JsObject::ordinary();
             proto.prototype = Some(object_proto);
             self.define_ctor_on_proto(&mut proto, sentinel);
+            // Receiver-checked accessors: reads on actual typed arrays are
+            // served by the inline dispatch arm; the getters here fire for
+            // everything else (TypedArray.prototype.buffer → TypeError).
+            for acc in ["buffer", "byteLength", "byteOffset", "length"] {
+                let getter_name = self.interner.intern(&format!("get {acc}"));
+                let acc_owned = acc.to_string();
+                let func: crate::runtime::object::NativeFn =
+                    std::sync::Arc::new(move |vm: &mut Vm, this: Value, _args: &[Value]| {
+                        let ta = this.as_object_id().and_then(|oid| vm.heap.get(oid)).and_then(|o| {
+                            if let ObjectKind::TypedArray { kind, elements, buffer } = &o.kind {
+                                Some((*kind, elements.len(), *buffer))
+                            } else {
+                                None
+                            }
+                        });
+                        let Some((k, len, buf)) = ta else {
+                            return Err(vm.make_native_error(
+                                "TypeError",
+                                "TypedArray accessor called on incompatible receiver",
+                            ));
+                        };
+                        Ok(match acc_owned.as_str() {
+                            "buffer" => Value::object_id(buf),
+                            "byteLength" => Value::int((len * k.bytes_per_element()) as i32),
+                            "byteOffset" => Value::int(0),
+                            _ => Value::int(len as i32),
+                        })
+                    });
+                let mut fn_obj = JsObject {
+                    properties: Vec::new(),
+                    prototype: Some(self.function_prototype),
+                    kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: getter_name, func }),
+                    marked: false,
+                    extensible: true,
+                };
+                let nk = self.interner.intern("name");
+                let lk = self.interner.intern("length");
+                fn_obj.define_property(nk, Property::with_flags(Value::string(getter_name), Property::CONFIGURABLE));
+                fn_obj.define_property(lk, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
+                let gv = Value::object_id(self.heap.allocate(fn_obj));
+                let gk = self.interner.intern(&format!("__get_{acc}__"));
+                proto.define_property(gk, Property::with_flags(gv, Property::CONFIGURABLE));
+            }
             // values/[Symbol.iterator]
             let values_fn = Value::function(-626); // reuse Array values iterator sentinel
             let sym_iter_key = self.interner.intern(&format!("__sym_{}__", self.sym_iterator));
