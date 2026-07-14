@@ -67,16 +67,15 @@ impl Vm {
                 step_r?
             };
             let Some(soid) = step.as_object_id() else { break };
-            let done = self.heap.get(soid)
-                .and_then(|o| o.get_property(done_key))
+            // done/value reads are observable (getters run, throws propagate).
+            let done = self.getter_aware_get(soid, "done")?
                 .map(|v| v.to_boolean())
                 .unwrap_or(false);
             if done {
                 break;
             }
-            let v = self.heap.get(soid)
-                .and_then(|o| o.get_property(value_key))
-                .unwrap_or(Value::undefined());
+            let v = self.getter_aware_get(soid, "value")?.unwrap_or(Value::undefined());
+            let _ = (done_key, value_key);
             out.push(v);
         }
         Ok(Some(out))
