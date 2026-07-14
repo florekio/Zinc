@@ -253,6 +253,15 @@ impl Vm {
         // calling its result lands here with this = the function being
         // uncurried; without this dispatch every uncurried primordial
         // silently returned undefined.
+        if matches!(packed, -597..=-595) && !self.value_callable(this_value) {
+            // call/apply/bind on a non-callable receiver throw.
+            let which = match packed { -595 => "call", -596 => "apply", _ => "bind" };
+            let err = self.make_native_error(
+                "TypeError",
+                &format!("Function.prototype.{which} called on incompatible receiver"),
+            );
+            return Err(VmError::Throw(err));
+        }
         if packed == -595 {
             let new_this = args.first().copied().unwrap_or(Value::undefined());
             let rest: &[Value] = args.get(1..).unwrap_or(&[]);
