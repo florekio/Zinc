@@ -1284,9 +1284,27 @@ impl Vm {
                     }
                     let is_define = which_owned.starts_with("__define");
                     let is_getter = which_owned.contains("Getter");
+                    // The callable check precedes ToPropertyKey (B.2.2.2 step 2).
+                    if is_define {
+                        let f = args.get(1).copied().unwrap_or(Value::undefined());
+                        if !vm.value_callable(f) {
+                            return Err(vm.make_native_error(
+                                "TypeError",
+                                if is_getter { "Getter must be a function" } else { "Setter must be a function" },
+                            ));
+                        }
+                    }
                     let key_val = args.first().copied().unwrap_or(Value::undefined());
+                    // ToPropertyKey is observable (a throwing toString wins).
                     let key_str = if key_val.is_symbol() {
                         format!("__sym_{}__", key_val.as_symbol_id().unwrap())
+                    } else if key_val.is_object() {
+                        let prim = match vm.try_coerce_to_primitive_hint(key_val, "string") {
+                            Ok(p) => p,
+                            Err(VmError::Throw(t)) => return Err(t),
+                            Err(e) => return Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                        };
+                        vm.value_to_string(prim)
                     } else {
                         vm.value_to_string(key_val)
                     };

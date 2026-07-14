@@ -807,6 +807,21 @@ impl Vm {
             "hasOwn" => {
                 let target = args.first().copied().unwrap_or(Value::undefined());
                 let key_val = args.get(1).copied().unwrap_or(Value::undefined());
+                // ToObject(target) runs FIRST: nullish targets throw before
+                // the key coerces.
+                if target.is_nullish() {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "Cannot convert undefined or null to object",
+                    )));
+                }
+                let key_val = if key_val.is_object() && !key_val.is_symbol() {
+                    let prim = self.try_coerce_to_primitive_hint(key_val, "string")?;
+                    let sid = self.interner.intern(&self.value_to_string(prim));
+                    Value::string(sid)
+                } else {
+                    key_val
+                };
                 if let Some(oid) = target.as_object_id() {
                     let key_str = if key_val.is_symbol() {
                         format!("__sym_{}__", key_val.as_symbol_id().unwrap())
