@@ -130,15 +130,24 @@ impl Vm {
                 }
             }
             "includes" | "startsWith" | "endsWith" => {
-                // A RegExp search argument throws (IsRegExp check).
+                // IsRegExp(searchString): the @@match read is observable
+                // (poisoned getters throw); truthy @@match or RegExp kind
+                // rejects.
                 if let Some(a) = args.first()
-                    && a.as_object_id().and_then(|o| self.heap.get(o))
-                        .is_some_and(|o| matches!(o.kind, ObjectKind::RegExp { .. }))
+                    && let Some(aoid) = a.as_object_id()
                 {
-                    return Err(VmError::Throw(self.make_native_error(
-                        "TypeError",
-                        "First argument must not be a regular expression",
-                    )));
+                    let m = self.getter_aware_get(aoid, "__sym_9__")?;
+                    let is_re = match m {
+                        Some(v) if !v.is_undefined() => v.to_boolean(),
+                        _ => self.heap.get(aoid)
+                            .is_some_and(|o| matches!(o.kind, ObjectKind::RegExp { .. })),
+                    };
+                    if is_re {
+                        return Err(VmError::Throw(self.make_native_error(
+                            "TypeError",
+                            "First argument must not be a regular expression",
+                        )));
+                    }
                 }
             }
             "replace" | "match" | "search" => {
@@ -3495,8 +3504,14 @@ impl Vm {
             }
             // String.prototype.toString / valueOf — unwrap a String primitive or wrapper.
             -634 | -635 => {
-                self.unwrap_wrapper_primitive(this_val, |v| v.is_string())
-                    .unwrap_or(Value::undefined())
+                // thisStringValue: string primitives / wrappers only.
+                let Some(inner) = self.unwrap_wrapper_primitive(this_val, |v| v.is_string()) else {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "String.prototype method called on incompatible receiver",
+                    )));
+                };
+                inner
             }
             // Array.prototype methods: dispatch via exec_array_method using this_val as array
             sentinel if (-629..=-600).contains(&sentinel) => {
