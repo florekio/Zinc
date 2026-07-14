@@ -1513,14 +1513,28 @@ impl Vm {
                 -508..=-504 | -516..=-510 | -539 | -520 | -543..=-540 | -550 | -551 | -570 | -580 | -638)
                 || (-673..=-660).contains(&packed);
         }
-        if let Some(o) = v.as_object_id().and_then(|oid| self.heap.get(oid)) {
-            let ctor_key = self.interner.get("__constructor__");
-            return match &o.kind {
-                ObjectKind::Function(crate::runtime::object::FunctionKind::Native { .. })
-                | ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { .. }) => false,
-                ObjectKind::Function(_) => true,
-                _ => ctor_key.is_some_and(|ck| o.get_property(ck).is_some()),
-            };
+        if let Some(oid) = v.as_object_id() {
+            // The GeneratorFunction/AsyncFunction intrinsics are Native fns
+            // that ARE constructors.
+            let ck = self.interner.get("constructor");
+            let is_intrinsic = ck.is_some_and(|ck| {
+                [self.generator_function_proto, self.async_function_proto].iter().any(|p| {
+                    p.and_then(|po| self.heap.get(po).and_then(|o| o.get_property(ck)))
+                        .and_then(|cv| cv.as_object_id()) == Some(oid)
+                })
+            });
+            if is_intrinsic {
+                return true;
+            }
+            if let Some(o) = self.heap.get(oid) {
+                let ctor_key = self.interner.get("__constructor__");
+                return match &o.kind {
+                    ObjectKind::Function(crate::runtime::object::FunctionKind::Native { .. })
+                    | ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { .. }) => false,
+                    ObjectKind::Function(_) => true,
+                    _ => ctor_key.is_some_and(|ck| o.get_property(ck).is_some()),
+                };
+            }
         }
         false
     }
