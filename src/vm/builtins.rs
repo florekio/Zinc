@@ -1627,18 +1627,22 @@ impl Vm {
             return Err(VmError::Throw(err));
         }
         if is_arr && let Ok(idx) = key.parse::<usize>() {
-            if let Some(o) = self.heap.get_mut(toid)
-                && let ObjectKind::Array(ref mut e) = o.kind
-            {
-                if idx < e.len() {
-                    e[idx] = v;
-                } else if idx == e.len() {
-                    e.push(v);
-                } else if idx <= 1_000_000 {
-                    e.resize(idx, Value::empty());
-                    e.push(v);
-                } else {
-                    o.set_property(key_id, v);
+            if let Some(o) = self.heap.get_mut(toid) {
+                // CreateDataProperty resets a configurable existing entry to
+                // full default flags — drop any stale map entry (data flags
+                // or accessor halves) so the dense element governs.
+                o.properties.retain(|(k, _)| *k != key_id && *k != get_id && *k != set_id);
+                if let ObjectKind::Array(ref mut e) = o.kind {
+                    if idx < e.len() {
+                        e[idx] = v;
+                    } else if idx == e.len() {
+                        e.push(v);
+                    } else if idx <= 1_000_000 {
+                        e.resize(idx, Value::empty());
+                        e.push(v);
+                    } else {
+                        o.set_property(key_id, v);
+                    }
                 }
             }
             let _ = dense_len;
@@ -2480,12 +2484,11 @@ impl Vm {
                         }
                         _ => false,
                     });
-                    idx_enum
-                        || o.get_property_descriptor(key_id)
-                            .or_else(|| o.get_property_descriptor(getter_key))
-                            .or_else(|| o.get_property_descriptor(setter_key))
-                            .map(|p| p.is_enumerable())
-                            .unwrap_or(false)
+                    o.get_property_descriptor(key_id)
+                        .or_else(|| o.get_property_descriptor(getter_key))
+                        .or_else(|| o.get_property_descriptor(setter_key))
+                        .map(|p| p.is_enumerable())
+                        .unwrap_or(idx_enum)
                 }).unwrap_or(false);
                 Ok(Value::boolean(is_enum))
             }
@@ -3267,7 +3270,9 @@ impl Vm {
                         // as own properties even though they aren't in `properties`.
                         let array_match = if let ObjectKind::Array(ref elems) = o.kind {
                             if key == "length" { true }
-                            else if let Ok(idx) = key.parse::<usize>() { idx < elems.len() }
+                            else if let Ok(idx) = key.parse::<usize>() {
+                                idx < elems.len() && !elems[idx].is_empty_marker()
+                            }
                             else { false }
                         } else { false };
                         array_match
@@ -3301,15 +3306,24 @@ impl Vm {
                 let getter_key = self.interner.intern(&format!("__get_{key}__"));
                 let setter_key = self.interner.intern(&format!("__set_{key}__"));
                 if let Some(oid) = this_val.as_object_id() {
-                    let is_enum = self.heap.get(oid).and_then(|o| {
-                        // Accessor properties are stored under __get_/__set_;
-                        // their descriptor's enumerable flag is the property's.
+                    let is_enum = self.heap.get(oid).map(|o| {
+                        // Dense array elements and wrapper chars are
+                        // enumerable own properties.
+                        let idx_enum = key.parse::<usize>().ok().is_some_and(|idx| match &o.kind {
+                            ObjectKind::Array(elems) => idx < elems.len() && !elems[idx].is_empty_marker(),
+                            ObjectKind::Wrapper(inner) if inner.is_string() => {
+                                inner.as_string_id()
+                                    .map(|sid| idx < self.interner.resolve(sid).chars().count())
+                                    .unwrap_or(false)
+                            }
+                            _ => false,
+                        });
                         o.get_property_descriptor(key_id)
                             .or_else(|| o.get_property_descriptor(getter_key))
                             .or_else(|| o.get_property_descriptor(setter_key))
-                    })
-                    .map(|p| p.is_enumerable())
-                    .unwrap_or(false);
+                            .map(|p| p.is_enumerable())
+                            .unwrap_or(idx_enum)
+                    }).unwrap_or(false);
                     Value::boolean(is_enum)
                 } else { Value::boolean(false) }
             }

@@ -5745,14 +5745,24 @@ impl Vm {
                                 let key_id = self.interner.intern(&key);
                                 let getter_key = self.interner.intern(&format!("__get_{key}__"));
                                 let setter_key = self.interner.intern(&format!("__set_{key}__"));
-                                let is_enum = self.heap.get(oid)
-                                    .and_then(|o| {
-                                        o.get_property_descriptor(key_id)
-                                            .or_else(|| o.get_property_descriptor(getter_key))
-                                            .or_else(|| o.get_property_descriptor(setter_key))
-                                    })
-                                    .map(|p| p.is_enumerable())
-                                    .unwrap_or(false);
+                                let is_enum = self.heap.get(oid).map(|o| {
+                                    // Dense array elements / wrapper chars are
+                                    // enumerable own properties.
+                                    let idx_enum = key.parse::<usize>().ok().is_some_and(|idx| match &o.kind {
+                                        ObjectKind::Array(elems) => idx < elems.len() && !elems[idx].is_empty_marker(),
+                                        ObjectKind::Wrapper(inner) if inner.is_string() => {
+                                            inner.as_string_id()
+                                                .map(|sid| idx < self.interner.resolve(sid).chars().count())
+                                                .unwrap_or(false)
+                                        }
+                                        _ => false,
+                                    });
+                                    o.get_property_descriptor(key_id)
+                                        .or_else(|| o.get_property_descriptor(getter_key))
+                                        .or_else(|| o.get_property_descriptor(setter_key))
+                                        .map(|p| p.is_enumerable())
+                                        .unwrap_or(idx_enum)
+                                }).unwrap_or(false);
                                 self.truncate_stack(obj_pos);
                                 self.push(Value::boolean(is_enum));
                                 continue;
