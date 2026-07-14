@@ -682,6 +682,13 @@ impl Vm {
             if has_setter {
                 break; // accessor without a getter: Get returns undefined
             }
+            // An Array in the chain exposes its implicit length.
+            if let Some(o) = self.heap.get(c)
+                && let ObjectKind::Array(ref e) = o.kind
+            {
+                raw = Value::int(e.len() as i32);
+                break;
+            }
             hops += 1;
             if hops > 64 {
                 break;
@@ -2327,12 +2334,39 @@ impl Vm {
                 let mut result: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
                     .unwrap_or_default();
+                let spreadable_key = self.interner.intern("__sym_12__");
                 for arg in args {
-                    if let Some(arg_oid) = arg.as_object_id()
-                        && let Some(obj) = self.heap.get(arg_oid)
-                            && let ObjectKind::Array(ref elems) = obj.kind {
-                                result.extend_from_slice(elems);
-                            } else {
+                    // IsConcatSpreadable: @@isConcatSpreadable wins when
+                    // defined; else IsArray.
+                    let (is_arr_kind, spread_flag) = match arg.as_object_id().and_then(|o| self.heap.get(o)) {
+                        Some(o) => (
+                            matches!(o.kind, ObjectKind::Array(_)),
+                            arg.as_object_id()
+                                .and_then(|ao| self.heap.get_property_chain(ao, spreadable_key))
+                                .filter(|v| !v.is_undefined())
+                                .map(|v| v.to_boolean()),
+                        ),
+                        None => (false, None),
+                    };
+                    let spread = spread_flag.unwrap_or(is_arr_kind);
+                    if spread && is_arr_kind {
+                        if let Some(obj) = self.heap.get(arg.as_object_id().unwrap())
+                            && let ObjectKind::Array(ref elems) = obj.kind
+                        {
+                            result.extend_from_slice(elems);
+                        }
+                    } else if spread {
+                        // Array-like spread: length (ToLength-clamped) +
+                        // index reads; misses become holes.
+                        let aoid = arg.as_object_id().unwrap();
+                        let len = self.array_like_length(aoid)?;
+                        for i in 0..len {
+                            match self.array_like_get(aoid, i)? {
+                                Some(v) => result.push(v),
+                                None => result.push(Value::empty()),
+                            }
+                        }
+                    } else {
                         result.push(*arg);
                     }
                 }

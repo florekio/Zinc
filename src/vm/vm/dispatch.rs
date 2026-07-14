@@ -3376,6 +3376,21 @@ impl Vm {
                                         setter_only = true;
                                         break;
                                     }
+                                    // Array objects in the chain expose their
+                                    // implicit length and dense elements.
+                                    if let ObjectKind::Array(ref elems) = o.kind {
+                                        if name_str == "length" {
+                                            owner_data = Some(Value::int(elems.len() as i32));
+                                            break;
+                                        }
+                                        if let Ok(idx) = name_str.parse::<usize>()
+                                            && idx < elems.len()
+                                            && !elems[idx].is_empty_marker()
+                                        {
+                                            owner_data = Some(elems[idx]);
+                                            break;
+                                        }
+                                    }
                                     cur = o.prototype;
                                 } else {
                                     break;
@@ -3559,6 +3574,7 @@ impl Vm {
                                 "toStringTag" => Value::symbol(self.sym_to_string_tag),
                                 "species" => Value::symbol(self.sym_species),
                                 "unscopables" => Value::symbol(self.sym_unscopables),
+                                "isConcatSpreadable" => Value::symbol(12),
                                 "asyncIterator" => Value::symbol(self.sym_async_iterator),
                                 "matchAll" => Value::symbol(self.sym_match_all),
                 "replace" => Value::symbol(8),
@@ -4199,8 +4215,29 @@ impl Vm {
                                 self.push(result);
                                 continue;
                             }
-                            let val = self.heap.get_property_chain(oid, name_id)
+                            let mut val = self.heap.get_property_chain(oid, name_id)
                                 .unwrap_or(Value::undefined());
+                            // Array ancestors expose their dense elements.
+                            if val.is_undefined()
+                                && let Ok(idx) = s.parse::<usize>()
+                            {
+                                let mut cur = self.heap.get(oid).and_then(|o| o.prototype);
+                                let mut hops = 0;
+                                while let Some(c) = cur {
+                                    if let Some(o) = self.heap.get(c) {
+                                        if let ObjectKind::Array(ref e) = o.kind
+                                            && idx < e.len()
+                                            && !e[idx].is_empty_marker()
+                                        {
+                                            val = e[idx];
+                                            break;
+                                        }
+                                        cur = o.prototype;
+                                    } else { break }
+                                    hops += 1;
+                                    if hops > 64 { break; }
+                                }
+                            }
                             self.push(val);
                             continue;
                         }

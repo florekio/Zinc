@@ -1269,6 +1269,7 @@ impl Vm {
                 "toStringTag" => Value::symbol(self.sym_to_string_tag),
                 "species" => Value::symbol(self.sym_species),
                 "unscopables" => Value::symbol(self.sym_unscopables),
+                "isConcatSpreadable" => Value::symbol(12),
                 "asyncIterator" => Value::symbol(self.sym_async_iterator),
                 "matchAll" => Value::symbol(self.sym_match_all),
                 "replace" => Value::symbol(8),

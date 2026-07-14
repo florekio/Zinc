@@ -649,6 +649,7 @@ impl Vm {
             Some(interner.intern("Symbol.match")),
             Some(interner.intern("Symbol.search")),
             Some(interner.intern("Symbol.split")),
+            Some(interner.intern("Symbol.isConcatSpreadable")),
         ];
 
         // Pre-populate fast lookup Vec from all initial globals
@@ -723,7 +724,7 @@ impl Vm {
             json_oid: Some(json_oid),
             symbol_descriptions: sym_descs,
             symbol_registry: std::collections::HashMap::new(),
-            next_symbol_id: 12, // 0-11 are well-known
+            next_symbol_id: 13, // 0-12 are well-known
             sym_iterator: 0,
             sym_has_instance: 1,
             sym_to_primitive: 2,
