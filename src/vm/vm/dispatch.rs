@@ -1336,6 +1336,22 @@ impl Vm {
                     }
 
                     // BigInt(value) — converts to a BigInt (not constructable).
+                    // Map/Set/WeakMap/WeakSet require `new` (super() still
+                    // constructs through the dedicated arm).
+                    if func_val.is_function()
+                        && func_val.as_function().is_some_and(|s| (-543..=-540).contains(&s))
+                        && !self.frames[self.super_frame_idx()].pending_super_call
+                    {
+                        let sentinel = func_val.as_function().unwrap();
+                        let name = match sentinel { -540 => "Map", -541 => "Set", -542 => "WeakMap", _ => "WeakSet" };
+                        let err = self.make_native_error(
+                            "TypeError",
+                            &format!("Constructor {name} requires 'new'"),
+                        );
+                        self.truncate_stack(func_pos);
+                        self.handle_throw(err)?;
+                        continue;
+                    }
                     // TypedArray/ArrayBuffer/DataView constructors require `new`
                     // (super() to them is construction, not a plain call).
                     if func_val.is_function()
@@ -6886,13 +6902,60 @@ impl Vm {
                                     } else {
                                         Vec::new()
                                     };
+                                    // Get(newMap, "set") must be callable when an
+                                    // iterable was supplied — user overrides of
+                                    // Map.prototype.set are consulted and CALLED.
+                                    let set_id = self.interner.intern("set");
+                                    let adder = self.func_prototypes.get(&-540).copied()
+                                        .and_then(|p| self.heap.get_property_chain(p, set_id));
+                                    let adder_callable = adder.is_some_and(|a| self.value_callable(a));
+                                    if !elems.is_empty() && !adder_callable {
+                                        let err = self.make_native_error(
+                                            "TypeError",
+                                            "Map.prototype.set is not callable",
+                                        );
+                                        self.truncate_stack(func_pos);
+                                        self.handle_throw(err)?;
+                                        continue;
+                                    }
+                                    let mut aborted = false;
                                     for elem in &elems {
-                                        if let Some(pair_oid) = elem.as_object_id()
-                                            && let Some(pair_obj) = self.heap.get(pair_oid)
-                                                && let ObjectKind::Array(ref pair) = pair_obj.kind
-                                                    && pair.len() >= 2 {
-                                                        entries.push((pair[0], pair[1]));
-                                                    }
+                                        // Each entry must be an object.
+                                        let Some(pair_oid) = elem.as_object_id() else {
+                                            let err = self.make_native_error(
+                                                "TypeError",
+                                                "Iterator value is not an entry object",
+                                            );
+                                            self.truncate_stack(func_pos);
+                                            self.handle_throw(err)?;
+                                            aborted = true;
+                                            break;
+                                        };
+                                        // Observable entry[0]/entry[1] reads.
+                                        let k = match self.array_like_get_public(pair_oid, 0) {
+                                            Ok(v) => v.unwrap_or(Value::undefined()),
+                                            Err(VmError::Throw(t)) => {
+                                                self.truncate_stack(func_pos);
+                                                self.handle_throw(t)?;
+                                                aborted = true;
+                                                break;
+                                            }
+                                            Err(e) => return Err(e),
+                                        };
+                                        let v = match self.array_like_get_public(pair_oid, 1) {
+                                            Ok(v) => v.unwrap_or(Value::undefined()),
+                                            Err(VmError::Throw(t)) => {
+                                                self.truncate_stack(func_pos);
+                                                self.handle_throw(t)?;
+                                                aborted = true;
+                                                break;
+                                            }
+                                            Err(e) => return Err(e),
+                                        };
+                                        entries.push((k, v));
+                                    }
+                                    if aborted {
+                                        continue;
                                     }
                                 }
                                 let obj = JsObject {
