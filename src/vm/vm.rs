@@ -1389,6 +1389,83 @@ impl Vm {
         }
     }
 
+    /// String.prototype[@@iterator]: stringify the receiver and hand back a
+    /// String Iterator (wrappers and primitives both route here).
+    pub(crate) fn init_string_iterator(&mut self) {
+        let name_id = self.interner.intern("[Symbol.iterator]");
+        let func: crate::runtime::object::NativeFn = std::sync::Arc::new(
+            |vm: &mut Vm, this: Value, _args: &[Value]| -> Result<Value, Value> {
+                if this.is_nullish() {
+                    return Err(vm.make_native_error(
+                        "TypeError",
+                        "String.prototype[Symbol.iterator] called on null or undefined",
+                    ));
+                }
+                if this.is_symbol() {
+                    return Err(vm.make_native_error(
+                        "TypeError",
+                        "Cannot convert a Symbol value to a string",
+                    ));
+                }
+                let s = if let Some(oid) = this.as_object_id() {
+                    match vm.heap.get(oid).map(|o| &o.kind) {
+                        Some(ObjectKind::Wrapper(inner)) if inner.is_string() => {
+                            let sid = inner.as_string_id().unwrap();
+                            vm.interner.resolve(sid).to_owned()
+                        }
+                        Some(ObjectKind::ConsString { .. }) | Some(ObjectKind::FlatString { .. }) => {
+                            vm.value_to_string(this)
+                        }
+                        _ => {
+                            // ToString(object) runs its toString observably.
+                            let prim = match vm.try_coerce_to_primitive_hint(this, "string") {
+                                Ok(p) => p,
+                                Err(VmError::Throw(t)) => return Err(t),
+                                Err(e) => return Err(vm.make_native_error("Error", &format!("{e:?}"))),
+                            };
+                            vm.value_to_string(prim)
+                        }
+                    }
+                } else {
+                    vm.value_to_string(this)
+                };
+                let chars: Vec<Value> = s.chars().map(|c| {
+                    let id = vm.interner.intern(&c.to_string());
+                    Value::string(id)
+                }).collect();
+                let mut arr = JsObject::array(chars);
+                arr.prototype = Some(vm.array_prototype);
+                let arr_oid = vm.heap.allocate(arr);
+                let iter_proto = vm.kind_iterator_prototype("String");
+                let iter_obj = JsObject {
+                    properties: Vec::new(),
+                    prototype: Some(iter_proto),
+                    kind: ObjectKind::ArrayIterator(arr_oid, 0),
+                    marked: false,
+                    extensible: true,
+                };
+                Ok(Value::object_id(vm.heap.allocate(iter_obj)))
+            },
+        );
+        let mut fn_obj = JsObject {
+            properties: Vec::new(),
+            prototype: Some(self.function_prototype),
+            kind: ObjectKind::Function(crate::runtime::object::FunctionKind::Native { name: name_id, func }),
+            marked: false,
+            extensible: true,
+        };
+        let name_key = self.interner.intern("name");
+        let len_key = self.interner.intern("length");
+        fn_obj.define_property(name_key, Property::with_flags(Value::string(name_id), Property::CONFIGURABLE));
+        fn_obj.define_property(len_key, Property::with_flags(Value::int(0), Property::CONFIGURABLE));
+        let v = Value::object_id(self.heap.allocate(fn_obj));
+        let sym_key = self.interner.intern("__sym_0__");
+        let sp = self.string_prototype;
+        if let Some(p) = self.heap.get_mut(sp) {
+            p.define_property(sym_key, Property::with_flags(v, Property::WRITABLE | Property::CONFIGURABLE));
+        }
+    }
+
     /// %ThrowTypeError%: the singleton poison-pill accessor for strict-mode
     /// `arguments.callee` (get === set, frozen, non-extensible, name "" /
     /// length 0).

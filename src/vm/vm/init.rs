@@ -746,6 +746,7 @@ impl Vm {
         vm.init_date_to_primitive();
         vm.init_legacy_accessors();
         vm.init_json_methods();
+        vm.init_string_iterator();
         vm
     }
 
