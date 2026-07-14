@@ -2068,23 +2068,57 @@ impl Vm {
             "find" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
-                    if result.to_boolean() { return Ok(*elem); }
+                let len = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
+                    .unwrap_or(0);
+                for i in 0..len {
+                    let elem = {
+                        let raw = self.heap.get(oid).and_then(|o| {
+                            if let ObjectKind::Array(ref e) = o.kind { e.get(i).copied() } else { None }
+                        });
+                        match raw {
+                            Some(v) if !v.is_empty_marker() => v,
+                            _ => {
+                                let ik = self.interner.intern(&i.to_string());
+                                match self.heap.get(oid).and_then(|o| o.prototype)
+                                    .and_then(|pr| self.heap.get_property_chain(pr, ik))
+                                {
+                                    Some(v) => v,
+                                    None => Value::undefined(),
+                                }
+                            }
+                        }
+                    };
+                    let result = self.call_function_this(callback, this_arg, &[elem, Value::int(i as i32), Value::object_id(oid)])?;
+                    if result.to_boolean() { return Ok(elem); }
                 }
                 Ok(Value::undefined())
             }
             "some" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
+                let len = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
+                    .unwrap_or(0);
+                for i in 0..len {
+                    let elem = {
+                        let raw = self.heap.get(oid).and_then(|o| {
+                            if let ObjectKind::Array(ref e) = o.kind { e.get(i).copied() } else { None }
+                        });
+                        match raw {
+                            Some(v) if !v.is_empty_marker() => v,
+                            _ => {
+                                let ik = self.interner.intern(&i.to_string());
+                                match self.heap.get(oid).and_then(|o| o.prototype)
+                                    .and_then(|pr| self.heap.get_property_chain(pr, ik))
+                                {
+                                    Some(v) => v,
+                                    None => Value::undefined(),
+                                }
+                            }
+                        }
+                    };
+                    let result = self.call_function_this(callback, this_arg, &[elem, Value::int(i as i32), Value::object_id(oid)])?;
                     if result.to_boolean() { return Ok(Value::boolean(true)); }
                 }
                 Ok(Value::boolean(false))
@@ -2092,11 +2126,28 @@ impl Vm {
             "every" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
+                let len = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
+                    .unwrap_or(0);
+                for i in 0..len {
+                    let elem = {
+                        let raw = self.heap.get(oid).and_then(|o| {
+                            if let ObjectKind::Array(ref e) = o.kind { e.get(i).copied() } else { None }
+                        });
+                        match raw {
+                            Some(v) if !v.is_empty_marker() => v,
+                            _ => {
+                                let ik = self.interner.intern(&i.to_string());
+                                match self.heap.get(oid).and_then(|o| o.prototype)
+                                    .and_then(|pr| self.heap.get_property_chain(pr, ik))
+                                {
+                                    Some(v) => v,
+                                    None => Value::undefined(),
+                                }
+                            }
+                        }
+                    };
+                    let result = self.call_function_this(callback, this_arg, &[elem, Value::int(i as i32), Value::object_id(oid)])?;
                     if !result.to_boolean() { return Ok(Value::boolean(false)); }
                 }
                 Ok(Value::boolean(true))
@@ -2104,11 +2155,28 @@ impl Vm {
             "findIndex" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                for (i, elem) in elements.iter().enumerate() {
-                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
+                let len = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
+                    .unwrap_or(0);
+                for i in 0..len {
+                    let elem = {
+                        let raw = self.heap.get(oid).and_then(|o| {
+                            if let ObjectKind::Array(ref e) = o.kind { e.get(i).copied() } else { None }
+                        });
+                        match raw {
+                            Some(v) if !v.is_empty_marker() => v,
+                            _ => {
+                                let ik = self.interner.intern(&i.to_string());
+                                match self.heap.get(oid).and_then(|o| o.prototype)
+                                    .and_then(|pr| self.heap.get_property_chain(pr, ik))
+                                {
+                                    Some(v) => v,
+                                    None => Value::undefined(),
+                                }
+                            }
+                        }
+                    };
+                    let result = self.call_function_this(callback, this_arg, &[elem, Value::int(i as i32), Value::object_id(oid)])?;
                     if result.to_boolean() { return Ok(Value::int(i as i32)); }
                 }
                 Ok(Value::int(-1))
@@ -2116,23 +2184,57 @@ impl Vm {
             "findLast" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                for (i, elem) in elements.iter().enumerate().rev() {
-                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
-                    if result.to_boolean() { return Ok(*elem); }
+                let len = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
+                    .unwrap_or(0);
+                for i in (0..len).rev() {
+                    let elem = {
+                        let raw = self.heap.get(oid).and_then(|o| {
+                            if let ObjectKind::Array(ref e) = o.kind { e.get(i).copied() } else { None }
+                        });
+                        match raw {
+                            Some(v) if !v.is_empty_marker() => v,
+                            _ => {
+                                let ik = self.interner.intern(&i.to_string());
+                                match self.heap.get(oid).and_then(|o| o.prototype)
+                                    .and_then(|pr| self.heap.get_property_chain(pr, ik))
+                                {
+                                    Some(v) => v,
+                                    None => Value::undefined(),
+                                }
+                            }
+                        }
+                    };
+                    let result = self.call_function_this(callback, this_arg, &[elem, Value::int(i as i32), Value::object_id(oid)])?;
+                    if result.to_boolean() { return Ok(elem); }
                 }
                 Ok(Value::undefined())
             }
             "findLastIndex" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).copied().unwrap_or(Value::undefined());
-                let elements: Vec<Value> = self.heap.get(oid)
-                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.clone() } else { vec![] })
-                    .unwrap_or_default();
-                for (i, elem) in elements.iter().enumerate().rev() {
-                    let result = self.call_function_this(callback, this_arg, &[*elem, Value::int(i as i32), Value::object_id(oid)])?;
+                let len = self.heap.get(oid)
+                    .map(|o| if let ObjectKind::Array(ref e) = o.kind { e.len() } else { 0 })
+                    .unwrap_or(0);
+                for i in (0..len).rev() {
+                    let elem = {
+                        let raw = self.heap.get(oid).and_then(|o| {
+                            if let ObjectKind::Array(ref e) = o.kind { e.get(i).copied() } else { None }
+                        });
+                        match raw {
+                            Some(v) if !v.is_empty_marker() => v,
+                            _ => {
+                                let ik = self.interner.intern(&i.to_string());
+                                match self.heap.get(oid).and_then(|o| o.prototype)
+                                    .and_then(|pr| self.heap.get_property_chain(pr, ik))
+                                {
+                                    Some(v) => v,
+                                    None => Value::undefined(),
+                                }
+                            }
+                        }
+                    };
+                    let result = self.call_function_this(callback, this_arg, &[elem, Value::int(i as i32), Value::object_id(oid)])?;
                     if result.to_boolean() { return Ok(Value::int(i as i32)); }
                 }
                 Ok(Value::int(-1))
@@ -2151,7 +2253,11 @@ impl Vm {
                 let mut acc = if args.len() > 1 { args[1] } else { *elements.last().unwrap() };
                 let end = if args.len() > 1 { elements.len() } else { elements.len() - 1 };
                 for i in (0..end).rev() {
-                    acc = self.call_function(callback, &[acc, elements[i], Value::int(i as i32), Value::object_id(oid)])?;
+                    let elem = self.heap.get(oid).and_then(|o| {
+                        if let ObjectKind::Array(ref e) = o.kind { e.get(i).copied() } else { None }
+                    });
+                    let Some(elem) = elem.filter(|v| !v.is_empty_marker()) else { continue };
+                    acc = self.call_function(callback, &[acc, elem, Value::int(i as i32), Value::object_id(oid)])?;
                 }
                 Ok(acc)
             }
