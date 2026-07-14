@@ -233,6 +233,12 @@ impl Vm {
             }
             "forEach" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
+                if !self.value_callable(callback) {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "callback is not a function",
+                    )));
+                }
                 let entries: Vec<(Value, Value)> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Map { entries } = &o.kind { entries.clone() } else { vec![] })
                     .unwrap_or_default();
@@ -326,6 +332,12 @@ impl Vm {
             }
             "forEach" => {
                 let callback = args.first().copied().unwrap_or(Value::undefined());
+                if !self.value_callable(callback) {
+                    return Err(VmError::Throw(self.make_native_error(
+                        "TypeError",
+                        "callback is not a function",
+                    )));
+                }
                 let entries: Vec<Value> = self.heap.get(oid)
                     .map(|o| if let ObjectKind::Set { entries } = &o.kind { entries.clone() } else { vec![] })
                     .unwrap_or_default();

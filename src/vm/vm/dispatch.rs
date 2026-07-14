@@ -6983,7 +6983,15 @@ impl Vm {
                                     } else if !arg.is_null() && !arg.is_undefined() {
                                         match self.collect_iterable(arg) {
                                             Ok(Some(items)) => entries = items,
-                                            Ok(None) => {}
+                                            Ok(None) => {
+                                                let err = self.make_native_error(
+                                                    "TypeError",
+                                                    "argument is not iterable",
+                                                );
+                                                self.truncate_stack(func_pos);
+                                                self.handle_throw(err)?;
+                                                continue;
+                                            }
                                             Err(VmError::Throw(v)) => {
                                                 self.truncate_stack(func_pos);
                                                 self.handle_throw(v)?;
@@ -6991,6 +6999,20 @@ impl Vm {
                                             }
                                             Err(e) => return Err(e),
                                         }
+                                    }
+                                    // Get(newSet, "add") must be callable when an
+                                    // iterable was supplied.
+                                    let add_id = self.interner.intern("add");
+                                    let adder = self.func_prototypes.get(&-541).copied()
+                                        .and_then(|p| self.heap.get_property_chain(p, add_id));
+                                    if !entries.is_empty() && !adder.is_some_and(|a| self.value_callable(a)) {
+                                        let err = self.make_native_error(
+                                            "TypeError",
+                                            "Set.prototype.add is not callable",
+                                        );
+                                        self.truncate_stack(func_pos);
+                                        self.handle_throw(err)?;
+                                        continue;
                                     }
                                     // Set semantics: dedupe (SameValueZero-ish via strict_eq).
                                     let mut deduped: Vec<Value> = Vec::with_capacity(entries.len());
