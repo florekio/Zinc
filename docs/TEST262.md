@@ -6,12 +6,15 @@ Run with: `cargo run --release --bin test262_runner`
 
 ## Results
 
-**90.0% pass rate** — 25,316 of 28,119 active tests pass (4,878 tests skipped).
+**92.7% pass rate** — 26,950 of 29,080 active tests pass (7,145 tests skipped).
 
-The runner now covers the **language suite plus 32 built-ins suites**
+The runner covers the **language suite plus 45 built-ins suites**
 (`Array`, `Object`, `String`, `RegExp`, `Promise`, `Date`, `Function`,
-`Map`/`Set`, `Symbol`, typed arrays, …) — nearly 3x the scope of earlier
-releases, which measured the language suite alone (currently at 96.4%).
+`Map`/`Set`, `Symbol`, `TypedArray`, `DataView`, `ArrayBuffer`, `BigInt`,
+the iterator prototypes, …) — nearly 3x the scope of earlier releases,
+which measured the language suite alone (currently at 96.4%). Conformance
+is verified cross-platform: macOS arm64, x86-64 Linux, and aarch64 Linux
+produce byte-identical failure sets.
 Remaining failures are concentrated in strict-mode early errors, deep
 observable protocols (Promise species/capability edge cases, RegExp lookahead
 grammar), and documented-unsupported features: `Proxy`, `Reflect` methods,

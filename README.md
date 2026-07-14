@@ -4,7 +4,7 @@ A JavaScript engine written from scratch in Rust with an **experimental JIT comp
 
 Zinc implements a complete pipeline from source code to execution: **lexer** → **parser** → **bytecode compiler** → **virtual machine** → **JIT**. Every component is hand-written with zero runtime dependencies on existing JS engines.
 
-**90.0% [Test262](docs/TEST262.md) conformance across language + built-ins (25,316 / 28,119 active tests)** — **96.4% on the language suite alone** | **238 tests** | **~41,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum**
+**92.7% [Test262](docs/TEST262.md) conformance across language + built-ins (26,950 / 29,080 active tests)** — **96.4% on the language suite alone** | **238 tests** | **~47,000 lines of Rust** | **beats V8 on fibonacci, ackermann, and loop_sum** | **identical conformance verified on macOS arm64, x86-64 Linux, and aarch64 Linux**
 
 ![Zinc Playground](web/screenshot.png)
 
@@ -77,14 +77,14 @@ See [JIT.md](docs/JIT.md) for technical details.
 | **Async/await** | `async function`, `await` on promises and values |
 | **Generators** | `function*`, `yield`, `yield*`, `.next(val)`, `.return()`, `.throw()`, `for...of` integration, abrupt-completion handling across suspension |
 | **Iterators** | `for...of` with array/string/generator iterator protocol, iterator closing on abrupt loop exits |
-| **Collections** | `Map`, `Set`, `WeakMap`, `WeakSet` with full prototype methods |
-| **Symbols** | `Symbol()`, well-known symbols (`iterator`, `hasInstance`, `toPrimitive`, `toStringTag` — honored by `Object.prototype.toString` — `species`, `asyncIterator`, …), symbol-keyed properties incl. accessors |
+| **Collections** | `Map`, `Set`, `WeakMap`, `WeakSet` with full prototype methods, the spec construction protocol (observable adders, iterator close, entry coercion) and per-kind iterator prototypes (`%MapIteratorPrototype%`, …) |
+| **Symbols** | `Symbol()`, `Symbol.prototype.description`/`toString`/`valueOf` with receiver checks, symbol wrapper objects, well-known symbols (`iterator`, `hasInstance`, `toPrimitive`, `toStringTag` — honored by `Object.prototype.toString` — `species` as spec accessors on the built-in constructors, `isConcatSpreadable`, `asyncIterator`, …), symbol-keyed properties incl. accessors |
 | **Error handling** | `try`/`catch`/`finally`, `throw`, the full `Error` constructor family including `AggregateError` (observable iterable-to-list, `errors` property), `instanceof` with prototype chain, catch destructuring |
-| **eval()** | Runtime compilation and execution, direct-eval scope semantics |
+| **eval()** | Runtime compilation and execution, direct-eval scope semantics incl. inherited strictness, strict-mode early errors (eval/arguments bindings, `with`, octal literals, duplicate params) |
 | **ES Modules** | `import { a } from './mod.js'`, `export`, `export default`, `export * from`, module caching |
 | **JSON** | `JSON.parse` (full recursive descent), `JSON.stringify`, `[object JSON]` |
 | **Math** | Full method set with spec `name`/`length` on every function |
-| **Typed arrays** | `ArrayBuffer`, `DataView`, typed array constructors |
+| **Typed arrays** | `ArrayBuffer`, `DataView` with the full `get*`/`set*` surface incl. `BigInt64`/`BigUint64`, typed array constructors with `BYTES_PER_ELEMENT` and receiver-checked prototype accessors |
 | **Globals** | `console.*`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `eval`, `encodeURI[Component]`, `decodeURI[Component]`, `globalThis` |
 
 ### Engine Internals
@@ -134,10 +134,11 @@ bash bench/sunspider/run.sh    # SunSpider benchmarks
 
 ## Test262 Conformance
 
-The conformance runner covers the **language suite plus 32 built-ins suites** (`Array`, `Object`, `String`, `RegExp`, `Promise`, `Date`, `Function`, `Map`/`Set`, `Symbol`, …) — nearly **3x the test scope of v0.4.0** (28,119 active tests vs 9,805, which covered only the language suite):
+The conformance runner covers the **language suite plus 45 built-ins suites** (`Array`, `Object`, `String`, `RegExp`, `Promise`, `Date`, `Function`, `Map`/`Set`, `Symbol`, `TypedArray`, `DataView`, `ArrayBuffer`, `BigInt`, the iterator prototypes, …) — nearly **3x the test scope of v0.4.0** (29,080 active tests vs 9,805, which covered only the language suite):
 
-- **Full run: 90.0%** (25,316 / 28,119 active tests)
+- **Full run: 92.7%** (26,950 / 29,080 active tests)
 - **Language suite alone: 96.4%** — 23 language categories at 100%
+- **Cross-platform**: byte-identical failure sets on macOS arm64, x86-64 Linux, and aarch64 Linux (the Linux runs surfaced and fixed a real NaN-boxing bug — glibc's negative NaNs collided with the tag space)
 
 See [TEST262.md](docs/TEST262.md).
 
@@ -189,9 +190,9 @@ web/                   WASM playground (HTML + compiled WASM)
 
 ## Stats
 
-- **~41,000 lines** of Rust
+- **~47,000 lines** of Rust
 - **238 tests** passing (94 VM unit tests + 111 end-to-end + parser/JIT suites)
-- **90.0%** Test262 conformance across language + built-ins (25,316 / 28,119 active tests); **96.4%** on the language suite
+- **92.7%** Test262 conformance across language + built-ins (26,950 / 29,080 active tests); **96.4%** on the language suite
 - **1.5 MB** WASM binary (includes regex engine)
 - **Beats V8** on fibonacci (1.75x), Ackermann (3.7x), and loop_sum (1.4x)
 - Zero external dependencies for code generation
