@@ -851,16 +851,29 @@ impl Vm {
     /// Shared Function/GeneratorFunction dynamic compilation; `keyword` is
     /// "function" or "function*".
     pub(crate) fn construct_function_kind(&mut self, args: &[Value], keyword: &str) -> Result<Value, VmError> {
-        let params_str = if args.len() > 1 {
-            args[..args.len() - 1]
-                .iter()
-                .map(|v| self.value_to_string(*v))
-                .collect::<Vec<_>>()
-                .join(",")
+        // ToString every argument observably (objects run their toString;
+        // Symbols throw).
+        let mut strs: Vec<String> = Vec::with_capacity(args.len());
+        for a in args {
+            if a.is_symbol() {
+                return Err(VmError::Throw(self.make_native_error(
+                    "TypeError",
+                    "Cannot convert a Symbol value to a string",
+                )));
+            }
+            let prim = if a.is_object() && !self.is_cons_string(*a) && !self.is_flat_string(*a) {
+                self.try_coerce_to_primitive_hint(*a, "string")?
+            } else {
+                *a
+            };
+            strs.push(self.value_to_string(prim));
+        }
+        let params_str = if strs.len() > 1 {
+            strs[..strs.len() - 1].join(",")
         } else {
             String::new()
         };
-        let body_str = args.last().map(|v| self.value_to_string(*v)).unwrap_or_default();
+        let body_str = strs.last().cloned().unwrap_or_default();
         let src = format!("return ({}({}){{ {} }})", keyword, params_str, body_str);
 
         // Lex, parse, compile

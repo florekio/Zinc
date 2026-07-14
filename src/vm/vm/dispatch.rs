@@ -6526,6 +6526,46 @@ impl Vm {
                     let func_pos = self.stack.len() - 1 - argc;
                     let func_val = self.stack[func_pos];
 
+                    // Bound function [[Construct]]: construct the TARGET with
+                    // boundArgs ++ args (boundThis is ignored; prototype comes
+                    // from the target).
+                    if let Some(oid) = func_val.as_object_id() {
+                        let bound_info = self.heap.get(oid).and_then(|o| {
+                            if let ObjectKind::Function(crate::runtime::object::FunctionKind::Bound {
+                                target, args, ..
+                            }) = &o.kind {
+                                Some((*target, args.clone()))
+                            } else { None }
+                        });
+                        if let Some((target_oid, bound_args)) = bound_info {
+                            let target_fn = self.heap.get(target_oid).map(|o| {
+                                match &o.kind {
+                                    ObjectKind::Function(crate::runtime::object::FunctionKind::Bytecode { chunk_idx, .. }) => {
+                                        Value::function(*chunk_idx as i64)
+                                    }
+                                    ObjectKind::Function(crate::runtime::object::FunctionKind::NativeSentinel { sentinel }) => {
+                                        Value::function(*sentinel)
+                                    }
+                                    _ => Value::object_id(target_oid),
+                                }
+                            });
+                            if let Some(fn_val) = target_fn {
+                                let call_args: Vec<Value> = bound_args.into_iter()
+                                    .chain((0..argc).map(|i| self.stack[func_pos + 1 + i]))
+                                    .collect();
+                                self.truncate_stack(func_pos);
+                                match self.construct_from_native(fn_val, &call_args) {
+                                    Ok(v) => self.push(v),
+                                    Err(VmError::Throw(v)) => {
+                                        self.handle_throw(v)?;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
                     // Per spec, IsConstructor check fires AFTER args are evaluated.
                     // If func_val is neither a function value nor a class-like object,
                     // throw TypeError. (Class objects have a __constructor__ marker.)
