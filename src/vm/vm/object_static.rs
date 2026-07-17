@@ -151,8 +151,16 @@ impl Vm {
                             let accessor_inner = {
                                 let name = self.interner.resolve(k);
                                 if let Some(rest) = name.strip_prefix("__get_").and_then(|s| s.strip_suffix("__")) {
+                                    // Symbol-keyed accessor halves stay hidden
+                                    // from the string-name listing.
+                                    if is_internal_key(rest) {
+                                        continue;
+                                    }
                                     Some(rest.to_owned())
                                 } else if let Some(rest) = name.strip_prefix("__set_").and_then(|s| s.strip_suffix("__")) {
+                                    if is_internal_key(rest) {
+                                        continue;
+                                    }
                                     Some(rest.to_owned())
                                 } else if is_internal_key(name) {
                                     continue;
@@ -594,7 +602,12 @@ impl Vm {
                     for k in raw_props {
                         let s = self.interner.resolve(k).to_owned();
                         let real = if (s.starts_with("__get_") || s.starts_with("__set_")) && s.ends_with("__") {
-                            s[6..s.len()-2].to_owned()
+                            let inner = s[6..s.len()-2].to_owned();
+                            // Symbol-keyed accessor halves are not string keys.
+                            if is_internal_key(&inner) {
+                                continue;
+                            }
+                            inner
                         } else if is_internal_key(&s) {
                             continue;
                         } else {

@@ -94,9 +94,22 @@ impl Vm {
         {
             return self.call_function_this(gfn, Value::object_id(oid), &[]);
         }
-        Ok(self.heap.get(oid)
-            .and_then(|o| o.get_property(name_id))
-            .unwrap_or(Value::undefined()))
+        match self.heap.get(oid).and_then(|o| o.get_property(name_id)) {
+            Some(v) => Ok(v),
+            None => {
+                // The binding vanished between HasBinding and GetValue (an
+                // unscopables getter deleted it): strict mode throws.
+                let strict = self.frames.last().is_some_and(|f| {
+                    self.chunks[f.chunk_idx].flags.contains(crate::compiler::chunk::ChunkFlags::STRICT)
+                });
+                if strict {
+                    let n = self.interner.resolve(name_id).to_owned();
+                    let err = self.make_native_error("ReferenceError", &format!("{n} is not defined"));
+                    return Err(VmError::Throw(err));
+                }
+                Ok(Value::undefined())
+            }
+        }
     }
 
     /// PutValue through a with-scope binding: run the setter if the property

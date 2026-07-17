@@ -778,7 +778,14 @@ impl Vm {
                             Err(e) => return Err(e),
                         };
                         if let Some(oid) = looked {
-                            let v = self.with_scope_get(oid, name_id)?;
+                            let v = match self.with_scope_get(oid, name_id) {
+                                Ok(v) => v,
+                                Err(VmError::Throw(t)) => {
+                                    self.handle_throw(t)?;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            };
                             self.push(v);
                             continue;
                         }
@@ -4217,10 +4224,23 @@ impl Vm {
                             self.push(val);
                             continue;
                         }
-                        // Symbol-keyed property lookup
+                        // Symbol-keyed property lookup (accessor-aware).
                         if key.is_symbol() {
                             let sid = key.as_symbol_id().unwrap();
-                            let sym_key = self.interner.intern(&format!("__sym_{sid}__"));
+                            let sym_key_str = format!("__sym_{sid}__");
+                            let getter_key = self.interner.intern(&format!("__get_{sym_key_str}__"));
+                            if let Some(gfn) = self.heap.get_property_chain(oid, getter_key)
+                                && self.value_callable(gfn)
+                            {
+                                let result = match self.call_function_this(gfn, obj_val, &[]) {
+                                    Ok(v) => v,
+                                    Err(VmError::Throw(t)) => { self.handle_throw(t)?; continue; }
+                                    Err(e) => return Err(e),
+                                };
+                                self.push(result);
+                                continue;
+                            }
+                            let sym_key = self.interner.intern(&sym_key_str);
                             let val = self.heap.get_property_chain(oid, sym_key)
                                 .unwrap_or(Value::undefined());
                             self.push(val);
@@ -4718,7 +4738,24 @@ impl Vm {
                         } else if key.is_symbol() {
                             // Store symbol-keyed properties using a prefix scheme
                             let sid = key.as_symbol_id().unwrap();
-                            let sym_key = self.interner.intern(&format!("__sym_{sid}__"));
+                            let sym_key_str = format!("__sym_{sid}__");
+                            let setter_key = self.interner.intern(&format!("__set_{sym_key_str}__"));
+                            if let Some(sfn) = self.heap.get_property_chain(oid, setter_key)
+                                && self.value_callable(sfn)
+                            {
+                                let prev_protect = self.protect_throw_depth;
+                                self.protect_throw_depth = self.frames.len() + 1;
+                                let r = self.call_function_this(sfn, obj_val, &[val]);
+                                self.protect_throw_depth = prev_protect;
+                                match r {
+                                    Ok(_) => {}
+                                    Err(VmError::Throw(t)) => { self.handle_throw(t)?; continue; }
+                                    Err(e) => return Err(e),
+                                }
+                                self.push(val);
+                                continue;
+                            }
+                            let sym_key = self.interner.intern(&sym_key_str);
                             if let Some(obj) = self.heap.get_mut(oid) {
                                 obj.set_property(sym_key, val);
                             }
@@ -8429,10 +8466,10 @@ impl Vm {
                         }
                         if let Some(obj) = self.heap.get_mut(oid)
                         {
-                            // Symbol-keyed accessors are stored under their symbol slot key.
-                            let accessor_key = if name_str.starts_with("__sym_") {
-                                self.interner.intern(&name_str)
-                            } else if opcode == OpCode::DefineGetter {
+                            // Accessor halves — symbol keys included — live
+                            // under the __get_/__set_ convention so the getter
+                            // machinery fires on reads.
+                            let accessor_key = if opcode == OpCode::DefineGetter {
                                 self.interner.intern(&format!("__get_{name_str}__"))
                             } else {
                                 self.interner.intern(&format!("__set_{name_str}__"))
@@ -10312,7 +10349,14 @@ impl Vm {
                     let target_oid = self.with_scope_lookup(self.frame_with_base(), name_id);
                     if let Some(oid) = target_oid {
                         if opcode == OpCode::WithGetCheck {
-                            let v = self.with_scope_get(oid, name_id)?;
+                            let v = match self.with_scope_get(oid, name_id) {
+                            Ok(v) => v,
+                            Err(VmError::Throw(t)) => {
+                                self.handle_throw(t)?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
                             self.push(v);
                         } else {
                             // Like SetLocal, the assigned value stays on the stack
@@ -10393,7 +10437,14 @@ impl Vm {
                     })?;
                     let target = self.peek()?;
                     if let Some(oid) = target.as_object_id() {
-                        let v = self.with_scope_get(oid, name_id)?;
+                        let v = match self.with_scope_get(oid, name_id) {
+                            Ok(v) => v,
+                            Err(VmError::Throw(t)) => {
+                                self.handle_throw(t)?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
                         self.push(v);
                         let f = self.frames.last_mut().unwrap();
                         f.ip = (f.ip as isize + offset as isize) as usize;
