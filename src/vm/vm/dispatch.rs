@@ -768,12 +768,20 @@ impl Vm {
                     // `with` scope: innermost-first, look up the name as a property of
                     // any with-scope object visible to this frame (entered in it or
                     // captured by its closure) before falling back to globals.
-                    if !self.with_stack.is_empty()
-                        && let Some(oid) = self.with_scope_lookup(self.frame_with_base(), name_id)
-                    {
-                        let v = self.with_scope_get(oid, name_id)?;
-                        self.push(v);
-                        continue;
+                    if !self.with_stack.is_empty() {
+                        let looked = match self.with_scope_lookup_checked(self.frame_with_base(), name_id) {
+                            Ok(v) => v,
+                            Err(VmError::Throw(t)) => {
+                                self.handle_throw(t)?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        if let Some(oid) = looked {
+                            let v = self.with_scope_get(oid, name_id)?;
+                            self.push(v);
+                            continue;
+                        }
                     }
                     // Script-level lexical TDZ: declared but not yet initialized.
                     if !self.tdz_globals.is_empty() && self.tdz_globals.contains(&name_id) {
@@ -857,11 +865,19 @@ impl Vm {
                     let val = self.peek()?;
                     // `with` scope: if a with-object visible to this frame owns this
                     // name, set it there.
-                    if !self.with_stack.is_empty()
-                        && let Some(oid) = self.with_scope_lookup(self.frame_with_base(), name_id)
-                    {
-                        self.with_scope_set(oid, name_id, val)?;
-                        continue;
+                    if !self.with_stack.is_empty() {
+                        let looked = match self.with_scope_lookup_checked(self.frame_with_base(), name_id) {
+                            Ok(v) => v,
+                            Err(VmError::Throw(t)) => {
+                                self.handle_throw(t)?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        if let Some(oid) = looked {
+                            self.with_scope_set(oid, name_id, val)?;
+                            continue;
+                        }
                     }
                     // Script-level lexical TDZ: assignment before initialization.
                     if !self.tdz_globals.is_empty() && self.tdz_globals.contains(&name_id) {
@@ -10340,7 +10356,14 @@ impl Vm {
                     let target = self.pop()?;
                     self.push(val);
                     if let Some(oid) = target.as_object_id() {
-                        let still_exists = self.with_scope_has_binding(oid, name_id);
+                        let still_exists = match self.with_scope_has_binding(oid, name_id) {
+                            Ok(b) => b,
+                            Err(VmError::Throw(t)) => {
+                                self.handle_throw(t)?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
                         if !still_exists
                             && self.chunks[self.cur_chunk()].flags.contains(ChunkFlags::STRICT)
                         {

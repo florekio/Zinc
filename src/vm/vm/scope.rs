@@ -12,7 +12,7 @@ impl Vm {
         &mut self,
         oid: ObjectId,
         name_id: crate::util::interner::StringId,
-    ) -> bool {
+    ) -> Result<bool, VmError> {
         let name_str = self.interner.resolve(name_id).to_owned();
         let getter_key = self.interner.intern(&format!("__get_{name_str}__"));
         let setter_key = self.interner.intern(&format!("__set_{name_str}__"));
@@ -22,19 +22,19 @@ impl Vm {
                 || o.get_property(setter_key).is_some()
         });
         if !owns {
-            return false;
+            return Ok(false);
         }
-        let unscopables_key = self
-            .interner
-            .intern(&format!("__sym_{}__", self.sym_unscopables));
-        let blocked = self.heap.get(oid)
-            .and_then(|o| o.get_property(unscopables_key))
-            .and_then(|v| v.as_object_id())
-            .and_then(|uo| self.heap.get(uo))
-            .and_then(|uo| uo.get_property(name_id))
-            .map(|v| self.truthy(v))
-            .unwrap_or(false);
-        !blocked
+        // Get(env, @@unscopables) and Get(unscopables, name) are both
+        // OBSERVABLE — throwing getters propagate to the identifier lookup.
+        let unscopables_sym = format!("__sym_{}__", self.sym_unscopables);
+        let unscopables = self.getter_aware_get(oid, &unscopables_sym)?;
+        let blocked = if let Some(uo) = unscopables.and_then(|v| v.as_object_id()) {
+            let flag = self.getter_aware_get(uo, &name_str)?;
+            flag.map(|v| self.truthy(v)).unwrap_or(false)
+        } else {
+            false
+        };
+        Ok(!blocked)
     }
 
     /// Start of the with-stack slice visible to the current frame: entries
@@ -58,11 +58,26 @@ impl Vm {
     ) -> Option<ObjectId> {
         for i in (from..self.with_stack.len()).rev() {
             let oid = self.with_stack[i];
-            if self.with_scope_has_binding(oid, name_id) {
+            if self.with_scope_has_binding(oid, name_id).unwrap_or(false) {
                 return Some(oid);
             }
         }
         None
+    }
+
+    /// with_scope_lookup with observable unscopables (throws propagate).
+    pub(crate) fn with_scope_lookup_checked(
+        &mut self,
+        from: usize,
+        name_id: crate::util::interner::StringId,
+    ) -> Result<Option<ObjectId>, VmError> {
+        for i in (from..self.with_stack.len()).rev() {
+            let oid = self.with_stack[i];
+            if self.with_scope_has_binding(oid, name_id)? {
+                return Ok(Some(oid));
+            }
+        }
+        Ok(None)
     }
 
     /// GetValue through a with-scope binding: run the getter if the property
